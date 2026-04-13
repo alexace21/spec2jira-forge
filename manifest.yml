@@ -1,0 +1,26 @@
+modules:
+  confluence:contentAction:
+    - key: spec2jira-for-confluence-and-jira-hello-world-content-action
+      resource: main
+      resolver:
+        function: resolver
+      viewportSize: medium
+      title: Generate AI Breakdown
+  function:
+    - key: resolver
+      handler: index.handler
+resources:
+  - key: main
+    path: static/hello-world/build
+permissions:
+  external:
+    fetch:
+      backend:
+        - address: https://api.spec2jira.com
+  scopes: []
+app:
+  runtime:
+    name: nodejs24.x
+    memoryMB: 256
+    architecture: arm64
+  id: ari:cloud:ecosystem::app/e804f31f-1cbf-4f09-86c1-11e36f387fe7
