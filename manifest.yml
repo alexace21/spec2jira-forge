@@ -1,11 +1,58 @@
 modules:
-  confluence:contentAction:
-    - key: spec2jira-for-confluence-and-jira-hello-world-content-action
+  # Migrated 2026-05-08 from confluence:contentAction (xlarge side-panel)
+  # → confluence:globalPage (full-page). Editor flow unified с future
+  # CG-12 dashboard в single app surface. Page binding: NEW page picker
+  # (no auto-binding via ctx.extension.content.id). Reinstall required
+  # на upgrade — module type change.
+  #
+  # Schema note (empirically verified runtime 2026-05-08): globalPage
+  # с Custom UI (resource form) REQUIRES `resolver:` binding для invoke()
+  # calls to route correctly. Forge linter incorrectly reports `resolver:`
+  # as invalid for globalPage (false positive — likely outdated lint plugin
+  # schema); Atlassian official docs explicitly include resolver block в
+  # globalPage Custom UI examples. Workaround: deploy с `forge deploy
+  # --no-verify` to bypass the false-positive lint check.
+  #
+  # Initial draft removed resolver per lint feedback → runtime crashed
+  # с "Entry point 'resolver' for extension 'spec2jira-app' could not
+  # be invoked" (binding gap). Re-added resolver binding 2026-05-08.
+  confluence:globalPage:
+    - key: spec2jira-app
+      title: Spec2Tickets
+      route: home
       resource: main
       resolver:
         function: resolver
-      viewportSize: medium
-      title: Generate AI Breakdown
+  # U3 part 33 (2026-05-09) — confluence:contentAction inline-on-page
+  # entry surface. Closes "Apps menu navigation friction" partner UX
+  # insight 2026-05-08 part 18 — user clicks "Generate Breakdown с
+  # Spec2Tickets" button on Confluence page byline → globalPage opens
+  # с that page already bound via KVS deep-link relay (no picker step).
+  #
+  # PARALLEL surface to globalPage (NOT replacement). Part 17 migration
+  # (2026-05-08) moved AWAY от contentAction-as-app-surface architecture
+  # because contentAction xlarge sidebar (~720-800px) constrained screen
+  # layouts. contentAction here renders the SAME `main` resource
+  # (App.js); App.js detects ctx.moduleKey === "spec2jira-launch" and
+  # uses Forge router.navigate({ target: "module",
+  # moduleKey: "spec2jira-app" }) to re-route to globalPage immediately.
+  # KVS relay (PENDING_DEEP_LINK_KEY) carries pageId/title across the
+  # navigation hop.
+  #
+  # Reinstall required on upgrade (new module type registration).
+  confluence:contentAction:
+    - key: spec2jira-launch
+      title: Generate Breakdown with Spec2Tickets
+      resource: main
+      resolver:
+        function: resolver
+  confluence:globalSettings:
+    - key: spec2jira-settings
+      resource: main
+      resolver:
+        function: resolver
+      title: Spec2JIRA Settings
+      useAsConfig: true
   function:
     - key: resolver
       handler: index.handler
@@ -16,11 +63,41 @@ permissions:
   external:
     fetch:
       backend:
+        # MVP: hardcoded to our dev backend.
+        # Phase C: solve egress for customer-hosted backends.
         - address: https://api.spec2jira.com
-  scopes: []
+  scopes:
+    - storage:app
+    # Added 2026-05-08 for globalPage migration page picker.
+    # Forge linter explicit (2026-05-08): /wiki/rest/api/content/search
+    # endpoint requires `search:confluence` scope specifically.
+    # H-1 self-review concern empirically resolved at pre-deploy lint
+    # gate (caught BEFORE sandbox 403). Granular scope (least-privilege).
+    # Triggers re-authorization on upgrade for existing installations.
+    - search:confluence
+    # B2 Search broken fix 2026-05-09 part 26 — partner sandbox confirmed
+    # `search:confluence` granted at app level (Authorization tab visible)
+    # but search still failing at runtime. Atlassian's own scope description
+    # explicitly states: "Search Confluence. Note, APIs using this scope
+    # may also return data allowed by read:confluence-space.summary and
+    # read:confluence-content.summary. However, this scope is NOT a
+    # substitute for read:confluence-space.summary or
+    # read:confluence-content.summary."
+    #
+    # Our search resolver uses /wiki/rest/api/content/search (the CQL
+    # endpoint that returns content shape — matches existing parser's
+    # data extraction). This is a CONTENT API endpoint, not the dedicated
+    # /wiki/rest/api/search endpoint. Per Atlassian's note, content
+    # endpoints need read:confluence-content.summary explicitly.
+    #
+    # This scope is ADDITIVE — `search:confluence` retained for
+    # forward-compat with /wiki/rest/api/search if we migrate later.
+    # Re-installation required (existing installations don't auto-grant
+    # new scopes; user must re-authorize via forge install --upgrade).
+    - read:confluence-content.summary
 app:
   runtime:
     name: nodejs24.x
-    memoryMB: 256
+    memoryMB: 512
     architecture: arm64
   id: ari:cloud:ecosystem::app/e804f31f-1cbf-4f09-86c1-11e36f387fe7

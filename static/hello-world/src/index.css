@@ -1,0 +1,92 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * Spec2JIRA — Swagger-inspired palette
+ * Source: OpenAPI/Swagger UI color system
+ * Applied: April 14, 2026
+ */
+:root {
+  --s2j-text:         #3b4151;
+  --s2j-text-light:   #6b7280;
+  --s2j-text-muted:   #8a8fa3;
+
+  --s2j-bg:           #ffffff;
+  --s2j-bg-section:   #fafafa;
+  --s2j-border:       #e2e2e2;
+
+  --s2j-blue:         #61affe;
+  --s2j-blue-bg:      #ebf3fb;
+  --s2j-blue-border:  #c5ddf5;
+
+  --s2j-green:        #49cc90;
+  --s2j-green-dark:   #3dba81;
+  --s2j-green-bg:     #ecfcf4;
+  --s2j-green-border: #a8e6c9;
+
+  --s2j-orange:       #fca130;
+  --s2j-orange-bg:    #fff5e6;
+  --s2j-orange-border:#fdd89b;
+
+  --s2j-red:          #f93e3e;
+  --s2j-red-bg:       #fdeaea;
+  --s2j-red-border:   #f5b4b4;
+}
+
+@layer components {
+  .btn-primary {
+    @apply inline-flex items-center gap-2 rounded-md px-4 py-2
+      text-sm font-semibold text-white shadow-sm
+      disabled:opacity-50 disabled:cursor-not-allowed
+      transition-colors;
+    background-color: var(--s2j-green);
+  }
+  .btn-primary:hover:not(:disabled) {
+    background-color: var(--s2j-green-dark);
+  }
+
+  .btn-secondary {
+    @apply inline-flex items-center gap-2 rounded-md
+      px-3 py-1.5 text-sm transition-colors;
+    color: var(--s2j-text);
+    border: 1px solid var(--s2j-border);
+    background: var(--s2j-bg);
+  }
+  .btn-secondary:hover {
+    background: var(--s2j-bg-section);
+  }
+
+  .btn-danger {
+    @apply inline-flex items-center gap-2 rounded-md px-4 py-2
+      text-sm font-semibold text-white shadow-sm
+      disabled:opacity-50 disabled:cursor-not-allowed
+      transition-colors;
+    background-color: var(--s2j-red);
+  }
+  .btn-danger:hover:not(:disabled) {
+    background-color: #e03535;
+  }
+}
+
+/* Forge iframe: fill the panel */
+html, body, #root {
+  height: 100vh;
+  margin: 0;
+}
+
+/* Base text color for Forge iframe */
+body {
+  color: var(--s2j-text);
+  background: var(--s2j-bg);
+}
+
+/* Override Tailwind grays to Swagger equivalents inside our app */
+@layer utilities {
+  .s2j-text         { color: var(--s2j-text); }
+  .s2j-text-light   { color: var(--s2j-text-light); }
+  .s2j-text-muted   { color: var(--s2j-text-muted); }
+  .s2j-bg           { background-color: var(--s2j-bg); }
+  .s2j-bg-section   { background-color: var(--s2j-bg-section); }
+  .s2j-border       { border-color: var(--s2j-border); }
+}
