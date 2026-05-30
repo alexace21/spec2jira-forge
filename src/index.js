@@ -4,8 +4,9 @@
  * Architecture (post-pivot 2026-05-28):
  *   - BYOK: customer's Anthropic API key stored in Forge KVS secret storage
  *   - Direct asUser() to Confluence (page content fetch) — no backend roundtrip
- *   - Async event consumer for Anthropic generateBreakdown (runtime constraint)
- *   - Direct asUser() to JIRA for push (Step 8 — currently stubbed)
+ *   - Anthropic Message Batches API for generation (startGeneration submits,
+ *     pollJobStatus polls) — async event consumers retired (55s timeout)
+ *   - Chunked asUser() JIRA push (startPush + UI-looped pushStep) — SHIPPED
  *
  * v2.x → v3.0.0 resolver changes:
  *   PRESERVED (Forge-native, no backend dependency):
@@ -23,9 +24,11 @@
  *     - startPreview (v3.0.0 single Anthropic call IS the breakdown)
  *     - healthCheck (no backend к probe)
  *
- *   JIRA push (Step 8 — synchronous asUser() via executePush; 2026-05-30):
- *     - dryRun (pre-flight project verify), pushToJira (full synchronous push)
- *     - pollPushStatus REMOVED — push е synchronous now, no polling
+ *   JIRA push (Step 8 — chunked asUser() resolver; 2026-05-30):
+ *     - dryRun (pre-flight project verify)
+ *     - startPush (lookup + Epic + KVS session) → pushStep, looped by the UI,
+ *       one bounded chunk per call (stays under the 25s resolver timeout).
+ *       No executePush/pushToJira; no queue (asUser() unavailable in consumers).
  */
 
 import Resolver from '@forge/resolver';
@@ -41,10 +44,18 @@ import {
   pollBatchStatus,
   fetchBatchResults,
   estimateCost,
+  resolveDependencyCycle,
   MODEL_PRIMARY,
   MODEL_FALLBACK,
 } from './anthropic_client.js';
 import { startPushSession, pushSessionStep } from './push_handler.js';
+import { detectCycles } from './graph.js';
+import {
+  TIERS,
+  checkQuota,
+  consumeQuota,
+  pricingTable,
+} from './usage.js';
 
 const resolver = new Resolver();
 
@@ -55,10 +66,15 @@ const SETTINGS_KEY = 'spec2jira_settings';
 // KVS prefix for generation job state (Anthropic batch lifecycle).
 const JOB_KEY_PREFIX = 'job:';
 
-// NOTE: generation uses Anthropic Message Batches API (polled via
-// pollJobStatus); push runs synchronously in the pushToJira resolver via
-// executePush(). Neither uses @forge/events queues anymore — asUser() е
-// unavailable in async consumers (AUTH_TYPE_UNAVAILABLE 2026-05-30).
+// Index: page id → latest generation jobId. Lets a reopened page reconnect to an
+// in-flight batch (getGenerationStatus) instead of showing Ready + spawning a
+// duplicate batch. Written by startGeneration; read by getGenerationStatus.
+const PAGE_JOB_PREFIX = 'pageJob:';
+
+// NOTE: generation uses the Anthropic Message Batches API (polled via
+// pollJobStatus); push is a CHUNKED resolver (startPush + UI-looped pushStep,
+// one bounded JIRA batch per call). Neither uses @forge/events queues anymore —
+// asUser() is unavailable in async consumers (AUTH_TYPE_UNAVAILABLE 2026-05-30).
 
 
 // ── Settings helpers ────────────────────────────────────────
@@ -281,7 +297,7 @@ resolver.define('searchPages', async ({ payload }) => {
     if (response.status === 403) {
       return {
         error: 'Confluence 403 — scope mismatch?',
-        detail: `Verify search:confluence + read:confluence-content.summary scopes. Body: ${text.substring(0, 200)}`,
+        detail: `Verify the search:confluence scope is granted, then reinstall the app. Body: ${text.substring(0, 200)}`,
       };
     }
     return {
@@ -446,17 +462,102 @@ function newJobId() {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
+// Bound the per-cycle resolution calls — each is a sync LLM call and pollJobStatus
+// runs under the 25-sec resolver limit. Real breakdowns have 0-2 cycles; this is a
+// runaway guard, not an expected ceiling. Cycles beyond it (or that the model
+// can't confidently resolve) are surfaced as spec_concerns rather than left silent.
+const MAX_CYCLE_RESOLVES = 3;
+
+/**
+ * Verify the cross-feature dependency graph is acyclic; auto-resolve each cycle by
+ * cutting the softest edge (a tiny LLM call), and surface anything unresolved as a
+ * spec_concern. Mutates `breakdown.features[].dependencies` + `breakdown.spec_concerns`
+ * in place. Fail-safe — the caller wraps it so generation never fails on repair.
+ */
+async function verifyAndRepairCycles(breakdown, apiKey, model) {
+  const features = breakdown?.features;
+  if (!Array.isArray(features) || features.length === 0) return;
+
+  const cycles = detectCycles(features); // pure, deterministic, exhaustive
+  if (cycles.length === 0) return;
+  console.log(`[cycle] detected ${cycles.length} dependency cycle(s)`);
+
+  const byName = new Map(features.map((f) => [f.name, f]));
+  const concerns = [];
+  let resolves = 0;
+
+  for (const path of cycles) {
+    const label = `${path.join(' → ')} → ${path[0]}`;
+    let cut = null;
+
+    if (apiKey && resolves < MAX_CYCLE_RESOLVES) {
+      const involved = path.map((n) => byName.get(n)).filter(Boolean);
+      try {
+        const r = await resolveDependencyCycle({ cyclePath: path, features: involved, apiKey, model });
+        if (r && !r.error && !r.uncertain && r.cut_from && r.cut_to) cut = r;
+      } catch (e) {
+        console.error(`[cycle] resolve threw: ${String(e?.message || e)}`);
+      }
+    }
+
+    if (cut) {
+      const f = byName.get(cut.cut_from);
+      if (f && Array.isArray(f.dependencies) && f.dependencies.includes(cut.cut_to)) {
+        f.dependencies = f.dependencies.filter((d) => d !== cut.cut_to);
+        resolves++;
+        console.log(`[cycle] cut "${cut.cut_from}" → "${cut.cut_to}" (${cut.reason || 'softer edge'})`);
+        concerns.push(
+          `[RISK|low] Circular dependency auto-resolved: dropped the "${cut.cut_from}" → "${cut.cut_to}" blocker (${cut.reason || 'softer edge'}). Confirm the ordering.`,
+        );
+        continue;
+      }
+    }
+
+    // Not resolved (no key / over budget / uncertain / invalid edge) → surface honestly.
+    concerns.push(
+      `[RISK|medium] Circular dependency detected but NOT auto-resolved: ${label}. Break it manually before relying on blocks-links for sprint sequencing.`,
+    );
+  }
+
+  if (concerns.length) {
+    breakdown.spec_concerns = [...(breakdown.spec_concerns || []), ...concerns];
+  }
+}
+
+/**
+ * Remove shared acceptance criteria that already appear (verbatim, normalized) in
+ * a feature's ACs. Such an entry is not a "shared/unassigned" cross-cutting rule —
+ * it is a duplicate that shows up redundantly in the Shared-AC assignment panel.
+ * Pure + deterministic (exact normalized string match — structure, not meaning);
+ * the prompt (rule 12) is the primary defense, this is the safety net. In place.
+ */
+function dedupeSharedAcceptanceCriteria(breakdown) {
+  const shared = breakdown?.shared_acceptance_criteria;
+  if (!Array.isArray(shared) || shared.length === 0) return;
+  const norm = (s) =>
+    String(s || '').trim().toLowerCase().replace(/\s+/g, ' ').replace(/[.;]+$/, '');
+  const featureACs = new Set();
+  for (const f of breakdown.features || []) {
+    for (const ac of f.acceptance_criteria || []) featureACs.add(norm(ac));
+  }
+  const before = shared.length;
+  breakdown.shared_acceptance_criteria = shared.filter((s) => !featureACs.has(norm(s)));
+  const removed = before - breakdown.shared_acceptance_criteria.length;
+  if (removed > 0) {
+    console.log(`[dedupe] removed ${removed} shared AC(s) already present in a feature`);
+  }
+}
+
 /**
  * Start a breakdown generation job using Anthropic Message Batches API.
  * Returns immediately с jobId after submitting batch (~1-2 sec total).
  * Forge UI polls pollJobStatus за batch lifecycle progress + results.
  *
- * Payload: { pageId, modelMode?, bypassCache? }
+ * Payload: { pageId, modelMode? }
  *   modelMode: 'primary' (Sonnet 4.6, default) | 'fallback' (Haiku 4.5)
- *   bypassCache: boolean (disable prompt caching — useful за testing)
  */
-resolver.define('startGeneration', async ({ payload }) => {
-  const { pageId, modelMode, bypassCache } = payload || {};
+resolver.define('startGeneration', async ({ payload, context }) => {
+  const { pageId, modelMode } = payload || {};
   if (!pageId) return { error: 'No page ID' };
 
   // Verify API key configured BEFORE fetching content (fail fast)
@@ -467,6 +568,33 @@ resolver.define('startGeneration', async ({ payload }) => {
       detail:
         'Anthropic API key not configured. Ask your Confluence admin к open Settings → Spec2Tickets and provide an Anthropic API key.',
     };
+  }
+
+  // Tier/usage gate (P3a). Fail OPEN — a metering glitch must never block a
+  // BYOK user who pays their own Anthropic bill. In 'meter' mode quota.allowed
+  // is always true (we never block pre-paid-listing); the gate only bites once
+  // ENFORCEMENT_MODE flips to 'block' (P3b, after the Marketplace paid listing).
+  // The counter is consumed AFTER a successful batch submit below, so a failed
+  // submit never burns the customer's quota.
+  let quota = null;
+  try {
+    quota = await checkQuota(context);
+    if (!quota.allowed) {
+      return {
+        error: 'quota_exceeded',
+        tier: quota.tier,
+        tierLabel: quota.tierLabel,
+        used: quota.used,
+        limit: quota.limit,
+        resetsAt: quota.resetsAt,
+        resetsAtLabel: quota.resetsAtLabel,
+        upgradePrice: TIERS.pro.price,
+        pricing: pricingTable(),
+        detail: `You've used all ${quota.limit} free breakdowns this month. Upgrade to ${TIERS.pro.label} — ${TIERS.pro.price} for unlimited breakdowns. Your free quota resets on ${quota.resetsAtLabel}.`,
+      };
+    }
+  } catch (e) {
+    console.error(`[startGeneration] quota check failed (failing open): ${String(e?.message || e)}`);
   }
 
   // Fetch page content (asUser so customer permissions apply).
@@ -509,6 +637,8 @@ resolver.define('startGeneration', async ({ payload }) => {
     model,
     createdAt: new Date().toISOString(),
   });
+  // Index page → this job so reopening mid-generation reconnects (not a new batch).
+  await kvs.set(`${PAGE_JOB_PREFIX}${String(pageId)}`, { jobId });
 
   // Submit batch к Anthropic (returns batch_id immediately)
   const submitResult = await submitBreakdownBatch({
@@ -516,7 +646,7 @@ resolver.define('startGeneration', async ({ payload }) => {
     pageContent,
     customId: jobId,
     model,
-    useCaching: bypassCache !== true,
+    useCaching: true,
   });
 
   if (submitResult.error) {
@@ -552,14 +682,35 @@ resolver.define('startGeneration', async ({ payload }) => {
     expiresAt: submitResult.expiresAt,
   });
 
+  // Consume one unit of quota — only now that the batch submitted successfully
+  // (a failed submit above returned early and never reaches here). Throw-safe:
+  // the generation already succeeded, so a metering write failure must not break
+  // the user's response — log it loudly instead (POLICY §11: never silent).
+  let usageInfo = null;
+  if (quota) {
+    try {
+      const used = await consumeQuota(quota.period);
+      usageInfo = {
+        tier: quota.tier,
+        used,
+        limit: quota.limit,
+        remaining: Math.max(0, quota.limit - used),
+        resetsAt: quota.resetsAt,
+      };
+    } catch (e) {
+      console.error(`[startGeneration] quota consume failed (generation still OK): ${String(e?.message || e)}`);
+    }
+  }
+
   console.log(
-    `[startGeneration] jobId=${jobId} batchId=${submitResult.batchId} status=submitted`,
+    `[startGeneration] jobId=${jobId} batchId=${submitResult.batchId} status=submitted${usageInfo ? ` usage=${usageInfo.used}/${usageInfo.limit}(${usageInfo.tier})` : ''}`,
   );
   return {
     jobId,
     job_id: jobId,
     status: 'batched',
     batchId: submitResult.batchId,
+    usage_tier: usageInfo,
   };
 });
 
@@ -665,6 +816,25 @@ resolver.define('pollJobStatus', async ({ payload }) => {
         };
       }
 
+      // Verify/repair the dependency graph BEFORE persisting: detect cycles
+      // (pure) + cut the softest edge per cycle (tiny LLM, bounded) + surface
+      // unresolved ones as spec_concerns. A silent cycle breaks downstream sprint
+      // sequencing and creates false confidence (§11). Fail-safe — non-fatal.
+      try {
+        const cycleApiKey = await getStoredApiKey();
+        await verifyAndRepairCycles(breakdown, cycleApiKey, fetchResult.model);
+      } catch (e) {
+        console.error(`[pollJobStatus] cycle repair failed (non-fatal): ${String(e?.message || e)}`);
+      }
+
+      // Drop shared ACs that duplicate a feature's AC (redundant in the assign
+      // panel — rule 12). Pure dedupe; non-fatal.
+      try {
+        dedupeSharedAcceptanceCriteria(breakdown);
+      } catch (e) {
+        console.error(`[pollJobStatus] shared-AC dedupe failed (non-fatal): ${String(e?.message || e)}`);
+      }
+
       const completed = {
         ...job,
         status: 'completed',
@@ -734,12 +904,75 @@ resolver.define('getResults', async ({ payload }) => {
  * jobId per page-id в KVS.
  */
 resolver.define('getGenerationStatus', async ({ payload }) => {
-  // TODO: implement page→latest-jobId index в KVS if Dashboard requires it
+  // Reconnect support: map page → its latest job (PAGE_JOB_PREFIX index, written
+  // by startGeneration) and report its status so reopening a page resumes the
+  // right screen instead of offering a fresh Generate (which spawned a duplicate
+  // batch — bug 2026-05-30):
+  //   - pending/batched → UI reconnects to the generating screen + resumes poll
+  //   - completed       → UI reopens the result (BreakdownEditor + Dashboard signals)
+  //   - failed/unknown  → 'idle' → fresh Ready screen
+  const pageId = payload?.pageId ? String(payload.pageId) : null;
+  if (!pageId) return { status: 'idle' };
+
+  const ref = await kvs.get(`${PAGE_JOB_PREFIX}${pageId}`);
+  if (!ref || !ref.jobId) return { status: 'idle' };
+
+  const job = await kvs.get(`${JOB_KEY_PREFIX}${ref.jobId}`);
+  if (!job) return { status: 'idle' };
+
+  if (job.status === 'completed') {
+    return { status: 'completed', job_id: job.jobId };
+  }
+  if (job.status === 'pending' || job.status === 'batched') {
+    const startedAt = job.submittedAt || job.createdAt;
+    const elapsed_seconds = startedAt
+      ? Math.max(0, Math.floor((Date.now() - new Date(startedAt).getTime()) / 1000))
+      : 0;
+    return { status: job.status, job_id: job.jobId, elapsed_seconds };
+  }
   return { status: 'idle' };
 });
 
+/**
+ * getUsage — current month's breakdown usage + tier, for the UI badge / upgrade
+ * nudge. Read-only (does not consume). Throw-safe: a metering glitch returns a
+ * benign null so the UI can simply hide the badge rather than error.
+ */
+resolver.define('getUsage', async ({ context }) => {
+  try {
+    const quota = await checkQuota(context);
+    return { ...quota, pricing: pricingTable() };
+  } catch (e) {
+    console.error(`[getUsage] failed: ${String(e?.message || e)}`);
+    return { error: 'usage_unavailable' };
+  }
+});
+
+/**
+ * purgeJob — data minimization: delete a generation job's stored page content +
+ * breakdown (and its page→job index) once it is no longer needed (after the user
+ * pushes to JIRA). Best-effort, non-fatal. Backs the privacy policy claim that
+ * page content is removed after processing rather than retained indefinitely.
+ */
+resolver.define('purgeJob', async ({ payload }) => {
+  const jobId = payload?.jobId;
+  if (!jobId) return { ok: false };
+  try {
+    const job = await kvs.get(`${JOB_KEY_PREFIX}${jobId}`);
+    if (job && job.pageId) {
+      await kvs.delete(`${PAGE_JOB_PREFIX}${String(job.pageId)}`);
+    }
+    await kvs.delete(`${JOB_KEY_PREFIX}${jobId}`);
+    console.log(`[purgeJob] removed job ${jobId} (page content + breakdown) post-push`);
+    return { ok: true };
+  } catch (e) {
+    console.error(`[purgeJob] failed (non-fatal): ${String(e?.message || e)}`);
+    return { ok: false };
+  }
+});
+
 // ════════════════════════════════════════════════════════════
-// JIRA PUSH — asUser() via async queue (Step 8 SHIPPED 2026-05-29)
+// JIRA PUSH — chunked asUser() resolver (startPush + looped pushStep); 2026-05-30
 // ════════════════════════════════════════════════════════════
 
 /**

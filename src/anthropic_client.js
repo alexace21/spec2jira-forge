@@ -718,6 +718,101 @@ export async function fetchBatchResults(resultsUrl, customId, apiKeyOverride = n
   };
 }
 
+// ── Dependency-cycle resolution (tiny sync call) ───────────────────────
+// Detection is a pure function (src/graph.js). Choosing WHICH edge of a cycle to
+// cut is meaning-reading (§4) — it needs to understand the features — so it is a
+// small, focused, universal LLM call, bounded by the caller (the 25-sec resolver
+// budget). Structured output → a deterministic { cut_from, cut_to, ... } verdict.
+
+const CYCLE_RESOLVE_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['cut_from', 'cut_to', 'uncertain', 'reason'],
+  properties: {
+    cut_from: { type: 'string' }, // the dependent feature
+    cut_to: { type: 'string' }, // the dependency to remove from cut_from.dependencies
+    uncertain: { type: 'boolean' }, // true only when both directions are hard prerequisites
+    reason: { type: 'string' },
+  },
+};
+
+const CYCLE_RESOLVE_SYSTEM = `You are a senior delivery architect resolving a circular dependency in a sprint dependency graph.
+
+RULES (cost asymmetry): a silent circular dependency BREAKS downstream sprint-sequencing tools and creates false confidence — that is the expensive error. Cutting a slightly-wrong edge only creates a mildly off ordering a human can fix. So when one edge is clearly the softer coupling, cut it confidently; set uncertain=true ONLY when both directions are genuine hard prerequisites (a real design conflict the spec author must resolve).
+
+DECISIVE TEST (holds across any domain, vendor, or technology): for each edge "A depends on B", ask — is B a HARD prerequisite (A cannot be built, tested, or function at all until B exists), or a SOFT coupling (A can be built first against a stub / mock / agreed contract, or the dependency is merely preferred ordering)? Cut the SOFTEST edge so the graph becomes acyclic. The true blocker is the one whose consumer literally cannot operate without the producer's output.
+
+OUTPUT CONTRACT: cut_from depends on cut_to; removing cut_to from cut_from's dependency list is what breaks the cycle. Both names MUST be taken verbatim from the cycle given to you.
+
+WORKED EXAMPLE (shows the reasoning, not a pattern to match):
+Cycle: "Subscription Management" depends on "Payment Processing"; "Payment Processing" depends on "Subscription Management".
+You cannot charge a subscription without payment rails (Subscription→Payment is HARD). Payment can be built and tested against a stubbed plan/price contract (Payment→Subscription is SOFT). → cut_from = "Payment Processing", cut_to = "Subscription Management", uncertain = false.`;
+
+/**
+ * Resolve one dependency cycle: decide which (soft) edge to cut.
+ *
+ * @param {{cyclePath: string[], features: Array<object>, apiKey: string, model?: string}} args
+ * @returns {Promise<{cut_from?, cut_to?, uncertain?, reason?, error?, detail?}>}
+ */
+export async function resolveDependencyCycle({ cyclePath, features, apiKey, model }) {
+  if (!apiKey) return { error: 'not_configured' };
+  if (!Array.isArray(cyclePath) || cyclePath.length < 2) return { error: 'bad_cycle' };
+
+  const ctx = (features || [])
+    .map(
+      (f) =>
+        `- ${f.name}: ${String(f.user_story || f.description || '').slice(0, 240)} [depends on: ${(f.dependencies || []).join(', ') || 'none'}]`,
+    )
+    .join('\n');
+
+  const userPrompt = `Circular dependency to resolve (each "X → Y" means X depends on Y):
+${cyclePath.join(' → ')} → ${cyclePath[0]}
+
+Features involved:
+${ctx}
+
+Identify the single softest edge to cut so the cycle is broken.`;
+
+  let response;
+  try {
+    response = await fetch(ANTHROPIC_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'anthropic-version': ANTHROPIC_VERSION,
+        'X-Api-Key': apiKey,
+      },
+      body: JSON.stringify({
+        model: model || MODEL_PRIMARY,
+        max_tokens: 500,
+        system: CYCLE_RESOLVE_SYSTEM,
+        messages: [{ role: 'user', content: userPrompt }],
+        output_config: { format: { type: 'json_schema', schema: CYCLE_RESOLVE_SCHEMA } },
+      }),
+    });
+  } catch (e) {
+    return { error: 'network_failure', detail: String(e?.message || e) };
+  }
+
+  if (!response.ok) {
+    return { error: `http_${response.status}`, detail: String(await response.text()).slice(0, 200) };
+  }
+
+  let data;
+  try {
+    data = await response.json();
+  } catch (e) {
+    return { error: 'parse_failed', detail: String(e?.message || e) };
+  }
+
+  const text = data?.content?.[0]?.text || '';
+  try {
+    return JSON.parse(text);
+  } catch (_) {
+    return { error: 'parse_failed', detail: String(text).slice(0, 200) };
+  }
+}
+
 /**
  * Salvage а usable breakdown от truncated JSON.
  *

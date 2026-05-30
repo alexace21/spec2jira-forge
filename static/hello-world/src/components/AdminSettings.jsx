@@ -24,13 +24,13 @@ const ERROR_MESSAGES = {
   NOT_CONFIGURED:
     "No API key configured. Paste your Anthropic API key above + click Save Settings first.",
   BACKEND_UNREACHABLE:
-    "Anthropic API е unreachable. Check your network OR Forge egress allowlist.",
+    "Anthropic API is unreachable. Check your network and Anthropic's status, then retry.",
   BACKEND_AUTH_FAILED:
     "Anthropic rejected the API key. Verify validity at console.anthropic.com → Settings → API Keys.",
   INSUFFICIENT_CREDITS:
     "Anthropic account has insufficient credits. Add credits at console.anthropic.com → Billing.",
   RATE_LIMITED:
-    "Anthropic rate limit reached. Wait а moment and retry.",
+    "Anthropic rate limit reached. Wait a moment and retry.",
 };
 
 function getErrorText(result) {
@@ -66,7 +66,7 @@ export default function AdminSettings() {
           setShowAdvanced(true); // auto-expand ako а value already exists
         }
       } catch (e) {
-        setMessage({ type: "error", text: "Failed к load settings" });
+        setMessage({ type: "error", text: "Failed to load settings" });
       } finally {
         setLoading(false);
       }
@@ -84,7 +84,7 @@ export default function AdminSettings() {
     if (trimmedKey && !trimmedKey.startsWith("sk-ant-")) {
       setMessage({
         type: "error",
-        text: "Anthropic API key should start with 'sk-ant-'. Verify the value от console.anthropic.com.",
+        text: "Anthropic API key should start with 'sk-ant-'. Verify the value from console.anthropic.com.",
       });
       return;
     }
@@ -98,13 +98,13 @@ export default function AdminSettings() {
 
     const cleanProjectKey = (defaultProjectKey || "").trim().toUpperCase();
     if (!cleanProjectKey) {
-      setMessage({ type: "error", text: "JIRA Project Key е required" });
+      setMessage({ type: "error", text: "JIRA Project Key is required" });
       return;
     }
     if (!/^[A-Z][A-Z0-9]{1,9}$/.test(cleanProjectKey)) {
       setMessage({
         type: "error",
-        text: "JIRA Project Key must be 2–10 characters, start с a letter, only uppercase letters + digits (e.g., PROJ, SCRUM2).",
+        text: "JIRA Project Key must be 2–10 characters, start with a letter, only uppercase letters + digits (e.g., PROJ, SCRUM2).",
       });
       return;
     }
@@ -113,7 +113,7 @@ export default function AdminSettings() {
     if (!trimmedKey && !apiKeyConfigured) {
       setMessage({
         type: "error",
-        text: "Please paste your Anthropic API key. Get one от console.anthropic.com → API Keys.",
+        text: "Please paste your Anthropic API key. Get one from console.anthropic.com → API Keys.",
       });
       return;
     }
@@ -134,7 +134,7 @@ export default function AdminSettings() {
       if (typeof parsed !== "object" || Array.isArray(parsed) || parsed === null) {
         setMessage({
           type: "error",
-          text: "Required custom fields must be а JSON object mapping field IDs к values.",
+          text: "Required custom fields must be a JSON object mapping field IDs to values.",
         });
         return;
       }
@@ -160,7 +160,7 @@ export default function AdminSettings() {
         }
       }
     } catch (e) {
-      setMessage({ type: "error", text: "Failed к save settings" });
+      setMessage({ type: "error", text: "Failed to save settings" });
     } finally {
       setSaving(false);
     }
@@ -169,7 +169,7 @@ export default function AdminSettings() {
   async function handleClearKey() {
     if (
       !confirm(
-        "Clear stored Anthropic API key? Spec2Tickets will not be able к generate breakdowns until а new key е provided.",
+        "Clear stored Anthropic API key? Spec2Tickets will not be able to generate breakdowns until a new key is provided.",
       )
     ) {
       return;
@@ -186,11 +186,11 @@ export default function AdminSettings() {
       } else {
         setMessage({
           type: "error",
-          text: result?.error || "Failed к clear API key",
+          text: result?.error || "Failed to clear API key",
         });
       }
     } catch (e) {
-      setMessage({ type: "error", text: "Failed к clear API key" });
+      setMessage({ type: "error", text: "Failed to clear API key" });
     } finally {
       setClearing(false);
     }
@@ -214,7 +214,7 @@ export default function AdminSettings() {
       setShowAdvanced(false);
       setMessage({ type: "success", text: "Settings reset" });
     } catch (e) {
-      setMessage({ type: "error", text: "Failed к reset settings" });
+      setMessage({ type: "error", text: "Failed to reset settings" });
     }
   }
 
@@ -223,7 +223,7 @@ export default function AdminSettings() {
     if (!trimmedKey && !apiKeyConfigured) {
       setMessage({
         type: "error",
-        text: "Paste your Anthropic API key first OR click Save Settings ако you've previously stored one.",
+        text: "Paste your Anthropic API key first OR click Save Settings if you've previously stored one.",
       });
       return;
     }
@@ -237,7 +237,7 @@ export default function AdminSettings() {
       if (result?.status === "ok") {
         setMessage({
           type: "success",
-          text: result.message || "Connected к Anthropic API",
+          text: result.message || "Connected to Anthropic API",
         });
       } else {
         setMessage({ type: "error", text: getErrorText(result) });
@@ -272,7 +272,7 @@ export default function AdminSettings() {
         Spec2Tickets Settings
       </h1>
       <p className="text-sm mb-5" style={{ color: "var(--s2j-text-muted)" }}>
-        Configure Spec2Tickets к generate JIRA breakdowns от your Confluence specifications using Claude AI.
+        Configure Spec2Tickets to generate JIRA breakdowns from your Confluence specifications using Claude AI.
       </p>
 
       {/* v3.0.0 BYOK info callout */}
@@ -285,7 +285,7 @@ export default function AdminSettings() {
         }}
       >
         <p className="mb-2">
-          <strong>Powered by Claude:</strong> Spec2Tickets uses Anthropic's Claude Sonnet 4.6 к analyze your specs. You provide your own Anthropic API key (BYOK); breakdowns run на Anthropic's infrastructure, never на Spec2Tickets servers.
+          <strong>Powered by Claude:</strong> Spec2Tickets uses Anthropic's Claude Sonnet 4.6 to analyze your specs. You provide your own Anthropic API key (BYOK); breakdowns run on Anthropic's infrastructure, never on Spec2Tickets servers.
         </p>
         <p className="mb-2">
           <strong>Get an API key:</strong>{" "}
@@ -297,10 +297,10 @@ export default function AdminSettings() {
           >
             console.anthropic.com → Settings → API Keys
           </a>{" "}
-          (free signup; pay-as-you-go pricing ~$0.05–$0.15 per breakdown).
+          (sign up free; billed pay-as-you-go to your own Anthropic account).
         </p>
         <p>
-          <strong>Privacy:</strong> Your spec content flows directly от Forge к Anthropic API using your key. Data falls under{" "}
+          <strong>Privacy:</strong> Your spec content flows directly from Forge to the Anthropic API using your key. Data falls under{" "}
           <a
             href="https://www.anthropic.com/legal/aup"
             target="_blank"
@@ -309,7 +309,7 @@ export default function AdminSettings() {
           >
             Anthropic's Usage Policy
           </a>
-          {" "}+ your own data processing agreement с Anthropic.
+          {" "}+ your own data processing agreement with Anthropic.
         </p>
       </div>
 
@@ -319,8 +319,8 @@ export default function AdminSettings() {
           label="Anthropic API Key"
           description={
             apiKeyConfigured
-              ? `API key configured${apiKeyLastSetAt ? ` (last set ${new Date(apiKeyLastSetAt).toLocaleDateString()})` : ""}. Paste а new value к replace, или leave blank к keep current.`
-              : "Paste your Anthropic API key (sk-ant-...). Stored encrypted в Forge KVS, never visible к the UI after save."
+              ? `API key configured${apiKeyLastSetAt ? ` (last set ${new Date(apiKeyLastSetAt).toLocaleDateString()})` : ""}. Paste a new value to replace, or leave blank to keep current.`
+              : "Paste your Anthropic API key (sk-ant-...). Stored encrypted in Forge KVS, never visible to the UI after save."
           }
           required={!apiKeyConfigured}
         >
@@ -369,7 +369,7 @@ export default function AdminSettings() {
 
         <Field
           label="Default JIRA Project Key"
-          description="2–10 uppercase letters/digits, starting с а letter. Used as the default destination когато pushing breakdowns к JIRA."
+          description="2–10 uppercase letters/digits, starting with a letter. Used as the default destination when pushing breakdowns to JIRA."
           required
         >
           <input
@@ -407,7 +407,7 @@ export default function AdminSettings() {
             <div className="mt-3">
               <Field
                 label="Required custom fields"
-                description="OPTIONAL — only needed ako your JIRA project requires custom fields on issue creation (e.g., a mandatory 'Team', 'Story Points', or 'Sprint' field). Without them, push fails с 'field is required'. Enter а JSON object mapping each field's ID к its value. Leave blank ако your project doesn't require any."
+                description="OPTIONAL — only needed if your JIRA project requires custom fields on issue creation (e.g., a mandatory 'Team', 'Story Points', or 'Sprint' field). Without them, push fails with 'field is required'. Enter a JSON object mapping each field's ID to its value. Leave blank if your project doesn't require any."
               >
                 <textarea
                   value={requiredCustomFieldsJson}
@@ -435,7 +435,7 @@ export default function AdminSettings() {
                 }}
               >
                 <p className="mb-1">
-                  <strong>How к find а field ID:</strong> в JIRA go к Settings → Issues → Custom fields, click the field → the URL contains <code>customfield_XXXXX</code>. The <em>value shape</em> depends on the field type:
+                  <strong>How to find a field ID:</strong> in JIRA go to Settings → Issues → Custom fields, click the field → the URL contains <code>customfield_XXXXX</code>. The <em>value shape</em> depends on the field type:
                 </p>
                 <ul style={{ marginLeft: "16px", listStyle: "disc" }}>
                   <li>Select/dropdown → <code>{'{ "value": "Option name" }'}</code></li>
@@ -483,7 +483,7 @@ export default function AdminSettings() {
           {saving ? "Saving..." : "Save Settings"}
         </button>
         <span className="text-xs" style={{ color: "var(--s2j-text-muted)" }}>
-          Settings apply к all users в this Confluence instance
+          Settings apply to all users in this Confluence instance
         </span>
       </div>
 

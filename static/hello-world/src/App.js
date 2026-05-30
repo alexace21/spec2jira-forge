@@ -73,7 +73,7 @@ const SCREEN_MAX_WIDTH_STYLE = {
  * _classifyBackendError — map backend error shape to user-friendly
  * message + routing decision. Generic helper — used by ALL error
  * paths that touch backend invokes (handlePageSelected, handleGenerate,
- * handlePreview, handlePush, handleViewDashboard, etc.).
+ * handlePush, handleViewDashboard, etc.).
  *
  * EH1 polish 2026-05-09 part 27 — extended from B1 polish (part 25).
  * Originally `_classifyDashboardError`; renamed для DRY reuse across
@@ -130,7 +130,7 @@ function _classifyBackendError(errorShape, contextLabel = "") {
   if (isConnection) {
     return {
       message:
-        "Backend is unreachable. Verify that the backend service is running and that Settings → Manage Apps → Spec2Tickets → Configure has the correct Backend URL.",
+        "Couldn't reach the Anthropic API. Check your network and Anthropic's status, and verify your Anthropic API key in Settings.",
       routeToSetup: false,
     };
   }
@@ -150,14 +150,37 @@ function App() {
   const [pageData, setPageData] = useState(null);
   const [pageId, setPageId] = useState(null);
   const [error, setError] = useState(null);
-  const [documentType, setDocumentType] = useState("MODULE");
+  const [quotaInfo, setQuotaInfo] = useState(null);
 
-  // Slice 3 (Layer 1 Session 4 — CG-9 cache bypass, 2026-05-08).
-  // ReadyScreen checkbox surfaces this; handleGenerate + handlePreview
-  // pass to invoke. Default false → cache lookups normal (typical
-  // re-run experience). User opts-in для fresh re-run when stochastic
-  // phase output (T>0) freezes one variant OR debugging cache invalidation.
-  const [bypassCache, setBypassCache] = useState(false);
+  // Usage/tier badge data (P3a) — shows the customer their monthly breakdown
+  // count + reset date on the Ready screen, for transparency BEFORE they hit the
+  // free-tier wall (not only after). Best-effort; fed by the getUsage resolver.
+  const [usage, setUsage] = useState(null);
+  const loadUsage = useCallback(async () => {
+    try {
+      const u = await invoke("getUsage");
+      if (u && !u.error) setUsage(u);
+    } catch (_) {
+      /* badge is best-effort — hide on failure */
+    }
+  }, []);
+
+  // Reset scroll to top on every screen change (UX, 2026-05-30). Without this,
+  // navigating away from a screen scrolled to the bottom (e.g. BreakdownEditor)
+  // lands the next screen at the bottom on blank space, forcing a scroll-up.
+  // Also refresh the usage badge whenever the user returns to the Ready screen.
+  useEffect(() => {
+    // Best-effort scroll-to-top on screen change. NOTE: Forge auto-resizes the
+    // Custom UI iframe, so on a tall screen the PARENT product page scrolls and a
+    // sandboxed iframe cannot reset the parent's scroll — so this only helps if
+    // the iframe itself scrolls. The #root-internal-scroll approach was reverted
+    // (2026-05-30): forcing #root to 100vh broke short screens (huge empty area
+    // on the picker). Scroll-to-top remains an open, Forge-specific UX item.
+    try {
+      window.scrollTo(0, 0);
+    } catch (_) {}
+    if (screen === "ready") loadUsage();
+  }, [screen, loadUsage]);
 
   // Generation
   const [jobId, setJobId] = useState(null);
@@ -174,7 +197,6 @@ function App() {
   const [pushPhase, setPushPhase] = useState("");
 
   // CG-7 spec linter pre-flight (Layer 1 Session 2, 2026-05-07)
-  const [previewResult, setPreviewResult] = useState(null);
 
   // CG-12 manager-summary dashboard (2026-05-09).
   // View-only surface for completed pipeline results — does NOT bind
@@ -422,7 +444,7 @@ function App() {
   // takes ~30-90 sec, so visible timing helps user calibrate expectations
   // (vs full ~10-30 min generate).
   useEffect(() => {
-    if ((screen === "generating" || screen === "previewing") && startTime) {
+    if (screen === "generating" && startTime) {
       timerRef.current = setInterval(
         () => setElapsed(Math.floor((Date.now() - startTime) / 1000)),
         1000,
@@ -474,21 +496,6 @@ function App() {
           if (full.error) {
             setError(full.error);
             setScreen("error");
-          } else if (st.kind === "preview") {
-            // CG-7: preview kind routes to dedicated result screen.
-            // Defensive split (M-2 self-review fix 2026-05-07) — kind alone
-            // gates the branch; missing preview_result surfaces an explicit
-            // error instead of silently falling to BreakdownEditor (which
-            // would crash on a preview-shape payload).
-            if (full.preview_result) {
-              setPreviewResult(full.preview_result);
-              setScreen("preview_result");
-            } else {
-              setError(
-                "Preview completed but result payload is missing. Try again or contact support.",
-              );
-              setScreen("error");
-            }
           } else {
             setResults(v3AdaptResultPayload(full));
             setScreen("reviewing");
@@ -527,10 +534,7 @@ function App() {
         setJobStatus(statusResult);
         setStartTime(Date.now() - (statusResult.elapsed_seconds || 0) * 1000);
         setElapsed(Math.floor(statusResult.elapsed_seconds || 0));
-        // CG-7 reconnect: preview kind reaches its own progress screen.
-        setScreen(
-          statusResult.kind === "preview" ? "previewing" : "generating",
-        );
+        setScreen("generating");
         startPolling(statusResult.job_id);
         return;
       }
@@ -539,24 +543,6 @@ function App() {
         const full = await invoke("getResults", {
           jobId: statusResult.job_id,
         });
-        // CG-7 reconnect: preview kind routes to dedicated result screen
-        // (job_store.to_result_dict pivots payload by kind — preview
-        // returns under preview_result key, generate under result key).
-        // Defensive split (M-2 self-review fix 2026-05-07) — kind="preview"
-        // без preview_result surfaces explicit error rather than silent
-        // fallback to "ready" (which loses the result without warning).
-        if (statusResult.kind === "preview") {
-          if (full.preview_result) {
-            setPreviewResult(full.preview_result);
-            setScreen("preview_result");
-            return;
-          }
-          setError(
-            "Preview job completed but result payload is missing. Try again.",
-          );
-          setScreen("error");
-          return;
-        }
         // v3.0.0: breakdown may live на full directly (resolver native
         // shape) OR under full.result (v2.x legacy compat). v3AdaptResultPayload
         // handles both + wraps в legacy capability shape для BreakdownEditor.
@@ -647,13 +633,18 @@ function App() {
 
     const result = await invoke("startGeneration", {
       pageId: pageData.page_id,
-      documentType,
       modelMode: "dual",
-      // Slice 3 (CG-9, 2026-05-08): bypassCache от ReadyScreen checkbox
-      // state. Forge resolver translates camelCase → snake_case body field.
-      bypassCache,
     });
 
+    if (result.error === "quota_exceeded") {
+      // Free-tier monthly limit reached (ENFORCEMENT_MODE = 'block'). This is a
+      // NORMAL state, not a failure — route to the dedicated limit screen, NOT
+      // the red "Something went wrong" error screen (which framed it as a bug
+      // and offered a pointless "Try again").
+      setQuotaInfo(result);
+      setScreen("limit_reached");
+      return;
+    }
     if (result.error) {
       // EH1 polish part 27 — friendly classifier replaces raw error string.
       const friendly = _classifyBackendError(result, "Generate failed");
@@ -674,49 +665,7 @@ function App() {
 
     setJobId(result.job_id);
     startPolling(result.job_id);
-  }, [pageData, documentType, bypassCache, startPolling]);
-
-  // ── Start preview (CG-7 spec linter pre-flight) ─────────────
-  // Backend POST /api/v1/specs/preview/{page_id} — Phase 0 routing +
-  // Phase 0b constraint extraction only (~30-90 sec). Backend returns
-  // 423 если pipeline busy (preview shares GPU lock с generate).
-  // Polling reuses startPolling — kind="preview" routes to result
-  // screen via st.kind branch.
-  const handlePreview = useCallback(async () => {
-    setScreen("previewing");
-    setStartTime(Date.now());
-    setElapsed(0);
-    setJobStatus({ progress: 0, phase: "Starting pre-flight..." });
-
-    const result = await invoke("startPreview", {
-      pageId: pageData.page_id,
-      // Slice 3 (CG-9, 2026-05-08): bypassCache от ReadyScreen checkbox
-      // state. Preview-side cache covers Phase 0 (atomic) + Phase 0b/0c
-      // (per-section); bypass forces fresh re-run.
-      bypassCache,
-    });
-
-    if (result.error) {
-      // EH1 polish part 27 — friendly classifier replaces raw error string.
-      const friendly = _classifyBackendError(result, "Preview failed");
-      if (friendly.routeToSetup) {
-        setError(friendly.message);
-        setScreen("setup");
-        return;
-      }
-      setError(friendly.message);
-      setScreen("error");
-      return;
-    }
-    if (result.busy) {
-      setError(`Pipeline busy: ${result.active_phase || "another job"}`);
-      setScreen("error");
-      return;
-    }
-
-    setJobId(result.job_id);
-    startPolling(result.job_id);
-  }, [pageData, bypassCache, startPolling]);
+  }, [pageData, startPolling]);
 
   // ── Push: Step 1 — compute count summary client-side → confirming screen
   //
@@ -798,6 +747,9 @@ function App() {
           setPushResult(step.result);
           setScreen("pushed");
           setIsPushing(false);
+          // Data minimization: page content + breakdown in KVS aren't needed
+          // after the push — purge them (best-effort). See privacy policy §5.
+          if (jobId) invoke("purgeJob", { jobId }).catch(() => {});
           return;
         }
         setPushProgress(typeof step.progress === "number" ? step.progress : 0);
@@ -814,7 +766,7 @@ function App() {
       setScreen("error");
       setIsPushing(false);
     }
-  }, [pendingBreakdown]);
+  }, [pendingBreakdown, jobId]);
 
   // ── Navigation ────────────────────────────────────────────────
   // handleRetry — same page, fresh attempt. Used by ErrorScreen
@@ -833,7 +785,6 @@ function App() {
     setJobId(null);
     setJobStatus(null);
     setResults(null);
-    setPreviewResult(null);
     setPushResult(null);
     setDryRunResult(null);
     setPendingBreakdown(null);
@@ -843,7 +794,7 @@ function App() {
 
   // handleNewPage — clear page binding, return to picker. Used от
   // PushedScreen "Generate Another" (post-push, user wants different
-  // spec). Resets bypassCache (page-specific power-user setting).
+  // spec).
   const handleNewPage = useCallback(() => {
     clearInterval(pollRef.current);
     clearInterval(pushPollRef.current);
@@ -853,12 +804,10 @@ function App() {
     setJobId(null);
     setJobStatus(null);
     setResults(null);
-    setPreviewResult(null);
     setPushResult(null);
     setDryRunResult(null);
     setPendingBreakdown(null);
     setIsPushing(false);
-    setBypassCache(false);
     setScreen("picker");
   }, []);
 
@@ -927,14 +876,10 @@ function App() {
         return;
       }
 
-      // Filter to completed generate-kind jobs only. Preview-kind
-      // results have no breakdown shape (CG-7 emits preview_result
-      // payload), so dashboard's deriveDashboardSignals would return
-      // null + empty-state surfaces. Same outcome for idle / running /
-      // failed statuses — empty-state is the honest signal.
+      // Filter to completed jobs with a breakdown. Idle / running / failed /
+      // missing-job-id all surface the empty-state — the honest signal.
       if (
         statusResult.status !== "completed" ||
-        statusResult.kind === "preview" ||
         !statusResult.job_id
       ) {
         setDashboardData(null);
@@ -973,8 +918,7 @@ function App() {
 
   // handleBackFromDashboard — clears dashboard-only state and routes
   // to picker. Does NOT clear pageId/pageData (since dashboard never
-  // set them); does NOT reset bypassCache (page-specific power-user
-  // setting). Lighter than handleNewPage which clears everything.
+  // set them). Lighter than handleNewPage which clears everything.
   // Note: PagePicker re-mounts on screen change → useState resets +
   // recent list re-fetches от KVS (KVS persistence is the cross-mount
   // continuity, не in-memory React state).
@@ -1102,6 +1046,7 @@ function App() {
       return (
         <ReadyScreen
           pageData={pageData}
+          usage={usage}
           onGenerate={handleGenerate}
           onBack={handleNewPage}
         />
@@ -1113,25 +1058,6 @@ function App() {
           jobStatus={jobStatus}
           elapsed={elapsed}
           onBack={handleNewPage}
-        />
-      );
-    case "previewing":
-      return (
-        <PreviewingScreen
-          pageTitle={pageData?.title}
-          jobStatus={jobStatus}
-          elapsed={elapsed}
-          onBack={handleNewPage}
-        />
-      );
-    case "preview_result":
-      return (
-        <PreviewResultScreen
-          pageTitle={pageData?.title}
-          previewResult={previewResult}
-          onGenerate={handleGenerate}
-          onCancel={handleRetry}
-          onBackToPicker={handleNewPage}
         />
       );
     case "confirming":
@@ -1155,6 +1081,8 @@ function App() {
           onNew={handleNewPage}
         />
       );
+    case "limit_reached":
+      return <LimitReachedScreen quota={quotaInfo} onBack={handleNewPage} />;
     case "error":
       return (
         <ErrorScreen
@@ -1210,9 +1138,12 @@ function Spinner({ size = 16 }) {
 
 function ReadyScreen({
   pageData,
+  usage,
   onGenerate,
   onBack,
 }) {
+  const proPrice =
+    usage && (usage.pricing || []).find((t) => t.key === "pro")?.price;
   return (
     <div className="p-6" style={SCREEN_MAX_WIDTH_STYLE}>
       {onBack && (
@@ -1231,6 +1162,39 @@ function ReadyScreen({
         {(pageData.body_length || 0).toLocaleString()} characters
       </p>
 
+      {usage && (
+        <div
+          className="rounded-md px-3 py-2 mb-4 text-xs"
+          style={{
+            background: "var(--s2j-bg-section)",
+            border: "1px solid var(--s2j-border)",
+            color: "var(--s2j-text-light)",
+          }}
+        >
+          {usage.unlimited ? (
+            <span>
+              <strong style={{ color: "var(--s2j-text)" }}>
+                {usage.tierLabel} plan
+              </strong>{" "}
+              · unlimited breakdowns
+            </span>
+          ) : (
+            <span>
+              <strong style={{ color: "var(--s2j-text)" }}>
+                {usage.used} of {usage.limit}
+              </strong>{" "}
+              free breakdowns used this month · resets {usage.resetsAtLabel}
+              {usage.remaining === 0 && (
+                <span style={{ color: "var(--s2j-text)" }}>
+                  {" "}
+                  · upgrade to Pro{proPrice ? ` (${proPrice})` : ""} for unlimited
+                </span>
+              )}
+            </span>
+          )}
+        </div>
+      )}
+
       {/* v3.0.0 ReadyScreen — simplified UX.
           v2.x had Document Type radios (MODULE/FEATURE/EPIC_PRODUCT) +
           Bypass Cache toggle + Preview button. v3.0.0 drops all three:
@@ -1248,11 +1212,10 @@ function ReadyScreen({
           color: "var(--s2j-text)",
         }}
       >
-        <strong>Ready к generate.</strong> Claude Sonnet 4.6 ще analyze
-        this Confluence page and produce а structured JIRA breakdown
-        (Stories + Subtasks + cross-feature dependencies + quality
-        signals). Typical runtime: 60-150 sec depending на spec size.
-        Cost on your Anthropic account: ~$0.05–$0.15 per breakdown.
+        <strong>Ready to generate.</strong> Claude Sonnet 4.6 will analyze
+        this Confluence page and produce a structured JIRA breakdown —
+        Stories, Subtasks, cross-feature dependencies, and quality signals.
+        Typical runtime: 60–150 seconds depending on spec size.
       </div>
 
       <div className="flex gap-3">
@@ -1441,363 +1404,7 @@ function GeneratingScreen({ pageTitle, jobStatus, elapsed, onBack }) {
   );
 }
 
-// ── Previewing (CG-7 spec linter pre-flight in progress) ───────
-
-function PreviewingScreen({ pageTitle, jobStatus, elapsed, onBack }) {
-  const pct = Math.round((jobStatus?.progress || 0) * 100);
-  return (
-    <div className="p-6" style={SCREEN_MAX_WIDTH_STYLE}>
-      {/* U2 part 33 (2026-05-09) — refactored to use shared BackButton.
-          Originally F2 part 30 affordance during pre-flight (~30-90 sec
-          typical). Same pattern as Generating screen — pipeline continues
-          background; reconnect on return. */}
-      {onBack && (
-        <BackButton
-          onClick={onBack}
-          title="Pre-flight continues in background. Return to picker; results surface via reconnect-to-active-job when you come back."
-        />
-      )}
-      <div className="flex items-center gap-2 mb-1">
-        <Spinner size={18} />
-        <h2
-          className="text-lg font-semibold"
-          style={{ color: "var(--s2j-text)" }}
-        >
-          Running pre-flight check
-        </h2>
-      </div>
-      <p className="text-sm mb-4" style={{ color: "var(--s2j-text-light)" }}>
-        {pageTitle}
-      </p>
-
-      {/* Progress bar */}
-      <div
-        className="w-full h-2 rounded-full overflow-hidden mb-2"
-        style={{ background: "var(--s2j-border)" }}
-      >
-        <div
-          className="h-full rounded-full transition-all duration-500"
-          style={{
-            width: `${Math.max(pct, 2)}%`,
-            background: "var(--s2j-blue)",
-          }}
-        />
-      </div>
-      <div className="flex justify-between text-sm mb-1">
-        <span style={{ color: "var(--s2j-text-light)" }}>
-          {jobStatus?.phase || "Starting..."}
-        </span>
-        <span className="font-semibold" style={{ color: "var(--s2j-blue)" }}>
-          {pct}%
-        </span>
-      </div>
-      <p className="text-xs mb-4" style={{ color: "var(--s2j-text-muted)" }}>
-        {fmtTime(elapsed)} elapsed
-      </p>
-
-      <div
-        className="rounded-lg p-3"
-        style={{
-          background: "var(--s2j-blue-bg)",
-          border: "1px solid var(--s2j-blue-border)",
-        }}
-      >
-        <p
-          className="text-xs font-medium mb-1"
-          style={{ color: "var(--s2j-text)" }}
-        >
-          Typically takes 30 to 90 seconds
-        </p>
-        <p className="text-xs" style={{ color: "var(--s2j-text-light)" }}>
-          Pre-flight runs Phase 0 routing + constraint extraction only.
-          Dense compliance specs may take longer. You will see predicted
-          counts, quality flags, and a wall-clock estimate before deciding
-          whether to commit to the full run.
-        </p>
-      </div>
-    </div>
-  );
-}
-
-// ── Preview Result (CG-7 pre-flight summary screen) ────────────
-
-function PreviewResultScreen({
-  pageTitle,
-  previewResult,
-  onGenerate,
-  onCancel,
-  onBackToPicker,
-}) {
-  const pr = previewResult || {};
-  const predictedCaps = pr.predicted_capabilities ?? 0;
-  const estFeatures = pr.estimated_features_min ?? 0;
-  const sectionCount = pr.section_count ?? 0;
-  const constraintCount = pr.constraint_count ?? 0;
-  const wallClock = pr.estimated_full_run_minutes || "—";
-  const routing = pr.routing_distribution || {};
-  const flags = pr.quality_flags || [];
-
-  // Group flags by severity. Server pre-sorts (Session 2 R-8 fix:
-  // sort_quality_flags_by_severity called server-side); we cluster
-  // for visual severity grouping. Unknown severity falls back to
-  // medium so UI never silently drops flags на schema drift.
-  const flagsBySeverity = { high: [], medium: [], low: [] };
-  flags.forEach((f) => {
-    const sev = (f.severity || "medium").toLowerCase();
-    if (flagsBySeverity[sev]) flagsBySeverity[sev].push(f);
-    else flagsBySeverity.medium.push(f);
-  });
-
-  return (
-    <div className="p-6" style={SCREEN_MAX_WIDTH_STYLE}>
-      {/* U2 part 33 (2026-05-09) — top-of-content back-to-picker
-          affordance. "Cancel" inline button (below) returns to ready
-          screen для same page; this top button abandons page entirely
-          and returns to picker. Clear semantic split. */}
-      {onBackToPicker && (
-        <BackButton
-          onClick={onBackToPicker}
-          title="Abandon pre-flight result and return to page picker (you can pick a different page or return to this one later)"
-        />
-      )}
-      <h2
-        className="text-lg font-semibold mb-1"
-        style={{ color: "var(--s2j-text)" }}
-      >
-        Pre-flight summary
-      </h2>
-      <p className="text-sm mb-4" style={{ color: "var(--s2j-text-light)" }}>
-        {pageTitle}
-      </p>
-
-      {/* Top stat block — predicted counts + wall-clock estimate. */}
-      <div
-        className="rounded-lg p-4 mb-4"
-        style={{
-          background: "var(--s2j-bg-section)",
-          border: "1px solid var(--s2j-border)",
-        }}
-      >
-        <div className="space-y-2 mb-3">
-          <SummaryRow
-            label="Capabilities (predicted)"
-            value={predictedCaps}
-            color="var(--s2j-blue)"
-          />
-          <SummaryRow
-            label="Features (approximate ≥)"
-            value={estFeatures}
-            color="var(--s2j-green)"
-          />
-          <SummaryRow
-            label="Constraints extracted"
-            value={constraintCount}
-            color="var(--s2j-orange)"
-          />
-        </div>
-        <div
-          className="pt-3"
-          style={{ borderTop: "1px solid var(--s2j-border)" }}
-        >
-          <div className="flex justify-between text-sm">
-            <span
-              className="font-semibold"
-              style={{ color: "var(--s2j-text)" }}
-            >
-              Estimated full run
-            </span>
-            <span
-              className="font-mono font-semibold"
-              style={{ color: "var(--s2j-text)" }}
-            >
-              {wallClock}
-            </span>
-          </div>
-          {sectionCount > 0 && (
-            <div className="flex justify-between text-xs mt-1">
-              <span style={{ color: "var(--s2j-text-muted)" }}>
-                Spec sections analyzed
-              </span>
-              <span
-                className="font-mono"
-                style={{ color: "var(--s2j-text-light)" }}
-              >
-                {sectionCount}
-              </span>
-            </div>
-          )}
-        </div>
-      </div>
-
-      {/* Quality flags — severity-grouped clusters. Each cluster
-          renders only когато non-empty. Server pre-sorts items WITHIN
-          each cluster, so render order matches insertion order. */}
-      {flags.length > 0 && (
-        <div className="space-y-2 mb-4">
-          <p
-            className="text-[11px] font-medium uppercase tracking-wider"
-            style={{ color: "var(--s2j-text-muted)" }}
-          >
-            Quality concerns ({flags.length})
-          </p>
-          {flagsBySeverity.high.length > 0 && (
-            <FlagCluster
-              severity="High"
-              flags={flagsBySeverity.high}
-              bg="var(--s2j-red-bg)"
-              fg="var(--s2j-red)"
-              border="var(--s2j-red-border)"
-            />
-          )}
-          {flagsBySeverity.medium.length > 0 && (
-            <FlagCluster
-              severity="Medium"
-              flags={flagsBySeverity.medium}
-              bg="var(--s2j-orange-bg)"
-              fg="var(--s2j-orange)"
-              border="var(--s2j-orange-border)"
-            />
-          )}
-          {flagsBySeverity.low.length > 0 && (
-            <FlagCluster
-              severity="Low"
-              flags={flagsBySeverity.low}
-              bg="var(--s2j-blue-bg)"
-              fg="var(--s2j-blue)"
-              border="var(--s2j-blue-border)"
-            />
-          )}
-        </div>
-      )}
-
-      {/* Routing distribution — section-bucket counts from Phase 0. */}
-      {Object.keys(routing).length > 0 && (
-        <div
-          className="rounded-lg p-3 mb-4"
-          style={{
-            background: "var(--s2j-bg-section)",
-            border: "1px solid var(--s2j-border)",
-          }}
-        >
-          <p
-            className="text-[11px] font-medium uppercase tracking-wider mb-2"
-            style={{ color: "var(--s2j-text-muted)" }}
-          >
-            Section routing
-          </p>
-          <div className="space-y-1">
-            <RoutingRow
-              label="Implement (will generate stories)"
-              value={routing.implement || 0}
-              color="var(--s2j-green)"
-            />
-            <RoutingRow
-              label="Shared AC"
-              value={routing.shared_ac || 0}
-              color="var(--s2j-blue)"
-            />
-            <RoutingRow
-              label="Context (background)"
-              value={routing.context || 0}
-              color="var(--s2j-text-light)"
-            />
-            <RoutingRow
-              label="Distributed AC (per-feature rules)"
-              value={routing.distributed_ac || 0}
-              color="var(--s2j-orange)"
-            />
-            <RoutingRow
-              label="Skip (excluded)"
-              value={routing.skip || 0}
-              color="var(--s2j-text-muted)"
-            />
-          </div>
-        </div>
-      )}
-
-      {/* Actions — Cancel returns to Ready (preserves doc-type choice
-          via handleRetry's setScreen("ready") + previewResult clear);
-          Generate Now hands off to handleGenerate (full pipeline run).
-          Arrow prefix on Cancel matches ConfirmScreen "← Back to Editor"
-          convention — visual directional cue makes secondary action
-          findable next to large primary CTA. Hierarchy preserved (primary
-          stretches via flex-1; secondary stays intrinsic-width). */}
-      <div className="flex gap-3">
-        <button onClick={onCancel} className="btn-secondary">
-          ← Cancel
-        </button>
-        <button
-          onClick={onGenerate}
-          className="btn-primary flex-1 justify-center"
-        >
-          Generate Now
-        </button>
-      </div>
-    </div>
-  );
-}
-
-function FlagCluster({ severity, flags, bg, fg, border }) {
-  return (
-    <div
-      className="rounded-lg p-3"
-      style={{
-        background: bg,
-        border: `1px solid ${border}`,
-      }}
-    >
-      <p
-        className="text-[10px] font-semibold uppercase tracking-wider mb-2"
-        style={{ color: fg }}
-      >
-        {severity} severity ({flags.length})
-      </p>
-      <ul
-        className="space-y-1.5"
-        style={{ listStyle: "none", margin: 0, padding: 0 }}
-      >
-        {flags.map((flag, i) => (
-          <li key={i} className="text-xs flex items-start gap-2">
-            <span
-              className="shrink-0 font-mono"
-              style={{ color: fg, opacity: 0.7 }}
-            >
-              §{(flag.section_index ?? 0) + 1}
-            </span>
-            <div className="flex-1 min-w-0">
-              <p
-                className="font-medium leading-tight"
-                style={{ color: "var(--s2j-text)" }}
-              >
-                {flag.section_heading || "(unnamed section)"}
-              </p>
-              <p
-                className="text-[11px] leading-tight mt-0.5"
-                style={{ color: "var(--s2j-text-light)" }}
-              >
-                {flag.message}
-              </p>
-            </div>
-          </li>
-        ))}
-      </ul>
-    </div>
-  );
-}
-
-function RoutingRow({ label, value, color }) {
-  return (
-    <div className="flex items-center justify-between text-xs">
-      <span style={{ color: "var(--s2j-text-light)" }}>{label}</span>
-      <span className="font-mono font-semibold" style={{ color }}>
-        {value}
-      </span>
-    </div>
-  );
-}
-
 // ── Confirm Push ────────────────────────────────────────────────
-
 // v3.0.0 ConfirmScreen — embeds Dashboard signals at the push decision point.
 //
 // Replaces the standalone Dashboard screen (which users rarely discovered —
@@ -2022,7 +1629,7 @@ function ConfirmScreen({
             className="text-xs mb-3"
             style={{ color: "var(--s2j-text-muted)" }}
           >
-            Spec-level concerns surfaced by AI analysis. Address before push когато severity е high.
+            Spec-level concerns surfaced by AI analysis. Address before push when severity is high.
           </p>
           <div className="space-y-2">
             {sortedSpecConcerns.map((concern, idx) => (
@@ -2045,7 +1652,7 @@ function ConfirmScreen({
           <strong style={{ color: "var(--s2j-text)" }}>
             +{signals.parsedFeatureConcerns.length} feature-level concerns
           </strong>{" "}
-          attached к individual features (review в the editor). High-severity{" "}
+          attached to individual features (review in the editor). High-severity{" "}
           {
             signals.parsedFeatureConcerns.filter((c) => c.severity === "high")
               .length
@@ -2099,7 +1706,7 @@ function ConfirmScreen({
         }}
       >
         <p className="text-xs" style={{ color: "var(--s2j-text)" }}>
-          This will create real JIRA issues. The action cannot be undone от Spec2Tickets.
+          This will create real JIRA issues. The action cannot be undone from within Spec2Tickets.
         </p>
       </div>
 
@@ -2249,7 +1856,17 @@ function PushingScreen({ progress, phase }) {
 // ── Pushed (Success) ────────────────────────────────────────────
 
 function PushedScreen({ result, onBack, onNew }) {
-  const total = result?.created_issues?.length || result?.total_items || 0;
+  const total = result?.total_items || result?.created_issues?.length || 0;
+  const stories = result?.created_issues || [];
+  const browseUrl = (key) =>
+    result?.browse_base ? `${result.browse_base}/browse/${key}` : `/browse/${key}`;
+  const openIssue = (key) => {
+    try {
+      router.open(browseUrl(key));
+    } catch (_) {
+      /* no-op if the bridge router is unavailable */
+    }
+  };
   return (
     <div className="p-6" style={SCREEN_MAX_WIDTH_STYLE}>
       <div
@@ -2292,6 +1909,66 @@ function PushedScreen({ result, onBack, onNew }) {
         </p>
       </div>
 
+      {(result?.epic_key || stories.length > 0) && (
+        <div
+          className="rounded-lg p-4 mb-4"
+          style={{
+            background: "var(--s2j-bg-section)",
+            border: "1px solid var(--s2j-border)",
+          }}
+        >
+          <p
+            className="text-xs font-medium mb-2"
+            style={{ color: "var(--s2j-text-light)" }}
+          >
+            Open in JIRA
+          </p>
+          {result?.epic_key && (
+            <button
+              onClick={() => openIssue(result.epic_key)}
+              className="btn-secondary mb-3"
+            >
+              Open Epic {result.epic_key} ↗
+            </button>
+          )}
+          {stories.length > 0 && (
+            <ul
+              style={{
+                margin: 0,
+                padding: 0,
+                listStyle: "none",
+              }}
+            >
+              {stories.map((s) => (
+                <li key={s.key} style={{ padding: "3px 0" }}>
+                  <button
+                    onClick={() => openIssue(s.key)}
+                    style={{
+                      background: "none",
+                      border: "none",
+                      padding: 0,
+                      cursor: "pointer",
+                      color: "var(--s2j-blue)",
+                      textDecoration: "underline",
+                      font: "inherit",
+                    }}
+                  >
+                    {s.key}
+                  </button>
+                  <span
+                    className="text-sm"
+                    style={{ color: "var(--s2j-text-muted)" }}
+                  >
+                    {" "}
+                    — {s.name}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+
       {/* Graceful-fallback note — project has no subtask type, tasks embedded
           as checklists in Story descriptions. Explains "0 Subtasks" honestly. */}
       {result?.subtasks_embedded && (result?.tasks_embedded || 0) > 0 && (
@@ -2322,7 +1999,7 @@ function PushedScreen({ result, onBack, onNew }) {
         </div>
       )}
 
-      {/* Partial-failure surfacing — executePush returns failures: {stories,
+      {/* Partial-failure surfacing — the push result returns failures: {stories,
           subtasks, links, details}. Surface counts + first few reasons so
           the user understands когато e.g. "0 Subtasks" appears. */}
       {(() => {
@@ -2336,11 +2013,19 @@ function PushedScreen({ result, onBack, onNew }) {
         if (failedStories) parts.push(`${failedStories} Stories`);
         if (failedSubtasks) parts.push(`${failedSubtasks} Subtasks`);
         if (failedLinks) parts.push(`${failedLinks} links`);
-        // First failure reason (most actionable — usually same root cause)
+        // First failure reason (most actionable — usually same root cause).
+        // Link failures carry { source, target, reason } (not batchError), so
+        // surface the specific blocked-by relationship — this is what lets a
+        // customer describe the problem and lets us diagnose it from a report.
+        const linkFail = f?.details?.links?.[0];
         const firstDetail =
           f?.details?.subtasks?.[0]?.batchError?.[0]?.message ||
           f?.details?.stories?.[0]?.batchError?.[0]?.message ||
-          f?.details?.links?.[0]?.detail ||
+          (linkFail
+            ? `Link "${linkFail.source}" → "${linkFail.target}": ${
+                linkFail.reason || linkFail.detail || "could not be created"
+              }`
+            : null) ||
           null;
         return (
           <div
@@ -2395,6 +2080,70 @@ function PushedScreen({ result, onBack, onNew }) {
 }
 
 // ── Error ───────────────────────────────────────────────────────
+
+// ── Free-tier limit reached ─────────────────────────────────────
+// A NORMAL freemium state (not an error) — friendly framing, no "Something went
+// wrong", no pointless "Try again", no support-as-primary. Shows the reset date
+// (the actionable info for a free user) + the Pro upgrade. When the paid
+// Marketplace listing is live (P3b), the Pro box becomes a real upgrade CTA.
+function LimitReachedScreen({ quota, onBack }) {
+  const limit = quota?.limit ?? 3;
+  const resetsAt =
+    quota?.resetsAtLabel ||
+    (quota?.resetsAt ? String(quota.resetsAt).slice(0, 10) : null);
+  const proPrice =
+    quota?.upgradePrice ||
+    (quota?.pricing || []).find((t) => t.key === "pro")?.price;
+
+  return (
+    <div className="p-6" style={SCREEN_MAX_WIDTH_STYLE}>
+      {onBack && (
+        <BackButton onClick={onBack} title="Return to the page picker" />
+      )}
+
+      <div
+        className="rounded-lg p-4 mb-4"
+        style={{
+          background: "var(--s2j-blue-bg)",
+          border: "1px solid var(--s2j-blue-border)",
+        }}
+      >
+        <h2 className="text-lg font-semibold mb-1" style={{ color: "var(--s2j-text)" }}>
+          You've reached your free limit
+        </h2>
+        <p className="text-sm mb-1" style={{ color: "var(--s2j-text)" }}>
+          You've used all {limit} free breakdowns this month.
+        </p>
+        {resetsAt && (
+          <p className="text-sm" style={{ color: "var(--s2j-text-light)" }}>
+            Your free quota resets on <strong>{resetsAt}</strong>.
+          </p>
+        )}
+      </div>
+
+      {proPrice && (
+        <div
+          className="rounded-lg p-4 mb-4"
+          style={{
+            background: "var(--s2j-green-bg)",
+            border: "1px solid var(--s2j-green-border)",
+          }}
+        >
+          <p className="text-sm font-medium mb-1" style={{ color: "var(--s2j-text)" }}>
+            Upgrade to Pro — {proPrice}
+          </p>
+          <p className="text-xs" style={{ color: "var(--s2j-text-light)" }}>
+            Unlimited breakdowns. You keep using your own Anthropic API key.
+          </p>
+        </div>
+      )}
+
+      <button onClick={onBack} className="btn-secondary">
+        ← Back to pages
+      </button>
+    </div>
+  );
+}
 
 function ErrorScreen({ error, partialBreakdown, onRetry, onBackToPicker }) {
   // Session 3 C1 forensic preservation (Layer 1, 2026-05-07): if the
@@ -2498,9 +2247,8 @@ function ErrorScreen({ error, partialBreakdown, onRetry, onBackToPicker }) {
  * Complements AdminSettings (does not repeat its content).
  *
  * Surfaces to customer:
- *   - Prerequisite: self-hosted backend must exist first
- *   - Navigation path: how to reach Configure
- *   - Forward-reference: whitelist/Early Access details live in Settings
+ *   - Prerequisite (BYOK): an Anthropic API key + a JIRA project key
+ *   - Navigation path: how to reach Settings to configure them
  */
 function SetupScreen({ message }) {
   return (
@@ -2544,7 +2292,7 @@ function SetupScreen({ message }) {
         <p className="text-sm mb-3" style={{ color: "var(--s2j-text)" }}>
           <strong>You will need:</strong>
           <br />
-          • An Anthropic API key (free signup at{" "}
+          • An Anthropic API key (sign up at{" "}
           <a
             href="https://console.anthropic.com/settings/keys"
             target="_blank"
@@ -2553,8 +2301,8 @@ function SetupScreen({ message }) {
           >
             console.anthropic.com → API Keys
           </a>
-          ; pay-as-you-go ~$0.05–$0.15 per breakdown)
-          <br />• A JIRA project key где the breakdown will be created
+          ; billed pay-as-you-go to your own Anthropic account)
+          <br />• A JIRA project key where the breakdown will be created
         </p>
 
         <div
@@ -2574,14 +2322,14 @@ function SetupScreen({ message }) {
             2. Click <strong>Apps → Manage Apps</strong>
           </p>
           <p>
-            3. Find <strong>Spec2Tickets Settings</strong> в the left sidebar
+            3. Find <strong>Spec2Tickets Settings</strong> in the left sidebar
           </p>
           <p>
             4. Paste your Anthropic API key + JIRA Project Key, then Test &amp;
             Save
           </p>
           <p style={{ marginTop: "6px", fontStyle: "italic" }}>
-            Powered by Claude Sonnet 4.6 — your spec content flows directly от Forge к Anthropic API using your own key. Zero data на Spec2Tickets servers.
+            Powered by Claude Sonnet 4.6 — your spec content flows directly from Forge to the Anthropic API using your own key. No data on Spec2Tickets servers.
           </p>
         </div>
       </div>

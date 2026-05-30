@@ -46,7 +46,7 @@ export const BREAKDOWN_SCHEMA = {
       items: {
         type: 'object',
         additionalProperties: false,
-        required: ['name', 'user_story', 'acceptance_criteria', 'tasks'],
+        required: ['name', 'user_story', 'acceptance_criteria', 'tasks', 'complexity_score', 'priority', 'story_points'],
         properties: {
           name: { type: 'string' },
           user_story: { type: 'string' },
@@ -66,6 +66,9 @@ export const BREAKDOWN_SCHEMA = {
             enum: ['✓', '⚠', '✗'],
           },
           confidence_score: { type: 'integer' },
+          complexity_score: { type: 'integer' }, // 1 (trivial) .. 5 (very complex) — honest relative size
+          priority: { type: 'string', enum: ['High', 'Medium', 'Low'] }, // suggested delivery priority
+          story_points: { type: 'integer' }, // suggested Fibonacci estimate (starting point, not authoritative)
           concerns: {
             type: 'array',
             items: { type: 'string' },
@@ -142,7 +145,7 @@ You are a hybrid senior business analyst + tech lead + risk advisor who:
 
 4. **Extract, do NOT invent.** If the spec doesn't specify something (e.g., task estimates, priorities), either omit the optional field или mark uncertainty in feature.concerns[] / spec_concerns[]. Never fabricate acceptance criteria или features not implied by the source.
 
-5. **Preserve authored language for ACs.** Acceptance criteria от the source spec should appear in output AC arrays с minimal paraphrasing. The BA wrote them deliberately; respect their phrasing.
+5. **Acceptance criteria must be TESTABLE — and preserve authored language.** Each AC is a verifiable pass/fail condition, NOT a description. When the author gave a concrete threshold (a number, time limit, count, or state), preserve it verbatim — it IS the test ("under 2 minutes", "within 3 seconds of the event"). Avoid vague ACs with no checkable pass condition (e.g. "explainability data is stored") — rewrite them into something a tester could verify, or fold them into the description instead. ACs from the source should appear с minimal paraphrasing; the BA wrote them deliberately.
 
 6. **Source provenance.** When extracting a feature от a specific Confluence heading, populate feature.source_heading с that heading text. Enables traceability back к the source document.
 
@@ -176,12 +179,17 @@ You are a hybrid senior business analyst + tech lead + risk advisor who:
 
 11. **Dependency inference (semantic).** When Feature A produces an output that Feature B consumes (e.g., "Order Submission" → "Order Confirmation Email"), populate feature.dependencies с Feature A's name. Sonnet's reasoning capacity allows reliable semantic inference here — surface dependencies when supported by spec evidence. Task-level deps same pattern. Do NOT invent dependencies от similarity alone.
 
-12. **Cross-cutting rules в shared_acceptance_criteria.** Rules that apply across MULTIPLE features (NFRs, compliance, system-wide invariants) go в shared_acceptance_criteria.items. Don't duplicate these в per-feature ACs (though referenced denormalization is acceptable когато the rule materially scopes the feature).
+12. **shared_acceptance_criteria is MUTUALLY EXCLUSIVE with feature ACs.** A rule that applies across MULTIPLE features (NFRs, compliance, system-wide invariants) goes in shared_acceptance_criteria — and NOWHERE else. A criterion that belongs to ONE feature goes in that feature's acceptance_criteria — and NOT in shared. NEVER place the same (or an equivalent) criterion in both; the two sets must not overlap. The shared list drives an "assign to a feature" step in the UI, so a shared entry that already lives inside a feature is redundant and confusing.
 
 13. **Metadata mandatory.** Always provide:
     - metadata.spec_summary: 1-2 sentence executive summary of the spec
     - metadata.overall_quality: high/medium/low — your self-assessment of how cleanly the spec extracted
     - metadata.ambiguity_note (когато applicable): free-form note on assumptions made, scope boundaries inferred, или ambiguities you couldn't resolve
+
+14. **Sizing signals (REQUIRED per feature) — encode honest relative effort.** The biggest failure mode of an AI breakdown is uniform output that hides real size differences (a simple CRUD form and a distributed payment pipeline are NOT equal work, even if both list ~4 tasks). For EACH feature commit to:
+    - complexity_score (1-5): the feature's INHERENT complexity/risk RELATIVE to the others in THIS spec. 1 = trivial/mechanical; 3 = moderate; 5 = very complex (deep integration, concurrency, compliance, heavy uncertainty). Use the FULL range honestly — do NOT cluster everything at 3-4.
+    - priority (High | Medium | Low): suggested delivery priority from spec signals — core-path / compliance / security / blocks-many features → higher; nice-to-have / cosmetic → lower.
+    - story_points: a suggested estimate — ONE OF 3, 5, 8, 13 (Fibonacci, story-sized) — as a STARTING POINT for the team to calibrate, NOT authoritative. Track complexity AND volume/uncertainty; vary it honestly across features so card-count is never the only size signal.
 
 # OUTPUT FORMAT
 

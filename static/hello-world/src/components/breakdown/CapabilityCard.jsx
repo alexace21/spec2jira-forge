@@ -1,5 +1,4 @@
 import { useState } from 'react';
-import EditableField from './EditableField.jsx';
 import FeatureCard from './FeatureCard.jsx';
 
 /**
@@ -13,11 +12,19 @@ export default function CapabilityCard({ capability, index, onUpdate, onDelete }
   const taskCount = (capability.features || []).reduce(
     (sum, f) => sum + (f.tasks?.length || 0), 0
   );
+  // Sum the feature-level suggested story points (v3). The old task-SP sum was
+  // always 0 — v3 tasks carry no story points (sizing lives on the feature).
   const totalSP = (capability.features || []).reduce(
-    (sum, f) => sum + (f.tasks || []).reduce(
-      (tSum, t) => tSum + (t.estimate_story_points || 0), 0
-    ), 0
+    (sum, f) => sum + (f.story_points || 0), 0
   );
+
+  // Read-only category profile — at-a-glance effort + risk for PO / SM / manager.
+  const feats = capability.features || [];
+  const highPriority = feats.filter((f) => String(f.priority || '').toLowerCase() === 'high').length;
+  const needsReview = feats.filter((f) => f.confidence_indicator === '⚠' || f.confidence_indicator === '✗').length;
+  const cHigh = feats.filter((f) => (f.complexity_score || 0) >= 4).length;
+  const cMed = feats.filter((f) => f.complexity_score === 3).length;
+  const cLow = feats.filter((f) => (f.complexity_score || 0) >= 1 && (f.complexity_score || 0) <= 2).length;
 
   function updateFeature(featureIndex, updatedFeature) {
     const newFeatures = [...capability.features];
@@ -36,11 +43,10 @@ export default function CapabilityCard({ capability, index, onUpdate, onDelete }
       name: 'New Feature',
       user_story: 'As a user, I want [goal], so that [benefit].',
       acceptance_criteria: ['Acceptance criterion'],
-      tasks: [{
-        type: 'API', summary: 'New task',
-        acceptance_criteria: ['Acceptance criterion'],
-        estimate_story_points: 3, dependencies: [], priority: 'MEDIUM',
-      }],
+      priority: 'Medium',
+      story_points: 3,
+      complexity_score: 3,
+      tasks: [{ type: 'API', summary: 'New task' }],
     };
     onUpdate({ ...capability, features: [...capability.features, newFeature] });
     if (!expanded) setExpanded(true);
@@ -106,39 +112,42 @@ export default function CapabilityCard({ capability, index, onUpdate, onDelete }
       {/* Expanded Content */}
       {expanded && (
         <div className="px-4 pb-4 pt-3 space-y-3" style={{ borderTop: '1px solid var(--s2j-border)' }}>
-          <div>
-            <label className="text-[11px] font-medium uppercase tracking-wider mb-1 block"
-              style={{ color: 'var(--s2j-text-muted)' }}>Category Name</label>
-            <EditableField
-              value={capability.name}
-              onChange={(val) => onUpdate({ ...capability, name: val })}
-              className="text-sm font-semibold"
-              style={{ color: 'var(--s2j-text)' }}
-            />
-          </div>
-
-          {/*
-            P2 fix 2026-05-27 — Capability description (epic_description)
-            editable field. Schema field е `epic_description` (Phase 2a v3
-            rich purpose, ~290 chars typical; stamped onto cap dict by
-            backend output_adapter.py:1143). Stranger-test demo 2026-05-27
-            surfaced gap: BA workflow could edit Capability Name + per-
-            Feature ACs but NOT the cap-level description text, even
-            though that text flows to JIRA Epic description on push.
-            Backward compat: capabilities without epic_description render
-            placeholder "Click to add..." italic muted.
-          */}
-          <div>
-            <label className="text-[11px] font-medium uppercase tracking-wider mb-1 block"
-              style={{ color: 'var(--s2j-text-muted)' }}>Description</label>
-            <EditableField
-              value={capability.epic_description || ''}
-              onChange={(val) => onUpdate({ ...capability, epic_description: val })}
-              multiline
-              placeholder="Click to add category description..."
-              className="text-sm"
-              style={{ color: 'var(--s2j-text)' }}
-            />
+          {/* Category is a READ-ONLY grouping in v3: the name is the JIRA label
+              (derived from each feature's `category`, not editable here), and v3
+              has no per-category Epic to push. So instead of editable fields that
+              wouldn't reach JIRA (confusing, and the empty description looked
+              broken), we surface a useful at-a-glance profile: effort + priority +
+              review load + complexity mix. The name is read-only in the header. */}
+          <div className="rounded-lg p-3" style={{ background: 'var(--s2j-bg-section)', border: '1px solid var(--s2j-border)' }}>
+            <div className="grid grid-cols-4 gap-2 text-center">
+              {[
+                { label: 'Features', value: featureCount, accent: false },
+                { label: 'Story Points', value: totalSP, accent: false },
+                { label: 'High priority', value: highPriority, accent: false },
+                { label: 'Need review', value: needsReview, accent: needsReview > 0 },
+              ].map((s) => (
+                <div key={s.label}>
+                  <div className="text-base font-semibold"
+                    style={{ color: s.accent ? 'var(--s2j-orange)' : 'var(--s2j-text)' }}>
+                    {s.value}
+                  </div>
+                  <div className="text-[10px] uppercase tracking-wider"
+                    style={{ color: 'var(--s2j-text-muted)' }}>
+                    {s.label}
+                  </div>
+                </div>
+              ))}
+            </div>
+            {cHigh + cMed + cLow > 0 && (
+              <div className="mt-2 pt-2 flex items-center gap-3 text-[11px]"
+                style={{ borderTop: '1px solid var(--s2j-border)', color: 'var(--s2j-text-light)' }}>
+                <span className="font-medium uppercase tracking-wider text-[10px]"
+                  style={{ color: 'var(--s2j-text-muted)' }}>Complexity</span>
+                {cHigh > 0 && <span style={{ color: 'var(--s2j-orange)' }}>{cHigh} high</span>}
+                {cMed > 0 && <span>{cMed} medium</span>}
+                {cLow > 0 && <span style={{ color: 'var(--s2j-green-dark)' }}>{cLow} low</span>}
+              </div>
+            )}
           </div>
 
           <div className="space-y-2">

@@ -61,6 +61,36 @@ CLM + Spec2jira specs.
 
 ---
 
+## 💰 Monetization & tier enforcement (DECIDED 2026-05-30 — do not re-litigate)
+
+Settled. Do NOT reopen these in future sessions:
+
+- **BYOK** — the customer brings their own Anthropic API key (pays Anthropic for
+  compute directly). No Spec2Tickets-operated backend.
+- **Pricing (MVP early access):** **Free = 3 breakdowns/month** (resets the 1st, UTC)
+  · **Pro = €20/month → UNLIMITED**. One flat paid price; €20 is a deliberate floor
+  (below it reads as a hobby). Sold as the Marketplace subscription —
+  `resolveTier()` reads `context.license.active` → active ⇒ Pro/unlimited.
+- **`block` is correct.** Free → 3 → block → Pro is a sound freemium funnel: the free
+  trial acquires, the €20-unlimited deal is the generous part. "Land-grab" = attractive
+  PRICING + early-access framing + grandfathering (`memory/migration-protections.md`),
+  NOT an unlimited free tier. (Was over-flagged once — do not re-debate.)
+- **`ENFORCEMENT_MODE` is per Forge environment** (`src/usage.js`, from `process.env`):
+  **production = `block`** (default when unset) · **dev = `meter`** via
+  `forge variables set --environment development ENFORCEMENT_MODE meter`. Dev tests
+  freely; production enforces.
+- **The €20 Marketplace listing goes live WITH the production release** (Marketplace
+  approval is part of the MVP launch). Dev having no listing is NORMAL, not a problem —
+  so block has a working upgrade path the moment real users can hit it.
+- **"Unlimited" is BYOK-only.** When vendor-pays lands (we pay the API; pending Anthropic
+  reselling approval), unlimited reverts to capped tiers (else unbounded cost). See
+  `memory/monetization-strategy.md`.
+- **Open production-readiness item:** wire a real Upgrade BUTTON on `LimitReachedScreen`
+  (`router.open` → Marketplace subscription) when the listing is live (currently
+  info-only — dev has no listing URL).
+
+---
+
 ## Architecture (end-to-end)
 
 ```
@@ -158,7 +188,7 @@ JIRA: 1 Epic + N Stories (category labels) + Subtasks + Story-blocks-Story links
 
 | File | Role |
 |---|---|
-| `manifest.yml` | One `resolver` function (handles ALL backend work). globalPage + contentAction + globalSettings modules. Egress to `api.anthropic.com`. Scopes: storage, search/read confluence, read:page:confluence, write/read jira-work. **No consumers** (generation = batches, push = chunked resolver). |
+| `manifest.yml` | One `resolver` function (handles ALL backend work). globalPage + contentAction + globalSettings modules. Egress to `api.anthropic.com`. Scopes (5, least-privilege — verified 2026-05-31): `storage:app`, `search:confluence`, `read:page:confluence`, `write:jira-work`, `read:jira-work` (classic `read:confluence-content.summary`/`.all` removed — dead since the v1→v2 page-read migration; search + v2 reads confirmed working on the granular scopes alone). **No consumers** (generation = batches, push = chunked resolver). |
 | `src/index.js` | All resolvers: settings (BYOK), Confluence fetch/search, `startGeneration`/`pollJobStatus`/`getResults` (batch lifecycle), `startPush`/`pushStep` (chunked push), `dryRun`. |
 | `src/anthropic_client.js` | BYOK key storage (kvs secret), `testConnection`, **`submitBreakdownBatch`/`pollBatchStatus`/`fetchBatchResults`** (Batches API + truncation salvage), `estimateCost`. Models: `claude-sonnet-4-6` (primary) / `claude-haiku-4-5` (fallback). `MAX_OUTPUT_TOKENS=48000`. |
 | `src/prompts.js` | `BREAKDOWN_SCHEMA` (strict JSON schema; concerns flattened to `[TYPE\|severity] text` strings) + `SYSTEM_PROMPT` (cacheable, 5 mandatory slots). |
@@ -205,54 +235,135 @@ forge logs --since 5m    # watch (no --tail flag in this CLI version)
 
 ## Current state & known gaps
 
-✅ **Working E2E**: Generate → Review → Push (Epic + Stories + Subtasks + links +
-labels). Dynamic subtask type. Chunked push with progress bar. 3 silent-misalignment
-defenses. Support email. Batches API (48K cap + salvage).
+✅ **Working E2E + scale-validated**: Generate → Review → Push (Epic + Stories +
+Subtasks + links + labels). Dynamic subtask type. Chunked push with progress bar.
+3 silent-misalignment defenses. Support email. Batches API (48K cap + salvage).
+Spec2jira spec (39 feat / 162 subtask / dense deps) validated through chunked push.
 
-📋 **Not yet done / next** (see HANDOVER below):
-- Scale validation: Spec2jira spec (39 features / 162 subtasks) through chunked push — user testing this.
-- Tier enforcement KVS counter (Phase 2 Step 4, pre-launch).
-- Marketplace resubmit: docs/privacy/pricing rewrite (Phase 3).
+✅ **P3a — tier enforcement** (`src/usage.js`): per-site monthly breakdown counter
+(KVS `usage:YYYY-MM`), license-aware `resolveTier`, `ENFORCEMENT_MODE` flag. Model:
+**Free 3/month + Pro €20/month unlimited** (BYOK-only economics — customer pays
+Anthropic; the €20 buys the app). `startGeneration` checks/consumes (fail-open,
+consume-on-success); `getUsage` feeds a usage badge on Ready; quota_exceeded →
+upgrade + reset date.
+
+✅ **UX + doc-hygiene pass**: scroll-to-top on screen change; JIRA deep-links
+(Open Epic + Stories) on the success screen; stale-comment fixes (executePush →
+chunked push); README rewrite; AGENTS.md removed; version → 3.0.0.
+
+✅ **Dead-code + tidy pass**: removed the unreachable `startPreview`/preview flow
+(handlePreview + PreviewingScreen/PreviewResultScreen/FlagCluster/RoutingRow +
+the polling/reconnect/dashboard preview branches); removed dead `documentType`/
+`bypassCache` wiring; `created_issues` now preserves duplicate-named Stories;
+package names de-scaffolded (→ `spec2tickets`). Build green (bundle ≈ −1.4 kB).
+
+✅ **MILESTONE — generation quality + push fields, E2E verified on SCRUM-DEV
+(178 items, 0 failures, 2026-05-30):**
+- Per-feature **complexity_score (1-5) + priority + story_points** (model-produced,
+  editable; sizing now varies honestly — fixes the uniform-task-count tell).
+- **Cycle Verify/Repair** (`src/graph.js` + `resolveDependencyCycle`): pure-function
+  DFS detection + a tiny LLM call to cut the soft edge of a circular dependency,
+  else a `spec_concern`. Verified auto-resolving the Stripe↔Subscription cycle.
+- **Shared-AC dedupe** (rule 12 mutual-exclusivity + exact-match safety net).
+- **Push fields**: priority → matched to the project's scheme; story_points →
+  dynamically-resolved SP custom field (gotcha #7 pattern); category → kebab label;
+  **reviewer-editable labels** on the Epic + each Story (`LabelsEditor`).
+- UI tidy: SP = Fibonacci select (3/5/8/13); subtasks have no stray priority/SP
+  controls; Category is a read-only profile; dedicated friendly `LimitReachedScreen`.
+
+📋 **Not yet done / next**:
+- **Monetization/tier enforcement** — DECIDED (see the Monetization section above).
+  Production-readiness: wire the Upgrade button on `LimitReachedScreen` when the €20
+  listing is live.
+- **Marketplace listing (P3b)**: listing copy + Free/Pro pricing editions + security
+  Q&A are drafted in `docs/MARKETPLACE-LISTING-v3.md` (ready to paste). At submission,
+  apply early-access framing + grandfather early adopters
+  (`memory/migration-protections.md`); the site (landing/docs/privacy) must be pushed
+  live first.
+- **Vendor-pays** (we pay the API): pending Anthropic reselling approval; reverts
+  unlimited → capped tiers when it lands.
+- **Dependency-link resolution** still keys Stories by name (`storyKeyMap`) → two
+  same-named Stories can mis-resolve a blocks-link. Deeper push fix (the success-
+  screen links are already fixed via `createdStories`).
+- **Scroll-to-top on view change** is OPEN (Forge-specific): the Custom UI iframe
+  auto-resizes, so on a tall screen the PARENT product page scrolls and a sandboxed
+  iframe can't reset it. The internal-`#root`-scroll attempt was REVERTED 2026-05-30
+  — forcing `#root` to 100vh broke short screens (huge empty area on the picker).
+  Needs a proven Forge resize/scroll approach, or accept for MVP (minor UX).
 - KVS value-size limit: push session stores full features array — very large specs
   (200+ features) may approach the ~240KB KVS limit. Monitor.
-- node_modules tracked in git — cleanup candidate (`git rm -r --cached node_modules`).
 
 ---
 
-## ⚡ HANDOVER NOTE (2026-05-30 — v3.0.0 MVP E2E happy path SHIPPED ✨)
+## ⚡ HANDOVER NOTE (2026-05-31 — launch prep: English UI sweep + least-privilege scopes + Marketplace listing doc)
 
-**Single-session arc** built the entire v3.0.0 Forge MVP from the pivot plan to a
-working end-to-end push. Read `docs/SESSION-2026-05-30-v3-mvp-e2e.md` for the full
-forensic arc (every bug + fix + the Forge-platform lessons).
+Pre-Marketplace-listing polish on top of the 05-30 milestone. Three things landed:
 
-**What shipped today** (all in `feature/v3-pivot`, ready to commit):
-1. **Generation via Anthropic Batches API** — `submitBreakdownBatch`/`pollBatchStatus`/
-   `fetchBatchResults`; `startGeneration`/`pollJobStatus` resolvers. Replaced the
-   async-event-consumer attempt (55s timeout incident) + sync attempt.
-2. **48K output cap + truncation salvage** (16K truncated 101K-char specs).
-3. **Confluence v2 API migration** (v1 → 410 Gone).
-4. **Chunked JIRA push** — `startPushSession`/`pushSessionStep` + UI loop +
-   `PushingScreen` progress bar (25s resolver timeout; JIRA bulk ~0.85s/issue).
-5. **Dynamic subtask type resolution** (`subtask:true` flag) — fixed 39/39 subtask
-   failures on team-managed projects.
-6. **3 silent-misalignment defenses**: graceful subtask fallback (embed tasks as
-   `☐` checklist in Story description + note), optional required-custom-fields config
-   in AdminSettings, support@spec2jira.com on error/partial screens.
-7. **Epic synthesis** (v3 schema has no epic field) + **category → JIRA labels**.
-8. **Schema adapter** (`v3Schema.js`) + Dashboard signals embedded in ConfirmScreen.
+**BG-mix English sweep** — all user-facing strings carrying Bulgarian particles →
+pure English (`AdminSettings.jsx` ~25 strings incl. a removed stray per-breakdown
+cost estimate; `Dashboard.jsx` 907/914/915; `App.js` 1632/1655/1709). Method note for
+future sweeps: a line-anchored grep blind-spots multi-line JSX (where `>` sits on the
+prior line), so an exhaustive `[а-яА-Я]` sweep over `static/src` is the authoritative
+check — everything else is comments (BG in comments is fine per POLICY). Build green.
 
-**Engineering env fixes**: `@forge/events` pinned to 1.x (2.x broken); Node upgraded
-to 24.x; `@forge/api`/`@forge/kvs` auto-resolved.
+**Least-privilege scopes** — dropped the two dead classic Confluence scopes
+`read:confluence-content.summary` + `.all` from `manifest.yml`. Repo grep proved only
+search (`/wiki/rest/api/search`) + v2 pages (`/wiki/api/v2/pages/{id}`) are called — no
+v1 `/content/{id}` remains. **Dev-verified**: PagePicker search + Generate both work on
+the 5 granular scopes alone (`storage:app`, `search:confluence`, `read:page:confluence`,
+`write:jira-work`, `read:jira-work`). Stale 403-handler hint in `index.js` updated;
+revert hint left in the manifest comment. ⚠ Future-session note: the "400 Bad Request"
+incident was `@forge/events` 2.x `Queue.push()` — NOT Confluence; Confluence was
+410 Gone on v1 → migrated v1→v2. Don't conflate them.
 
-**NEXT SESSION entry points**:
-- **P1 (user-actionable)**: validate Spec2jira spec (39 feat / 162 subtask / large
-  dependency graph) end-to-end through chunked push at scale. Watch KVS session size
-  + step count + total wall-clock.
-- **P2 (commit)**: commit the day's work (commit message provided in the closing
-  message; stage only source paths — node_modules is tracked).
-- **P3 (MVP backlog)**: tier enforcement KVS counter (Step 4) → error-handling polish
-  → Marketplace resubmit (docs/privacy/pricing rewrite, Phase 3).
-- **P4 (cleanup)**: untrack node_modules; consider splitting today's mega-arc into a
-  cleaner commit history if desired (currently one big working state).
+**Marketplace listing doc** — `docs/MARKETPLACE-LISTING-v3.md`: the copy-paste source
+for the vendor portal (tagline/summary/description/highlights/what's-new, Free+Pro
+pricing editions, privacy+security listing fields, a full security-questionnaire draft
+grounded in manifest+privacy, pre-submission checklist). Categories: Project management
++ Workflow. EULA: Atlassian standard (no custom terms).
 
-С усмивка ✨ — the v3.0.0 pivot is technically proven end-to-end.
+**NEXT (2026-06-01):**
+- **Marketplace listing submission** — upload public version 3.0.0, paste the §2 copy,
+  configure Free/Pro editions, fill §4/§5 security, add screenshots + icon, submit for
+  review. The listing doc has everything.
+- **Anthropic reselling approval** — submit the vendor-pays inquiry (we pay the API).
+  When approved, unlimited reverts to capped tiers (`memory/monetization-strategy.md`).
+- Before prod: production `ENFORCEMENT_MODE=block` (default when unset); push the site
+  (landing/docs/privacy) live to spec2jira.com; lawyer review of privacy.
+- Open [YOUR CALL] from the listing doc: `security@` vs `support@` mailbox; final €20
+  confirmation; screenshots.
+
+С усмивка ✨ — английски почистен, scopes минимизирани и dev-verified, listing-ът подготвен.
+
+---
+
+## ⚡ HANDOVER NOTE (2026-05-30 — P3a tier enforcement + UX/cleanup pass)
+
+The v3.0.0 MVP E2E arc (Generate → Review → Push) is SHIPPED and committed — see
+git log + `docs/SESSION-2026-05-30-v3-mvp-e2e.md` for the original forensic arc
+(every bug + fix + Forge-platform lesson). This session built on top of it:
+
+**Scale-validated**: Spec2jira spec (39 feat / 162 subtask / dense deps) passed
+end-to-end through chunked push.
+
+**P3a — tier enforcement** (`src/usage.js`, new): per-site monthly breakdown
+counter, license-aware `resolveTier`, `ENFORCEMENT_MODE`. Model **Free 3/month +
+Pro €20/month unlimited** (BYOK-only economics — see `memory/monetization-strategy.md`).
+`startGeneration` checks/consumes quota (fail-open, consume-on-success); `getUsage`
+feeds the Ready-screen usage badge; quota_exceeded → upgrade message + exact reset date.
+
+**UX pass**: scroll-to-top on screen change; JIRA deep-links (Open Epic + Story list)
+on the success screen (`browse_base` from Epic `self` origin + `router.open`).
+
+**Doc-hygiene**: stale comments fixed (executePush/queue → chunked startPush/pushStep);
+README rewritten; AGENTS.md removed (misleading generic Forge boilerplate); version → 3.0.0.
+
+**NEXT entry points**:
+- **⚠ Before prod**: `ENFORCEMENT_MODE='block'` needs the €20 Marketplace listing
+  LICENSE-ENABLED, else free users dead-end. Use `meter` mode for dev testing.
+- **P3b — Marketplace listing**: pricing/privacy/docs + early-access framing +
+  grandfather early adopters (`memory/migration-protections.md`). Apply BEFORE go-to-market.
+- **Vendor-pays**: pending Anthropic reselling approval → reverts unlimited to capped tiers.
+- Monitor KVS push-session size on very large specs (~240KB limit).
+
+С усмивка ✨ — MVP е технически доказан, scale-validated, и tier-enforced.

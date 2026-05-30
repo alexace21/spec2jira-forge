@@ -120,16 +120,9 @@ export default function SharedACPanel({
             <span className="text-[11px]" style={{ color: 'var(--s2j-text-muted)' }}>
               From: <span style={{ color: 'var(--s2j-text-light)' }}>{sourceLabel}</span>
             </span>
-            {!allAssigned && regular.length > 0 && (
-              <button
-                onClick={onAssignAll}
-                className="text-[11px] transition-colors"
-                style={{ color: 'var(--s2j-green)' }}
-                title="Auto-assigns regular items с suggestions to their suggested features. Flagged ('Possible noise') and removed items are skipped — they need explicit BA review first."
-              >
-                Accept all suggestions
-              </button>
-            )}
+            {/* "Accept all suggestions" removed — it relied on a per-AC
+                suggested_feature that v3 does not produce (shared ACs are
+                cross-cutting strings). Assign each via the dropdown below. */}
           </div>
 
           {/* Regular ACs */}

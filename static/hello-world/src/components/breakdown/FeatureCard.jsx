@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import EditableField from './EditableField.jsx';
 import TaskCard from './TaskCard.jsx';
+import LabelsEditor from './LabelsEditor.jsx';
 
 /**
  * FeatureCard — Editor for a single Feature (→ JIRA Story).
@@ -44,13 +45,44 @@ function _confidenceVisuals(indicator) {
   return null;
 }
 
+// complexity_score 1-5 → color cluster. Low (1-2) green, mid (3) neutral,
+// high (4-5) orange — the honest "these cards are not equal" signal.
+function _complexityVisuals(score) {
+  if (typeof score !== 'number') return null;
+  if (score <= 2) return { fg: 'var(--s2j-green-dark)', bg: 'var(--s2j-green-bg)', border: 'var(--s2j-green-border)' };
+  if (score === 3) return { fg: 'var(--s2j-text-light)', bg: 'var(--s2j-bg-section)', border: 'var(--s2j-border)' };
+  return { fg: 'var(--s2j-orange)', bg: 'var(--s2j-orange-bg)', border: 'var(--s2j-orange-border)' };
+}
+
+// priority High/Medium/Low → color cluster.
+function _priorityVisuals(priority) {
+  const k = String(priority || '').toLowerCase();
+  if (k === 'high') return { fg: 'var(--s2j-red)', bg: 'var(--s2j-red-bg)', border: 'var(--s2j-red-border)' };
+  if (k === 'medium') return { fg: 'var(--s2j-text-light)', bg: 'var(--s2j-bg-section)', border: 'var(--s2j-border)' };
+  if (k === 'low') return { fg: 'var(--s2j-text-muted)', bg: 'var(--s2j-bg-section)', border: 'var(--s2j-border)' };
+  return null;
+}
+
 export default function FeatureCard({ feature, index, onUpdate, onDelete }) {
   const [expanded, setExpanded] = useState(false);
 
   const taskCount = feature.tasks?.length || 0;
-  const totalSP = (feature.tasks || []).reduce(
-    (sum, t) => sum + (t.estimate_story_points || 0), 0
-  );
+
+  // Feature-level sizing signals (v3 — model-suggested, editable below). Replaces
+  // the old task story-point sum, which was always 0 in v3 (tasks carry no SP).
+  const complexity = feature.complexity_score;
+  const priority = feature.priority;
+  const storyPoints = feature.story_points;
+  const complexityVisuals = _complexityVisuals(complexity);
+  const priorityVisuals = _priorityVisuals(priority);
+
+  // Story points are constrained to Fibonacci (story-sized). Include the current
+  // value if it falls outside the set (legacy/edge) so it is never silently lost.
+  const SP_OPTIONS = [3, 5, 8, 13];
+  const spOptions =
+    typeof storyPoints === "number" && !SP_OPTIONS.includes(storyPoints)
+      ? [...SP_OPTIONS, storyPoints].sort((a, b) => a - b)
+      : SP_OPTIONS;
 
   // ── CG-2 confidence + CG-4 source_heading extraction ──
   // All three fields are optional; legacy breakdowns без them render
@@ -90,10 +122,7 @@ export default function FeatureCard({ feature, index, onUpdate, onDelete }) {
   }
 
   function addTask() {
-    const newTask = {
-      type: 'API', summary: 'New task', description: 'Describe the unit of work.',
-      estimate_story_points: 3, dependencies: [], priority: 'MEDIUM',
-    };
+    const newTask = { type: 'API', summary: 'New task' };
     onUpdate({ ...feature, tasks: [...feature.tasks, newTask] });
     if (!expanded) setExpanded(true);
   }
@@ -160,11 +189,32 @@ export default function FeatureCard({ feature, index, onUpdate, onDelete }) {
               {confidenceIndicator} {confidence}
             </span>
           )}
+          {complexityVisuals && (
+            <span
+              className="rounded-full px-2 py-0.5 text-[10px] font-semibold leading-none"
+              title={`Complexity ${complexity}/5 — 1 = trivial, 5 = very complex (inherent difficulty/risk, relative to this spec)`}
+              style={{ background: complexityVisuals.bg, color: complexityVisuals.fg, border: `1px solid ${complexityVisuals.border}` }}
+            >
+              C{complexity}
+            </span>
+          )}
+          {priorityVisuals && (
+            <span
+              className="rounded-full px-2 py-0.5 text-[10px] font-semibold leading-none"
+              title="Suggested delivery priority — adjust in the card"
+              style={{ background: priorityVisuals.bg, color: priorityVisuals.fg, border: `1px solid ${priorityVisuals.border}` }}
+            >
+              {priority}
+            </span>
+          )}
           <span>{taskCount} task{taskCount !== 1 ? 's' : ''}</span>
-          <span className="rounded px-1.5 py-0.5 font-mono"
-            style={{ background: 'var(--s2j-bg-section)', color: 'var(--s2j-text-light)' }}>
-            {totalSP} SP
-          </span>
+          {storyPoints != null && (
+            <span className="rounded px-1.5 py-0.5 font-mono"
+              title="Suggested story points — a starting estimate for the team to calibrate"
+              style={{ background: 'var(--s2j-bg-section)', color: 'var(--s2j-text-light)' }}>
+              {storyPoints} SP
+            </span>
+          )}
         </span>
 
         <span
@@ -250,6 +300,54 @@ export default function FeatureCard({ feature, index, onUpdate, onDelete }) {
               )}
             </div>
           )}
+          {/* Sizing — model-suggested, editable. complexity_score is the model's
+              honest INHERENT-difficulty rating (1-5, display-only); priority +
+              story points are starting suggestions the team calibrates before push. */}
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-2 pb-1">
+            <label className="flex items-center gap-1.5 text-[11px]" style={{ color: 'var(--s2j-text-muted)' }}>
+              <span className="font-medium uppercase tracking-wider">Priority</span>
+              <select
+                value={priority || 'Medium'}
+                onChange={(e) => updateField('priority', e.target.value)}
+                className="text-xs rounded px-1.5 py-0.5"
+                style={{ background: 'var(--s2j-bg)', color: 'var(--s2j-text)', border: '1px solid var(--s2j-border)' }}
+              >
+                <option value="High">High</option>
+                <option value="Medium">Medium</option>
+                <option value="Low">Low</option>
+              </select>
+            </label>
+            <label className="flex items-center gap-1.5 text-[11px]" style={{ color: 'var(--s2j-text-muted)' }}>
+              <span className="font-medium uppercase tracking-wider">Story Points</span>
+              <select
+                value={storyPoints ?? ''}
+                onChange={(e) => updateField('story_points', e.target.value === '' ? null : Number(e.target.value))}
+                className="text-xs rounded px-1.5 py-0.5"
+                style={{ background: 'var(--s2j-bg)', color: 'var(--s2j-text)', border: '1px solid var(--s2j-border)' }}
+              >
+                <option value="">—</option>
+                {spOptions.map((v) => (
+                  <option key={v} value={v}>{v}</option>
+                ))}
+              </select>
+            </label>
+            <span
+              className="text-[11px]"
+              style={{ color: 'var(--s2j-text-muted)' }}
+              title="Model's inherent-complexity rating. Scale: 1 = trivial · 2 = small · 3 = moderate · 4 = complex · 5 = very complex."
+            >
+              <span className="font-medium uppercase tracking-wider">Complexity</span>{' '}
+              <span style={{ color: 'var(--s2j-text)' }}>{complexity != null ? `${complexity}/5` : '—'}</span>
+            </span>
+          </div>
+
+          <div>
+            <label className="text-[11px] font-medium uppercase tracking-wider mb-1 block"
+              style={{ color: 'var(--s2j-text-muted)' }}>Labels</label>
+            <LabelsEditor labels={feature.labels || []}
+              onChange={(val) => updateField('labels', val)} />
+          </div>
+
           <div>
             <label className="text-[11px] font-medium uppercase tracking-wider mb-1 block"
               style={{ color: 'var(--s2j-text-muted)' }}>Feature Name</label>

@@ -2,6 +2,7 @@ import { useState, useMemo, useEffect } from 'react';
 import EditableField from './EditableField.jsx';
 import CapabilityCard from './CapabilityCard.jsx';
 import SharedACPanel from './SharedACPanel.jsx';
+import LabelsEditor from './LabelsEditor.jsx';
 
 export default function BreakdownEditor({ initialBreakdown, onPush, isPushing = false }) {
   const [breakdown, setBreakdown] = useState(() => JSON.parse(JSON.stringify(initialBreakdown)));
@@ -60,20 +61,6 @@ export default function BreakdownEditor({ initialBreakdown, onPush, isPushing = 
       if (!item?.assigned_feature) return p;
       _removeACFromFeature(u, item.assigned_feature, item.text);
       item.assigned_feature = null;
-      return u;
-    });
-  }
-  function assignAllSuggestions() {
-    setBreakdown((p) => {
-      const u = JSON.parse(JSON.stringify(p));
-      for (const item of u.shared_acceptance_criteria?.items || []) {
-        // Skip flagged + removed items — only auto-assign clean regular ACs.
-        if (item.removed_by_user || item.quality_warning === 'possible_noise') continue;
-        if (!item.assigned_feature && item.suggested_feature) {
-          item.assigned_feature = item.suggested_feature;
-          _addACToFeature(u, item.suggested_feature, `${item.id}: ${item.text}`);
-        }
-      }
       return u;
     });
   }
@@ -206,6 +193,12 @@ export default function BreakdownEditor({ initialBreakdown, onPush, isPushing = 
                 multiline className="text-sm leading-relaxed"
                 style={{ color: 'var(--s2j-text-light)' }} />
             </div>
+            <div>
+              <label className="text-[11px] font-medium uppercase tracking-wider mb-1 block"
+                style={{ color: 'var(--s2j-text-muted)' }}>Labels (pushed to the Epic)</label>
+              <LabelsEditor labels={breakdown.epic.labels || []}
+                onChange={(v) => updateEpic('labels', v)} />
+            </div>
           </div>
         )}
 
@@ -216,7 +209,6 @@ export default function BreakdownEditor({ initialBreakdown, onPush, isPushing = 
             availableFeatures={availableFeatures}
             onAssign={assignSharedAC}
             onUnassign={unassignSharedAC}
-            onAssignAll={assignAllSuggestions}
             onRemove={removeSharedACItem}
             onRestore={restoreSharedACItem}
             onRestoreFromNoise={restoreSharedACFromNoise}

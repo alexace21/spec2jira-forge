@@ -265,12 +265,47 @@ async function lookupProject(projectKey) {
   const issueTypes = Array.isArray(project.issueTypes) ? project.issueTypes : [];
   const subtaskType = issueTypes.find((t) => t.subtask === true);
 
+  // Resolve the Story Points custom field id DYNAMICALLY (gotcha #7 lesson —
+  // never hardcode customfield ids; they vary per instance, and team-managed
+  // projects name it "Story point estimate" vs company-managed "Story Points").
+  // Graceful: if not found, SP simply isn't pushed.
+  let storyPointsFieldId = null;
+  try {
+    const fr = await api.asUser().requestJira(route`/rest/api/3/field`);
+    if (fr.ok) {
+      const list = await fr.json();
+      const all = Array.isArray(list) ? list : [];
+      const sp =
+        all.find((f) => f.custom && /^story points$/i.test(f.name || '')) ||
+        all.find((f) => f.custom && /story point/i.test(f.name || ''));
+      storyPointsFieldId = sp?.id || null;
+    }
+  } catch (_) {
+    /* SP just won't be pushed — graceful */
+  }
+
+  // Resolve valid priority names so we only set a priority the project's scheme
+  // accepts (an unknown name fails the create — we omit instead). Null = couldn't
+  // resolve → best-effort (High/Medium/Low are near-universal).
+  let validPriorities = null;
+  try {
+    const pr = await api.asUser().requestJira(route`/rest/api/3/priority`);
+    if (pr.ok) {
+      const prs = await pr.json();
+      validPriorities = (Array.isArray(prs) ? prs : []).map((p) => p.name).filter(Boolean);
+    }
+  } catch (_) {
+    /* priority best-effort — graceful */
+  }
+
   return {
     ok: true,
     project,
     subtaskTypeId: subtaskType?.id || null,
     subtaskTypeName: subtaskType?.name || null,
     issueTypesAvailable: issueTypes.map((t) => `${t.name}${t.subtask ? '(sub)' : ''}`),
+    storyPointsFieldId,
+    validPriorities,
   };
 }
 
@@ -414,11 +449,29 @@ function buildEpicPayload(projectKey, epic, customFields) {
     summary: (epic.summary || 'Spec Breakdown').substring(0, 255),
     description: plainADF(epic.description || ''),
   };
+  if (Array.isArray(epic.labels) && epic.labels.length > 0) {
+    fields.labels = epic.labels;
+  }
   return { fields: applyCustomFields(fields, customFields) };
 }
 
+// Map a model-suggested priority (High/Medium/Low) to a name the project's
+// priority scheme accepts. validPriorities null = couldn't resolve → best-effort
+// (return as-is; High/Medium/Low are near-universal). No match → null (omit, so a
+// non-standard scheme never fails the create — the gotcha #7 discipline).
+function matchPriority(suggested, validPriorities) {
+  if (!suggested) return null;
+  if (!Array.isArray(validPriorities)) return suggested;
+  return validPriorities.find((p) => p.toLowerCase() === String(suggested).toLowerCase()) || null;
+}
+
 function buildStoryPayload(projectKey, feature, parentEpicKey, opts = {}) {
-  const { embedTasks = false, customFields = null } = opts;
+  const {
+    embedTasks = false,
+    customFields = null,
+    storyPointsFieldId = null,
+    validPriorities = null,
+  } = opts;
   const fields = {
     project: { key: projectKey },
     issuetype: { name: 'Story' },
@@ -435,13 +488,35 @@ function buildStoryPayload(projectKey, feature, parentEpicKey, opts = {}) {
   if (parentEpicKey) {
     fields.parent = { key: parentEpicKey };
   }
+  // Suggested delivery priority → only set a name the project's scheme accepts.
+  const priorityName = matchPriority(feature.priority, validPriorities);
+  if (priorityName) {
+    fields.priority = { name: priorityName };
+  }
+  // Suggested story points → the dynamically-resolved custom field (if found).
+  if (storyPointsFieldId && typeof feature.story_points === 'number') {
+    fields[storyPointsFieldId] = feature.story_points;
+  }
   // Category label for JIRA filtering (v3.0.0 — single Epic + Story per category groups).
   // Category names с spaces → kebab-case labels (JIRA labels не allow spaces).
+  // Labels = auto category label (single-dash kebab) + any reviewer-added labels.
+  const labels = [];
   if (feature.category && feature.category.trim()) {
-    const label = feature.category.trim().toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
-    if (label) {
-      fields.labels = [label];
+    const catLabel = feature.category
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '');
+    if (catLabel) labels.push(catLabel);
+  }
+  if (Array.isArray(feature.labels)) {
+    for (const l of feature.labels) {
+      const clean = String(l || '').trim();
+      if (clean && !labels.includes(clean)) labels.push(clean);
     }
+  }
+  if (labels.length > 0) {
+    fields.labels = labels;
   }
   return { fields: applyCustomFields(fields, customFields) };
 }
@@ -496,11 +571,24 @@ export async function startPushSession(breakdown, projectKey, customFields = nul
   if (!hasSubtasks) {
     console.warn(`[push] No subtask type in ${projectKey} - tasks embedded as checklists.`);
   }
+  console.log(
+    `[push] story-points field=${projectResult.storyPointsFieldId || 'NOT FOUND'} | priorities=[${(projectResult.validPriorities || []).join(', ') || 'unresolved'}]`,
+  );
 
   const { epic, features, links } = flattenBreakdown(breakdown);
 
   // Create the Epic (one fast call) up front.
   let epicKey = null;
+  // Site base URL for browse deep-links on the success screen. NOT derivable
+  // from a create-response `self` (that is the api.atlassian.com/ex/jira proxy
+  // host, which 404s in a browser); serverInfo.baseUrl is the real site URL.
+  let browseBase = null;
+  try {
+    const si = await api.asUser().requestJira(route`/rest/api/3/serverInfo`);
+    if (si.ok) browseBase = (await si.json()).baseUrl || null;
+  } catch (_) {
+    /* deep-links fall back to a site-relative path in the UI */
+  }
   if (epic) {
     const r = await createSingleIssue(buildEpicPayload(projectKey, epic, customFields));
     if (!r.ok) {
@@ -524,10 +612,14 @@ export async function startPushSession(breakdown, projectKey, customFields = nul
     customFields,
     subtaskTypeId,
     hasSubtasks,
+    storyPointsFieldId: projectResult.storyPointsFieldId || null,
+    validPriorities: projectResult.validPriorities || null,
     epicKey,
+    browseBase,
     features,
     links,
     storyKeyMap: {},
+    createdStories: [],
     phase: features.length > 0 ? 'stories' : links.length > 0 ? 'links' : 'done',
     cursor: 0,
     counts: {
@@ -603,12 +695,18 @@ async function stepStories(s) {
     buildStoryPayload(s.projectKey, f, s.epicKey, {
       embedTasks: !s.hasSubtasks,
       customFields: s.customFields,
+      storyPointsFieldId: s.storyPointsFieldId,
+      validPriorities: s.validPriorities,
     }),
   );
   const bulk = await bulkCreateIssues(payloads);
   for (let j = 0; j < bulk.issues.length; j++) {
     if (bulk.issues[j]) {
       s.storyKeyMap[slice[j].name] = bulk.issues[j].key;
+      // Append-only list (preserves duplicate-named stories, unlike the
+      // name-keyed storyKeyMap) so the success screen can deep-link every
+      // created Story, not just the last one per name.
+      s.createdStories.push({ name: slice[j].name, key: bulk.issues[j].key });
       s.counts.stories_created++;
     } else {
       s.counts.story_failures++;
@@ -765,7 +863,8 @@ function buildFinalResult(s) {
       subtasks_embedded: !s.hasSubtasks,
       tasks_embedded: c.tasks_embedded,
       epic_key: s.epicKey,
-      created_issues: Object.entries(s.storyKeyMap).map(([name, key]) => ({ name, key })),
+      browse_base: s.browseBase || null,
+      created_issues: s.createdStories || [],
       failures: {
         stories: c.story_failures,
         subtasks: c.subtask_failures,

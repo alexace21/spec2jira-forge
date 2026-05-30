@@ -904,15 +904,15 @@ function CapabilityCouplingOverview({ groups }) {
           style={{ color: "var(--s2j-text-light)" }}
         >
           ({totalCouplings} cross-capability coupling
-          {totalCouplings === 1 ? "" : "s"} derived от feature dependencies)
+          {totalCouplings === 1 ? "" : "s"} derived from feature dependencies)
         </span>
       </h3>
       <p
         className="text-xs mb-2"
         style={{ color: "var(--s2j-text-light)" }}
       >
-        Aggregated Epic-level view: counts features в each source capability
-        that block features в other capabilities. Strong (≥50%) suggests
+        Aggregated Epic-level view: counts features in each source capability
+        that block features in other capabilities. Strong (≥50%) suggests
         Epic-level ordering; moderate (25-49%) partial dependency; light
         (&lt;25%) minor coupling.
       </p>

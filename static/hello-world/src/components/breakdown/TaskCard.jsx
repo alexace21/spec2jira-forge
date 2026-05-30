@@ -1,10 +1,6 @@
 import { useState } from 'react';
 import EditableField from './EditableField.jsx';
-import {
-  TASK_TYPES, TASK_TYPE_COLORS,
-  PRIORITIES, PRIORITY_COLORS,
-  STORY_POINTS, SP_LABELS, SP_COLORS,
-} from './constants.js';
+import { TASK_TYPES, TASK_TYPE_COLORS } from './constants.js';
 
 /**
  * SelectBadge — Badge that doubles as a dropdown selector.
@@ -170,13 +166,8 @@ export default function TaskCard({ task, index, onUpdate, onDelete }) {
             className="text-sm font-medium" maxLength={200} />
         </div>
 
-        <SelectBadge value={task.estimate_story_points} options={STORY_POINTS}
-          colorMap={SP_COLORS} labelMap={SP_LABELS}
-          onChange={(val) => updateField('estimate_story_points', val)} />
-
-        <SelectBadge value={task.priority} options={PRIORITIES} colorMap={PRIORITY_COLORS}
-          onChange={(val) => updateField('priority', val)} />
-
+        {/* Subtask priority + story points removed — sizing lives at the Story
+            (feature) level in v3, not per-subtask. */}
         <button onClick={onDelete}
           className="shrink-0 rounded p-1 opacity-0 group-hover/task:opacity-100 transition-all"
           style={{ color: 'var(--s2j-text-muted)' }}

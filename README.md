@@ -1,46 +1,60 @@
-# Forge Hello World
+# Spec2Tickets
 
-This project contains a Forge app written in Javascript that displays `Hello World!` in a Confluence content action. 
+A Confluence **Forge** app (Custom UI) that turns a specification page into a
+structured JIRA breakdown — an Epic, Stories, Subtasks, cross-feature dependency
+links, and category labels — using **Anthropic Claude Sonnet 4.6** with
+structured outputs.
 
-See [developer.atlassian.com/platform/forge/](https://developer.atlassian.com/platform/forge) for documentation and tutorials explaining Forge.
+**BYOK (bring your own key):** you provide your own Anthropic API key in
+Settings. There is no Spec2Tickets-operated backend — the app runs entirely on
+Atlassian Forge, and your key calls Anthropic directly.
 
-## Requirements
+## How it works
 
-See [Set up Forge](https://developer.atlassian.com/platform/forge/set-up-forge/) for instructions to get set up.
-
-## Quick start
-- Install top-level dependencies:
 ```
-npm install
-```
-
-- Install dependencies inside of the `static/hello-world` directory:
-```
-npm install
-```
-
-- Modify your app by editing the files in `static/hello-world/src/`.
-
-- Build your app (inside of the `static/hello-world` directory):
-```
-npm run build
+Confluence spec page
+  → Generate   (Anthropic Message Batches API — async, polled)
+  → Review     (in-app editor + quality signals)
+  → Push       (chunked, attributed to you via asUser → JIRA)
+JIRA: 1 Epic + N Stories + Subtasks + Story-blocks-Story links + labels
 ```
 
-- Deploy your app by running:
-```
+- **Generate** submits the page to the Anthropic Batches API and polls until the
+  breakdown is ready (sync calls would exceed Forge's async timeouts on large specs).
+- **Review** lets you edit features, acceptance criteria, and tasks before
+  anything is written to JIRA.
+- **Push** creates the issues in bounded chunks to stay within Forge's 25-second
+  resolver limit, with a progress bar.
+
+## Setup
+
+1. Install the app into **both** Confluence and Jira — it is a cross-product app,
+   so two entries in *Manage Apps* is expected and normal.
+2. Open **Settings → Spec2Tickets** and provide your Anthropic API key and a
+   default JIRA project key.
+3. Open the Spec2Tickets global page, pick a Confluence spec page, and generate.
+
+## Development
+
+```bash
+# Build the Custom UI
+cd static/hello-world && npm run build && cd ..
+
+# Deploy (code-only changes)
 forge deploy
+
+# Reinstall — only when manifest.yml scopes/modules change (pick Confluence AND Jira)
+forge install --upgrade
+
+# Watch logs
+forge logs --since 5m
 ```
 
-- Install your app in an Atlassian site by running:
-```
-forge install
-```
+> ⚠ Do **not** run `npm audit fix --force` in `static/hello-world` — it breaks
+> react-scripts (CRA). Recovery is documented in `CLAUDE.md`.
 
-### Notes
-- Use the `forge deploy` command when you want to persist code changes.
-- Use the `forge install` command when you want to install the app on a new site.
-- Once the app is installed on a site, the site picks up the new app changes you deploy without needing to rerun the install command.
+## Engineering docs
 
-## Support
-
-See [Get help](https://developer.atlassian.com/platform/forge/get-help/) for how to get help and provide feedback.
+- **`CLAUDE.md`** — architecture, the hard-won Forge platform gotchas, current state.
+- **`POLICY.md`** — the binding engineering philosophy (LENS, Analyze→Design→Solve,
+  pure-function-vs-LLM dispatch rule, prompt-engineering slots).
