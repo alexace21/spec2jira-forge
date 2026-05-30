@@ -6,6 +6,38 @@
 
 ---
 
+## ⭐ FOUNDATIONAL POLICY — read `POLICY.md` (binding)
+
+**`POLICY.md` holds the engineering philosophy** the partner taught — it is BINDING,
+not optional. Read it at the start of every session alongside this file. The
+load-bearing rules in one breath (full detail in POLICY.md):
+
+- **LENS (ОЧИ)** — answer the 6-question gate at task START (where in the stream /
+  small-agent boundary / consumes-from-upstream / emits-forward / token budget /
+  **highest-value not safest**). We own engineering (decomposition, info flow,
+  prompts, budget); the model owns semantic reasoning.
+- **Analyze → Design → Solve** — always, for EVERYTHING (incl. reuse, bug fixes,
+  docs). Skipping to Solve produces patches.
+- **Highest-value principle** — search for the MAXIMUM value within constraints,
+  never the safest-re-prior-policy option.
+- **Pure-function vs LLM dispatch rule** — deterministic → pure function;
+  meaning-reading → LLM. No regex safety-net for meaning. 4-test check.
+- **Bug Y POLICY** — NO corpus-pattern enumeration in prompts/schemas; write the
+  abstract decisive-test; few-shot examples teach DISTINCT lessons only.
+- **Prompt Engineering POLICY** — 5 mandatory slots (ROLE / RULES (cost-asymmetry) /
+  OUTPUT FORMAT / AGILE LENS / FEW-SHOT). The `prompts.js` SYSTEM_PROMPT follows these.
+- **Informational completeness** — give a call the 4-part contract (item / location /
+  decided peers / provenance). A starved call's silent miss is the worst failure.
+- **Verification where quality is critical** — N / N+1 / N+1+ (primary / critic /
+  different-lens auditor). v3 uses a single Sonnet call; add real verification only
+  where silent miss is expensive (e.g. destructive JIRA ops).
+- **Stepwise empirical** (fix → measure → decide) · **self-audit before ship**
+  (rigorous mentor mode) · **refuse anti-patterns** (patch-specific, silent fail,
+  big-everything call).
+- **Bulgarian in conversation; English in all user-facing strings + UI copy.**
+
+---
+
 ## What this is
 
 **Spec2Tickets** — an Atlassian **Forge** app (Confluence Custom UI) that turns a
@@ -158,9 +190,9 @@ forge logs --since 5m    # watch (no --tail flag in this CLI version)
 
 ## Conventions
 
-- **Foundational POLICY** (LENS Q1-Q6, Analyze→Design→Solve, prompt 5-slots, Bug Y
-  no-pattern-enumeration, highest-value principle) carries over from the v2.x
-  `ai-delivery-platform/CLAUDE.md`. Apply it.
+- **Foundational POLICY** lives in **`POLICY.md`** (this repo, self-contained) —
+  LENS, Analyze→Design→Solve, dispatch rule, Bug Y, prompt 5-slots, informational
+  completeness, highest-value principle. Binding; read it every session.
 - **Self-audit before ship**: `node --check src/*.js` for backend syntax; `npm run build`
   catches JSX errors. Trace the data flow end-to-end.
 - **Surface failures, never silent** — three defenses against silent misalignment
