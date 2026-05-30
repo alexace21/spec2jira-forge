@@ -1,38 +1,71 @@
 /**
- * Forge resolver functions — Phase B.
- * Settings stored in Forge Storage (per installation).
- * Backend URL is dynamic: reads from Storage, falls back to default.
+ * Spec2Tickets v3.0.0 — Forge resolver entry point.
  *
- * KVS schema for 'spec2jira_settings':
- *   {
- *     backendUrl: string,
- *     backendApiKey: string,
- *     defaultProjectKey: string,
- *     lastTestOk?: boolean    // true = testConnection succeeded with CURRENT config
- *                             //        (undefined/false = requires pre-flight at app mount)
- *   }
+ * Architecture (post-pivot 2026-05-28):
+ *   - BYOK: customer's Anthropic API key stored in Forge KVS secret storage
+ *   - Direct asUser() to Confluence (page content fetch) — no backend roundtrip
+ *   - Async event consumer for Anthropic generateBreakdown (runtime constraint)
+ *   - Direct asUser() to JIRA for push (Step 8 — currently stubbed)
+ *
+ * v2.x → v3.0.0 resolver changes:
+ *   PRESERVED (Forge-native, no backend dependency):
+ *     - searchPages, getRecentPages, getLastSelectedPage, recordPageSelection
+ *     - setPendingDeepLink, consumePendingDeepLink
+ *
+ *   REWRITTEN:
+ *     - getSettings, saveSettings, resetSettings (BYOK API key model)
+ *     - testConnection (calls Anthropic /v1/messages with minimal payload)
+ *     - fetchPage (direct asUser() to Confluence; no backend roundtrip)
+ *     - startGeneration (enqueues async event, returns jobId)
+ *     - pollJobStatus, getResults (read KVS by jobId)
+ *
+ *   REMOVED:
+ *     - startPreview (v3.0.0 single Anthropic call IS the breakdown)
+ *     - healthCheck (no backend к probe)
+ *
+ *   JIRA push (Step 8 — synchronous asUser() via executePush; 2026-05-30):
+ *     - dryRun (pre-flight project verify), pushToJira (full synchronous push)
+ *     - pollPushStatus REMOVED — push е synchronous now, no polling
  */
-import Resolver from "@forge/resolver";
-import { kvs } from "@forge/kvs";
-import api, { route } from "@forge/api";
+
+import Resolver from '@forge/resolver';
+import { kvs } from '@forge/kvs';
+import api, { route } from '@forge/api';
+
+import {
+  setStoredApiKey,
+  clearStoredApiKey,
+  getStoredApiKey,
+  testConnection as anthropicTestConnection,
+  submitBreakdownBatch,
+  pollBatchStatus,
+  fetchBatchResults,
+  estimateCost,
+  MODEL_PRIMARY,
+  MODEL_FALLBACK,
+} from './anthropic_client.js';
+import { startPushSession, pushSessionStep } from './push_handler.js';
 
 const resolver = new Resolver();
+
+// ── Constants ──────────────────────────────────────────────
+
+const SETTINGS_KEY = 'spec2jira_settings';
+
+// KVS prefix for generation job state (Anthropic batch lifecycle).
+const JOB_KEY_PREFIX = 'job:';
+
+// NOTE: generation uses Anthropic Message Batches API (polled via
+// pollJobStatus); push runs synchronously in the pushToJira resolver via
+// executePush(). Neither uses @forge/events queues anymore — asUser() е
+// unavailable in async consumers (AUTH_TYPE_UNAVAILABLE 2026-05-30).
+
 
 // ── Settings helpers ────────────────────────────────────────
 
 async function loadSettings() {
-  const s = await kvs.get("spec2jira_settings");
+  const s = await kvs.get(SETTINGS_KEY);
   return s || {};
-}
-
-async function getApiKey() {
-  const s = await loadSettings();
-  return s.backendApiKey || null;
-}
-
-async function getBackendUrl() {
-  const s = await loadSettings();
-  return s.backendUrl || null;
 }
 
 async function getProjectKey(payloadKey) {
@@ -41,417 +74,214 @@ async function getProjectKey(payloadKey) {
   return s.defaultProjectKey || null;
 }
 
-// ── Backend HTTP helpers ────────────────────────────────────
+// ════════════════════════════════════════════════════════════
+// SETTINGS RESOLVERS — BYOK Anthropic API key + JIRA project key
+// ════════════════════════════════════════════════════════════
 
-const NOT_CONFIGURED = {
-  error: "not_configured",
-  detail:
-    "Spec2Tickets is not configured yet. Ask your Confluence admin to set the Backend URL in Settings → Manage Apps → Spec2Tickets → Configure.",
-};
-
-async function backendGet(path) {
-  const url = await getBackendUrl();
-  if (!url) return NOT_CONFIGURED;
-  const apiKey = await getApiKey();
-  if (!apiKey) {
-    return {
-      error: "not_configured",
-      detail:
-        "Backend API Key is not configured. Ask your Confluence admin to set it in Settings → Manage Apps → Spec2Tickets → Configure.",
-    };
-  }
-  const headers = {
-    Accept: "application/json",
-    Authorization: `Bearer ${apiKey}`,
+/**
+ * Load settings for the Settings UI.
+ * Returns project key + boolean indicating whether API key е stored.
+ * Does NOT return the actual API key value (Forge KVS secrets are
+ * resolver-only and we don't echo them back к the UI for security).
+ */
+resolver.define('getSettings', async () => {
+  const s = await loadSettings();
+  const storedKey = await getStoredApiKey();
+  return {
+    defaultProjectKey: s.defaultProjectKey || '',
+    apiKeyConfigured: !!storedKey,
+    apiKeyLastSetAt: s.apiKeyLastSetAt || null,
+    // Optional advanced config — required custom fields JSON (raw string for
+    // round-trip editing). Empty когато the project doesn't require custom fields.
+    requiredCustomFieldsJson: s.requiredCustomFieldsJson || '',
   };
-  // if (apiKey) headers["X-API-Key"] = apiKey;
+});
 
-  // B2 part 26 (2026-05-09) diagnostic logging — partner manual-entry
-  // case: backend curl returns 200 OK on same page ID (3964939) but
-  // Forge UI manual entry fails. Logging captures the actual fetch
-  // outcome so partner can paste console output for diagnosis.
-  // Visible via `forge logs --since 5m` after sandbox reproduction.
-  let r;
+/**
+ * Parse the admin-configured required-custom-fields JSON string into an object.
+ * Returns { ok, value } or { ok: false, error }. Empty/blank → ok with null.
+ */
+function parseRequiredCustomFields(raw) {
+  const text = (raw || '').trim();
+  if (!text) return { ok: true, value: null };
+  let parsed;
   try {
-    r = await fetch(`${url}${path}`, { method: "GET", headers });
+    parsed = JSON.parse(text);
   } catch (e) {
-    console.error(
-      `[backendGet] FETCH THREW for ${path} — ${String(e?.message || e)}`,
-    );
-    return {
-      error: "Backend unreachable",
-      detail: `fetch threw: ${String(e?.message || e)}`,
-    };
+    return { ok: false, error: 'Custom fields must be valid JSON (e.g. {"customfield_10042": {"value": "Team A"}}).' };
   }
-  if (!r.ok) {
-    const b = await r.text();
-    console.warn(
-      `[backendGet] ${path} → HTTP ${r.status}: ${b.substring(0, 300)}`,
-    );
-    return { error: `Backend ${r.status}`, detail: b.substring(0, 300) };
+  if (typeof parsed !== 'object' || Array.isArray(parsed) || parsed === null) {
+    return { ok: false, error: 'Custom fields must be а JSON object mapping field IDs к values.' };
   }
-  // Successful response — log path + status only (avoid leaking body).
-  console.log(`[backendGet] ${path} → HTTP ${r.status} OK`);
-  return await r.json();
+  return { ok: true, value: parsed };
 }
 
-async function backendPost(path, body) {
-  const url = await getBackendUrl();
-  if (!url) return NOT_CONFIGURED;
-  const apiKey = await getApiKey();
-  if (!apiKey) {
-    return {
-      error: "not_configured",
-      detail:
-        "Backend API Key is not configured. Ask your Confluence admin to set it in Settings → Manage Apps → Spec2Tickets → Configure.",
-    };
-  }
-  const headers = {
-    Accept: "application/json",
-    "Content-Type": "application/json",
-    Authorization: `Bearer ${apiKey}`,
-  };
-  // const headers = {
-  //   Accept: "application/json",
-  //   "Content-Type": "application/json",
-  // };
-  // if (apiKey) headers["X-API-Key"] = apiKey;
-  const r = await fetch(`${url}${path}`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(body),
-  });
-  if (r.status === 423) {
-    const d = await r.json();
-    return { busy: true, ...d.detail };
-  }
-  if (!r.ok) {
-    const t = await r.text();
-    return { error: `Backend ${r.status}`, detail: t.substring(0, 300) };
-  }
-  return await r.json();
-}
+/**
+ * Save settings от Settings UI.
+ *
+ * Payload: { anthropicApiKey?: string, defaultProjectKey: string }
+ *
+ * If anthropicApiKey provided + non-empty, stores it via Forge secret KVS.
+ * If omitted/empty, existing key (if any) е preserved.
+ * defaultProjectKey е always validated + saved.
+ */
+resolver.define('saveSettings', async ({ payload }) => {
+  const { anthropicApiKey, defaultProjectKey, requiredCustomFieldsJson } = payload || {};
 
-// ── Settings resolvers ──────────────────────────────────────
-
-resolver.define("getSettings", async () => {
-  return await loadSettings();
-});
-
-resolver.define("resetSettings", async () => {
-  await kvs.delete("spec2jira_settings");
-  return { success: true };
-});
-
-resolver.define("saveSettings", async ({ payload }) => {
-  const { backendUrl, backendApiKey, defaultProjectKey } = payload;
-
-  // Server-side validation (defense in depth — client validates too, but
-  // resolver must guard against direct calls or UI bypasses).
-
-  // Validate URL format
-  if (!backendUrl) {
-    return { error: "Backend URL is required" };
-  }
-  if (!backendUrl.startsWith("https://")) {
-    return { error: "Backend URL must start with https://" };
-  }
-
-  // Validate API key — required, reasonable length.
-  // Server-side enforcement (defense in depth — client validates too,
-  // but resolver must guard against direct calls or UI bypasses).
-  const trimmedApiKey = (backendApiKey || "").trim();
-  if (!trimmedApiKey) {
-    return { error: "Backend API Key is required" };
-  }
-  if (trimmedApiKey.length < 16) {
-    return { error: "Backend API Key must be at least 16 characters" };
-  }
-  if (trimmedApiKey.length > 256) {
-    return { error: "Backend API Key must be at most 256 characters" };
-  }
-
-  const cleanProjectKey = (defaultProjectKey || "").trim().toUpperCase();
+  // Validate project key
+  const cleanProjectKey = (defaultProjectKey || '').trim().toUpperCase();
   if (!cleanProjectKey) {
-    return { error: "JIRA Project Key is required" };
+    return { error: 'JIRA Project Key е required' };
   }
   if (!/^[A-Z][A-Z0-9]{1,9}$/.test(cleanProjectKey)) {
     return {
       error:
-        "JIRA Project Key must be 2–10 characters (letter first, then letters/digits).",
+        'JIRA Project Key must be 2–10 characters, start with а letter, only uppercase letters and digits (e.g., PROJ, SCRUM2)',
     };
   }
 
-  // Strip trailing slash
-  const cleanUrl = backendUrl ? backendUrl.replace(/\/+$/, "") : "";
+  // Validate optional custom-fields JSON (fail fast so the admin fixes it now,
+  // не discovers it as а push failure later).
+  const cfRaw = (requiredCustomFieldsJson || '').trim();
+  const cfParse = parseRequiredCustomFields(cfRaw);
+  if (!cfParse.ok) {
+    return { error: cfParse.error };
+  }
 
-  // Load existing settings to determine if connectivity-affecting fields changed.
-  // If url/apiKey unchanged, preserve lastTestOk (avoid forcing unnecessary
-  // re-test when user just updates projectKey).
+  // Conditionally update API key
+  let apiKeyUpdated = false;
+  const incomingKey = (anthropicApiKey || '').trim();
+  if (incomingKey) {
+    const result = await setStoredApiKey(incomingKey);
+    if (!result.success) {
+      return { error: result.error };
+    }
+    apiKeyUpdated = true;
+  }
+
+  // Update non-secret settings (project key + custom fields + metadata)
   const current = await loadSettings();
-  const urlChanged = current.backendUrl !== cleanUrl;
-  const keyChanged = (current.backendApiKey || "") !== (backendApiKey || "");
-  const preserveLastTestOk =
-    !urlChanged && !keyChanged && current.lastTestOk === true;
-
   const next = {
-    backendUrl: cleanUrl,
-    backendApiKey: backendApiKey || "",
+    ...current,
     defaultProjectKey: cleanProjectKey,
+    requiredCustomFieldsJson: cfRaw, // store raw string for UI round-trip
   };
-  if (preserveLastTestOk) next.lastTestOk = true;
+  if (apiKeyUpdated) {
+    next.apiKeyLastSetAt = new Date().toISOString();
+  }
+  await kvs.set(SETTINGS_KEY, next);
 
-  await kvs.set("spec2jira_settings", next);
+  return { success: true, apiKeyUpdated };
+});
 
+/**
+ * Clear Anthropic API key only (preserves project key).
+ * Useful когато admin wants к rotate keys или disconnect Spec2Tickets.
+ */
+resolver.define('clearAnthropicApiKey', async () => {
+  const result = await clearStoredApiKey();
+  if (result.success) {
+    // Remove timestamp от settings
+    const current = await loadSettings();
+    if (current.apiKeyLastSetAt) {
+      delete current.apiKeyLastSetAt;
+      await kvs.set(SETTINGS_KEY, current);
+    }
+  }
+  return result;
+});
+
+/**
+ * Reset all settings (clears API key AND project key + KVS metadata).
+ * Confirmation prompt should be shown in UI BEFORE calling this.
+ */
+resolver.define('resetSettings', async () => {
+  await clearStoredApiKey();
+  await kvs.delete(SETTINGS_KEY);
   return { success: true };
 });
 
 /**
- * testConnection — verifies backend reachability + classifies failures
- * using Forge egress proxy headers (empirically validated Apr 18 2026):
- *
- *   forge-proxy-error: BLOCKED_EGRESS  → domain not whitelisted
- *   x-squid-error: <code>              → proxy couldn't reach backend
- *   (no Forge headers) + status        → real passthrough from backend
- *
- * Side-effect: persists `lastTestOk` in KVS when tested config matches
- * stored config. This enables App.js to skip pre-flight on mount when
- * a recent successful test exists.
- *
- * Expects the backend to have a /health endpoint returning 200 when healthy.
+ * Test the customer's stored Anthropic API key (or override from UI).
+ * Returns { status: 'ok', model } on success or { status: 'error', code, detail }.
+ * Compatible с existing AdminSettings.jsx error code mapping.
  */
-resolver.define("testConnection", async ({ payload }) => {
-  const result = await runTestConnection(payload);
-  await persistTestStatusIfMatching(payload, result.status === "ok");
-  return result;
+resolver.define('testConnection', async ({ payload }) => {
+  // payload may include { anthropicApiKey } when testing a key BEFORE save
+  const candidateKey = (payload?.anthropicApiKey || '').trim() || null;
+  const result = await anthropicTestConnection(candidateKey);
+
+  if (result.ok) {
+    return {
+      status: 'ok',
+      message: `Connected к Anthropic API (${result.model})`,
+    };
+  }
+
+  // Map к error codes (some preserved от v2.x format)
+  const codeMap = {
+    not_configured: 'NOT_CONFIGURED',
+    network_failure: 'BACKEND_UNREACHABLE',
+    auth_rejected: 'BACKEND_AUTH_FAILED',
+    insufficient_credits: 'INSUFFICIENT_CREDITS',
+    rate_limited: 'RATE_LIMITED',
+  };
+  return {
+    status: 'error',
+    code: codeMap[result.error] || 'UNEXPECTED',
+    detail: result.detail,
+  };
 });
 
-async function runTestConnection(payload) {
-  const { backendUrl, backendApiKey } = payload || {};
+// ════════════════════════════════════════════════════════════
+// CONFLUENCE PAGE PICKER — preserved от v2.x (Forge-native)
+// ════════════════════════════════════════════════════════════
 
-  if (!backendUrl) {
-    return {
-      status: "error",
-      code: "UNEXPECTED",
-      detail: "Backend URL is required",
-    };
-  }
-
-  // Normalize URL (strip trailing slash to avoid "//health")
-  const base = backendUrl.replace(/\/+$/, "");
-  const healthUrl = `${base}/health`;
-
-  let res;
-  try {
-    const headers = { Accept: "application/json" };
-    if (backendApiKey) {
-      headers["Authorization"] = `Bearer ${backendApiKey}`;
-    }
-    res = await fetch(healthUrl, { method: "GET", headers });
-  } catch (e) {
-    // Forge egress proxy synthesizes HTTP responses for egress failures,
-    // so this catch block should only fire for resolver-level bugs.
-    return {
-      status: "error",
-      code: "UNEXPECTED",
-      detail: String(e?.message || e),
-    };
-  }
-
-  // ─── Classification by Forge proxy headers FIRST ─────────────
-
-  if (res.headers.get("forge-proxy-error") === "BLOCKED_EGRESS") {
-    return {
-      status: "error",
-      code: "FORGE_FETCH_BLOCKED",
-      detail: `HTTP ${res.status} — forge-proxy-error: BLOCKED_EGRESS`,
-    };
-  }
-
-  const squidError = res.headers.get("x-squid-error");
-  if (squidError) {
-    return {
-      status: "error",
-      code: "BACKEND_UNREACHABLE",
-      detail: `HTTP ${res.status} — x-squid-error: ${squidError}`,
-    };
-  }
-
-  // ─── From here on, response is a real passthrough from backend ──
-
-  if (res.status === 401 || res.status === 403) {
-    return {
-      status: "error",
-      code: "BACKEND_AUTH_FAILED",
-      detail: `HTTP ${res.status} from backend`,
-    };
-  }
-
-  if (!res.ok) {
-    return {
-      status: "error",
-      code: "BACKEND_NOT_HEALTHY",
-      detail: `HTTP ${res.status} from backend`,
-    };
-  }
-
-  // 2xx — try to parse body for a friendlier message.
-  let bodyMessage;
-  try {
-    const body = await res.json();
-    bodyMessage = body?.message || body?.status;
-  } catch {
-    // Body not JSON or empty — fine.
-  }
-
-  return { status: "ok", message: bodyMessage || "Backend is healthy" };
-}
-
-/**
- * Persist lastTestOk to KVS — but ONLY if the tested URL+apiKey match
- * what's currently stored. Prevents mismatch where user types a different
- * URL in the form, tests it, gets success, but saved config still has old URL.
- */
-async function persistTestStatusIfMatching(payload, isOk) {
-  const { backendUrl, backendApiKey } = payload || {};
-  if (!backendUrl) return;
-
-  const current = await loadSettings();
-  const cleanTestedUrl = backendUrl.replace(/\/+$/, "");
-
-  const urlMatches = current.backendUrl === cleanTestedUrl;
-  const keyMatches = (current.backendApiKey || "") === (backendApiKey || "");
-
-  if (urlMatches && keyMatches) {
-    await kvs.set("spec2jira_settings", { ...current, lastTestOk: isOk });
-  }
-  // If no match, do nothing — we don't know if this test result applies
-  // to the saved config. App.js will pre-flight at next mount.
-}
-
-// ── Page metadata ───────────────────────────────────────────
-
-resolver.define("fetchPage", async ({ payload }) => {
-  const { pageId } = payload;
-  if (!pageId) return { error: "No page ID" };
-  return backendGet(`/api/v1/pages/${pageId}`);
-});
-
-// ── Page picker (globalPage migration 2026-05-08) ───────────
-// Editor flow no longer auto-binds via ctx.extension.content.id (this
-// affordance is contentAction-specific). Users now select a page through
-// PagePickerScreen which combines:
-//   - Recent list (last MAX_RECENT_PAGES selections, persisted in KVS)
-//   - Title search across user's accessible pages (cross-space, CQL ~)
-//   - Manual page-ID input fallback (for empty results / permission gaps)
-//
-// KVS schema:
-//   spec2jira_recent_pages    : [{id, title, spaceKey, spaceName,
-//                                 lastSelectedAt}, ...]  (newest-first)
-//   spec2jira_last_selected_page : {id, title, ...}      (single entry)
-//
-// Scope: requires `search:confluence` (granted in manifest.yml 2026-05-08).
-//        Forge linter empirically confirmed this scope name 2026-05-08
-//        (initial draft used `read:page:confluence` which was insufficient
-//        for /wiki/rest/api/content/search v1 CQL endpoint — H-1 self-
-//        review risk caught BEFORE sandbox deploy via lint gate).
-//        Triggers re-authorization on upgrade for existing installations.
-
-const RECENT_PAGES_KEY = "spec2jira_recent_pages";
-const LAST_SELECTED_KEY = "spec2jira_last_selected_page";
+const RECENT_PAGES_KEY = 'spec2jira_recent_pages';
+const LAST_SELECTED_KEY = 'spec2jira_last_selected_page';
 const MAX_RECENT_PAGES = 10;
-// U3 part 33 (2026-05-09) — deep-link relay between contentAction module
-// and globalPage. contentAction sets pending_deep_link с page context;
-// globalPage init() consumes it. Stale entries (>5 min old) auto-cleared
-// to prevent zombie state if user аборт-ва navigation mid-flight.
-const PENDING_DEEP_LINK_KEY = "spec2jira_pending_deep_link";
-const PENDING_DEEP_LINK_MAX_AGE_MS = 5 * 60 * 1000; // 5 minutes
+const PENDING_DEEP_LINK_KEY = 'spec2jira_pending_deep_link';
+const PENDING_DEEP_LINK_MAX_AGE_MS = 5 * 60 * 1000;
 const SEARCH_MIN_QUERY_LEN = 2;
 const SEARCH_RESULT_LIMIT = 20;
 
-/**
- * searchPages — title-substring search across user's accessible pages.
- *
- * Uses CQL v1 endpoint (`/wiki/rest/api/content/search`) because v2 API's
- * /pages endpoint only supports exact-match `title` parameter, not
- * substring search. CQL `title ~ "query"` is case-insensitive partial.
- *
- * Returns: { results: [{id, title, spaceKey, spaceName}] } | { error, detail }
- */
-resolver.define("searchPages", async ({ payload }) => {
-  const query = (payload?.query || "").trim();
+resolver.define('searchPages', async ({ payload }) => {
+  const query = (payload?.query || '').trim();
   if (query.length < SEARCH_MIN_QUERY_LEN) {
     return { results: [] };
   }
 
-  // CQL escape: backslashes FIRST (so quote-escapes added below не
-  // double-escape), then quotes. M-1 self-review fix 2026-05-08 —
-  // original code only escaped quotes; user typing `\` followed by
-  // anything broke CQL parser.
-  const safeQuery = query
-    .replace(/\\/g, "\\\\")
-    .replace(/"/g, '\\"');
+  const safeQuery = query.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
   const cql = `type=page AND title ~ "${safeQuery}"`;
 
+  // v1 /wiki/rest/api/content/search → 410 Gone (deprecated 2026-05);
+  // /wiki/rest/api/search (no /content/ prefix) е the dedicated CQL search
+  // endpoint, still supported. Different response envelope — results
+  // wrap each match в {content: {...}} object.
   let response;
   try {
     response = await api
       .asUser()
       .requestConfluence(
-        route`/wiki/rest/api/content/search?cql=${cql}&limit=${SEARCH_RESULT_LIMIT}&expand=space`,
+        route`/wiki/rest/api/search?cql=${cql}&limit=${SEARCH_RESULT_LIMIT}`,
       );
   } catch (e) {
-    console.error(
-      `[searchPages] requestConfluence THREW for query="${query}" — ${String(
-        e?.message || e,
-      )}`,
-    );
-    return { error: "Search failed", detail: String(e?.message || e) };
+    console.error(`[searchPages] threw: ${String(e?.message || e)}`);
+    return { error: 'Search failed', detail: String(e?.message || e) };
   }
 
-  // B2 part 26 (2026-05-09) diagnostic logging — partner sandbox case:
-  // search broken despite scope granted. Logging captures actual HTTP
-  // status + Forge proxy headers so failure mode is visible via
-  // `forge logs --since 5m` after sandbox reproduction.
-  console.log(
-    `[searchPages] query="${query}" → HTTP ${response.status} ${
-      response.ok ? "OK" : "FAIL"
-    }`,
-  );
-
-  // M-4 self-review fix 2026-05-08 — Forge-proxy diagnostic headers
-  // (mirror testConnection pattern). Egress proxy synthesizes responses
-  // for blocked domains / unreachable backends; classifying via headers
-  // makes scope-mismatch / proxy-blocked failures debuggable instead of
-  // an opaque "403". Critical for sandbox validation of H-1 (scope
-  // sufficiency for v1 CQL endpoint not yet empirically verified).
-  if (response.headers.get("forge-proxy-error") === "BLOCKED_EGRESS") {
+  if (response.headers.get('forge-proxy-error') === 'BLOCKED_EGRESS') {
     return {
-      error: "FORGE_FETCH_BLOCKED",
-      detail: `HTTP ${response.status} — forge-proxy-error: BLOCKED_EGRESS (likely missing scope OR app-config issue)`,
+      error: 'FORGE_FETCH_BLOCKED',
+      detail: 'Egress blocked. Verify scopes + reinstall the app.',
     };
   }
-  const squidError = response.headers.get("x-squid-error");
-  if (squidError) {
-    return {
-      error: "BACKEND_UNREACHABLE",
-      detail: `HTTP ${response.status} — x-squid-error: ${squidError}`,
-    };
-  }
-
   if (!response.ok) {
     const text = await response.text();
-    console.warn(
-      `[searchPages] Confluence ${response.status} body: ${text.substring(
-        0,
-        300,
-      )}`,
-    );
-    // 403 specifically — most common scope-mismatch outcome on first deploy.
     if (response.status === 403) {
       return {
-        error: "Confluence 403 — scope mismatch?",
-        detail: `Granted scopes (search:confluence + read:confluence-content.summary post part 26 fix) may be insufficient OR app needs reinstall to grant new scopes. Run 'forge install --upgrade' and re-authorize. Body: ${text.substring(0, 200)}`,
+        error: 'Confluence 403 — scope mismatch?',
+        detail: `Verify search:confluence + read:confluence-content.summary scopes. Body: ${text.substring(0, 200)}`,
       };
     }
     return {
@@ -462,208 +292,609 @@ resolver.define("searchPages", async ({ payload }) => {
 
   try {
     const data = await response.json();
-    const results = (data.results || []).map((p) => ({
-      id: String(p.id),
-      title: p.title || "(untitled)",
-      spaceKey: p.space?.key || "",
-      spaceName: p.space?.name || "",
-    }));
+    const results = (data.results || []).map((r) => {
+      const c = r.content || {};
+      return {
+        id: String(c.id || ''),
+        title: c.title || r.title || '(untitled)',
+        spaceKey: c.space?.key || r.resultGlobalContainer?.key || '',
+        spaceName: c.space?.name || r.resultGlobalContainer?.title || '',
+      };
+    }).filter((r) => r.id);
     return { results };
   } catch (e) {
-    return { error: "Parse failed", detail: String(e?.message || e) };
+    return { error: 'Parse failed', detail: String(e?.message || e) };
   }
 });
 
-/**
- * getRecentPages — reads KVS recent list (newest-first per recordPageSelection
- * contract). Returns empty array когато KVS empty or schema-shape unexpected.
- */
-resolver.define("getRecentPages", async () => {
+resolver.define('getRecentPages', async () => {
   const list = await kvs.get(RECENT_PAGES_KEY);
   return { recent: Array.isArray(list) ? list : [] };
 });
 
-/**
- * getLastSelectedPage — reload continuity surface. App.js can pre-populate
- * the picker с last-selected page, OR auto-route to editor flow if user
- * intends to continue. Returns null когато no prior selection exists.
- */
-resolver.define("getLastSelectedPage", async () => {
+resolver.define('getLastSelectedPage', async () => {
   const last = await kvs.get(LAST_SELECTED_KEY);
   return { lastSelected: last || null };
 });
 
-/**
- * recordPageSelection — invoked when user confirms a page choice.
- * Side effects:
- *   1. Recent list — dedupe by id, prepend new entry, truncate to MAX_RECENT_PAGES
- *   2. last_selected_page — replace с new entry (single-value)
- *
- * Both writes are best-effort sequential; failure between them leaves recent
- * list updated but last_selected stale. Acceptable trade-off (low-frequency
- * write path; KVS reliability per Forge SLA).
- */
-resolver.define("recordPageSelection", async ({ payload }) => {
+resolver.define('recordPageSelection', async ({ payload }) => {
   const { id, title, spaceKey, spaceName } = payload || {};
-  if (!id || !title) {
-    return { error: "Missing page id or title" };
-  }
-
+  if (!id || !title) return { error: 'Missing page id or title' };
   const stringId = String(id);
   const entry = {
     id: stringId,
     title,
-    spaceKey: spaceKey || "",
-    spaceName: spaceName || "",
+    spaceKey: spaceKey || '',
+    spaceName: spaceName || '',
     lastSelectedAt: new Date().toISOString(),
   };
-
   const current = await kvs.get(RECENT_PAGES_KEY);
   const list = Array.isArray(current) ? current : [];
   const filtered = list.filter((p) => p.id !== stringId);
   const next = [entry, ...filtered].slice(0, MAX_RECENT_PAGES);
-
   await kvs.set(RECENT_PAGES_KEY, next);
   await kvs.set(LAST_SELECTED_KEY, entry);
-
   return { success: true, recent: next };
 });
 
-/**
- * setPendingDeepLink (U3 part 33, 2026-05-09) — contentAction module
- * writes pending page reference here, then navigates to globalPage.
- * globalPage init() reads via consumePendingDeepLink as its FIRST gate
- * after settings/connection checks; if present, pre-binds the page +
- * routes по job status (skips picker entirely).
- *
- * Closes "Apps menu navigation friction" partner UX insight 2026-05-08
- * part 18 — user clicks contentAction byline button on a Confluence
- * page → globalPage opens с that page already bound. ZERO picker steps.
- *
- * Payload: { pageId, title, spaceKey, spaceName }
- */
-resolver.define("setPendingDeepLink", async ({ payload }) => {
+resolver.define('setPendingDeepLink', async ({ payload }) => {
   const { pageId, title, spaceKey, spaceName } = payload || {};
-  if (!pageId) return { error: "Missing pageId" };
+  if (!pageId) return { error: 'Missing pageId' };
   await kvs.set(PENDING_DEEP_LINK_KEY, {
     pageId: String(pageId),
-    title: title || "",
-    spaceKey: spaceKey || "",
-    spaceName: spaceName || "",
+    title: title || '',
+    spaceKey: spaceKey || '',
+    spaceName: spaceName || '',
     setAt: Date.now(),
   });
   return { success: true };
 });
 
-/**
- * consumePendingDeepLink (U3 part 33, 2026-05-09) — globalPage init
- * reads pending deep-link, deletes it (single-use), and pre-binds the
- * page. Stale entries (>5 min old) are silently dropped without
- * consumption — guards against zombie KVS state if contentAction set
- * a deep-link but user аборт-ва before reaching globalPage (e.g.,
- * closed tab mid-navigation; deep-link should not silently re-bind
- * stale page on next session).
- *
- * Returns: { pending: { pageId, title, spaceKey, spaceName } | null }
- */
-resolver.define("consumePendingDeepLink", async () => {
+resolver.define('consumePendingDeepLink', async () => {
   const pending = await kvs.get(PENDING_DEEP_LINK_KEY);
-  if (!pending || !pending.pageId) {
-    return { pending: null };
-  }
-  // Always clear KVS — single-use semantic regardless of staleness.
+  if (!pending || !pending.pageId) return { pending: null };
   await kvs.delete(PENDING_DEEP_LINK_KEY);
   const ageMs = Date.now() - (pending.setAt || 0);
-  if (ageMs > PENDING_DEEP_LINK_MAX_AGE_MS) {
-    return { pending: null }; // stale → discard
-  }
+  if (ageMs > PENDING_DEEP_LINK_MAX_AGE_MS) return { pending: null };
   return {
     pending: {
       pageId: pending.pageId,
-      title: pending.title || "",
-      spaceKey: pending.spaceKey || "",
-      spaceName: pending.spaceName || "",
+      title: pending.title || '',
+      spaceKey: pending.spaceKey || '',
+      spaceName: pending.spaceName || '',
     },
   };
 });
 
-// ── Generation ──────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════
+// CONFLUENCE PAGE METADATA + CONTENT — direct asUser()
+// (v2.x routed via customer backend; v3.0.0 calls Confluence directly)
+// ════════════════════════════════════════════════════════════
 
-resolver.define("getGenerationStatus", async ({ payload }) => {
-  const { pageId } = payload;
-  if (!pageId) return { status: "idle" };
-  return backendGet(`/api/v1/generate/status?page_id=${pageId}`);
+/**
+ * Fetch Confluence page metadata + body content via asUser().
+ * Returns:
+ *   { pageId, title, spaceKey, spaceName, version, body, bodyLength }
+ *   OR { error, detail }
+ *
+ * v2 Confluence API (2026-05-29 migration — v1 /wiki/rest/api/content/{id}
+ * returned 410 Gone). v2 endpoint е /wiki/api/v2/pages/{id}; response shape
+ * differs (spaceId instead of nested space object — space key/name require
+ * separate lookup; omitted here for simplicity since they're display-only).
+ */
+resolver.define('fetchPage', async ({ payload }) => {
+  const pageId = payload?.pageId;
+  if (!pageId) return { error: 'No page ID' };
+
+  let response;
+  try {
+    response = await api
+      .asUser()
+      .requestConfluence(
+        route`/wiki/api/v2/pages/${pageId}?body-format=storage`,
+      );
+  } catch (e) {
+    return { error: 'Fetch failed', detail: String(e?.message || e) };
+  }
+
+  if (response.status === 404) {
+    return { error: 'page_not_found', detail: `Page ${pageId} does not exist or you don't have access` };
+  }
+  if (response.status === 403) {
+    return { error: 'permission_denied', detail: 'You do not have permission к view this page' };
+  }
+  if (!response.ok) {
+    const text = await response.text();
+    return { error: `confluence_${response.status}`, detail: text.substring(0, 300) };
+  }
+
+  const data = await response.json();
+  const bodyStorage = data.body?.storage?.value || '';
+
+  // snake_case field names — matches App.js UI expectations (preserved
+  // от v2.x backend response shape). Frontend reads pageData.page_id,
+  // pageData.space_name, pageData.body_length etc.
+  return {
+    page_id: String(data.id),
+    title: data.title,
+    space_key: '',  // v2 API returns spaceId only; separate /spaces/{spaceId} call needed за key/name
+    space_name: '',
+    version: data.version?.number || 1,
+    body: bodyStorage,
+    body_length: bodyStorage.length,
+  };
 });
 
-resolver.define("startGeneration", async ({ payload }) => {
-  const { pageId, documentType, modelMode, projectKey, bypassCache } = payload;
-  if (!pageId) return { error: "No page ID" };
-  const pk = await getProjectKey(projectKey);
-  // Slice 3 (Layer 1 Session 4 — CG-9 cache bypass, 2026-05-08).
-  // Forge UI ReadyScreen "Bypass cache" checkbox passes bypassCache=true
-  // когато user wants fresh re-run без cache lookups. Default false →
-  // legacy clients не sending field behave exactly как before.
-  return backendPost("/api/v1/generate", {
-    page_id: pageId,
-    document_type: documentType || "MODULE",
-    model_mode: modelMode || "dual",
-    project_key: pk,
-    bypass_cache: bypassCache === true,
+// ════════════════════════════════════════════════════════════
+// GENERATION — Anthropic Message Batches API pattern
+//
+// Why batches: Forge async events have а 55-sec hard timeout per invocation.
+// Sync generateBreakdown runs 60-150 sec. Batches submit instantly + Anthropic
+// processes async (typically 2-10 min). UI polls pollJobStatus which polls
+// Anthropic batch status. 50% cheaper than sync calls. Bonus.
+//
+// Job lifecycle в KVS:
+//   pending (just created) → batched (submitted к Anthropic) →
+//   completed (results fetched + breakdown stored)
+//   OR failed (any error along the way)
+// ════════════════════════════════════════════════════════════
+
+function newJobId() {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+    return crypto.randomUUID();
+  }
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+/**
+ * Start a breakdown generation job using Anthropic Message Batches API.
+ * Returns immediately с jobId after submitting batch (~1-2 sec total).
+ * Forge UI polls pollJobStatus за batch lifecycle progress + results.
+ *
+ * Payload: { pageId, modelMode?, bypassCache? }
+ *   modelMode: 'primary' (Sonnet 4.6, default) | 'fallback' (Haiku 4.5)
+ *   bypassCache: boolean (disable prompt caching — useful за testing)
+ */
+resolver.define('startGeneration', async ({ payload }) => {
+  const { pageId, modelMode, bypassCache } = payload || {};
+  if (!pageId) return { error: 'No page ID' };
+
+  // Verify API key configured BEFORE fetching content (fail fast)
+  const apiKey = await getStoredApiKey();
+  if (!apiKey) {
+    return {
+      error: 'not_configured',
+      detail:
+        'Anthropic API key not configured. Ask your Confluence admin к open Settings → Spec2Tickets and provide an Anthropic API key.',
+    };
+  }
+
+  // Fetch page content (asUser so customer permissions apply).
+  let pageFetch;
+  try {
+    pageFetch = await api
+      .asUser()
+      .requestConfluence(
+        route`/wiki/api/v2/pages/${pageId}?body-format=storage`,
+      );
+  } catch (e) {
+    return { error: 'fetch_threw', detail: String(e?.message || e) };
+  }
+  if (!pageFetch.ok) {
+    const text = await pageFetch.text();
+    return {
+      error: `confluence_${pageFetch.status}`,
+      detail: text.substring(0, 300),
+    };
+  }
+  const pageData = await pageFetch.json();
+  const pageContent = pageData.body?.storage?.value || '';
+  if (pageContent.length < 50) {
+    return {
+      error: 'page_too_small',
+      detail: `Page content е too short к extract a meaningful breakdown (${pageContent.length} chars)`,
+    };
+  }
+
+  const jobId = newJobId();
+  const pageTitle = pageData.title || 'Untitled';
+  const model = modelMode === 'fallback' ? MODEL_FALLBACK : MODEL_PRIMARY;
+
+  // Persist initial job state
+  await kvs.set(`${JOB_KEY_PREFIX}${jobId}`, {
+    jobId,
+    pageId: String(pageId),
+    pageTitle,
+    status: 'pending',
+    model,
+    createdAt: new Date().toISOString(),
   });
-});
 
-// CG-7 spec linter pre-flight (Layer 1 Session 2, 2026-05-07).
-// Runs Phase 0 + Phase 0b only (~30-90 sec). Backend route accepts
-// page_id as path param. Slice 3 (2026-05-08): backend now accepts
-// optional body с `bypass_cache` field for symmetry с /generate;
-// legacy `{}` body still routes bypass_cache=False (backward-compat).
-// Concurrency: shares GPU lock с /generate — backend returns 423
-// если pipeline busy. Polling reuses pollJobStatus + getResults
-// (job_store routes payload by kind="preview" → preview_result key).
-resolver.define("startPreview", async ({ payload }) => {
-  const { pageId, bypassCache } = payload;
-  if (!pageId) return { error: "No page ID" };
-  return backendPost(`/api/v1/specs/preview/${pageId}`, {
-    bypass_cache: bypassCache === true,
+  // Submit batch к Anthropic (returns batch_id immediately)
+  const submitResult = await submitBreakdownBatch({
+    pageTitle,
+    pageContent,
+    customId: jobId,
+    model,
+    useCaching: bypassCache !== true,
   });
+
+  if (submitResult.error) {
+    console.error(
+      `[startGeneration] batch submit failed: ${submitResult.error} | ${submitResult.detail}`,
+    );
+    await kvs.set(`${JOB_KEY_PREFIX}${jobId}`, {
+      jobId,
+      pageId: String(pageId),
+      pageTitle,
+      status: 'failed',
+      createdAt: new Date().toISOString(),
+      error: submitResult.error,
+      detail: submitResult.detail,
+    });
+    return {
+      error: submitResult.error,
+      detail: submitResult.detail,
+    };
+  }
+
+  // Successfully submitted — store batchId с job state
+  await kvs.set(`${JOB_KEY_PREFIX}${jobId}`, {
+    jobId,
+    pageId: String(pageId),
+    pageTitle,
+    status: 'batched',
+    model,
+    batchId: submitResult.batchId,
+    batchStatus: submitResult.status, // 'in_progress'
+    createdAt: new Date().toISOString(),
+    submittedAt: new Date().toISOString(),
+    expiresAt: submitResult.expiresAt,
+  });
+
+  console.log(
+    `[startGeneration] jobId=${jobId} batchId=${submitResult.batchId} status=submitted`,
+  );
+  return {
+    jobId,
+    job_id: jobId,
+    status: 'batched',
+    batchId: submitResult.batchId,
+  };
 });
 
-resolver.define("pollJobStatus", async ({ payload }) => {
-  const { jobId } = payload;
-  if (!jobId) return { error: "No job ID" };
-  return backendGet(`/api/v1/jobs/${jobId}`);
+/**
+ * Poll the status of an active generation job.
+ * Returns the current job state stored в KVS.
+ * Use after startGeneration; UI polls every 3-5 seconds.
+ */
+resolver.define('pollJobStatus', async ({ payload }) => {
+  const jobId = payload?.jobId;
+  if (!jobId) return { error: 'No job ID' };
+  const job = await kvs.get(`${JOB_KEY_PREFIX}${jobId}`);
+  if (!job) {
+    return { error: 'not_found', detail: `Job ${jobId} not found (may have been purged)` };
+  }
+
+  // Terminal states return immediately
+  if (job.status === 'completed' || job.status === 'failed') {
+    return job;
+  }
+
+  // Active batch states — poll Anthropic for current status
+  if (job.status === 'batched' && job.batchId) {
+    const pollResult = await pollBatchStatus(job.batchId);
+
+    if (pollResult.error) {
+      console.error(
+        `[pollJobStatus] jobId=${jobId} batchId=${job.batchId} poll failed: ${pollResult.error}`,
+      );
+      // Soft fail — return current job state; next poll cycle will retry.
+      return {
+        ...job,
+        phase: `Batch poll error: ${pollResult.error}`,
+      };
+    }
+
+    const counts = pollResult.requestCounts || {};
+    const totalRequests =
+      (counts.processing || 0) +
+      (counts.succeeded || 0) +
+      (counts.errored || 0) +
+      (counts.canceled || 0) +
+      (counts.expired || 0);
+
+    // Batch still processing — return progress info
+    if (pollResult.status === 'in_progress' || pollResult.status === 'canceling') {
+      return {
+        ...job,
+        batchStatus: pollResult.status,
+        phase: 'Anthropic processing batch...',
+        progress: totalRequests > 0 ? (counts.succeeded || 0) / totalRequests : 0,
+        request_counts: counts,
+      };
+    }
+
+    // Batch ended — fetch + parse results
+    if (pollResult.status === 'ended') {
+      if (!pollResult.resultsUrl) {
+        const failed = {
+          ...job,
+          status: 'failed',
+          completedAt: new Date().toISOString(),
+          error: 'no_results_url',
+          detail: 'Batch ended но Anthropic returned no results_url.',
+        };
+        await kvs.set(`${JOB_KEY_PREFIX}${jobId}`, failed);
+        return failed;
+      }
+
+      const fetchResult = await fetchBatchResults(
+        pollResult.resultsUrl,
+        jobId, // custom_id ≡ jobId
+      );
+
+      if (fetchResult.error) {
+        const failed = {
+          ...job,
+          status: 'failed',
+          completedAt: new Date().toISOString(),
+          error: fetchResult.error,
+          detail: fetchResult.detail,
+          usage: fetchResult.usage || null,
+        };
+        await kvs.set(`${JOB_KEY_PREFIX}${jobId}`, failed);
+        return failed;
+      }
+
+      // Success — compute cost + persist completed state
+      const costEstimate = estimateCost(fetchResult.usage, fetchResult.model);
+      const elapsedMs =
+        Date.now() - new Date(job.submittedAt || job.createdAt).getTime();
+
+      // Synthesize Epic от Confluence page title + spec summary.
+      // v3 schema doesn't emit а top-level `epic` field; Option A push pattern
+      // (1 Epic + N Stories) requires we manufacture it here. push_handler.js
+      // reads `breakdown.epic.{summary, description}` directly.
+      const breakdown = fetchResult.breakdown || {};
+      const specSummary = breakdown?.metadata?.spec_summary || '';
+      if (!breakdown.epic) {
+        breakdown.epic = {
+          summary: job.pageTitle || 'Spec Breakdown',
+          description: specSummary,
+        };
+      }
+
+      const completed = {
+        ...job,
+        status: 'completed',
+        completedAt: new Date().toISOString(),
+        breakdown,
+        usage: fetchResult.usage,
+        model: fetchResult.model,
+        cost_estimate_usd: costEstimate.total_usd,
+        cache_hit: costEstimate.cache_hit,
+        elapsedMs,
+        stop_reason: fetchResult.stop_reason,
+        // Partial-recovery flag когато output hit max_tokens but features salvaged.
+        ...(fetchResult.truncated
+          ? { truncated: true, truncation_note: fetchResult.truncation_note }
+          : {}),
+      };
+      await kvs.set(`${JOB_KEY_PREFIX}${jobId}`, completed);
+
+      console.log(
+        `[pollJobStatus] jobId=${jobId} batchId=${job.batchId} COMPLETED features=${(breakdown.features || []).length} elapsed=${elapsedMs}ms cost=$${costEstimate.total_usd.toFixed(4)}${fetchResult.truncated ? ' [TRUNCATED-PARTIAL]' : ''}`,
+      );
+      return completed;
+    }
+
+    // Unknown batch status
+    return {
+      ...job,
+      batchStatus: pollResult.status,
+      phase: `Unknown batch status: ${pollResult.status}`,
+    };
+  }
+
+  // pending / unknown state — just return as-is
+  return job;
 });
 
-resolver.define("getResults", async ({ payload }) => {
-  const { jobId } = payload;
-  if (!jobId) return { error: "No job ID" };
-  return backendGet(`/api/v1/results/${jobId}`);
+/**
+ * Fetch the completed breakdown result for a job.
+ * Returns the breakdown object directly, OR error if job not complete.
+ */
+resolver.define('getResults', async ({ payload }) => {
+  const jobId = payload?.jobId;
+  if (!jobId) return { error: 'No job ID' };
+  const job = await kvs.get(`${JOB_KEY_PREFIX}${jobId}`);
+  if (!job) return { error: 'not_found' };
+  if (job.status === 'failed') {
+    return { error: job.error || 'failed', detail: job.detail || 'Job failed' };
+  }
+  if (job.status !== 'completed') {
+    return { error: 'not_ready', detail: `Job status: ${job.status}` };
+  }
+  return {
+    breakdown: job.breakdown,
+    usage: job.usage,
+    model: job.model,
+    cost_estimate_usd: job.cost_estimate_usd,
+    elapsedMs: job.elapsedMs,
+  };
 });
 
-// ── JIRA push ───────────────────────────────────────────────
-
-resolver.define("dryRun", async ({ payload }) => {
-  const { breakdown, projectKey } = payload;
-  if (!breakdown) return { error: "No breakdown data" };
-  const pk = await getProjectKey(projectKey);
-  return backendPost("/api/v1/jira/dry-run", { breakdown, project_key: pk });
+/**
+ * Get the current/most-recent generation job state for a page.
+ * Used by Dashboard к see whether page has been processed recently.
+ *
+ * NOTE: v3.0.0 does NOT maintain a global page→jobId index by default.
+ * For now this returns 'idle' status. Future enhancement: index latest
+ * jobId per page-id в KVS.
+ */
+resolver.define('getGenerationStatus', async ({ payload }) => {
+  // TODO: implement page→latest-jobId index в KVS if Dashboard requires it
+  return { status: 'idle' };
 });
 
-resolver.define("pushToJira", async ({ payload }) => {
-  const { breakdown, projectKey } = payload;
-  if (!breakdown) return { error: "No breakdown data" };
-  const pk = await getProjectKey(projectKey);
-  return backendPost("/api/v1/jira/push/start", { breakdown, project_key: pk });
+// ════════════════════════════════════════════════════════════
+// JIRA PUSH — asUser() via async queue (Step 8 SHIPPED 2026-05-29)
+// ════════════════════════════════════════════════════════════
+
+/**
+ * dryRun — synchronous pre-flight validation.
+ * Verifies project exists + user has access via asUser(). Counts come от
+ * the client-side computation done by App.js handlePush (no longer needs
+ * roundtrip just для counts).
+ *
+ * v3.0.0 simplification: this е now primarily а "verify project + return
+ * project metadata" check. Counts already в payload. Called from App.js
+ * BEFORE actual push к fail fast on misconfigured project key.
+ */
+resolver.define('dryRun', async ({ payload }) => {
+  const requestedKey = (payload?.project_key || '').trim().toUpperCase();
+  const settings = await loadSettings();
+  const projectKey = requestedKey || settings.defaultProjectKey || '';
+
+  if (!projectKey) {
+    return {
+      error: 'no_project_key',
+      detail:
+        'No JIRA project key configured. Open Settings → Spec2Tickets and set Default JIRA Project Key.',
+    };
+  }
+
+  // Verify project exists + user has access
+  let response;
+  try {
+    response = await api
+      .asUser()
+      .requestJira(route`/rest/api/3/project/${projectKey}`);
+  } catch (e) {
+    return { error: 'jira_fetch_failed', detail: String(e?.message || e) };
+  }
+  if (response.status === 404) {
+    return {
+      error: 'project_not_found',
+      detail: `JIRA project "${projectKey}" does not exist OR you don't have access.`,
+    };
+  }
+  if (response.status === 403) {
+    return {
+      error: 'permission_denied',
+      detail: `You lack permission к view project "${projectKey}".`,
+    };
+  }
+  if (!response.ok) {
+    const text = await response.text();
+    return {
+      error: `jira_${response.status}`,
+      detail: text.substring(0, 300),
+    };
+  }
+  const project = await response.json();
+  return {
+    ok: true,
+    project_key: projectKey,
+    project_name: project.name,
+    project_id: project.id,
+    // Counts pre-computed by App.js handlePush (client-side от edited breakdown)
+    items: payload?.items || [],
+    total_items: payload?.total_items || 0,
+    total_epics: payload?.total_epics || 0,
+    total_stories: payload?.total_stories || 0,
+    total_subtasks: payload?.total_subtasks || 0,
+    dependency_links: payload?.dependency_links || 0,
+  };
 });
 
-resolver.define("pollPushStatus", async ({ payload }) => {
-  const { jobId } = payload;
-  if (!jobId) return { error: "No job ID" };
-  return backendGet(`/api/v1/jira/push/status/${jobId}`);
+/**
+ * startPush — begin a chunked JIRA push session.
+ *
+ * ⚠ 2026-05-30: chunked-resolver pattern. JIRA bulk create е slow (~0.85
+ * sec/issue); a single synchronous push of 200 items exceeds the 25-sec
+ * resolver timeout. asUser() е unavailable in async consumers, so we chunk:
+ * startPush does project lookup + Epic create + stores а session; the UI then
+ * loops pushStep until done, each step doing one bounded JIRA batch.
+ *
+ * Returns { ok, sessionId, phase, totals } OR { error, detail }.
+ */
+resolver.define('startPush', async ({ payload }) => {
+  const { breakdown, projectKey: payloadProjectKey } = payload || {};
+  if (!breakdown) {
+    return { error: 'no_breakdown', detail: 'No breakdown payload provided' };
+  }
+
+  const projectKey = await getProjectKey(payloadProjectKey);
+  if (!projectKey) {
+    return {
+      error: 'no_project_key',
+      detail:
+        'No JIRA project key configured. Open Settings → Spec2Tickets and set Default JIRA Project Key.',
+    };
+  }
+
+  // Optional admin-configured required custom fields (advanced).
+  const settings = await loadSettings();
+  const cfParse = parseRequiredCustomFields(settings.requiredCustomFieldsJson);
+  const customFields = cfParse.ok ? cfParse.value : null;
+
+  let outcome;
+  try {
+    outcome = await startPushSession(breakdown, projectKey, customFields);
+  } catch (e) {
+    console.error(`[startPush] threw: ${String(e?.message || e)}`);
+    return { error: 'push_exception', detail: String(e?.message || e) };
+  }
+  if (!outcome.ok) {
+    return { error: outcome.error, detail: outcome.detail };
+  }
+  return {
+    session_id: outcome.sessionId,
+    phase: outcome.phase,
+    totals: outcome.totals,
+    epic_key: outcome.epicKey,
+    progress: 0,
+  };
 });
 
-// ── Health ──────────────────────────────────────────────────
+/**
+ * pushStep — advance a push session by one bounded chunk. UI loops this until
+ * { done: true }. Each call stays under the 25-sec resolver timeout.
+ * Returns { done, phase, progress, counts } OR { done:true, result, partial }
+ * OR { error, detail }.
+ */
+resolver.define('pushStep', async ({ payload }) => {
+  const sessionId = payload?.sessionId;
+  if (!sessionId) return { error: 'no_session', detail: 'No session id provided.' };
 
-resolver.define("healthCheck", async () => backendGet("/health"));
+  let outcome;
+  try {
+    outcome = await pushSessionStep(sessionId);
+  } catch (e) {
+    console.error(`[pushStep] threw: ${String(e?.message || e)}`);
+    return { error: 'push_exception', detail: String(e?.message || e) };
+  }
+  if (!outcome.ok) {
+    return { error: outcome.error, detail: outcome.detail };
+  }
+  if (outcome.done) {
+    return {
+      done: true,
+      status: 'completed',
+      result: outcome.result,
+      partial: outcome.partial || false,
+    };
+  }
+  return {
+    done: false,
+    phase: outcome.phase,
+    progress: outcome.progress,
+    counts: outcome.counts,
+  };
+});
+
+// ── Export handler bound к manifest function key "resolver" ──
 
 export const handler = resolver.getDefinitions();

@@ -13,7 +13,35 @@ import AdminSettings from "./components/AdminSettings";
 import PagePickerScreen from "./components/PagePicker";
 import DashboardScreen from "./components/Dashboard";
 import BackButton from "./components/BackButton";
+import {
+  adaptToLegacyShape,
+  extractV3Signals,
+  sortConcernsBySeverity,
+  SEVERITY_PALETTE,
+  CONCERN_TYPE_LABEL,
+  QUALITY_PALETTE,
+} from "./lib/v3Schema";
 import "./index.css";
+
+// v3.0.0 result-loading helper. Resolver getResults returns either
+//   { breakdown, usage, model, cost_estimate_usd, elapsedMs }       — v3 native
+//   { result: {breakdown, ...} }                                     — v2.x legacy compat
+//
+// Wraps the inner breakdown через adaptToLegacyShape so BreakdownEditor's
+// v2.x capability-shape expectations remain backward compatible while
+// _v3_original е preserved за native Dashboard signal extraction.
+function v3AdaptResultPayload(full) {
+  if (!full || typeof full !== "object") return full;
+  const inner = full.result || full;
+  const breakdown = inner.breakdown || inner;
+  if (!breakdown || typeof breakdown !== "object") return inner;
+  const adaptedBreakdown = adaptToLegacyShape(breakdown);
+  // Re-wrap в expected shape — BreakdownEditor reads `result.breakdown`
+  return {
+    ...inner,
+    breakdown: adaptedBreakdown,
+  };
+}
 
 const POLL_MS = 5000;
 
@@ -141,6 +169,9 @@ function App() {
   const [results, setResults] = useState(null);
   const [isPushing, setIsPushing] = useState(false);
   const [pushResult, setPushResult] = useState(null);
+  // Chunked-push progress (2026-05-30) — UI loops pushStep, updates these.
+  const [pushProgress, setPushProgress] = useState(0);
+  const [pushPhase, setPushPhase] = useState("");
 
   // CG-7 spec linter pre-flight (Layer 1 Session 2, 2026-05-07)
   const [previewResult, setPreviewResult] = useState(null);
@@ -223,27 +254,19 @@ function App() {
           }
         }
 
-        // ═══ Gate 1 — Settings ═══
+        // ═══ Gate 1 — Settings (v3.0.0 BYOK shape) ═══
+        // v2.x checked backendUrl + backendApiKey + lastTestOk; v3.0.0
+        // checks the BYOK Anthropic key + default JIRA project key. Both
+        // must be configured за app к be usable. Stale-cache concerns
+        // about Anthropic API health are deferred к actual generate-time
+        // (when failures surface как clear errors с specific causes);
+        // no automatic re-test на every app open (avoids а ~3 sec
+        // Anthropic round-trip at every mount).
         const settings = await invoke("getSettings");
 
-        if (!settings?.backendUrl) {
+        if (!settings?.apiKeyConfigured || !settings?.defaultProjectKey) {
           setScreen("setup");
           return;
-        }
-
-        // ═══ Gate 2 — Connection ═══
-        if (settings.lastTestOk !== true) {
-          const tc = await invoke("testConnection", {
-            backendUrl: settings.backendUrl,
-            backendApiKey: settings.backendApiKey,
-          });
-          if (tc.status !== "ok") {
-            setError(
-              "Spec2Tickets is configured but cannot reach the backend. Open Settings to verify the connection.",
-            );
-            setScreen("setup");
-            return;
-          }
         }
 
         // ═══ Gate 3 — Pending deep-link consumption (U3 part 33) ═══
@@ -367,7 +390,8 @@ function App() {
             if (
               !pageResult.error &&
               (statusResult.status === "running" ||
-                statusResult.status === "pending")
+                statusResult.status === "pending" ||
+                statusResult.status === "batched")
             ) {
               await routeByPageStatus(last, pageResult, statusResult);
               return;
@@ -466,7 +490,7 @@ function App() {
               setScreen("error");
             }
           } else {
-            setResults(full.result || full);
+            setResults(v3AdaptResultPayload(full));
             setScreen("reviewing");
           }
         } else if (st.status === "failed") {
@@ -496,7 +520,8 @@ function App() {
 
       if (
         statusResult.status === "running" ||
-        statusResult.status === "pending"
+        statusResult.status === "pending" ||
+        statusResult.status === "batched"
       ) {
         setJobId(statusResult.job_id);
         setJobStatus(statusResult);
@@ -532,8 +557,11 @@ function App() {
           setScreen("error");
           return;
         }
-        if (full.result?.breakdown) {
-          setResults(full.result);
+        // v3.0.0: breakdown may live на full directly (resolver native
+        // shape) OR under full.result (v2.x legacy compat). v3AdaptResultPayload
+        // handles both + wraps в legacy capability shape для BreakdownEditor.
+        if (full.result?.breakdown || full.breakdown) {
+          setResults(v3AdaptResultPayload(full));
           setScreen("reviewing");
           return;
         }
@@ -690,91 +718,97 @@ function App() {
     startPolling(result.job_id);
   }, [pageData, bypassCache, startPolling]);
 
-  // ── Push: Step 1 — dry run → confirming screen ───────────────
+  // ── Push: Step 1 — compute count summary client-side → confirming screen
+  //
+  // v3.0.0 change (2026-05-28): dropped the round-trip к "dryRun" resolver
+  // (was returning JIRA project metadata + would create issues а la backend).
+  // v3.0.0 architecture has no customer backend; counts are computed
+  // directly от the edited breakdown. ConfirmScreen renders count summary
+  // + embedded Dashboard signals (overall_quality, confidence distribution,
+  // spec_concerns, dependencies) at this push-decision step — eliminating
+  // the standalone Dashboard surface which users rarely discovered.
   const handlePush = useCallback(async (editedBreakdown) => {
-    setIsPushing(true);
-    try {
-      const preview = await invoke("dryRun", { breakdown: editedBreakdown });
+    // Compute counts от edited breakdown shape (legacy-adapted shape — has
+    // capabilities[] wrapper applied by v3AdaptResultPayload at load time).
+    const caps = editedBreakdown?.capabilities || [];
+    const features = caps.flatMap((c) => c.features || []);
+    const tasks = features.flatMap((f) => f.tasks || []);
+    let depCount = 0;
+    for (const f of features) depCount += (f.dependencies || []).length;
+    for (const t of tasks) depCount += (t.dependencies || []).length;
 
-      if (preview.error) {
-        // EH1 polish part 27 — friendly classifier replaces raw error string.
-        const friendly = _classifyBackendError(preview, "Validation failed");
-        if (friendly.routeToSetup) {
-          setError(friendly.message);
-          setScreen("setup");
-          return;
-        }
-        setError(friendly.message);
-        setScreen("error");
-        return;
-      }
-      if (preview.busy) {
-        setError(`Pipeline busy: ${preview.active_phase || "unknown"}`);
-        setScreen("error");
-        return;
-      }
-
-      setPendingBreakdown(editedBreakdown);
-      setDryRunResult(preview);
-      setScreen("confirming");
-    } catch (err) {
-      setError(err.message || "Validation failed");
-      setScreen("error");
-    } finally {
-      setIsPushing(false);
-    }
+    setPendingBreakdown(editedBreakdown);
+    setDryRunResult({
+      total_stories: features.length,
+      total_subtasks: tasks.length,
+      total_epics: editedBreakdown?.epic ? 1 : 0,
+      total_items: features.length + tasks.length + (editedBreakdown?.epic ? 1 : 0),
+      dependency_links: depCount,
+      project_key: null, // populated from Settings; resolver fills at push time
+      items: [], // not pre-computed — ConfirmScreen reads counts directly
+    });
+    setScreen("confirming");
   }, []);
 
-  // ── Push: Step 2 — confirmed → async create in JIRA ────────
+  // ── Push: Step 2 — confirmed → chunked create in JIRA ────────
+  // 2026-05-30: chunked-resolver pattern. JIRA bulk create е slow (~0.85
+  // sec/issue); a 200-item push exceeds the 25-sec resolver timeout. So the
+  // UI calls startPush (lookup + Epic) then loops pushStep (one bounded JIRA
+  // batch per call) until done, showing a progress bar on the "pushing" screen.
   const handleConfirmedPush = useCallback(async () => {
     setIsPushing(true);
-    try {
-      const start = await invoke("pushToJira", { breakdown: pendingBreakdown });
+    setPushProgress(0);
+    setPushPhase("starting");
+    setScreen("pushing");
 
+    const fail = (res, fallback) => {
+      const friendly = _classifyBackendError(res, "Push to JIRA failed");
+      const message = res?.detail
+        ? `${friendly.message} (${res.detail})`
+        : friendly.message || fallback;
+      setError(message);
+      setScreen(friendly.routeToSetup ? "setup" : "error");
+      setIsPushing(false);
+    };
+
+    try {
+      const start = await invoke("startPush", { breakdown: pendingBreakdown });
       if (start.error) {
-        // EH1 polish part 27 — friendly classifier replaces raw error string.
-        const friendly = _classifyBackendError(start, "Push to JIRA failed");
-        if (friendly.routeToSetup) {
-          setError(friendly.message);
-          setScreen("setup");
+        fail(start, "Push failed to start");
+        return;
+      }
+      const sessionId = start.session_id;
+      if (!sessionId) {
+        setError("Push did not start correctly (no session id).");
+        setScreen("error");
+        setIsPushing(false);
+        return;
+      }
+      setPushPhase(start.phase || "stories");
+
+      // Loop pushStep until done. Safety cap prevents runaway (huge specs
+      // chunk in 15s → 2000 steps would be ~30000 items, far beyond any real spec).
+      for (let i = 0; i < 2000; i++) {
+        const step = await invoke("pushStep", { sessionId });
+        if (step.error) {
+          fail(step, "Push step failed");
+          return;
+        }
+        if (step.done) {
+          setPushResult(step.result);
+          setScreen("pushed");
           setIsPushing(false);
           return;
         }
-        setError(friendly.message);
-        setScreen("error");
-        return;
+        setPushProgress(typeof step.progress === "number" ? step.progress : 0);
+        setPushPhase(step.phase || "");
       }
 
-      // Backend returns {job_id, status: "running"} — poll for result
-      const pushJobId = start.job_id;
-      pushPollRef.current = setInterval(async () => {
-        try {
-          const st = await invoke("pollPushStatus", { jobId: pushJobId });
-
-          if (st.error) {
-            clearInterval(pushPollRef.current);
-            setError(st.error);
-            setScreen("error");
-            setIsPushing(false);
-            return;
-          }
-
-          if (st.status === "completed") {
-            clearInterval(pushPollRef.current);
-            setPushResult(st.result);
-            setScreen("pushed");
-            setIsPushing(false);
-          } else if (st.status === "failed") {
-            clearInterval(pushPollRef.current);
-            setError(st.error || "Push to JIRA failed");
-            setScreen("error");
-            setIsPushing(false);
-          }
-          // status === 'running' → keep polling
-        } catch (e) {
-          console.error("Push poll error:", e);
-        }
-      }, 3000);
+      setError(
+        "Push took an unexpectedly large number of steps. Check JIRA for created items; contact support@spec2jira.com if items are missing.",
+      );
+      setScreen("error");
+      setIsPushing(false);
     } catch (err) {
       setError(err.message || "Push failed");
       setScreen("error");
@@ -924,12 +958,11 @@ function App() {
         return;
       }
 
-      // H-1 self-review fix 2026-05-09 — match startPolling line 195
-      // fallback convention `full.result || full`. Backend MAY return
-      // result wrapped (`{result: {breakdown, ...}}`) OR directly
-      // (`{breakdown, ...}`); fallback handles both. Without this,
-      // direct-shape responses route to empty-state when data IS present.
-      const payload = full.result || full || null;
+      // v3.0.0: getResults returns { breakdown, usage, model, ... } or wrapped
+      // в { result: { breakdown, ... } }. v3AdaptResultPayload normalizes
+      // both shapes + adapts the v3 flat-features schema к legacy capabilities
+      // wrapper which Dashboard's deriveDashboardSignals still expects.
+      const payload = v3AdaptResultPayload(full);
       setDashboardData(payload);
       setDashboardLoading(false);
     } catch (err) {
@@ -1069,11 +1102,6 @@ function App() {
       return (
         <ReadyScreen
           pageData={pageData}
-          documentType={documentType}
-          onDocTypeChange={setDocumentType}
-          bypassCache={bypassCache}
-          onBypassCacheChange={setBypassCache}
-          onPreview={handlePreview}
           onGenerate={handleGenerate}
           onBack={handleNewPage}
         />
@@ -1110,12 +1138,15 @@ function App() {
       return (
         <ConfirmScreen
           dryRunResult={dryRunResult}
+          breakdown={pendingBreakdown}
           isPushing={isPushing}
           onConfirm={handleConfirmedPush}
           onBack={handleBackToReview}
           onBackToPicker={handleNewPage}
         />
       );
+    case "pushing":
+      return <PushingScreen progress={pushProgress} phase={pushPhase} />;
     case "pushed":
       return (
         <PushedScreen
@@ -1179,19 +1210,11 @@ function Spinner({ size = 16 }) {
 
 function ReadyScreen({
   pageData,
-  documentType,
-  onDocTypeChange,
-  bypassCache,
-  onBypassCacheChange,
-  onPreview,
   onGenerate,
   onBack,
 }) {
   return (
     <div className="p-6" style={SCREEN_MAX_WIDTH_STYLE}>
-      {/* U2 part 33 (2026-05-09) — refactored to use shared BackButton.
-          Originally added partner UX directive U1-partial 2026-05-09 to
-          give user nav-back when they want to abandon page mid-Ready. */}
       {onBack && (
         <BackButton
           onClick={onBack}
@@ -1205,85 +1228,34 @@ function ReadyScreen({
         {pageData.title}
       </h2>
       <p className="text-sm mb-4" style={{ color: "var(--s2j-text-light)" }}>
-        {pageData.space_name} · {pageData.body_length?.toLocaleString()}{" "}
-        characters
+        {(pageData.body_length || 0).toLocaleString()} characters
       </p>
 
+      {/* v3.0.0 ReadyScreen — simplified UX.
+          v2.x had Document Type radios (MODULE/FEATURE/EPIC_PRODUCT) +
+          Bypass Cache toggle + Preview button. v3.0.0 drops all three:
+          - Sonnet 4.6 doesn't need document-type scoping hint (handles
+            structure automatically via its 1M context + agentic reasoning)
+          - Prompt caching е auto-managed by Anthropic; не customer-facing
+          - Preview (CG-7 pre-flight) was а ~30-90 sec sanity check на
+            v2.x's ~10-30 min full pipeline. v3.0.0 full run е already
+            60-150 sec total — preview adds no value. */}
       <div
-        className="rounded-lg p-4 mb-4"
+        className="rounded-lg p-4 mb-4 text-sm"
         style={{
-          background: "var(--s2j-bg-section)",
-          border: "1px solid var(--s2j-border)",
+          background: "var(--s2j-blue-bg)",
+          border: "1px solid var(--s2j-blue-border)",
+          color: "var(--s2j-text)",
         }}
       >
-        <label
-          className="text-sm font-medium block mb-2"
-          style={{ color: "var(--s2j-text)" }}
-        >
-          Document type
-        </label>
-        <p className="text-xs mb-3" style={{ color: "var(--s2j-text-muted)" }}>
-          Controls how the AI scopes the breakdown.
-        </p>
-        <div className="space-y-2">
-          {DOC_TYPES.map((dt) => (
-            <label
-              key={dt.value}
-              className="flex items-center gap-2 text-sm cursor-pointer"
-              style={{ color: "var(--s2j-text)" }}
-            >
-              <input
-                type="radio"
-                name="docType"
-                value={dt.value}
-                checked={documentType === dt.value}
-                onChange={() => onDocTypeChange(dt.value)}
-                style={{ accentColor: "var(--s2j-green)" }}
-              />
-              <strong>{dt.label}</strong>
-              <span style={{ color: "var(--s2j-text-muted)" }}>
-                — {dt.desc}
-              </span>
-            </label>
-          ))}
-        </div>
+        <strong>Ready к generate.</strong> Claude Sonnet 4.6 ще analyze
+        this Confluence page and produce а structured JIRA breakdown
+        (Stories + Subtasks + cross-feature dependencies + quality
+        signals). Typical runtime: 60-150 sec depending на spec size.
+        Cost on your Anthropic account: ~$0.05–$0.15 per breakdown.
       </div>
 
-      {/* CG-9 cache-bypass toggle (Slice 3, 2026-05-08). Default off
-          for typical re-run UX (cache hits give ~30 min → 2-3 min cycle
-          per architecture promise). User opts-in за fresh re-run when
-          stochastic phase output froze a bad variant OR debugging cache
-          invalidation. Below docType card / above action buttons —
-          power-user concern, не primary path. */}
-      <label
-        className="flex items-start gap-2 mb-4 text-xs cursor-pointer"
-        style={{ color: "var(--s2j-text-light)" }}
-      >
-        <input
-          type="checkbox"
-          checked={bypassCache === true}
-          onChange={(e) => onBypassCacheChange(e.target.checked)}
-          style={{ accentColor: "var(--s2j-blue)", marginTop: "2px" }}
-        />
-        <span>
-          <strong style={{ color: "var(--s2j-text)" }}>Bypass cache</strong>
-          {" "}— skip cached phase outputs and recompute fresh. Slower run
-          but useful for verifying cache invalidation or re-rolling
-          stochastic outputs.
-        </span>
-      </label>
-
-      {/* CG-7: Preview (secondary) + Generate (primary) side-by-side.
-          Preview runs ~30-90 sec pre-flight (Phase 0 + 0b only), surfaces
-          predicted counts + quality flags + wall-clock estimate before
-          author commits to full ~10-30 min generate run. */}
       <div className="flex gap-3">
-        <button
-          onClick={onPreview}
-          className="btn-secondary flex-1 justify-center"
-        >
-          Preview
-        </button>
         <button
           onClick={onGenerate}
           className="btn-primary flex-1 justify-center"
@@ -1826,37 +1798,48 @@ function RoutingRow({ label, value, color }) {
 
 // ── Confirm Push ────────────────────────────────────────────────
 
+// v3.0.0 ConfirmScreen — embeds Dashboard signals at the push decision point.
+//
+// Replaces the standalone Dashboard screen (which users rarely discovered —
+// flow was BreakdownEditor → push, не back-to-picker → Dashboard → push).
+// PO / Scrum Master / engineering manager gets quality signals + concerns +
+// dependency preview AT the moment they're about к commit Stories/Subtasks к
+// JIRA — the only meaningful decision point.
+//
+// Surfaces (in priority order):
+//   1. Spec quality rating (TrustCard) — overall_quality + averageScore
+//   2. Count summary (Stories + Subtasks + dependency links + project)
+//   3. Concerns to review — high/medium/low severity ranking от spec_concerns
+//   4. Confidence distribution (✓/⚠/✗) с feature-level concern counts
+//   5. Categories breakdown ako multiple categories present
+//   6. Ambiguity note от Sonnet's self-assessment
+//   7. Action: Back to Editor | Create N Items в JIRA
 function ConfirmScreen({
   dryRunResult,
+  breakdown,
   isPushing,
   onConfirm,
   onBack,
   onBackToPicker,
 }) {
-  const items = dryRunResult?.items || [];
-  const total = items.length || dryRunResult?.total_items || 0;
-  const epics =
-    dryRunResult?.total_epics ||
-    items.filter((i) => i.type === "Epic").length ||
-    0;
-  const stories =
-    dryRunResult?.total_stories ||
-    items.filter((i) => i.type === "Story").length ||
-    0;
-  const tasks =
-    dryRunResult?.total_subtasks ||
-    items.filter((i) => i.type === "Sub-task").length ||
-    0;
+  const total = dryRunResult?.total_items || 0;
+  const epics = dryRunResult?.total_epics || 0;
+  const stories = dryRunResult?.total_stories || 0;
+  const tasks = dryRunResult?.total_subtasks || 0;
   const links = dryRunResult?.dependency_links || 0;
-  const project = dryRunResult?.project_key || "unknown";
+  const project = dryRunResult?.project_key || "(Settings)";
+
+  // Extract v3 native signals от breakdown's _v3_original (preserved by
+  // v3AdaptResultPayload at result-load time). Falls back gracefully когато
+  // legacy-only shape (no _v3_original) — empty signals + counts still render.
+  const signals = extractV3Signals(breakdown || {});
+  const sortedSpecConcerns = sortConcernsBySeverity(signals.parsedSpecConcerns);
+  const qualityPalette = signals.overallQuality
+    ? QUALITY_PALETTE[signals.overallQuality]
+    : null;
 
   return (
     <div className="p-6" style={SCREEN_MAX_WIDTH_STYLE}>
-      {/* U2 part 33 (2026-05-09) — top-of-content escape hatch.
-          DESTRUCTIVE: discards in-progress edits + push intent.
-          "← Back to Editor" inline button (below) preserves edits;
-          this top button discards them entirely. Tooltip warns explicitly
-          so user picks the right escape route. */}
       {onBackToPicker && (
         <BackButton
           onClick={onBackToPicker}
@@ -1864,13 +1847,76 @@ function ConfirmScreen({
         />
       )}
       <h2
-        className="text-lg font-semibold mb-4"
+        className="text-lg font-semibold mb-2"
         style={{ color: "var(--s2j-text)" }}
       >
-        Confirm Push to JIRA
+        Review and Push to JIRA
       </h2>
+      {signals.specSummary && (
+        <p
+          className="text-sm mb-5"
+          style={{ color: "var(--s2j-text-muted)" }}
+        >
+          {signals.specSummary}
+        </p>
+      )}
 
-      {/* Summary card */}
+      {/* TrustCard — overall quality + confidence + average score */}
+      {(qualityPalette || signals.confidence.total > 0) && (
+        <div
+          className="rounded-lg p-4 mb-4"
+          style={{
+            background: qualityPalette?.bg || "var(--s2j-bg-section)",
+            border: `1px solid ${qualityPalette?.border || "var(--s2j-border)"}`,
+          }}
+        >
+          <div className="flex items-center justify-between gap-4">
+            <div>
+              <p
+                className="text-xs font-medium uppercase tracking-wider mb-1"
+                style={{ color: qualityPalette?.text || "var(--s2j-text-muted)" }}
+              >
+                AI Extraction Quality
+              </p>
+              {qualityPalette && (
+                <p
+                  className="text-2xl font-bold"
+                  style={{ color: qualityPalette.text }}
+                >
+                  {qualityPalette.label}
+                </p>
+              )}
+              {signals.confidence.averageScore !== null && (
+                <p className="text-xs mt-1" style={{ color: "var(--s2j-text-muted)" }}>
+                  Avg feature confidence: {signals.confidence.averageScore}/100
+                </p>
+              )}
+            </div>
+            <div className="flex gap-4 text-sm">
+              <ConfidenceBadge
+                indicator="✓"
+                count={signals.confidence["✓"]}
+                color="var(--s2j-green)"
+                label="High"
+              />
+              <ConfidenceBadge
+                indicator="⚠"
+                count={signals.confidence["⚠"]}
+                color="var(--s2j-orange)"
+                label="Review"
+              />
+              <ConfidenceBadge
+                indicator="✗"
+                count={signals.confidence["✗"]}
+                color="var(--s2j-red)"
+                label="Manual"
+              />
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Count summary — what will be created в JIRA */}
       <div
         className="rounded-lg p-4 mb-4"
         style={{
@@ -1882,11 +1928,14 @@ function ConfirmScreen({
           className="text-xs font-medium uppercase tracking-wider mb-3"
           style={{ color: "var(--s2j-text-muted)" }}
         >
-          Project: {project}
+          What will be created
+          {project !== "(Settings)" && ` — Project: ${project}`}
         </p>
 
         <div className="space-y-2 mb-3">
-          <SummaryRow label="Epics" value={epics} color="var(--s2j-blue)" />
+          {epics > 0 && (
+            <SummaryRow label="Epics" value={epics} color="var(--s2j-blue)" />
+          )}
           <SummaryRow
             label="Stories"
             value={stories}
@@ -1920,7 +1969,7 @@ function ConfirmScreen({
           {links > 0 && (
             <div className="flex justify-between text-xs mt-1">
               <span style={{ color: "var(--s2j-text-muted)" }}>
-                Dependency links
+                Dependency links (Story-blocks-Story)
               </span>
               <span
                 className="font-mono"
@@ -1930,10 +1979,118 @@ function ConfirmScreen({
               </span>
             </div>
           )}
+          {signals.counts.sharedACs > 0 && (
+            <div className="flex justify-between text-xs mt-1">
+              <span style={{ color: "var(--s2j-text-muted)" }}>
+                Cross-cutting rules (shared ACs)
+              </span>
+              <span
+                className="font-mono"
+                style={{ color: "var(--s2j-text-light)" }}
+              >
+                {signals.counts.sharedACs}
+              </span>
+            </div>
+          )}
+          {signals.categories.length > 1 && (
+            <div className="flex justify-between text-xs mt-1">
+              <span style={{ color: "var(--s2j-text-muted)" }}>
+                Categories
+              </span>
+              <span
+                className="font-mono"
+                style={{ color: "var(--s2j-text-light)" }}
+              >
+                {signals.categories.length}
+              </span>
+            </div>
+          )}
         </div>
       </div>
 
-      {/* Warning */}
+      {/* Spec-level concerns — risks/ambiguity/compliance ranked by severity */}
+      {sortedSpecConcerns.length > 0 && (
+        <div className="mb-4">
+          <h3
+            className="text-sm font-semibold mb-2 flex items-center gap-2"
+            style={{ color: "var(--s2j-text)" }}
+          >
+            <span>⚠</span>
+            <span>Review before push ({sortedSpecConcerns.length})</span>
+          </h3>
+          <p
+            className="text-xs mb-3"
+            style={{ color: "var(--s2j-text-muted)" }}
+          >
+            Spec-level concerns surfaced by AI analysis. Address before push когато severity е high.
+          </p>
+          <div className="space-y-2">
+            {sortedSpecConcerns.map((concern, idx) => (
+              <ConcernRow key={idx} concern={concern} />
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Feature-level concerns summary (count only — detail в editor) */}
+      {signals.parsedFeatureConcerns.length > 0 && (
+        <div
+          className="rounded-lg p-3 mb-4 text-xs"
+          style={{
+            background: "var(--s2j-bg-section)",
+            border: "1px solid var(--s2j-border)",
+            color: "var(--s2j-text-muted)",
+          }}
+        >
+          <strong style={{ color: "var(--s2j-text)" }}>
+            +{signals.parsedFeatureConcerns.length} feature-level concerns
+          </strong>{" "}
+          attached к individual features (review в the editor). High-severity{" "}
+          {
+            signals.parsedFeatureConcerns.filter((c) => c.severity === "high")
+              .length
+          }{" "}
+          · Medium{" "}
+          {
+            signals.parsedFeatureConcerns.filter((c) => c.severity === "medium")
+              .length
+          }{" "}
+          · Low{" "}
+          {
+            signals.parsedFeatureConcerns.filter((c) => c.severity === "low")
+              .length
+          }
+        </div>
+      )}
+
+      {/* Ambiguity note — Sonnet self-disclosed assumption boundary */}
+      {signals.ambiguityNote && (
+        <details
+          className="mb-4 rounded-lg"
+          style={{
+            border: "1px solid var(--s2j-border)",
+            background: "var(--s2j-bg-section)",
+          }}
+        >
+          <summary
+            className="cursor-pointer text-xs font-medium uppercase tracking-wider p-3"
+            style={{ color: "var(--s2j-text-muted)" }}
+          >
+            AI ambiguity note
+          </summary>
+          <div
+            className="p-3 pt-0 text-xs"
+            style={{
+              color: "var(--s2j-text)",
+              borderTop: "1px solid var(--s2j-border)",
+            }}
+          >
+            {signals.ambiguityNote}
+          </div>
+        </details>
+      )}
+
+      {/* Final action */}
       <div
         className="rounded-lg p-3 mb-4"
         style={{
@@ -1942,12 +2099,10 @@ function ConfirmScreen({
         }}
       >
         <p className="text-xs" style={{ color: "var(--s2j-text)" }}>
-          This will create real JIRA issues. This action cannot be undone from
-          here.
+          This will create real JIRA issues. The action cannot be undone от Spec2Tickets.
         </p>
       </div>
 
-      {/* Actions */}
       <div className="flex gap-3">
         <button onClick={onBack} className="btn-secondary" disabled={isPushing}>
           ← Back to Editor
@@ -1971,6 +2126,61 @@ function ConfirmScreen({
   );
 }
 
+// v3.0.0 — confidence indicator с count badge
+function ConfidenceBadge({ indicator, count, color, label }) {
+  return (
+    <div className="text-center">
+      <div
+        className="text-xl font-bold leading-none"
+        style={{ color: count > 0 ? color : "var(--s2j-text-light)" }}
+      >
+        {indicator} {count}
+      </div>
+      <div
+        className="text-[10px] uppercase tracking-wider mt-1"
+        style={{ color: "var(--s2j-text-muted)" }}
+      >
+        {label}
+      </div>
+    </div>
+  );
+}
+
+// v3.0.0 — single concern row с severity badge + type label
+function ConcernRow({ concern }) {
+  const palette = SEVERITY_PALETTE[concern.severity] || SEVERITY_PALETTE.medium;
+  const typeLabel = CONCERN_TYPE_LABEL[concern.type] || concern.type;
+  return (
+    <div
+      className="rounded-lg p-3 text-sm"
+      style={{
+        background: palette.bg,
+        border: `1px solid ${palette.border}`,
+        color: "var(--s2j-text)",
+      }}
+    >
+      <div className="flex items-center gap-2 mb-1">
+        <span
+          className="text-[10px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded"
+          style={{
+            background: palette.text,
+            color: "white",
+          }}
+        >
+          {concern.severity}
+        </span>
+        <span
+          className="text-xs font-semibold"
+          style={{ color: palette.text }}
+        >
+          {typeLabel}
+        </span>
+      </div>
+      <p style={{ color: "var(--s2j-text)" }}>{concern.text}</p>
+    </div>
+  );
+}
+
 function SummaryRow({ label, value, color }) {
   return (
     <div className="flex items-center justify-between text-sm">
@@ -1984,6 +2194,54 @@ function SummaryRow({ label, value, color }) {
       <span className="font-mono font-semibold" style={{ color }}>
         {value}
       </span>
+    </div>
+  );
+}
+
+// ── Pushing (in-progress, chunked) ──────────────────────────────
+
+function PushingScreen({ progress, phase }) {
+  const pct = Math.round((progress || 0) * 100);
+  const phaseLabel =
+    phase === "stories"
+      ? "Creating stories..."
+      : phase === "subtasks"
+        ? "Creating subtasks..."
+        : phase === "links"
+          ? "Linking dependencies..."
+          : phase === "starting"
+            ? "Setting up..."
+            : "Working...";
+  return (
+    <div className="p-6" style={SCREEN_MAX_WIDTH_STYLE}>
+      <div className="flex items-center gap-2 mb-3">
+        <Spinner size={18} />
+        <h2 className="text-lg font-semibold" style={{ color: "var(--s2j-text)" }}>
+          Creating issues in JIRA
+        </h2>
+      </div>
+      <p className="text-sm mb-4" style={{ color: "var(--s2j-text-muted)" }}>
+        {phaseLabel}
+      </p>
+
+      {/* Progress bar */}
+      <div
+        className="w-full rounded-full overflow-hidden mb-2"
+        style={{ height: "10px", background: "var(--s2j-bg-section)" }}
+      >
+        <div
+          style={{
+            height: "100%",
+            width: `${pct}%`,
+            background: "var(--s2j-green)",
+            transition: "width 0.3s ease",
+          }}
+        />
+      </div>
+      <p className="text-xs" style={{ color: "var(--s2j-text-light)" }}>
+        {pct}% complete · keep this panel open until it finishes (~10–60 sec
+        depending on size). Closing now may leave a partial push.
+      </p>
     </div>
   );
 }
@@ -2024,29 +2282,97 @@ function PushedScreen({ result, onBack, onNew }) {
         </p>
         <p className="text-xs" style={{ color: "var(--s2j-text-light)" }}>
           {result?.total_epics || 0} Epics · {result?.total_stories || 0}{" "}
-          Stories · {result?.total_subtasks || 0} Subtasks
+          Stories ·{" "}
+          {result?.subtasks_embedded
+            ? `${result?.tasks_embedded || 0} tasks (as checklists)`
+            : `${result?.total_subtasks || 0} Subtasks`}
           {result?.dependency_links_created
             ? ` · ${result.dependency_links_created} links`
             : ""}
         </p>
       </div>
 
-      {result?.errors?.length > 0 && (
+      {/* Graceful-fallback note — project has no subtask type, tasks embedded
+          as checklists in Story descriptions. Explains "0 Subtasks" honestly. */}
+      {result?.subtasks_embedded && (result?.tasks_embedded || 0) > 0 && (
         <div
-          className="rounded-lg p-3 mb-4"
+          className="rounded-lg p-3 mb-4 text-xs"
           style={{
-            background: "var(--s2j-orange-bg)",
-            border: "1px solid var(--s2j-orange-border)",
+            background: "var(--s2j-blue-bg)",
+            border: "1px solid var(--s2j-blue-border)",
+            color: "var(--s2j-text)",
           }}
         >
-          <p
-            className="text-xs font-medium"
-            style={{ color: "var(--s2j-text)" }}
-          >
-            {result.errors.length} warning(s) during creation
+          <p className="font-medium mb-1">
+            Tasks added as checklists ({result.tasks_embedded})
+          </p>
+          <p style={{ color: "var(--s2j-text-muted)" }}>
+            This JIRA project has no Subtask issue type, so the task breakdown
+            was embedded into each Story description as a checklist. To create
+            them as separate Subtask issues, enable the Subtask type in project
+            settings — or contact{" "}
+            <a
+              href="mailto:support@spec2jira.com"
+              style={{ color: "var(--s2j-blue)", textDecoration: "underline" }}
+            >
+              support@spec2jira.com
+            </a>
+            .
           </p>
         </div>
       )}
+
+      {/* Partial-failure surfacing — executePush returns failures: {stories,
+          subtasks, links, details}. Surface counts + first few reasons so
+          the user understands когато e.g. "0 Subtasks" appears. */}
+      {(() => {
+        const f = result?.failures;
+        const failedStories = f?.stories || 0;
+        const failedSubtasks = f?.subtasks || 0;
+        const failedLinks = f?.links || 0;
+        const totalFailed = failedStories + failedSubtasks + failedLinks;
+        if (totalFailed === 0) return null;
+        const parts = [];
+        if (failedStories) parts.push(`${failedStories} Stories`);
+        if (failedSubtasks) parts.push(`${failedSubtasks} Subtasks`);
+        if (failedLinks) parts.push(`${failedLinks} links`);
+        // First failure reason (most actionable — usually same root cause)
+        const firstDetail =
+          f?.details?.subtasks?.[0]?.batchError?.[0]?.message ||
+          f?.details?.stories?.[0]?.batchError?.[0]?.message ||
+          f?.details?.links?.[0]?.detail ||
+          null;
+        return (
+          <div
+            className="rounded-lg p-3 mb-4"
+            style={{
+              background: "var(--s2j-orange-bg)",
+              border: "1px solid var(--s2j-orange-border)",
+            }}
+          >
+            <p
+              className="text-xs font-medium mb-1"
+              style={{ color: "var(--s2j-text)" }}
+            >
+              {parts.join(" · ")} could not be created
+            </p>
+            {firstDetail && (
+              <p className="text-xs mb-1" style={{ color: "var(--s2j-text-muted)" }}>
+                Reason: {String(firstDetail).substring(0, 200)}
+              </p>
+            )}
+            <p className="text-xs" style={{ color: "var(--s2j-text-muted)" }}>
+              Need help?{" "}
+              <a
+                href="mailto:support@spec2jira.com"
+                style={{ color: "var(--s2j-blue)", textDecoration: "underline" }}
+              >
+                support@spec2jira.com
+              </a>
+            </p>
+          </div>
+        );
+      })()}
 
       {/* F3 misplacement fix part 32 (2026-05-09) — "Run again on this
           page" was removed because re-running на same page POST-PUSH
@@ -2145,6 +2471,24 @@ function ErrorScreen({ error, partialBreakdown, onRetry, onBackToPicker }) {
       <button onClick={onRetry} className="btn-secondary">
         ← Try again
       </button>
+
+      {/* Universal support escape-hatch — for anything the user can't
+          self-resolve (auth, project config, custom fields, etc). */}
+      <div
+        className="mt-5 pt-4 text-xs"
+        style={{
+          borderTop: "1px solid var(--s2j-border)",
+          color: "var(--s2j-text-muted)",
+        }}
+      >
+        Still stuck? We're here to help —{" "}
+        <a
+          href="mailto:support@spec2jira.com"
+          style={{ color: "var(--s2j-blue)", textDecoration: "underline" }}
+        >
+          support@spec2jira.com
+        </a>
+      </div>
     </div>
   );
 }
@@ -2196,19 +2540,21 @@ function SetupScreen({ message }) {
           Spec2Tickets needs to be configured before first use.
         </p>
 
-        {/* Prerequisite — explicit before nav steps */}
+        {/* v3.0.0 BYOK prerequisite — customer needs Anthropic key + JIRA project */}
         <p className="text-sm mb-3" style={{ color: "var(--s2j-text)" }}>
-          <strong>Prerequisite:</strong> Spec2Tickets connects to a self-hosted
-          AI backend. If you haven't deployed the backend yet, follow the{" "}
+          <strong>You will need:</strong>
+          <br />
+          • An Anthropic API key (free signup at{" "}
           <a
-            href="https://spec2jira.com/docs"
+            href="https://console.anthropic.com/settings/keys"
             target="_blank"
             rel="noopener noreferrer"
             style={{ color: "var(--s2j-blue)", textDecoration: "underline" }}
           >
-            setup guide
-          </a>{" "}
-          first.
+            console.anthropic.com → API Keys
+          </a>
+          ; pay-as-you-go ~$0.05–$0.15 per breakdown)
+          <br />• A JIRA project key где the breakdown will be created
         </p>
 
         <div
@@ -2225,18 +2571,17 @@ function SetupScreen({ message }) {
             1. Go to <strong>Confluence Settings</strong> (gear icon, top right)
           </p>
           <p>
-            2. Click <strong>Manage Apps</strong>
+            2. Click <strong>Apps → Manage Apps</strong>
           </p>
           <p>
-            3. Find <strong>Spec2Tickets</strong> and click{" "}
-            <strong>Configure</strong>
+            3. Find <strong>Spec2Tickets Settings</strong> в the left sidebar
           </p>
           <p>
-            4. Enter your Backend URL and JIRA Project Key, then Test & Save
+            4. Paste your Anthropic API key + JIRA Project Key, then Test &amp;
+            Save
           </p>
           <p style={{ marginTop: "6px", fontStyle: "italic" }}>
-            Early Access: whitelist approval may be required — details in the
-            Settings page.
+            Powered by Claude Sonnet 4.6 — your spec content flows directly от Forge к Anthropic API using your own key. Zero data на Spec2Tickets servers.
           </p>
         </div>
       </div>

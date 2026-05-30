@@ -223,18 +223,18 @@ export default function BreakdownEditor({ initialBreakdown, onPush, isPushing = 
           />
         )}
 
-        {/* Capabilities */}
+        {/* Categories (each groups Stories; pushes as а single root JIRA Epic per Spec2Tickets v3.0.0) */}
         <div className="space-y-3">
           <div className="flex items-center justify-between">
             <h3 className="text-xs font-semibold uppercase tracking-wider"
               style={{ color: 'var(--s2j-text-muted)' }}>
-              Capabilities ({stats.capCount})
+              Categories ({stats.capCount})
             </h3>
             <button onClick={addCapability} className="text-xs transition-colors"
               style={{ color: 'var(--s2j-green)' }}
               onMouseEnter={e => e.target.style.color = 'var(--s2j-green-dark)'}
               onMouseLeave={e => e.target.style.color = 'var(--s2j-green)'}>
-              + Add Capability
+              + Add Category
             </button>
           </div>
           {breakdown.capabilities.map((cap, i) => (

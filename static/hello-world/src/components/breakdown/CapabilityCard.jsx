@@ -72,7 +72,7 @@ export default function CapabilityCard({ capability, index, onUpdate, onDelete }
             style={{ background: 'var(--s2j-blue-bg)', color: 'var(--s2j-blue)' }}>
             CAP-{index + 1}
           </span>
-          <span className="text-[10px]" style={{ color: 'var(--s2j-text-muted)' }}>Epic</span>
+          <span className="text-[10px]" style={{ color: 'var(--s2j-text-muted)' }}>Category</span>
         </span>
 
         <span className="flex-1 truncate text-sm font-semibold" style={{ color: 'var(--s2j-text)' }}>
@@ -108,7 +108,7 @@ export default function CapabilityCard({ capability, index, onUpdate, onDelete }
         <div className="px-4 pb-4 pt-3 space-y-3" style={{ borderTop: '1px solid var(--s2j-border)' }}>
           <div>
             <label className="text-[11px] font-medium uppercase tracking-wider mb-1 block"
-              style={{ color: 'var(--s2j-text-muted)' }}>Capability Name</label>
+              style={{ color: 'var(--s2j-text-muted)' }}>Category Name</label>
             <EditableField
               value={capability.name}
               onChange={(val) => onUpdate({ ...capability, name: val })}
@@ -135,7 +135,7 @@ export default function CapabilityCard({ capability, index, onUpdate, onDelete }
               value={capability.epic_description || ''}
               onChange={(val) => onUpdate({ ...capability, epic_description: val })}
               multiline
-              placeholder="Click to add capability description..."
+              placeholder="Click to add category description..."
               className="text-sm"
               style={{ color: 'var(--s2j-text)' }}
             />

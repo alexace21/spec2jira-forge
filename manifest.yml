@@ -54,6 +54,16 @@ modules:
       title: Spec2JIRA Settings
       useAsConfig: true
   function:
+    # Single resolver handles ALL backend work in v3.0.1+:
+    #   - Settings (BYOK API key), Confluence page fetch/search
+    #   - Generation: Anthropic Message Batches API (submit + poll). Async
+    #     event consumers were retired 2026-05-29 (55-sec timeout → runaway
+    #     retries) в favour of Anthropic-side batch processing.
+    #   - JIRA push: synchronous executePush() via asUser(). Async event
+    #     consumers were retired 2026-05-30 — asUser() е unavailable in
+    #     async context (AUTH_TYPE_UNAVAILABLE); it works ONLY in resolver
+    #     context. executePush parallelizes к stay under the 25-sec resolver
+    #     timeout (~4-8 sec for а 200-item push).
     - key: resolver
       handler: index.handler
 resources:
@@ -62,39 +72,44 @@ resources:
 permissions:
   external:
     fetch:
+      # v3.0.0 pivot 2026-05-28: replaced customer-hosted backend
+      # (https://api.spec2jira.com — Qwen 14B GGUF on NVIDIA GPU) с
+      # direct Anthropic API call (Claude Sonnet 4.6 + structured
+      # outputs). BYOK pattern — customer provides own API key via
+      # Settings UI, stored in Forge KVS secret storage.
+      #
+      # Property name 'backend' е the Forge manifest schema's predefined
+      # key for external fetch egress (не arbitrary). Despite the name,
+      # this declares egress access TO https://api.anthropic.com — there
+      # е no Spec2JIRA-operated backend.
       backend:
-        # MVP: hardcoded to our dev backend.
-        # Phase C: solve egress for customer-hosted backends.
-        - address: https://api.spec2jira.com
+        - address: https://api.anthropic.com
   scopes:
     - storage:app
-    # Added 2026-05-08 for globalPage migration page picker.
-    # Forge linter explicit (2026-05-08): /wiki/rest/api/content/search
-    # endpoint requires `search:confluence` scope specifically.
-    # H-1 self-review concern empirically resolved at pre-deploy lint
-    # gate (caught BEFORE sandbox 403). Granular scope (least-privilege).
-    # Triggers re-authorization on upgrade for existing installations.
+    # Confluence read scopes.
+    # search:confluence: enables /wiki/rest/api/search CQL endpoint
+    # used by PagePicker.
     - search:confluence
-    # B2 Search broken fix 2026-05-09 part 26 — partner sandbox confirmed
-    # `search:confluence` granted at app level (Authorization tab visible)
-    # but search still failing at runtime. Atlassian's own scope description
-    # explicitly states: "Search Confluence. Note, APIs using this scope
-    # may also return data allowed by read:confluence-space.summary and
-    # read:confluence-content.summary. However, this scope is NOT a
-    # substitute for read:confluence-space.summary or
-    # read:confluence-content.summary."
-    #
-    # Our search resolver uses /wiki/rest/api/content/search (the CQL
-    # endpoint that returns content shape — matches existing parser's
-    # data extraction). This is a CONTENT API endpoint, not the dedicated
-    # /wiki/rest/api/search endpoint. Per Atlassian's note, content
-    # endpoints need read:confluence-content.summary explicitly.
-    #
-    # This scope is ADDITIVE — `search:confluence` retained for
-    # forward-compat with /wiki/rest/api/search if we migrate later.
-    # Re-installation required (existing installations don't auto-grant
-    # new scopes; user must re-authorize via forge install --upgrade).
+    # Classic v1 scope — granular fallback за legacy /content/* endpoints
+    # used когато v2 doesn't yet expose equivalent feature.
     - read:confluence-content.summary
+    # Read full page body content via v1 endpoints (legacy fallback).
+    - read:confluence-content.all
+    # v3.0.0 (2026-05-29 migration) — granular v2 scope required for
+    # /wiki/api/v2/pages/{id} endpoint used by fetchPage + startGeneration.
+    # v1 /wiki/rest/api/content/{id} now returns 410 Gone; v2 е mandatory.
+    - read:page:confluence
+    # v3.0.0 NEW — JIRA write scopes for asUser() push.
+    # Replaces v2.x service-account pattern (was: backend uses customer-
+    # provisioned email + API token к POST к JIRA). Forge native
+    # asUser() means the invoking user's permissions apply automatically
+    # — no service account needed; closes Atlassian's earlier security
+    # review concern about service-account model.
+    #
+    # write:jira-work — create Story + Subtask issues
+    # read:jira-work — read project metadata (issue types, fields) before create
+    - write:jira-work
+    - read:jira-work
 app:
   runtime:
     name: nodejs24.x

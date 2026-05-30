@@ -49,5 +49,28 @@ Thumbs.db
 *.wmv
 
 
+# ── Forge ──────────────────────────────────────────────────
 /.forge/
+
+# ── Custom UI (CRA) build + coverage ───────────────────────
 static/hello-world/build/
+build/
+coverage/
+*.tsbuildinfo
+
+# ── Secrets / local env (Forge uses `forge variables`; never commit keys) ──
+.env
+.env.*
+!.env.example
+*.local
+
+# ── Editor ─────────────────────────────────────────────────
+.vscode/
+*.swp
+*~
+
+# ── Prototype generated outputs (reproducible; not source) ──
+# Keep prototype/ scripts + fixtures (Phase 1 validation record + reusable
+# test specs); ignore the regenerable Sonnet output dumps.
+prototype/out_*.json
+prototype/**/out_*.json
