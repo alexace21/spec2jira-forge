@@ -68,19 +68,12 @@ export default function BreakdownEditor({ initialBreakdown, onPush, isPushing = 
     });
   }
 
-  // Track 2 (Audit-X UI editorial control, 2026-05-09).
-  // Soft-delete: stamp removed_by_user=true; if item was assigned to a feature,
-  // unassign + remove from feature.AC (avoids ghost AC remaining in feature
-  // after item soft-deleted from panel). Restorable via "Restore" button
-  // в RemovedSubsection. State persists в breakdown JSON; на JIRA push,
-  // jira_client should skip removed_by_user items (defense-in-depth —
-  // currently they still exist as panel items so jira_client behavior depends
-  // on its current panel-item handling. Future axis: add `removed_by_user`
-  // filter to jira_client.push_breakdown if items leak through).
-  // M-1 self-review fix (2026-05-09): renamed от `_removed` (underscore =
-  // transient/internal convention) to `removed_by_user` (public — must
-  // survive JSON serialization for downstream consumers + future re-import
-  // flows).
+  // Soft-delete a shared AC: stamp removed_by_user=true; if it was assigned to a
+  // feature, unassign + remove it from that feature.acceptance_criteria (so no
+  // ghost AC lingers). The item stays in the breakdown JSON (restorable from the
+  // "Removed" subsection) but, being unassigned, is part of no feature and so is
+  // never pushed to JIRA. `removed_by_user` is a public field so it survives JSON
+  // serialization.
   function removeSharedACItem(sacId) {
     setBreakdown((p) => {
       const u = JSON.parse(JSON.stringify(p));
@@ -103,34 +96,8 @@ export default function BreakdownEditor({ initialBreakdown, onPush, isPushing = 
       const item = u.shared_acceptance_criteria?.items?.find((i) => i.id === sacId);
       if (!item) return p;
       delete item.removed_by_user;
-      // Note: item returns to its original section (regular OR flagged) based
-      // on whether quality_warning is still set. assigned_feature was cleared
-      // on remove; user reassigns if desired.
-      return u;
-    });
-  }
-
-  // Track 2 — restore from "Possible noise" subsection back to regular AC
-  // list. Clears Track 1 critic's quality_warning flag (false-positive
-  // recovery path — BA confirms item IS a real testable AC despite critic
-  // flag). Item moves visually from "Possible noise" group to regular AC
-  // list. Critic-decided drop record в Theme A dropped_items remains for
-  // forensic audit (BA override doesn't rewrite history).
-  function restoreSharedACFromNoise(sacId) {
-    setBreakdown((p) => {
-      const u = JSON.parse(JSON.stringify(p));
-      const item = u.shared_acceptance_criteria?.items?.find((i) => i.id === sacId);
-      if (!item) return p;
-      delete item.quality_warning;
-      delete item.quality_warning_reason;
-      // BA-override marker — useful in case downstream consumers (cross-spec
-      // measurement / Track 1 calibration analysis) want to count BA flips
-      // as critic false-positive signal.
-      // M-1 self-review fix (2026-05-09): renamed от `_ba_restored_from_noise`
-      // (underscore = transient/internal convention) to `restored_from_noise_flag`
-      // (public — must survive JSON serialization for cross-spec FP-rate
-      // measurement scripts to read it).
-      item.restored_from_noise_flag = true;
+      // Item returns to the regular AC list. assigned_feature was cleared on
+      // remove; the user reassigns it if desired.
       return u;
     });
   }
@@ -214,7 +181,6 @@ export default function BreakdownEditor({ initialBreakdown, onPush, isPushing = 
             onUnassign={unassignSharedAC}
             onRemove={removeSharedACItem}
             onRestore={restoreSharedACItem}
-            onRestoreFromNoise={restoreSharedACFromNoise}
           />
         )}
 
