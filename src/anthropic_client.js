@@ -32,14 +32,18 @@ const ANTHROPIC_VERSION = '2023-06-01';
 export const MODEL_PRIMARY = 'claude-sonnet-4-6';
 export const MODEL_FALLBACK = 'claude-haiku-4-5';
 
-// Sonnet 4.6 supports up к 64K output tokens. Empirical sizing (2026-05-29):
-//   - CLM spec: 28K chars input → 9K output (comfortable)
-//   - Spec2jira spec: 101K chars input → ~32.5K output NEEDED (truncated at 16K)
-// 48K cap gives safe headroom above the largest observed real spec while
-// staying well under the 64K model limit. Batch pricing (50% off) keeps the
-// larger ceiling cheap. Specs needing >48K output should be split (the salvage
-// path + truncation_note guide the user there).
-const MAX_OUTPUT_TOKENS = 48000;
+// Output cap. Sonnet 4.6's max output is 64K tokens — we use ALL of it for
+// maximum headroom (it is a CEILING, not a target: a small spec still emits a
+// small breakdown, so the larger cap costs nothing on normal specs). Sizing:
+//   - CLM spec: 28K chars input → 9K output
+//   - Spec2jira spec: 101K chars (~17K words) → ~32.5K output
+// Empirically ~1.9K output tokens per 1K spec words. Real-world specs run
+// ~3K–11K words → ~6K–21K output — comfortably under this cap; a single
+// breakdown covers the largest specs seen in practice. A spec dense enough to
+// STILL exceed 64K is salvaged (complete features recovered) and the user is
+// warned via truncation_note (split the spec per the message). Batch pricing
+// (~50% off) keeps the larger ceiling cheap.
+const MAX_OUTPUT_TOKENS = 64000;
 
 // KVS secret key для customer's BYOK Anthropic API key.
 // Set via kvs.setSecret(KVS_API_KEY_NAME, ...) от Settings UI resolver.

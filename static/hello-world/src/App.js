@@ -110,23 +110,63 @@ function _classifyBackendError(errorShape, contextLabel = "") {
     };
   }
 
-  // Class 2: connection-related (sniff by error code or detail content)
-  const isConnection =
-    /Backend (502|503|504)/i.test(errorStr) ||
-    /Backend unreachable/i.test(errorStr) ||
-    /FORGE_FETCH_BLOCKED/i.test(errorStr) ||
-    /BACKEND_UNREACHABLE/i.test(errorStr) ||
-    /timeout/i.test(errorStr + detail) ||
-    /network/i.test(errorStr + detail);
-  if (isConnection) {
+  // Class 2: Anthropic temporarily unavailable / overloaded (5xx, 529). This is
+  // on Anthropic's side — not the user's spec or key. Just retry in a few minutes.
+  if (
+    /anthropic_5\d\d/i.test(errorStr) ||
+    /results_fetch_5\d\d/i.test(errorStr) ||
+    /Backend (500|502|503|504)/i.test(errorStr) ||
+    /overloaded/i.test(errorStr + detail)
+  ) {
     return {
       message:
-        "Couldn't reach the Anthropic API. Check your network and Anthropic's status, and verify your Anthropic API key in Settings.",
+        "Anthropic's API is temporarily unavailable or overloaded. This is on Anthropic's side, not your spec — please wait a few minutes and try Generate again.",
       routeToSetup: false,
     };
   }
 
-  // Class 3: generic — pass through with optional context label
+  // Class 3: Anthropic rate limit reached for this API key.
+  if (/rate_limit/i.test(errorStr)) {
+    return {
+      message:
+        "Anthropic's rate limit was reached for your API key. Wait a moment and try again, or review your limits at console.anthropic.com.",
+      routeToSetup: false,
+    };
+  }
+
+  // Class 4: Anthropic account out of credits.
+  if (/insufficient_credits/i.test(errorStr)) {
+    return {
+      message:
+        "Your Anthropic account is out of credits. Add credits at console.anthropic.com → Billing, then try again.",
+      routeToSetup: false,
+    };
+  }
+
+  // Class 5: API key rejected — route to Settings so the admin can fix the key.
+  if (/auth_rejected/i.test(errorStr)) {
+    return {
+      message:
+        "Anthropic rejected the API key. Open Settings and verify your Anthropic API key (console.anthropic.com → API Keys).",
+      routeToSetup: true,
+    };
+  }
+
+  // Class 6: network / unreachable — the request never reached Anthropic.
+  if (
+    /network/i.test(errorStr + detail) ||
+    /timeout/i.test(errorStr + detail) ||
+    /FORGE_FETCH_BLOCKED/i.test(errorStr) ||
+    /unreachable/i.test(errorStr)
+  ) {
+    return {
+      message:
+        "Couldn't reach the Anthropic API. Check your network connection and verify your Anthropic API key in Settings.",
+      routeToSetup: false,
+    };
+  }
+
+  // Class 7: generic — pass through with optional context label
   const errorPart = errorStr || "Unknown error";
   const detailPart = detail ? `: ${detail}` : "";
   const labelPart = contextLabel ? `${contextLabel}: ` : "";
