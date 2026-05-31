@@ -46,7 +46,7 @@ export const BREAKDOWN_SCHEMA = {
       items: {
         type: 'object',
         additionalProperties: false,
-        required: ['name', 'user_story', 'acceptance_criteria', 'tasks', 'complexity_score', 'priority', 'story_points'],
+        required: ['name', 'user_story', 'acceptance_criteria', 'tasks', 'complexity_score', 'priority', 'story_points', 'confidence_indicator', 'confidence_score'],
         properties: {
           name: { type: 'string' },
           user_story: { type: 'string' },
