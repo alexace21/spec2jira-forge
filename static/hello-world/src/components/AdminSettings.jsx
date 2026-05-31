@@ -46,6 +46,7 @@ export default function AdminSettings() {
   const [apiKeyLastSetAt, setApiKeyLastSetAt] = useState(null);
   const [requiredCustomFieldsJson, setRequiredCustomFieldsJson] = useState("");
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const [account, setAccount] = useState(null); // Plan / usage / member-since (getUsage)
 
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -69,6 +70,13 @@ export default function AdminSettings() {
         setMessage({ type: "error", text: "Failed to load settings" });
       } finally {
         setLoading(false);
+      }
+      // Account/Plan status (best-effort — the panel just hides on failure).
+      try {
+        const u = await invoke("getUsage");
+        if (u && !u.error) setAccount(u);
+      } catch (_) {
+        /* non-fatal */
       }
     })();
   }, []);
@@ -274,6 +282,63 @@ export default function AdminSettings() {
       <p className="text-sm mb-5" style={{ color: "var(--s2j-text-muted)" }}>
         Configure Spec2Tickets to generate JIRA breakdowns from your Confluence specifications using Claude AI.
       </p>
+
+      {/* Account / Plan — read-only status for the customer's admin */}
+      {account && (
+        <div
+          className="rounded-lg p-4 mb-6"
+          style={{
+            background: "var(--s2j-bg-section)",
+            border: "1px solid var(--s2j-border)",
+          }}
+        >
+          <p
+            className="text-xs font-medium uppercase tracking-wider mb-3"
+            style={{ color: "var(--s2j-text-muted)" }}
+          >
+            Account
+          </p>
+          <div className="space-y-2 text-sm">
+            <div className="flex items-center justify-between">
+              <span style={{ color: "var(--s2j-text-muted)" }}>Plan</span>
+              <span className="font-medium" style={{ color: "var(--s2j-text)" }}>
+                {account.tierLabel || "Free"}
+              </span>
+            </div>
+            <div className="flex items-center justify-between">
+              <span style={{ color: "var(--s2j-text-muted)" }}>
+                Breakdowns this month
+              </span>
+              <span className="font-medium" style={{ color: "var(--s2j-text)" }}>
+                {account.unlimited
+                  ? "Unlimited"
+                  : `${account.used ?? 0} / ${account.limit ?? 3}`}
+              </span>
+            </div>
+            {!account.unlimited && account.resetsAtLabel && (
+              <div className="flex items-center justify-between">
+                <span style={{ color: "var(--s2j-text-muted)" }}>Resets on</span>
+                <span className="font-medium" style={{ color: "var(--s2j-text)" }}>
+                  {account.resetsAtLabel}
+                </span>
+              </div>
+            )}
+            {account.memberSinceLabel && (
+              <div className="flex items-center justify-between">
+                <span style={{ color: "var(--s2j-text-muted)" }}>Member since</span>
+                <span className="font-medium" style={{ color: "var(--s2j-text)" }}>
+                  {account.memberSinceLabel}
+                </span>
+              </div>
+            )}
+          </div>
+          {account.tier !== "pro" && (
+            <p className="text-xs mt-3" style={{ color: "var(--s2j-text-muted)" }}>
+              Free includes 3 breakdowns per month. Upgrade to Pro for unlimited breakdowns.
+            </p>
+          )}
+        </div>
+      )}
 
       {/* v3.0.0 BYOK info callout */}
       <div

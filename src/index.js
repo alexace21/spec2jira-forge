@@ -54,6 +54,7 @@ import {
   checkQuota,
   consumeQuota,
   recordFirstSeen,
+  formatResetDate,
   pricingTable,
 } from './usage.js';
 
@@ -955,8 +956,10 @@ resolver.define('getUsage', async ({ context }) => {
   // Capture the install's first-seen timestamp (grandfathering signal — see
   // usage.js recordFirstSeen). Independent try/catch so a glitch in one never
   // suppresses the other; getUsage runs on app open, the broadest capture point.
+  let firstSeenAt = null;
   try {
     const seen = await recordFirstSeen();
+    firstSeenAt = seen?.firstSeenAt || null;
     if (seen?.created) {
       console.log(`[install] first seen at ${seen.firstSeenAt} (grandfathering signal recorded via getUsage)`);
     }
@@ -965,7 +968,14 @@ resolver.define('getUsage', async ({ context }) => {
   }
   try {
     const quota = await checkQuota(context);
-    return { ...quota, pricing: pricingTable() };
+    return {
+      ...quota,
+      pricing: pricingTable(),
+      // Install provenance for the customer-facing Account panel (the
+      // grandfathering signal, surfaced). null until the first capture.
+      memberSince: firstSeenAt,
+      memberSinceLabel: firstSeenAt ? formatResetDate(firstSeenAt) : null,
+    };
   } catch (e) {
     console.error(`[getUsage] failed: ${String(e?.message || e)}`);
     return { error: 'usage_unavailable' };
