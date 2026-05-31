@@ -25,7 +25,7 @@ import { invoke } from "@forge/bridge";
 const SEARCH_DEBOUNCE_MS = 350;
 const SEARCH_MIN_QUERY_LEN = 2;
 
-function PagePickerScreen({ onSelect, onView }) {
+function PagePickerScreen({ onSelect }) {
   const [recent, setRecent] = useState([]);
   const [recentLoaded, setRecentLoaded] = useState(false);
 
@@ -218,7 +218,6 @@ function PagePickerScreen({ onSelect, onView }) {
                 key={`s-${p.id}`}
                 page={p}
                 onPick={handlePick}
-                onView={onView}
               />
             ))}
           </ul>
@@ -258,7 +257,6 @@ function PagePickerScreen({ onSelect, onView }) {
                 key={`r-${p.id}`}
                 page={p}
                 onPick={handlePick}
-                onView={onView}
               />
             ))}
           </ul>
@@ -344,18 +342,13 @@ function PagePickerScreen({ onSelect, onView }) {
 
 /**
  * PageRow — single page list item shared by search results AND recent list.
- * Primary click (title area) triggers onPick(page) → editor flow.
- * Secondary "Dashboard" button triggers onView(page) → dashboard flow.
+ * Click (title area) triggers onPick(page) → editor flow.
  *
- * onView prop optional — backward-compat: callers без CG-12 dashboard
- * functionality просто omit onView, dashboard button doesn't render
- * (legacy single-action row preserved за future picker reuse).
- *
- * CG-12 (2026-05-09): dual-button affordance per D10.B (87% ratified —
- * preferred over A top-nav tabs at 84%). Manager view-only entry to
- * past results without touching editor flow.
+ * (The legacy CG-12 secondary "Dashboard" button was removed 2026-05-31 — the
+ * standalone manager dashboard surface was obsolete and misled users on the
+ * picker; quality signals now live inline on the Review screen.)
  */
-function PageRow({ page, onPick, onView }) {
+function PageRow({ page, onPick }) {
   return (
     <li>
       <div
@@ -389,26 +382,6 @@ function PageRow({ page, onPick, onView }) {
             </div>
           )}
         </button>
-        {onView && (
-          <button
-            onClick={() => onView(page)}
-            className="text-xs"
-            style={{
-              background: "transparent",
-              border: "none",
-              borderLeft: "1px solid var(--s2j-border)",
-              color: "var(--s2j-blue)",
-              cursor: "pointer",
-              whiteSpace: "nowrap",
-              outline: "none",
-              padding: "0 12px",
-              fontWeight: 500,
-            }}
-            title="View results dashboard for this page"
-          >
-            Dashboard
-          </button>
-        )}
       </div>
     </li>
   );

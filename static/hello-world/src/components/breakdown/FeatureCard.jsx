@@ -85,10 +85,16 @@ export default function FeatureCard({ feature, index, onUpdate, onDelete }) {
       : SP_OPTIONS;
 
   // ── CG-2 confidence + CG-4 source_heading extraction ──
-  // All three fields are optional; legacy breakdowns без them render
-  // unchanged. `hasConfidence` requires BOTH a numeric score AND a
-  // valid indicator (defensive against partial-stamp scenarios).
-  const confidence = feature.confidence;
+  // All three fields are optional; legacy breakdowns without them render
+  // unchanged. `hasConfidence` requires BOTH a numeric score AND a valid
+  // indicator (defensive against partial-stamp scenarios).
+  //
+  // BUG FIX 2026-05-31: v3 emits `confidence_score` (src/prompts.js rule 9);
+  // v2.x used `confidence`. This read `feature.confidence` only, so in v3 it was
+  // always undefined -> hasConfidence false -> the per-feature ✓/⚠/✗ badge NEVER
+  // rendered, leaving the Review-screen "Manual/Review" counts untraceable to a
+  // feature. Read score-first with a legacy fallback.
+  const confidence = feature.confidence_score ?? feature.confidence;
   const confidenceIndicator = feature.confidence_indicator;
   const confidenceConcerns = feature.confidence_reasons || [];
   const confidenceVisuals = _confidenceVisuals(confidenceIndicator);
@@ -98,14 +104,12 @@ export default function FeatureCard({ feature, index, onUpdate, onDelete }) {
     feature.source_heading || feature._source_heading || ''
   ).trim();
 
-  // ── Phase 3.8 v3 dep-tracking extraction (Round 5 axis 2026-05-10) ──
-  // dependency_metadata stamped by _apply_v3_edges_to_breakdown ✓ tier
-  // (active feature.dependencies + parallel structured metadata). ⚠ tier
-  // edges live в feature.dependency_review_queue surfaced separately в
-  // Dashboard's DependencyReviewQueue component; this card surfaces only
-  // ✓ tier (auto-applied JIRA Story-blocks-Story link provenance).
-  // Legacy breakdowns без the field render unchanged (empty array shape
-  // skips the rendering block entirely).
+  // dependency_metadata — vestigial field from the v2.x/Qwen dep-tracking
+  // pipeline (`_apply_v3_edges_to_breakdown`); the current v3 Sonnet generation
+  // does NOT emit it, so this is always an empty array and the block below
+  // renders nothing. Live cross-feature dependencies are `feature.dependencies`
+  // (surfaced on the Review screen by DependencyStructure). Kept as a harmless
+  // no-op; safe to remove with its rendering block in a future tidy pass.
   const dependencyMetadata = feature.dependency_metadata || [];
 
   function updateField(field, value) { onUpdate({ ...feature, [field]: value }); }
@@ -177,8 +181,12 @@ export default function FeatureCard({ feature, index, onUpdate, onDelete }) {
               className="rounded-full px-2 py-0.5 text-[10px] font-semibold leading-none"
               title={
                 confidenceConcerns.length > 0
-                  ? `Concerns: ${confidenceConcerns.join('; ')}`
-                  : 'Auto-approve — no concerns flagged'
+                  ? `AI flagged: ${confidenceConcerns.join('; ')}`
+                  : confidenceIndicator === '✓'
+                    ? 'Confident — clean extraction, little or no guesswork. A quick check is still worth it.'
+                    : confidenceIndicator === '⚠'
+                      ? 'Unsure — the AI inferred or assumed some details. Review this feature.'
+                      : 'Low confidence — the spec was vague or contradictory here. Manual review essential.'
               }
               style={{
                 background: confidenceVisuals.bg,

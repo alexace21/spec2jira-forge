@@ -11,11 +11,12 @@ import { invoke, view, router } from "@forge/bridge";
 import BreakdownEditor from "./components/breakdown";
 import AdminSettings from "./components/AdminSettings";
 import PagePickerScreen from "./components/PagePicker";
-import DashboardScreen from "./components/Dashboard";
 import BackButton from "./components/BackButton";
 import {
   adaptToLegacyShape,
   extractV3Signals,
+  removeFeatureDependency,
+  addFeatureDependency,
   sortConcernsBySeverity,
   SEVERITY_PALETTE,
   CONCERN_TYPE_LABEL,
@@ -73,7 +74,7 @@ const SCREEN_MAX_WIDTH_STYLE = {
  * _classifyBackendError — map backend error shape to user-friendly
  * message + routing decision. Generic helper — used by ALL error
  * paths that touch backend invokes (handlePageSelected, handleGenerate,
- * handlePush, handleViewDashboard, etc.).
+ * handlePush, etc.).
  *
  * EH1 polish 2026-05-09 part 27 — extended from B1 polish (part 25).
  * Originally `_classifyDashboardError`; renamed для DRY reuse across
@@ -197,19 +198,6 @@ function App() {
   const [pushPhase, setPushPhase] = useState("");
 
   // CG-7 spec linter pre-flight (Layer 1 Session 2, 2026-05-07)
-
-  // CG-12 manager-summary dashboard (2026-05-09).
-  // View-only surface for completed pipeline results — does NOT bind
-  // page (pageId/pageData stay independent от dashboard state). User
-  // enters via PagePicker "View Dashboard" button per row. Back button
-  // returns to picker; bound-page state stays untouched (was never set).
-  // PagePicker UI state (query/scroll) resets on re-mount; recent list
-  // re-fetches от KVS (KVS persists across mounts so user sees same
-  // entries — но in-memory state само е fresh each visit).
-  const [dashboardData, setDashboardData] = useState(null);
-  const [dashboardSourcePage, setDashboardSourcePage] = useState(null);
-  const [dashboardLoading, setDashboardLoading] = useState(false);
-  const [dashboardError, setDashboardError] = useState(null);
 
   // Confirmation flow
   const [dryRunResult, setDryRunResult] = useState(null);
@@ -699,6 +687,25 @@ function App() {
     setScreen("confirming");
   }, []);
 
+  // ── Review-screen dependency editing ─────────────────────────
+  // Remove / restore a cross-feature dependency at the push-decision point. The
+  // change is applied to the breakdown JSON the push reads (startPush sends
+  // pendingBreakdown) — NOT just the display — so the JIRA push will not recreate
+  // a removed Story-blocks-Story link. dependency_links is kept in sync so the
+  // "What will be created" tally matches. See v3Schema.removeFeatureDependency.
+  const handleRemoveDependency = useCallback((source, target) => {
+    setPendingBreakdown((prev) => removeFeatureDependency(prev, source, target));
+    setDryRunResult((dr) =>
+      dr ? { ...dr, dependency_links: Math.max(0, (dr.dependency_links || 0) - 1) } : dr,
+    );
+  }, []);
+  const handleRestoreDependency = useCallback((source, target) => {
+    setPendingBreakdown((prev) => addFeatureDependency(prev, source, target));
+    setDryRunResult((dr) =>
+      dr ? { ...dr, dependency_links: (dr.dependency_links || 0) + 1 } : dr,
+    );
+  }, []);
+
   // ── Push: Step 2 — confirmed → chunked create in JIRA ────────
   // 2026-05-30: chunked-resolver pattern. JIRA bulk create е slow (~0.85
   // sec/issue); a 200-item push exceeds the 25-sec resolver timeout. So the
@@ -817,119 +824,6 @@ function App() {
     setScreen("reviewing");
   }, []);
 
-  // ── Dashboard navigation (CG-12, 2026-05-09) ─────────────────
-  // handleViewDashboard — picker hands off a page reference; we
-  // resolve its latest completed job via getGenerationStatus, then
-  // load the result_payload via getResults. На no-result OR transient
-  // errors, surface DashboardEmptyState (D9.A) — better UX than error
-  // screen since "no results yet" is а valid steady state.
-  //
-  // Does NOT bind the page (no setPageData/setPageId) — dashboard is
-  // view-only. If user wants to edit, они return to picker + click
-  // primary "Open" button.
-  const handleViewDashboard = useCallback(async (pageRef) => {
-    setDashboardSourcePage(pageRef);
-    setDashboardData(null);
-    setDashboardError(null);
-    setDashboardLoading(true);
-    setScreen("dashboard");
-
-    try {
-      const statusResult = await invoke("getGenerationStatus", {
-        pageId: pageRef.id,
-      });
-
-      // H-2 self-review fix 2026-05-09 — backendGet wraps error/busy
-      // responses as {error, detail} OR {busy, active_phase} shapes
-      // BEFORE the status field is ever populated. Without these guards,
-      // a real backend 503 / not-configured / busy-other surfaces as
-      // empty-state ("No results yet") which misleads users — the
-      // truth is operational. Mirror startPolling's `if (st.error)`
-      // pattern for consistency.
-      //
-      // B1 polish 2026-05-09 part 25 — differentiate error TYPE so the
-      // user gets actionable next-step. Three classes:
-      //   1. Connection-related (Backend 502/503/504 / FORGE_FETCH_BLOCKED /
-      //      x-squid / network) → "Backend unreachable" + link to Settings
-      //   2. not_configured → route directly to Setup screen (configuration
-      //      gap, not transient failure)
-      //   3. Generic (auth failure / parse error / etc.) → fall through with
-      //      raw error message
-      if (statusResult.error) {
-        const friendly = _classifyBackendError(statusResult, "Could not load dashboard");
-        if (friendly.routeToSetup) {
-          setError(friendly.message);
-          setScreen("setup");
-          return;
-        }
-        setDashboardError(friendly.message);
-        setDashboardLoading(false);
-        return;
-      }
-      if (statusResult.busy === true) {
-        setDashboardError(
-          `Pipeline busy: ${
-            statusResult.active_phase || "another job is running"
-          }. Try again when it completes.`,
-        );
-        setDashboardLoading(false);
-        return;
-      }
-
-      // Filter to completed jobs with a breakdown. Idle / running / failed /
-      // missing-job-id all surface the empty-state — the honest signal.
-      if (
-        statusResult.status !== "completed" ||
-        !statusResult.job_id
-      ) {
-        setDashboardData(null);
-        setDashboardLoading(false);
-        return;
-      }
-
-      const full = await invoke("getResults", {
-        jobId: statusResult.job_id,
-      });
-
-      if (full.error) {
-        const friendly = _classifyBackendError(full, "Could not load dashboard");
-        if (friendly.routeToSetup) {
-          setError(friendly.message);
-          setScreen("setup");
-          return;
-        }
-        setDashboardError(friendly.message);
-        setDashboardLoading(false);
-        return;
-      }
-
-      // v3.0.0: getResults returns { breakdown, usage, model, ... } or wrapped
-      // в { result: { breakdown, ... } }. v3AdaptResultPayload normalizes
-      // both shapes + adapts the v3 flat-features schema к legacy capabilities
-      // wrapper which Dashboard's deriveDashboardSignals still expects.
-      const payload = v3AdaptResultPayload(full);
-      setDashboardData(payload);
-      setDashboardLoading(false);
-    } catch (err) {
-      setDashboardError(err?.message || "Failed to load dashboard");
-      setDashboardLoading(false);
-    }
-  }, []);
-
-  // handleBackFromDashboard — clears dashboard-only state and routes
-  // to picker. Does NOT clear pageId/pageData (since dashboard never
-  // set them). Lighter than handleNewPage which clears everything.
-  // Note: PagePicker re-mounts on screen change → useState resets +
-  // recent list re-fetches от KVS (KVS persistence is the cross-mount
-  // continuity, не in-memory React state).
-  const handleBackFromDashboard = useCallback(() => {
-    setDashboardData(null);
-    setDashboardSourcePage(null);
-    setDashboardError(null);
-    setDashboardLoading(false);
-    setScreen("picker");
-  }, []);
-
   // ── Render ────────────────────────────────────────────────────
   // Admin page has its own full-screen component.
   if (screen === "admin") return <AdminSettings />;
@@ -1029,17 +923,6 @@ function App() {
       return (
         <PagePickerScreen
           onSelect={handlePageSelected}
-          onView={handleViewDashboard}
-        />
-      );
-    case "dashboard":
-      return (
-        <DashboardScreen
-          data={dashboardData}
-          sourcePage={dashboardSourcePage}
-          loading={dashboardLoading}
-          error={dashboardError}
-          onBack={handleBackFromDashboard}
         />
       );
     case "ready":
@@ -1069,6 +952,8 @@ function App() {
           onConfirm={handleConfirmedPush}
           onBack={handleBackToReview}
           onBackToPicker={handleNewPage}
+          onRemoveDependency={handleRemoveDependency}
+          onRestoreDependency={handleRestoreDependency}
         />
       );
     case "pushing":
@@ -1428,6 +1313,8 @@ function ConfirmScreen({
   onConfirm,
   onBack,
   onBackToPicker,
+  onRemoveDependency,
+  onRestoreDependency,
 }) {
   const total = dryRunResult?.total_items || 0;
   const epics = dryRunResult?.total_epics || 0;
@@ -1473,29 +1360,36 @@ function ConfirmScreen({
         <div
           className="rounded-lg p-4 mb-4"
           style={{
-            background: qualityPalette?.bg || "var(--s2j-bg-section)",
-            border: `1px solid ${qualityPalette?.border || "var(--s2j-border)"}`,
+            background: "var(--s2j-bg-section)",
+            border: "1px solid var(--s2j-border)",
           }}
         >
           <div className="flex items-center justify-between gap-4">
             <div>
               <p
                 className="text-xs font-medium uppercase tracking-wider mb-1"
-                style={{ color: qualityPalette?.text || "var(--s2j-text-muted)" }}
+                style={{ color: "var(--s2j-text-muted)" }}
               >
-                AI Extraction Quality
+                AI self-check
               </p>
               {qualityPalette && (
                 <p
-                  className="text-2xl font-bold"
+                  className="text-base font-semibold"
                   style={{ color: qualityPalette.text }}
                 >
                   {qualityPalette.label}
                 </p>
               )}
+              <p
+                className="text-xs mt-1"
+                style={{ color: "var(--s2j-text-muted)", maxWidth: "34ch" }}
+              >
+                The AI's own confidence in this breakdown — a guide for where to
+                look, not a guarantee.
+              </p>
               {signals.confidence.averageScore !== null && (
                 <p className="text-xs mt-1" style={{ color: "var(--s2j-text-muted)" }}>
-                  Avg feature confidence: {signals.confidence.averageScore}/100
+                  Average self-rated confidence: {signals.confidence.averageScore}/100
                 </p>
               )}
             </div>
@@ -1504,22 +1398,81 @@ function ConfirmScreen({
                 indicator="✓"
                 count={signals.confidence["✓"]}
                 color="var(--s2j-green)"
-                label="High"
+                label="Confident"
               />
               <ConfidenceBadge
                 indicator="⚠"
                 count={signals.confidence["⚠"]}
                 color="var(--s2j-orange)"
-                label="Review"
+                label="Unsure"
               />
               <ConfidenceBadge
                 indicator="✗"
                 count={signals.confidence["✗"]}
                 color="var(--s2j-red)"
-                label="Manual"
+                label="Low confidence"
               />
             </div>
           </div>
+
+          {/* Traceability worklist — names the ⚠/✗ features behind the counts so
+              a "1 low-confidence" count is findable (✗ first). Without this the
+              counts were a dead end (partner feedback 2026-05-31). */}
+          {signals.confidence.flagged?.length > 0 && (
+            <div
+              className="mt-3 pt-3"
+              style={{ borderTop: "1px solid var(--s2j-border)" }}
+            >
+              <p
+                className="text-xs font-medium uppercase tracking-wider mb-2"
+                style={{ color: "var(--s2j-text-muted)" }}
+              >
+                Needs your attention before push
+              </p>
+              <ul
+                className="space-y-1"
+                style={{ listStyle: "none", margin: 0, padding: 0 }}
+              >
+                {signals.confidence.flagged.slice(0, 6).map((f, i) => (
+                  <li key={i} className="flex items-center gap-2 text-xs">
+                    <span
+                      style={{
+                        color:
+                          f.indicator === "✗"
+                            ? "var(--s2j-red)"
+                            : "var(--s2j-orange)",
+                        flexShrink: 0,
+                      }}
+                    >
+                      {f.indicator}
+                    </span>
+                    <span
+                      className="truncate"
+                      style={{ color: "var(--s2j-text)" }}
+                    >
+                      {f.name}
+                    </span>
+                    {typeof f.score === "number" && (
+                      <span
+                        style={{ color: "var(--s2j-text-muted)", flexShrink: 0 }}
+                      >
+                        {f.score}/100
+                      </span>
+                    )}
+                  </li>
+                ))}
+              </ul>
+              {signals.confidence.flagged.length > 6 && (
+                <p
+                  className="text-xs mt-1"
+                  style={{ color: "var(--s2j-text-muted)" }}
+                >
+                  +{signals.confidence.flagged.length - 6} more — find them in the
+                  breakdown below
+                </p>
+              )}
+            </div>
+          )}
         </div>
       )}
 
@@ -1614,6 +1567,17 @@ function ConfirmScreen({
           )}
         </div>
       </div>
+
+      {/* Cross-feature dependency structure — shows WHICH feature depends on
+          WHICH and lets the reviewer remove an over-inferred edge before push
+          (partner request 2026-05-31). Always rendered: it self-guards (returns
+          null when there are no active AND no removed edges), so it stays mounted
+          even after the LAST active edge is removed — preserving the restore list. */}
+      <DependencyStructure
+        edges={signals.dependencyEdges}
+        onRemove={onRemoveDependency}
+        onRestore={onRestoreDependency}
+      />
 
       {/* Spec-level concerns — risks/ambiguity/compliance ranked by severity */}
       {sortedSpecConcerns.length > 0 && (
@@ -1729,6 +1693,207 @@ function ConfirmScreen({
           )}
         </button>
       </div>
+    </div>
+  );
+}
+
+// v3.0.0 — cross-feature dependency structure for the Review screen (interactive).
+//
+// The "What will be created" card shows only a COUNT of dependency links, which
+// hides WHICH feature depends on WHICH. This renders the actual edges, grouped by
+// source feature, AND lets the reviewer remove an edge that doesn't belong (e.g.
+// an over-inferred dependency) before pushing.
+//
+// Data: edges = signals.dependencyEdges = [{source, target}] where `source` is
+// the feature that depends on `target` (v3Schema.extractV3Signals; mirrors
+// prompts.js rule 11 — feature.dependencies lists what THIS feature needs). In
+// JIRA each edge becomes a Story-blocks-Story link — `target` blocks `source`
+// (the dependency must be completed first).
+//
+// Remove/restore call back to the parent (onRemove/onRestore), which mutates the
+// breakdown JSON the push reads — NOT just this view — so a removed edge is not
+// recreated in JIRA. `removed` is local UI state only: it drives the restore
+// affordance and resets when the screen remounts (a fresh review session).
+function DependencyStructure({ edges, onRemove, onRestore }) {
+  const [removed, setRemoved] = useState([]);
+
+  const handleRemove = (source, target) => {
+    onRemove?.(source, target);
+    setRemoved((prev) =>
+      prev.some((r) => r.source === source && r.target === target)
+        ? prev
+        : [...prev, { source, target }],
+    );
+  };
+  const handleRestore = (source, target) => {
+    onRestore?.(source, target);
+    setRemoved((prev) =>
+      prev.filter((r) => !(r.source === source && r.target === target)),
+    );
+  };
+
+  // Group active targets by source feature, preserving first-seen order. Dedupe a
+  // repeated (source,target) pair defensively (a malformed breakdown could list
+  // the same dependency twice — show it once).
+  const bySource = new Map();
+  for (const e of edges || []) {
+    if (!e || !e.source || !e.target) continue;
+    if (!bySource.has(e.source)) bySource.set(e.source, []);
+    const targets = bySource.get(e.source);
+    if (!targets.includes(e.target)) targets.push(e.target);
+  }
+  const groups = Array.from(bySource.entries());
+
+  // Nothing active AND nothing removed → render nothing.
+  if (groups.length === 0 && removed.length === 0) return null;
+
+  return (
+    <div className="mb-4">
+      {groups.length > 0 && (
+        <>
+          <h3
+            className="text-sm font-semibold mb-1 flex items-center gap-2"
+            style={{ color: "var(--s2j-text)" }}
+          >
+            <span aria-hidden="true">🔗</span>
+            <span>Cross-feature dependencies ({edges.length})</span>
+          </h3>
+          <p className="text-xs mb-3" style={{ color: "var(--s2j-text-muted)" }}>
+            Each becomes a Story-blocks-Story link in JIRA — the feature it depends on
+            must be completed first. Remove any that don't belong before pushing.
+          </p>
+        </>
+      )}
+
+      {groups.length > 0 && (
+        <div
+          className="rounded-lg p-3"
+          style={{
+            background: "var(--s2j-bg-section)",
+            border: "1px solid var(--s2j-border)",
+          }}
+        >
+          <ul
+            className="space-y-2"
+            style={{ listStyle: "none", margin: 0, padding: 0 }}
+          >
+            {groups.map(([source, targets], gIdx) => {
+              const isLast = gIdx === groups.length - 1;
+              return (
+                <li
+                  key={source}
+                  style={{
+                    paddingBottom: isLast ? 0 : 8,
+                    borderBottom: isLast
+                      ? "none"
+                      : "1px dashed var(--s2j-border)",
+                  }}
+                >
+                  <div
+                    className="text-xs font-medium leading-tight"
+                    style={{ color: "var(--s2j-text)" }}
+                  >
+                    {source}
+                  </div>
+                  <ul
+                    className="mt-1 space-y-0.5"
+                    style={{ listStyle: "none", margin: 0, padding: 0 }}
+                  >
+                    {targets.map((t, tIdx) => (
+                      <li
+                        key={tIdx}
+                        className="flex items-center justify-between gap-2 text-xs leading-snug"
+                      >
+                        <span
+                          className="flex items-start gap-1.5"
+                          style={{ minWidth: 0 }}
+                        >
+                          <span style={{ color: "var(--s2j-blue)", flexShrink: 0 }}>
+                            depends on →
+                          </span>
+                          <span style={{ color: "var(--s2j-text-light)" }}>{t}</span>
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => handleRemove(source, t)}
+                          title={`Remove this dependency — "${source}" will no longer be blocked by "${t}" in JIRA`}
+                          aria-label={`Remove dependency: ${source} depends on ${t}`}
+                          style={{
+                            background: "transparent",
+                            border: "none",
+                            color: "var(--s2j-text-muted)",
+                            cursor: "pointer",
+                            flexShrink: 0,
+                            padding: "0 4px",
+                            lineHeight: 1,
+                            fontSize: "13px",
+                          }}
+                        >
+                          ✕
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      )}
+
+      {removed.length > 0 && (
+        <div
+          className="mt-2 rounded-lg p-3"
+          style={{
+            background: "var(--s2j-bg-section)",
+            border: "1px dashed var(--s2j-border)",
+          }}
+        >
+          <p
+            className="text-[11px] font-medium uppercase tracking-wider mb-2"
+            style={{ color: "var(--s2j-text-muted)" }}
+          >
+            Removed — won't be pushed to JIRA ({removed.length})
+          </p>
+          <ul
+            className="space-y-1"
+            style={{ listStyle: "none", margin: 0, padding: 0 }}
+          >
+            {removed.map((r, idx) => (
+              <li
+                key={idx}
+                className="flex items-center justify-between gap-2 text-xs"
+              >
+                <span
+                  style={{
+                    color: "var(--s2j-text-muted)",
+                    textDecoration: "line-through",
+                    minWidth: 0,
+                  }}
+                >
+                  {r.source} → {r.target}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => handleRestore(r.source, r.target)}
+                  title="Restore this dependency"
+                  style={{
+                    background: "transparent",
+                    border: "none",
+                    color: "var(--s2j-blue)",
+                    cursor: "pointer",
+                    flexShrink: 0,
+                    padding: "0 4px",
+                    fontWeight: 500,
+                  }}
+                >
+                  ↩ Restore
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
     </div>
   );
 }
@@ -2084,8 +2249,16 @@ function PushedScreen({ result, onBack, onNew }) {
 // ── Free-tier limit reached ─────────────────────────────────────
 // A NORMAL freemium state (not an error) — friendly framing, no "Something went
 // wrong", no pointless "Try again", no support-as-primary. Shows the reset date
-// (the actionable info for a free user) + the Pro upgrade. When the paid
-// Marketplace listing is live (P3b), the Pro box becomes a real upgrade CTA.
+// (the actionable info for a free user) + the Pro upgrade CTA.
+//
+// PRO_UPGRADE_URL — where "Upgrade to Pro" sends the user. The exact per-listing
+// Marketplace subscription deep link only exists once the paid listing is live
+// (P3b); until then we send them to the Atlassian admin hub, where app
+// subscriptions are managed (universal — no per-site / per-listing URL needed).
+// Set to null to fall back to info-only (no button — today's pre-CTA behaviour);
+// refine to the exact listing subscription URL once it is known.
+const PRO_UPGRADE_URL = "https://admin.atlassian.com/";
+
 function LimitReachedScreen({ quota, onBack }) {
   const limit = quota?.limit ?? 3;
   const resetsAt =
@@ -2094,6 +2267,14 @@ function LimitReachedScreen({ quota, onBack }) {
   const proPrice =
     quota?.upgradePrice ||
     (quota?.pricing || []).find((t) => t.key === "pro")?.price;
+  const openUpgrade = () => {
+    if (!PRO_UPGRADE_URL) return;
+    try {
+      router.open(PRO_UPGRADE_URL);
+    } catch (_) {
+      /* no-op if the bridge router is unavailable */
+    }
+  };
 
   return (
     <div className="p-6" style={SCREEN_MAX_WIDTH_STYLE}>
@@ -2132,9 +2313,28 @@ function LimitReachedScreen({ quota, onBack }) {
           <p className="text-sm font-medium mb-1" style={{ color: "var(--s2j-text)" }}>
             Upgrade to Pro — {proPrice}
           </p>
-          <p className="text-xs" style={{ color: "var(--s2j-text-light)" }}>
+          <p
+            className="text-xs"
+            style={{
+              color: "var(--s2j-text-light)",
+              marginBottom: PRO_UPGRADE_URL ? 12 : 0,
+            }}
+          >
             Unlimited breakdowns. You keep using your own Anthropic API key.
           </p>
+          {PRO_UPGRADE_URL && (
+            <>
+              <button onClick={openUpgrade} className="btn-primary">
+                Upgrade to Pro
+              </button>
+              <p
+                className="text-xs"
+                style={{ color: "var(--s2j-text-light)", marginTop: 8 }}
+              >
+                Subscriptions are managed by your Atlassian site admin.
+              </p>
+            </>
+          )}
         </div>
       )}
 

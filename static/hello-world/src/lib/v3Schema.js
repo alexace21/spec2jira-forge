@@ -245,6 +245,19 @@ export function extractV3Signals(breakdown) {
 
   const parsedSpecConcerns = (v3.spec_concerns || []).map(parseConcernPrefix);
 
+  // Flagged features (⚠/✗) WITH their names — the worklist behind the TrustCard
+  // counts, so a "low-confidence" count is traceable to WHICH feature (the count
+  // alone was a dead end). ✗ sorted first (the must-look tier). Pure derive — the
+  // names were already in `features`; we just stopped throwing them away.
+  const flagged = features
+    .filter((f) => f.confidence_indicator === '⚠' || f.confidence_indicator === '✗')
+    .map((f) => ({
+      name: f.name,
+      indicator: f.confidence_indicator,
+      score: typeof f.confidence_score === 'number' ? f.confidence_score : null,
+    }))
+    .sort((a, b) => (a.indicator === '✗' ? 0 : 1) - (b.indicator === '✗' ? 0 : 1));
+
   return {
     counts: {
       features: features.length,
@@ -259,6 +272,7 @@ export function extractV3Signals(breakdown) {
       ...confidence,
       total: features.length,
       averageScore: scoreCount > 0 ? Math.round(scoreSum / scoreCount) : null,
+      flagged,
     },
     overallQuality: v3.metadata?.overall_quality || null,
     specSummary: v3.metadata?.spec_summary || null,
@@ -273,6 +287,71 @@ export function extractV3Signals(breakdown) {
     epicSummary: v3.epic?.summary || null,
     hasEpic: !!v3.epic,
   };
+}
+
+// ════════════════════════════════════════════════════════════
+// DEPENDENCY EDITING (Review-screen remove / restore)
+// ════════════════════════════════════════════════════════════
+//
+// Removing a cross-feature dependency on the Review screen must mutate the
+// breakdown JSON the JIRA push reads — NOT just the display. The push
+// (push_handler.flattenBreakdown) reads feature.dependencies from
+// breakdown.capabilities[].features (legacy-adapted) OR breakdown.features (v3
+// native); the Review display (extractV3Signals) reads breakdown._v3_original
+// .features. adaptToLegacyShape puts the SAME feature object references in both
+// capabilities[] and _v3_original — but an immutable (React-safe) update
+// replaces those references, so to reach BOTH the push and the display we must
+// rebuild EVERY array that could hold the feature. Pure structural edit — no LLM.
+
+/**
+ * Internal: return a NEW breakdown with `fn(dependencies[])` applied to the
+ * feature named `sourceFeatureName`, wherever that feature lives
+ * (capabilities[].features — push legacy; features — push v3 native;
+ * _v3_original.features — display). Immutable; untouched features kept by ref.
+ */
+function mapFeatureDependencies(breakdown, sourceFeatureName, fn) {
+  if (!breakdown || typeof breakdown !== 'object') return breakdown;
+  const editFeature = (f) =>
+    f && f.name === sourceFeatureName
+      ? { ...f, dependencies: fn(Array.isArray(f.dependencies) ? f.dependencies : []) }
+      : f;
+  const next = { ...breakdown };
+  if (Array.isArray(breakdown.capabilities)) {
+    next.capabilities = breakdown.capabilities.map((c) => ({
+      ...c,
+      features: Array.isArray(c.features) ? c.features.map(editFeature) : c.features,
+    }));
+  }
+  if (Array.isArray(breakdown.features)) {
+    next.features = breakdown.features.map(editFeature);
+  }
+  if (breakdown._v3_original && Array.isArray(breakdown._v3_original.features)) {
+    next._v3_original = {
+      ...breakdown._v3_original,
+      features: breakdown._v3_original.features.map(editFeature),
+    };
+  }
+  return next;
+}
+
+/**
+ * Remove `targetName` from the dependencies of the feature `sourceFeatureName`,
+ * across every shape the push/display read. Returns a NEW breakdown.
+ */
+export function removeFeatureDependency(breakdown, sourceFeatureName, targetName) {
+  return mapFeatureDependencies(breakdown, sourceFeatureName, (deps) =>
+    deps.filter((d) => d !== targetName)
+  );
+}
+
+/**
+ * Inverse of removeFeatureDependency — re-add `targetName` (idempotent: never
+ * duplicates). Backs the Review-screen "restore" affordance.
+ */
+export function addFeatureDependency(breakdown, sourceFeatureName, targetName) {
+  return mapFeatureDependencies(breakdown, sourceFeatureName, (deps) =>
+    deps.includes(targetName) ? deps : [...deps, targetName]
+  );
 }
 
 // ════════════════════════════════════════════════════════════
