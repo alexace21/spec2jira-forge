@@ -900,6 +900,11 @@ resolver.define('getResults', async ({ payload }) => {
     breakdown: job.breakdown,
     usage: job.usage,
     model: job.model,
+    // Forward the partial-recovery signal so the UI can warn the user that the
+    // breakdown is incomplete (output hit the cap and was salvaged). Both are
+    // undefined on a normal complete run.
+    truncated: job.truncated,
+    truncation_note: job.truncation_note,
   };
 });
 

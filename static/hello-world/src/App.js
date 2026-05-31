@@ -961,6 +961,7 @@ function App() {
         <ConfirmScreen
           dryRunResult={dryRunResult}
           breakdown={pendingBreakdown}
+          truncationNote={results?.truncation_note}
           isPushing={isPushing}
           onConfirm={handleConfirmedPush}
           onBack={handleBackToReview}
@@ -1224,6 +1225,7 @@ function GeneratingScreen({ pageTitle, jobStatus, elapsed, onBack }) {
 function ConfirmScreen({
   dryRunResult,
   breakdown,
+  truncationNote,
   isPushing,
   onConfirm,
   onBack,
@@ -1268,6 +1270,30 @@ function ConfirmScreen({
         >
           {signals.specSummary}
         </p>
+      )}
+
+      {/* Partial-breakdown warning — generation output hit the token cap and was
+          salvaged, so later features may be missing. Surfaced at the push
+          decision point so the user doesn't create an incomplete JIRA set
+          unknowingly (truncation_note forwarded by getResults). */}
+      {truncationNote && (
+        <div
+          className="rounded-lg p-3 mb-4 flex items-start gap-2"
+          style={{
+            background: "var(--s2j-orange-bg)",
+            border: "1px solid var(--s2j-orange-border)",
+          }}
+        >
+          <span aria-hidden="true" style={{ flexShrink: 0 }}>⚠</span>
+          <div>
+            <p className="text-sm font-medium" style={{ color: "var(--s2j-text)" }}>
+              Partial breakdown — some features may be missing
+            </p>
+            <p className="text-xs mt-0.5" style={{ color: "var(--s2j-text-light)" }}>
+              {truncationNote}
+            </p>
+          </div>
+        </div>
       )}
 
       {/* TrustCard — overall quality + confidence + average score */}
