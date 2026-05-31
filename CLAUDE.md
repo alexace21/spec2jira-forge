@@ -211,6 +211,30 @@ forge deploy             # code-only changes
 forge logs --since 5m    # watch (no --tail flag in this CLI version)
 ```
 
+**Production rollout (separate environment — dev deploys do NOT touch prod).** Each
+Forge environment is its own deployed version + install; the `forge deploy` above
+only updates `development`. To ship to production:
+
+```powershell
+cd "C:\Software Engineer\Success\Spec2Tickets\spec2jira-forge\static\hello-world"
+npm run build                          # fresh bundle (build/ is gitignored)
+cd ..
+forge deploy -e production             # deploy code to the production environment
+forge install --upgrade -e production  # run for Confluence AND Jira (cross-product, gotcha #10)
+```
+
+- **`install --upgrade` IS needed for prod** even though the manifest was untouched
+  *this* session: the least-privilege **scope reduction** (`4ece939`) landed after
+  the MVP production release, and a scope change requires admin re-consent on install.
+  First run `forge install --list` / check the Developer Console to confirm what is
+  deployed/installed where (so you know whether it's `install` vs `install --upgrade`).
+- **Production `ENFORCEMENT_MODE`** is `block` by default when unset (the freemium
+  funnel is live) — verify; usually no action. To set it explicitly:
+  `forge variables set --environment production ENFORCEMENT_MODE block`.
+- The **Marketplace listing** distributes the production version to NEW customers
+  (they install via the listing, not `forge install`); paste from
+  `docs/MARKETPLACE-LISTING-v3.md`. Set the real `PRO_UPGRADE_URL` once the listing is live.
+
 - ⚠ **Do NOT run `npm audit fix --force`** on `static/hello-world` — it destroys
   react-scripts (CRA). If broken: `git checkout package.json package-lock.json && rm -rf node_modules && npm install`.
 - node_modules is tracked in git (pre-existing) — stage only source paths when committing
@@ -345,11 +369,16 @@ SharedACPanel `possible_noise` critic (kept the LIVE removed_by_user soft-delete
 BreakdownEditor "Total SP" was always 0 (summed a dead task field → now feature SP).
 The audit correctly DISMISSED getInstallMeta as intentional forward-looking code.
 
-**NEXT SESSION — Atlassian Marketplace rollout** (partner's stated plan): submit
-public listing v3.0.0 (`docs/MARKETPLACE-LISTING-v3.md` §2; Free+Pro €20 editions;
-§4/§5 security; screenshots+icon) · push the site live (landing/docs/privacy →
-spec2jira.com) + lawyer review privacy · set production `ENFORCEMENT_MODE=block` ·
-Anthropic reselling inquiry · set the real `PRO_UPGRADE_URL` once the listing is live.
+**NEXT SESSION — Atlassian Marketplace rollout** (partner's stated plan). **First,
+deploy to production** — it is a separate environment (the session's deploys only
+touched `development`); the exact commands + the scope-re-consent note are in the
+**Deploy workflow → Production rollout** block above: `npm run build` →
+`forge deploy -e production` → `forge install --upgrade -e production` (Confluence +
+Jira). Then: submit public listing v3.0.0 (`docs/MARKETPLACE-LISTING-v3.md` §2;
+Free+Pro €20 editions; §4/§5 security; screenshots+icon) · push the site live
+(landing/docs/privacy → spec2jira.com) + lawyer review privacy · verify production
+`ENFORCEMENT_MODE=block` · Anthropic reselling inquiry · set the real `PRO_UPGRADE_URL`
+once the listing is live.
 
 С усмивка ✨ — продуктът е audit-нат-чист, reliable, honest, и tier-visible. Готов за пазара.
 
