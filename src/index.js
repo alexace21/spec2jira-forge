@@ -25,7 +25,6 @@
  *     - healthCheck (no backend к probe)
  *
  *   JIRA push (Step 8 — chunked asUser() resolver; 2026-05-30):
- *     - dryRun (pre-flight project verify)
  *     - startPush (lookup + Epic + KVS session) → pushStep, looped by the UI,
  *       one bounded chunk per call (stays under the 25s resolver timeout).
  *       No executePush/pushToJira; no queue (asUser() unavailable in consumers).
@@ -724,7 +723,6 @@ resolver.define('startGeneration', async ({ payload, context }) => {
     job_id: jobId,
     status: 'batched',
     batchId: submitResult.batchId,
-    usage_tier: usageInfo,
   };
 });
 
@@ -856,8 +854,6 @@ resolver.define('pollJobStatus', async ({ payload }) => {
         breakdown,
         usage: fetchResult.usage,
         model: fetchResult.model,
-        cost_estimate_usd: costEstimate.total_usd,
-        cache_hit: costEstimate.cache_hit,
         elapsedMs,
         stop_reason: fetchResult.stop_reason,
         // Partial-recovery flag когато output hit max_tokens but features salvaged.
@@ -904,8 +900,6 @@ resolver.define('getResults', async ({ payload }) => {
     breakdown: job.breakdown,
     usage: job.usage,
     model: job.model,
-    cost_estimate_usd: job.cost_estimate_usd,
-    elapsedMs: job.elapsedMs,
   };
 });
 
@@ -999,73 +993,6 @@ resolver.define('purgeJob', async ({ payload }) => {
 // ════════════════════════════════════════════════════════════
 // JIRA PUSH — chunked asUser() resolver (startPush + looped pushStep); 2026-05-30
 // ════════════════════════════════════════════════════════════
-
-/**
- * dryRun — synchronous pre-flight validation.
- * Verifies project exists + user has access via asUser(). Counts come от
- * the client-side computation done by App.js handlePush (no longer needs
- * roundtrip just для counts).
- *
- * v3.0.0 simplification: this е now primarily а "verify project + return
- * project metadata" check. Counts already в payload. Called from App.js
- * BEFORE actual push к fail fast on misconfigured project key.
- */
-resolver.define('dryRun', async ({ payload }) => {
-  const requestedKey = (payload?.project_key || '').trim().toUpperCase();
-  const settings = await loadSettings();
-  const projectKey = requestedKey || settings.defaultProjectKey || '';
-
-  if (!projectKey) {
-    return {
-      error: 'no_project_key',
-      detail:
-        'No JIRA project key configured. Open Settings → Spec2Tickets and set Default JIRA Project Key.',
-    };
-  }
-
-  // Verify project exists + user has access
-  let response;
-  try {
-    response = await api
-      .asUser()
-      .requestJira(route`/rest/api/3/project/${projectKey}`);
-  } catch (e) {
-    return { error: 'jira_fetch_failed', detail: String(e?.message || e) };
-  }
-  if (response.status === 404) {
-    return {
-      error: 'project_not_found',
-      detail: `JIRA project "${projectKey}" does not exist OR you don't have access.`,
-    };
-  }
-  if (response.status === 403) {
-    return {
-      error: 'permission_denied',
-      detail: `You lack permission к view project "${projectKey}".`,
-    };
-  }
-  if (!response.ok) {
-    const text = await response.text();
-    return {
-      error: `jira_${response.status}`,
-      detail: text.substring(0, 300),
-    };
-  }
-  const project = await response.json();
-  return {
-    ok: true,
-    project_key: projectKey,
-    project_name: project.name,
-    project_id: project.id,
-    // Counts pre-computed by App.js handlePush (client-side от edited breakdown)
-    items: payload?.items || [],
-    total_items: payload?.total_items || 0,
-    total_epics: payload?.total_epics || 0,
-    total_stories: payload?.total_stories || 0,
-    total_subtasks: payload?.total_subtasks || 0,
-    dependency_links: payload?.dependency_links || 0,
-  };
-});
 
 /**
  * startPush — begin a chunked JIRA push session.

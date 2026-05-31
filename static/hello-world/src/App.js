@@ -25,12 +25,12 @@ import {
 import "./index.css";
 
 // v3.0.0 result-loading helper. Resolver getResults returns either
-//   { breakdown, usage, model, cost_estimate_usd, elapsedMs }       — v3 native
-//   { result: {breakdown, ...} }                                     — v2.x legacy compat
+//   { breakdown, usage, model }                — v3 native
+//   { result: {breakdown, ...} }               — v2.x legacy compat
 //
 // Wraps the inner breakdown через adaptToLegacyShape so BreakdownEditor's
 // v2.x capability-shape expectations remain backward compatible while
-// _v3_original е preserved за native Dashboard signal extraction.
+// _v3_original е preserved за the embedded Dashboard-signal panel (ConfirmScreen).
 function v3AdaptResultPayload(full) {
   if (!full || typeof full !== "object") return full;
   const inner = full.result || full;
@@ -45,16 +45,6 @@ function v3AdaptResultPayload(full) {
 }
 
 const POLL_MS = 5000;
-
-const DOC_TYPES = [
-  { value: "MODULE", label: "Module", desc: "One module or subsystem" },
-  { value: "FEATURE", label: "Feature", desc: "Single feature or enhancement" },
-  {
-    value: "EPIC_PRODUCT",
-    label: "Full Product",
-    desc: "Multi-domain product spec",
-  },
-];
 
 // BE1 part 29 (2026-05-09) — universal max-width style for all screens
 // post-globalPage migration. Pre-2026-05-08 contentAction was xlarge
@@ -428,9 +418,8 @@ function App() {
   }, []);
 
   // ── Timer ─────────────────────────────────────────────────────
-  // CG-7: previewing screen shares the elapsed-time counter — pre-flight
-  // takes ~30-90 sec, so visible timing helps user calibrate expectations
-  // (vs full ~10-30 min generate).
+  // The generating screen shows an elapsed-time counter — visible timing
+  // helps the user calibrate expectations during the 60-150 sec run.
   useEffect(() => {
     if (screen === "generating" && startTime) {
       timerRef.current = setInterval(
@@ -490,9 +479,7 @@ function App() {
           }
         } else if (st.status === "failed") {
           clearInterval(pollRef.current);
-          // Session 3 C1 forensic: leave jobStatus.partial_breakdown
-          // intact — ErrorScreen surfaces last-known state to caller.
-          setError(st.error || "Pipeline failed");
+          setError(st.error || "Generation failed");
           setScreen("error");
         }
       } catch (e) {
@@ -503,11 +490,10 @@ function App() {
 
   // ── Page selection routing (post globalPage migration) ───────
   // routeByPageStatus is shared между init's reconnect path AND
-  // handlePageSelected (picker → editor handoff). Mirrors the old
-  // init's gate 3 routing: active job → generating/previewing screen
-  // с polling resumed; completed → reviewing/preview_result;
-  // busy_other → error; idle → ready. Sets pageId + pageData как
-  // side-effect.
+  // handlePageSelected (picker → editor handoff). v3 routing: active job
+  // (running/pending/batched) → generating screen с polling resumed;
+  // completed → reviewing; idle / no job → ready. Sets pageId + pageData
+  // как side-effect.
   const routeByPageStatus = useCallback(
     async (pageRef, pageResult, statusResult) => {
       setPageId(String(pageRef.id));
@@ -539,14 +525,6 @@ function App() {
           setScreen("reviewing");
           return;
         }
-      }
-
-      if (statusResult.status === "busy_other") {
-        setError(
-          `Pipeline is processing "${statusResult.active_page_title}". Try again later.`,
-        );
-        setScreen("error");
-        return;
       }
 
       // Idle / no job → fresh start.
@@ -621,7 +599,7 @@ function App() {
 
     const result = await invoke("startGeneration", {
       pageId: pageData.page_id,
-      modelMode: "dual",
+      modelMode: "primary",
     });
 
     if (result.error === "quota_exceeded") {
@@ -642,11 +620,6 @@ function App() {
         return;
       }
       setError(friendly.message);
-      setScreen("error");
-      return;
-    }
-    if (result.busy) {
-      setError(`Pipeline busy: ${result.active_phase}`);
       setScreen("error");
       return;
     }
@@ -972,7 +945,6 @@ function App() {
       return (
         <ErrorScreen
           error={error}
-          partialBreakdown={jobStatus?.partial_breakdown}
           onRetry={handleRetry}
           onBackToPicker={pageData ? handleNewPage : null}
         />
@@ -1117,82 +1089,8 @@ function ReadyScreen({
 
 // ── Generating ──────────────────────────────────────────────────
 
-// CG-1 partial_breakdown summary helper (Layer 1 Session 3, 2026-05-07).
-// Renders a single-line "latest snapshot" copy from the partial_breakdown
-// dict per Session 1 PHASE_OUTPUT_CONTRACT. Returns null for missing /
-// unknown phase_id values — forward-compat: ignore newer emit shapes
-// the UI hasn't learned yet rather than crashing render.
-//
-// Capabilities shape varies by phase: phase2/2.5 emit dict
-// {cap_heading: {features[], ...}}; phase3 emits list
-// [{name, features[], ...}]. _walkCapabilities normalizes both.
-function _walkCapabilities(caps) {
-  if (Array.isArray(caps)) return caps;
-  if (caps && typeof caps === "object") return Object.values(caps);
-  return [];
-}
-
-function _renderPartialBreakdownLine(snapshot) {
-  if (!snapshot || typeof snapshot !== "object") return null;
-  const pid = snapshot.phase_id;
-
-  if (pid === "phase1") {
-    const caps = (snapshot.feature_groups || []).length;
-    const feats = (snapshot.feature_signals || []).length;
-    return `Routing complete — ${caps} ${
-      caps === 1 ? "capability" : "capabilities"
-    } detected, ${feats} ${
-      feats === 1 ? "feature" : "features"
-    } identified`;
-  }
-  if (pid === "phase0b") {
-    const constraints = snapshot.phase0_constraints || {};
-    const n = Object.keys(constraints).length;
-    return `Constraints extracted — ${n} ${
-      n === 1 ? "section" : "sections"
-    } processed`;
-  }
-  if (pid === "phase1.5") {
-    return "Context summary ready";
-  }
-  if (pid === "phase2") {
-    const walked = _walkCapabilities(snapshot.capabilities);
-    const capCount = walked.length;
-    const storyCount = walked.reduce(
-      (sum, c) => sum + ((c.features || []).length),
-      0,
-    );
-    return `Stories generated — ${capCount} ${
-      capCount === 1 ? "capability" : "capabilities"
-    }, ${storyCount} ${storyCount === 1 ? "story" : "stories"}`;
-  }
-  if (pid === "phase2.5") {
-    return "Story names refined";
-  }
-  if (pid === "phase3") {
-    const walked = _walkCapabilities(snapshot.capabilities);
-    let acCount = 0;
-    walked.forEach((c) => {
-      (c.features || []).forEach((f) => {
-        acCount += (f.acceptance_criteria || []).length;
-      });
-    });
-    return `Acceptance criteria attached — ${acCount} total AC${
-      acCount === 1 ? "" : "s"
-    }`;
-  }
-  return null;
-}
-
 function GeneratingScreen({ pageTitle, jobStatus, elapsed, onBack }) {
   const pct = Math.round((jobStatus?.progress || 0) * 100);
-  // CG-1 latest snapshot — incremental visibility into what
-  // the pipeline has produced so far. Block omitted когато
-  // partial_breakdown is null (early/init emits) OR phase_id
-  // is unknown (forward-compat).
-  const snapshotLine = _renderPartialBreakdownLine(
-    jobStatus?.partial_breakdown,
-  );
   return (
     <div className="p-6" style={SCREEN_MAX_WIDTH_STYLE}>
       {/* U2 part 33 (2026-05-09) — refactored to use shared BackButton.
@@ -1243,29 +1141,6 @@ function GeneratingScreen({ pageTitle, jobStatus, elapsed, onBack }) {
       <p className="text-xs mb-4" style={{ color: "var(--s2j-text-muted)" }}>
         {fmtTime(elapsed)} elapsed
       </p>
-
-      {/* CG-1 latest snapshot — appears ABOVE "You can close this panel"
-          hint so reading order is: progress → emerging content →
-          close-panel affordance. Renders only когато non-null. */}
-      {snapshotLine && (
-        <div
-          className="rounded-lg p-3 mb-4"
-          style={{
-            background: "var(--s2j-bg-section)",
-            border: "1px solid var(--s2j-border)",
-          }}
-        >
-          <p
-            className="text-[10px] font-medium uppercase tracking-wider mb-1"
-            style={{ color: "var(--s2j-text-muted)" }}
-          >
-            Latest
-          </p>
-          <p className="text-sm" style={{ color: "var(--s2j-text)" }}>
-            {snapshotLine}
-          </p>
-        </div>
-      )}
 
       <div
         className="rounded-lg p-3"
@@ -2227,11 +2102,9 @@ function PushedScreen({ result, onBack, onNew }) {
       {/* F3 misplacement fix part 32 (2026-05-09) — "Run again on this
           page" was removed because re-running на same page POST-PUSH
           would create duplicate JIRA tickets (semantically wrong post-
-          push context). Re-running need is already covered: ReadyScreen
-          has Preview + Generate buttons that re-run when clicked.
-          "Generate Another" renamed → "Generate on new page" для
-          clarity (explicitly indicates picker-route to different page,
-          avoiding "another what?" ambiguity). */}
+          push context). "Generate Another" renamed → "Generate on new
+          page" для clarity (explicitly indicates picker-route to a
+          different page, avoiding "another what?" ambiguity). */}
       <div className="flex gap-3">
         <button onClick={onBack} className="btn-secondary">
           Back to Editor
@@ -2345,15 +2218,7 @@ function LimitReachedScreen({ quota, onBack }) {
   );
 }
 
-function ErrorScreen({ error, partialBreakdown, onRetry, onBackToPicker }) {
-  // Session 3 C1 forensic preservation (Layer 1, 2026-05-07): if the
-  // pipeline crashed mid-run, job_store.to_status_dict carries the
-  // last partial_breakdown snapshot per E2 always-present key contract.
-  // Surfacing the snapshot saves the user от re-running blind — they
-  // see how far the pipeline got. Block omitted когато null OR на
-  // unknown phase_id (forward-compat).
-  const forensicLine = _renderPartialBreakdownLine(partialBreakdown);
-
+function ErrorScreen({ error, onRetry, onBackToPicker }) {
   // EH1 polish part 27 (2026-05-09) — last-resort defensive HTML strip.
   // Most error paths now route through `_classifyBackendError` which
   // discards HTML detail bodies, but legacy paths (mid-pipeline polling
@@ -2396,26 +2261,6 @@ function ErrorScreen({ error, partialBreakdown, onRetry, onBackToPicker }) {
           {displayError}
         </p>
       </div>
-
-      {forensicLine && (
-        <div
-          className="rounded-lg p-3 mb-4"
-          style={{
-            background: "var(--s2j-bg-section)",
-            border: "1px solid var(--s2j-border)",
-          }}
-        >
-          <p
-            className="text-[10px] font-medium uppercase tracking-wider mb-1"
-            style={{ color: "var(--s2j-text-muted)" }}
-          >
-            Last known state before failure
-          </p>
-          <p className="text-sm" style={{ color: "var(--s2j-text)" }}>
-            {forensicLine}
-          </p>
-        </div>
-      )}
 
       <button onClick={onRetry} className="btn-secondary">
         ← Try again

@@ -2,13 +2,14 @@
  * Spec2Tickets v3.0.0 schema helpers.
  *
  * Bridges new flat-features schema (от Anthropic Sonnet 4.6) к the
- * v2.x-shaped consumers (BreakdownEditor, Dashboard) without requiring
- * full UI refactor in this session.
+ * v2.x-shaped consumers (BreakdownEditor + the embedded Dashboard-signal
+ * panel in ConfirmScreen) without requiring full UI refactor in this session.
  *
  * Two main responsibilities:
  *   1. adaptToLegacyShape(v3) — wraps flat features в synthetic capability
  *      groups based on feature.category для BreakdownEditor compatibility
- *   2. extractV3Signals(v3) — extracts Dashboard signals natively от v3:
+ *   2. extractV3Signals(v3) — extracts signals natively от v3 for the
+ *      embedded Dashboard-signal panel in ConfirmScreen:
  *      counts, confidence distribution, parsed concerns, dependencies
  *
  * Plus parseConcernPrefix — splits "[TYPE|severity] text" encoding.
@@ -57,11 +58,6 @@ export function parseConcernPrefix(raw) {
  */
 export function adaptToLegacyShape(v3) {
   if (!v3 || typeof v3 !== 'object') return v3;
-
-  // If breakdown already has v2.x capabilities[] structure, pass through
-  if (Array.isArray(v3.capabilities) && v3.capabilities.length > 0) {
-    return v3;
-  }
 
   const features = Array.isArray(v3.features) ? v3.features : [];
 
@@ -119,45 +115,6 @@ export function adaptToLegacyShape(v3) {
     spec_concerns: v3.spec_concerns,
     _v3_original: v3,
   };
-}
-
-/**
- * Inverse — convert legacy-shaped (post-edit) back к v3 native shape.
- * Used когато BreakdownEditor commits edits + we want к persist v3 form.
- *
- * Flattens capabilities back к features array, preserves все other
- * v3-native fields (spec_concerns, metadata, etc.) от _v3_original.
- */
-export function unadaptToV3(adapted) {
-  if (!adapted || typeof adapted !== 'object') return adapted;
-  if (!Array.isArray(adapted.capabilities)) return adapted;
-
-  const features = adapted.capabilities.flatMap((cap) => cap.features || []);
-
-  // Flatten shared AC items back к string array
-  let sharedAC;
-  if (adapted.shared_acceptance_criteria?.items?.length > 0) {
-    sharedAC = adapted.shared_acceptance_criteria.items.map(
-      (i) => i.text || ''
-    ).filter(Boolean);
-  }
-
-  const original = adapted._v3_original || {};
-
-  const result = {
-    ...original,
-    features,
-  };
-  if (adapted.epic && (adapted.epic.summary || adapted.epic.description)) {
-    result.epic = adapted.epic;
-  }
-  if (sharedAC && sharedAC.length > 0) {
-    result.shared_acceptance_criteria = sharedAC;
-  }
-  if (adapted.metadata) {
-    result.metadata = adapted.metadata;
-  }
-  return result;
 }
 
 // ════════════════════════════════════════════════════════════

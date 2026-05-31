@@ -59,83 +59,6 @@ function SelectBadge({ value, options, colorMap, labelMap, onChange }) {
 }
 
 /**
- * AcceptanceCriteriaList — Editable list of acceptance criteria.
- */
-function AcceptanceCriteriaList({ criteria, onChange }) {
-  function updateItem(index, newValue) { const u = [...criteria]; u[index] = newValue; onChange(u); }
-  function deleteItem(index) { if (criteria.length <= 1) return; onChange(criteria.filter((_, i) => i !== index)); }
-  function addItem() { onChange([...criteria, 'New acceptance criterion']); }
-
-  return (
-    <div className="space-y-1.5">
-      <div className="flex items-center justify-between">
-        <span className="text-[11px] font-medium uppercase tracking-wider"
-          style={{ color: 'var(--s2j-text-muted)' }}>Acceptance Criteria</span>
-        <button onClick={addItem} className="text-[11px] transition-colors"
-          style={{ color: 'var(--s2j-green)' }}>+ Add</button>
-      </div>
-      {criteria.map((ac, i) => (
-        <div key={i} className="group flex items-start gap-2">
-          <span className="mt-1 text-[10px] select-none" style={{ color: 'var(--s2j-text-muted)' }}>{i + 1}.</span>
-          <div className="flex-1 min-w-0">
-            <EditableField value={ac} onChange={(v) => updateItem(i, v)} multiline
-              className="text-xs leading-relaxed" style={{ color: 'var(--s2j-text-light)' }} />
-          </div>
-          {criteria.length > 1 && (
-            <button onClick={() => deleteItem(i)}
-              className="mt-0.5 opacity-0 group-hover:opacity-100 transition-all text-xs px-1"
-              style={{ color: 'var(--s2j-red)' }}>✕</button>
-          )}
-        </div>
-      ))}
-    </div>
-  );
-}
-
-/**
- * DependencyList — Editable list of task dependencies.
- */
-function DependencyList({ deps, onChange }) {
-  function updateItem(i, v) { const u = [...deps]; u[i] = v; onChange(u); }
-  function deleteItem(i) { onChange(deps.filter((_, idx) => idx !== i)); }
-  function addItem() { onChange([...deps, 'New dependency']); }
-
-  if (deps.length === 0) {
-    return (
-      <button onClick={addItem} className="text-[11px] transition-colors"
-        style={{ color: 'var(--s2j-text-muted)' }}
-        onMouseEnter={e => e.target.style.color = 'var(--s2j-text-light)'}
-        onMouseLeave={e => e.target.style.color = 'var(--s2j-text-muted)'}>
-        + Add dependency
-      </button>
-    );
-  }
-
-  return (
-    <div className="space-y-1">
-      <div className="flex items-center justify-between">
-        <span className="text-[11px] font-medium uppercase tracking-wider"
-          style={{ color: 'var(--s2j-text-muted)' }}>Dependencies</span>
-        <button onClick={addItem} className="text-[11px] transition-colors"
-          style={{ color: 'var(--s2j-green)' }}>+ Add</button>
-      </div>
-      {deps.map((dep, i) => (
-        <div key={i} className="group flex items-center gap-2">
-          <span className="text-[10px]" style={{ color: 'var(--s2j-text-muted)' }}>→</span>
-          <div className="flex-1 min-w-0">
-            <EditableField value={dep} onChange={(v) => updateItem(i, v)}
-              className="text-xs" style={{ color: 'var(--s2j-text-light)' }} />
-          </div>
-          <button onClick={() => deleteItem(i)}
-            className="opacity-0 group-hover:opacity-100 transition-all text-xs px-1"
-            style={{ color: 'var(--s2j-red)' }}>✕</button>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-/**
  * TaskCard — Full inline editor for a single task (→ JIRA Subtask).
  * Light theme (Swagger palette).
  */
@@ -191,12 +114,6 @@ export default function TaskCard({ task, index, onUpdate, onDelete }) {
               multiline className="text-xs leading-relaxed mt-1" style={{ color: 'var(--s2j-text-light)' }} />
           </div>
         )}
-        {task.acceptance_criteria && task.acceptance_criteria.length > 0 && (
-          <AcceptanceCriteriaList criteria={task.acceptance_criteria}
-            onChange={(val) => updateField('acceptance_criteria', val)} />
-        )}
-        <DependencyList deps={task.dependencies || []}
-          onChange={(val) => updateField('dependencies', val)} />
       </div>
     </div>
   );

@@ -21,7 +21,6 @@ export default function SharedACPanel({
   availableFeatures = [],
   onAssign,
   onUnassign,
-  onAssignAll,
   onRemove,
   onRestore,
   onRestoreFromNoise,
@@ -378,7 +377,6 @@ function SharedACItem({
   isFlagged = false,
 }) {
   const isAssigned = !!item.assigned_feature;
-  const hasSuggestion = !!item.suggested_feature && !isAssigned;
 
   function truncate(str, max = 50) {
     if (!str) return '';
@@ -386,8 +384,7 @@ function SharedACItem({
   }
 
   // Flagged items use neutral-grey accent (clear visual distinction от regular
-  // green-when-assigned); restore button replaces "Use suggestion" в the
-  // action row.
+  // green-when-assigned); the restore button sits в the action row.
   const borderColor = isFlagged
     ? 'var(--s2j-border)'
     : isAssigned
@@ -483,19 +480,6 @@ function SharedACItem({
             title="Restore as regular AC (clear noise flag — false-positive recovery)"
           >
             Restore as AC
-          </button>
-        )}
-
-        {hasSuggestion && !isFlagged && (
-          <button onClick={() => onAssign(item.suggested_feature)}
-            className="shrink-0 rounded px-2 py-1 text-[10px] font-medium transition-colors"
-            style={{
-              border: '1px solid var(--s2j-orange-border)',
-              background: 'var(--s2j-orange-bg)',
-              color: '#92400e',
-            }}
-            title={`Suggested: ${item.suggested_feature}`}>
-            Use suggestion
           </button>
         )}
 

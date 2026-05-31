@@ -9,12 +9,12 @@ import LabelsEditor from './LabelsEditor.jsx';
  *
  * CG-2 confidence + CG-4 source_heading inline rendering (Layer 2 Trust
  * UX integration, 2026-05-07): when the breakdown carries CG-2 confidence
- * fields (per-Story trust score 0-100 + indicator ✓/⚠/✗ + concern reasons)
- * or CG-4 source_heading (provenance), this card surfaces them inline:
+ * fields (per-Story trust score 0-100 + indicator ✓/⚠/✗) or CG-4
+ * source_heading (provenance), this card surfaces them inline:
  *   - Collapsed header: confidence badge (indicator + score) с palette-
- *     mapped color cluster + native browser tooltip listing concerns.
- *   - Expanded: "Source:" line + "Confidence concerns:" bullet list under
- *     a dashed separator before the editable fields.
+ *     mapped color cluster + native browser tooltip explaining the stance.
+ *   - Expanded: "Source:" line under a dashed separator before the
+ *     editable fields.
  *
  * Backward compat: legacy breakdowns без these fields render exactly как
  * before — guarded by `hasConfidence` + truthy `sourceHeading` checks.
@@ -96,21 +96,12 @@ export default function FeatureCard({ feature, index, onUpdate, onDelete }) {
   // feature. Read score-first with a legacy fallback.
   const confidence = feature.confidence_score ?? feature.confidence;
   const confidenceIndicator = feature.confidence_indicator;
-  const confidenceConcerns = feature.confidence_reasons || [];
   const confidenceVisuals = _confidenceVisuals(confidenceIndicator);
   const hasConfidence =
     confidence != null && confidenceIndicator && confidenceVisuals;
   const sourceHeading = (
     feature.source_heading || feature._source_heading || ''
   ).trim();
-
-  // dependency_metadata — vestigial field from the v2.x/Qwen dep-tracking
-  // pipeline (`_apply_v3_edges_to_breakdown`); the current v3 Sonnet generation
-  // does NOT emit it, so this is always an empty array and the block below
-  // renders nothing. Live cross-feature dependencies are `feature.dependencies`
-  // (surfaced on the Review screen by DependencyStructure). Kept as a harmless
-  // no-op; safe to remove with its rendering block in a future tidy pass.
-  const dependencyMetadata = feature.dependency_metadata || [];
 
   function updateField(field, value) { onUpdate({ ...feature, [field]: value }); }
 
@@ -175,18 +166,16 @@ export default function FeatureCard({ feature, index, onUpdate, onDelete }) {
           {/* CG-2 confidence badge — leads the right-side status cluster
               so BA's eye lands here first when scanning a long feature
               list for ⚠/✗ items needing attention. Native title tooltip
-              surfaces concerns on hover (no extra UI library). */}
+              explains the stance on hover (no extra UI library). */}
           {hasConfidence && (
             <span
               className="rounded-full px-2 py-0.5 text-[10px] font-semibold leading-none"
               title={
-                confidenceConcerns.length > 0
-                  ? `AI flagged: ${confidenceConcerns.join('; ')}`
-                  : confidenceIndicator === '✓'
-                    ? 'Confident — clean extraction, little or no guesswork. A quick check is still worth it.'
-                    : confidenceIndicator === '⚠'
-                      ? 'Unsure — the AI inferred or assumed some details. Review this feature.'
-                      : 'Low confidence — the spec was vague or contradictory here. Manual review essential.'
+                confidenceIndicator === '✓'
+                  ? 'Confident — clean extraction, little or no guesswork. A quick check is still worth it.'
+                  : confidenceIndicator === '⚠'
+                    ? 'Unsure — the AI inferred or assumed some details. Review this feature.'
+                    : 'Low confidence — the spec was vague or contradictory here. Manual review essential.'
               }
               style={{
                 background: confidenceVisuals.bg,
@@ -243,69 +232,20 @@ export default function FeatureCard({ feature, index, onUpdate, onDelete }) {
       {/* Expanded Content */}
       {expanded && (
         <div className="px-3 pb-3 pt-2.5 space-y-3" style={{ borderTop: '1px solid var(--s2j-border)' }}>
-          {/* CG-4 source provenance + CG-2 confidence concerns — appears
-              ABOVE the editable fields so BA reading-order is:
-                1. Where did this Story come from? (provenance)
-                2. Why might it need attention? (concerns)
-                3. Now edit the fields.
-              Renders only when ≥1 of the two has content; legacy
-              breakdowns без both fields skip this block entirely. The
-              dashed bottom border separates non-editable metadata от
-              editable fields below. */}
-          {(sourceHeading || (hasConfidence && confidenceConcerns.length > 0) || dependencyMetadata.length > 0) && (
+          {/* CG-4 source provenance — appears ABOVE the editable fields so
+              BA reading-order is: where did this Story come from? → now edit
+              the fields. Renders only when source_heading has content; legacy
+              breakdowns без it skip this block entirely. The dashed bottom
+              border separates non-editable metadata от editable fields below. */}
+          {sourceHeading && (
             <div className="space-y-2 pb-2.5"
               style={{ borderBottom: '1px dashed var(--s2j-border)' }}>
-              {sourceHeading && (
-                <div className="flex items-start gap-2">
-                  <span className="text-[10px] font-medium uppercase tracking-wider shrink-0 pt-0.5"
-                    style={{ color: 'var(--s2j-text-muted)' }}>Source</span>
-                  <span className="text-[11px] leading-relaxed"
-                    style={{ color: 'var(--s2j-text-light)' }}>{sourceHeading}</span>
-                </div>
-              )}
-              {hasConfidence && confidenceConcerns.length > 0 && (
-                <div className="flex items-start gap-2">
-                  <span className="text-[10px] font-medium uppercase tracking-wider shrink-0 pt-0.5"
-                    style={{ color: 'var(--s2j-text-muted)' }}>Concerns</span>
-                  <ul className="flex-1 space-y-0.5"
-                    style={{ listStyle: 'none', margin: 0, padding: 0 }}>
-                    {confidenceConcerns.map((reason, i) => (
-                      <li key={i} className="text-[11px] leading-relaxed flex items-start gap-1.5"
-                        style={{ color: 'var(--s2j-text-light)' }}>
-                        <span className="shrink-0 pt-0.5"
-                          style={{ color: 'var(--s2j-text-muted)' }}>•</span>
-                        <span>{reason}</span>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              )}
-              {dependencyMetadata.length > 0 && (
-                <div className="flex items-start gap-2">
-                  <span className="text-[10px] font-medium uppercase tracking-wider shrink-0 pt-0.5"
-                    style={{ color: 'var(--s2j-text-muted)' }}
-                    title="Phase 3.8 v3 cross-feature workflow ordering — ✓ auto-approved (active JIRA Story-blocks-Story link)">
-                    Depends on
-                  </span>
-                  <ul className="flex-1 space-y-0.5"
-                    style={{ listStyle: 'none', margin: 0, padding: 0 }}>
-                    {dependencyMetadata.map((dep, i) => (
-                      <li key={i} className="text-[11px] leading-relaxed flex items-start gap-1.5"
-                        style={{ color: 'var(--s2j-text-light)' }}>
-                        <span className="shrink-0 pt-0.5"
-                          style={{ color: 'var(--s2j-green)' }}>{dep.confidence || '✓'}</span>
-                        <span className="flex-1">
-                          <span style={{ color: 'var(--s2j-text)' }}>{dep.target}</span>
-                          {dep.reason && (
-                            <span className="block text-[10px] italic mt-0.5"
-                              style={{ color: 'var(--s2j-text-muted)' }}>{dep.reason}</span>
-                          )}
-                        </span>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              )}
+              <div className="flex items-start gap-2">
+                <span className="text-[10px] font-medium uppercase tracking-wider shrink-0 pt-0.5"
+                  style={{ color: 'var(--s2j-text-muted)' }}>Source</span>
+                <span className="text-[11px] leading-relaxed"
+                  style={{ color: 'var(--s2j-text-light)' }}>{sourceHeading}</span>
+              </div>
             </div>
           )}
           {/* Sizing — model-suggested, editable. complexity_score is the model's
@@ -417,7 +357,7 @@ export default function FeatureCard({ feature, index, onUpdate, onDelete }) {
                 style={{ color: 'var(--s2j-green)' }}>+ Add Task</button>
             </div>
             {feature.tasks.map((task, tIdx) => (
-              <TaskCard key={task._uid || tIdx} task={task} index={tIdx}
+              <TaskCard key={tIdx} task={task} index={tIdx}
                 onUpdate={(updated) => updateTask(tIdx, updated)}
                 onDelete={() => deleteTask(tIdx)} />
             ))}

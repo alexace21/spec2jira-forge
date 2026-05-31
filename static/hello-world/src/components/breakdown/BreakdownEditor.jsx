@@ -15,7 +15,9 @@ export default function BreakdownEditor({ initialBreakdown, onPush, isPushing = 
     const caps = breakdown.capabilities || [];
     const features = caps.flatMap((c) => c.features || []);
     const tasks = features.flatMap((f) => f.tasks || []);
-    const totalSP = tasks.reduce((s, t) => s + (t.estimate_story_points || 0), 0);
+    // Story points live on the feature in v3 (tasks carry none); mirror
+    // CapabilityCard's feature-level sum. Tasks are kept only for the count.
+    const totalSP = features.reduce((s, f) => s + (f.story_points || 0), 0);
     return {
       capCount: caps.length, featureCount: features.length,
       taskCount: tasks.length, totalSP,
@@ -29,7 +31,8 @@ export default function BreakdownEditor({ initialBreakdown, onPush, isPushing = 
   function addCapability() {
     setBreakdown((p) => ({ ...p, capabilities: [...p.capabilities, {
       name: 'New Capability', features: [{ name: 'New Feature', user_story: 'As a user, I want [goal], so that [benefit].',
-        acceptance_criteria: ['Acceptance criterion'], tasks: [{ type: 'API', summary: 'New task', estimate_story_points: 3, dependencies: [], priority: 'MEDIUM' }] }]
+        acceptance_criteria: ['Acceptance criterion'], priority: 'Medium', story_points: 3, complexity_score: 3,
+        tasks: [{ type: 'API', summary: 'New task' }] }]
     }] }));
   }
   function resetBreakdown() { setBreakdown(JSON.parse(JSON.stringify(initialBreakdown))); }
@@ -230,7 +233,7 @@ export default function BreakdownEditor({ initialBreakdown, onPush, isPushing = 
             </button>
           </div>
           {breakdown.capabilities.map((cap, i) => (
-            <CapabilityCard key={cap._uid || i} capability={cap} index={i}
+            <CapabilityCard key={i} capability={cap} index={i}
               onUpdate={(u) => updateCapability(i, u)} onDelete={() => deleteCapability(i)} />
           ))}
         </div>

@@ -164,7 +164,7 @@ export default function CapabilityCard({ capability, index, onUpdate, onDelete }
             </div>
             {capability.features.map((feature, fIdx) => (
               <FeatureCard
-                key={feature._uid || fIdx}
+                key={fIdx}
                 feature={feature}
                 index={fIdx}
                 onUpdate={(updated) => updateFeature(fIdx, updated)}

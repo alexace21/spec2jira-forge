@@ -207,177 +207,10 @@ export async function testConnection(apiKey = null) {
   return { ok: true, model: data.model || MODEL_PRIMARY };
 }
 
-// ── Main API call — generateBreakdown ───────────────────────
-
-/**
- * Generate a structured breakdown от Confluence spec content.
- *
- * BYOK pattern: API key retrieved automatically от Forge KVS secret
- * storage. Customer admin must have configured the key via Settings UI.
- *
- * @param {object} args
- * @param {string} args.pageTitle - Confluence page title
- * @param {string} args.pageContent - Confluence page content (raw text/markdown)
- * @param {string} [args.model] - Model ID (default: Sonnet 4.6)
- * @param {boolean} [args.useCaching=true] - Enable prompt caching
- * @param {string} [args.apiKeyOverride] - Override stored key (used by testConnection)
- * @returns {Promise<{breakdown?, usage?, model?, error?, detail?}>}
- */
-export async function generateBreakdown({
-  pageTitle,
-  pageContent,
-  model = MODEL_PRIMARY,
-  useCaching = true,
-  apiKeyOverride = null,
-}) {
-  const apiKey = apiKeyOverride || (await getStoredApiKey());
-  if (!apiKey) {
-    return {
-      error: 'not_configured',
-      detail:
-        'Anthropic API key not configured. Ask your Confluence admin к open Settings → Spec2Tickets and provide an Anthropic API key.',
-    };
-  }
-  if (!pageContent || pageContent.trim().length < 50) {
-    return {
-      error: 'input_too_small',
-      detail: `Page content е too short к extract meaningful breakdown (${pageContent?.length || 0} chars).`,
-    };
-  }
-
-  const systemContent = useCaching
-    ? [
-        {
-          type: 'text',
-          text: SYSTEM_PROMPT,
-          cache_control: { type: 'ephemeral' },
-        },
-      ]
-    : SYSTEM_PROMPT;
-
-  const requestBody = {
-    model,
-    max_tokens: MAX_OUTPUT_TOKENS,
-    system: systemContent,
-    messages: [
-      {
-        role: 'user',
-        content: buildUserPrompt(pageTitle, pageContent),
-      },
-    ],
-    output_config: {
-      format: {
-        type: 'json_schema',
-        schema: BREAKDOWN_SCHEMA,
-      },
-    },
-  };
-
-  let response;
-  const startTime = Date.now();
-  try {
-    response = await fetch(ANTHROPIC_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'anthropic-version': ANTHROPIC_VERSION,
-        'X-Api-Key': apiKey,
-      },
-      body: JSON.stringify(requestBody),
-    });
-  } catch (e) {
-    console.error(`[anthropic] Fetch threw: ${String(e?.message || e)}`);
-    return {
-      error: 'network_failure',
-      detail: `Fetch threw before response: ${String(e?.message || e)}`,
-    };
-  }
-
-  const elapsedMs = Date.now() - startTime;
-
-  // Error classification
-  if (response.status === 401) {
-    return {
-      error: 'auth_rejected',
-      detail:
-        'Anthropic rejected the API key. Open Settings → Spec2Tickets and verify the API key е valid.',
-    };
-  }
-  if (response.status === 402) {
-    return {
-      error: 'insufficient_credits',
-      detail:
-        'Anthropic account has insufficient credits. Add credits at console.anthropic.com → Billing.',
-    };
-  }
-  if (response.status === 429) {
-    return {
-      error: 'rate_limited',
-      detail:
-        'Anthropic rate limit exceeded. Retry after а moment OR upgrade usage tier at console.anthropic.com.',
-    };
-  }
-  if (response.status === 529) {
-    return {
-      error: 'overloaded',
-      detail: 'Anthropic API е temporarily overloaded. Retry в a moment.',
-    };
-  }
-  if (!response.ok) {
-    const text = await response.text();
-    console.warn(`[anthropic] HTTP ${response.status}: ${text.substring(0, 300)}`);
-    return {
-      error: `anthropic_${response.status}`,
-      detail: text.substring(0, 500),
-    };
-  }
-
-  const data = await response.json();
-
-  if (data.stop_reason === 'refusal') {
-    return {
-      error: 'refused',
-      detail:
-        'Anthropic refused к process this spec (safety filter triggered). Try simplifying spec content или contact support.',
-      usage: data.usage,
-    };
-  }
-  if (data.stop_reason === 'max_tokens') {
-    return {
-      error: 'truncated',
-      detail: `Output truncated at ${MAX_OUTPUT_TOKENS} tokens. Spec may be too large; consider splitting into smaller specs.`,
-      usage: data.usage,
-    };
-  }
-
-  let breakdown;
-  try {
-    breakdown = JSON.parse(data.content[0].text);
-  } catch (e) {
-    return {
-      error: 'parse_failed',
-      detail: `Unexpected: structured output returned invalid JSON. Raw: ${data.content[0]?.text?.substring(0, 300)}`,
-      usage: data.usage,
-    };
-  }
-
-  console.log(
-    `[anthropic] generateBreakdown OK | model=${data.model} | features=${(breakdown.features || []).length} | elapsed=${elapsedMs}ms | input=${data.usage?.input_tokens || 0} | output=${data.usage?.output_tokens || 0}`,
-  );
-
-  return {
-    breakdown,
-    usage: data.usage,
-    model: data.model,
-    elapsedMs,
-    stop_reason: data.stop_reason,
-  };
-}
-
 // ── Cost estimator ──────────────────────────────────────────
 
 /**
- * Estimate cost of a generateBreakdown call в USD.
+ * Estimate cost of a breakdown generation call в USD от its token usage.
  * Used by tier enforcement к decide когато customer hits subscription cap.
  *
  * Sonnet 4.6 pricing (verified 2026-05-27):
@@ -436,7 +269,7 @@ export function estimateCost(usage, model = MODEL_PRIMARY) {
 /**
  * Submit а 1-request batch to Anthropic. Returns batch_id immediately.
  *
- * @param {object} args - same as generateBreakdown (pageTitle, pageContent, model, useCaching, apiKeyOverride)
+ * @param {object} args - pageTitle, pageContent, model, useCaching, apiKeyOverride (the breakdown generation inputs)
  * @param {string} args.customId - custom_id for the request (typically our jobId)
  * @returns {Promise<{batchId?, customId?, error?, detail?}>}
  */
