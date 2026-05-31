@@ -61,25 +61,35 @@ CLM + Spec2jira specs.
 
 ---
 
-## 💰 Monetization & tier enforcement (DECIDED 2026-05-30 — do not re-litigate)
+## 💰 Monetization & tier enforcement (DECIDED 2026-05-30; pricing revised UP 2026-06-01 — do not re-litigate)
 
 Settled. Do NOT reopen these in future sessions:
 
 - **BYOK** — the customer brings their own Anthropic API key (pays Anthropic for
   compute directly). No Spec2Tickets-operated backend.
-- **Pricing (MVP early access):** **Free = 3 breakdowns/month** (resets the 1st, UTC)
-  · **Pro = €20/month → UNLIMITED**. One flat paid price; €20 is a deliberate floor
-  (below it reads as a hobby). Sold as the Marketplace subscription —
-  `resolveTier()` reads `context.license.active` → active ⇒ Pro/unlimited.
+- **Pricing (MVP early access — REVISED 2026-06-01 UP from €20):** **Free = 3
+  breakdowns/month** (resets the 1st, UTC) · **Pro = €39/month flat, "Early Access"**
+  → unlimited breakdowns. €39 (not €20) because pricing is value-based, not
+  cost-based: under BYOK the subscription is pure app-value — a spec→JIRA breakdown
+  saves ~1-3 h of BA/PO time (~€50-200 each), so €20 under-captured (~2-10% of the
+  value) AND under-signalled (B2B buyers eliminate the cheapest option first). €29 is
+  the floor; €20 is retired. Sold as the Marketplace subscription — `resolveTier()`
+  reads `context.license.active` → active ⇒ Pro.
+- **NEXT pricing iteration — per-seat above 10 users.** Atlassian-native model = flat
+  ≤10 users, then per-user above (advanced apps run $10-30/user/mo); a €39 flat alone
+  under-prices large teams (a 200-user org pays the same as a 3-person team). So:
+  launch €39 flat early-access; THEN add ~€5/user above 10 → captures big-team value +
+  matches Marketplace norms. Frame **introductory + grandfather early adopters**
+  (`memory/migration-protections.md`) so the structure can evolve UP without churn.
 - **`block` is correct.** Free → 3 → block → Pro is a sound freemium funnel: the free
-  trial acquires, the €20-unlimited deal is the generous part. "Land-grab" = attractive
-  PRICING + early-access framing + grandfathering (`memory/migration-protections.md`),
-  NOT an unlimited free tier. (Was over-flagged once — do not re-debate.)
+  trial acquires, the €39 flat early-access deal is the generous part. "Land-grab" =
+  attractive PRICING + early-access framing + grandfathering
+  (`memory/migration-protections.md`), NOT an unlimited free tier.
 - **`ENFORCEMENT_MODE` is per Forge environment** (`src/usage.js`, from `process.env`):
   **production = `block`** (default when unset) · **dev = `meter`** via
   `forge variables set --environment development ENFORCEMENT_MODE meter`. Dev tests
   freely; production enforces.
-- **The €20 Marketplace listing goes live WITH the production release** (Marketplace
+- **The €39 Marketplace listing goes live WITH the production release** (Marketplace
   approval is part of the MVP launch). Dev having no listing is NORMAL, not a problem —
   so block has a working upgrade path the moment real users can hit it.
 - **"Unlimited" is BYOK-only.** When vendor-pays lands (we pay the API; pending Anthropic
@@ -266,8 +276,9 @@ Spec2jira spec (39 feat / 162 subtask / dense deps) validated through chunked pu
 
 ✅ **P3a — tier enforcement** (`src/usage.js`): per-site monthly breakdown counter
 (KVS `usage:YYYY-MM`), license-aware `resolveTier`, `ENFORCEMENT_MODE` flag. Model:
-**Free 3/month + Pro €20/month unlimited** (BYOK-only economics — customer pays
-Anthropic; the €20 buys the app). `startGeneration` checks/consumes (fail-open,
+**Free 3/month + Pro €39/month flat (early access; per-seat above 10 users next)**
+(BYOK-only economics — customer pays Anthropic; the €39 buys the app).
+`startGeneration` checks/consumes (fail-open,
 consume-on-success); `getUsage` feeds a usage badge on Ready; quota_exceeded →
 upgrade + reset date.
 

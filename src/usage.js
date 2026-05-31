@@ -8,18 +8,20 @@
  *   (POLICY §4 dispatch rule: counting + threshold compare is *structure*, not
  *   meaning-reading → a pure function, never a model call).
  *
- * THE MODEL (BYOK MVP launch — partner decision 2026-05-30)
+ * THE MODEL (BYOK MVP launch — partner decision 2026-05-30; price revised 2026-06-01)
  *   - Free: 3 breakdowns / month, resets the 1st of each month (UTC). A trial.
- *   - Pro:  €20 / month → UNLIMITED breakdowns.
- *   Two tiers, one flat paid price. Rationale: under BYOK the customer brings
- *   their own Anthropic key and pays Anthropic for compute, so "unlimited"
- *   costs us nothing and is a genuinely strong, simple value prop. €20 is a
- *   deliberate floor — below it the product reads as a hobby, not a tool.
+ *   - Pro:  €39 / month flat ("Early Access") → UNLIMITED breakdowns.
+ *   Two tiers, one flat paid price for launch. Rationale: pricing is value-based,
+ *   not cost-based — under BYOK the customer pays Anthropic for compute, so the
+ *   subscription is pure app-value (a breakdown saves ~1-3 h of BA/PO time). €20
+ *   under-captured (~2-10% of value) + under-signalled; €39 is the early-access
+ *   floor. NEXT iteration: per-seat above 10 users (~€5/user) — Atlassian-native
+ *   model, captures big-team value. Frame introductory + grandfather early adopters.
  *
  *   ⚠ "Unlimited" is safe ONLY while BYOK. When the future "vendor-pays" model
  *   lands (we pay the API, pending Anthropic reselling approval), unlimited
  *   becomes an unbounded-cost liability and MUST revert to a usage cap / metered
- *   pricing. Do not carry €20-unlimited into the vendor-pays era unchanged.
+ *   pricing. Do not carry flat-unlimited into the vendor-pays era unchanged.
  *
  * ENFORCEMENT MODE
  *   'block' = hard-block when a free site reaches its monthly limit, returning a
@@ -27,16 +29,16 @@
  *   'meter' = track only, never block.
  *
  *   PER-ENVIRONMENT (see ENFORCEMENT_MODE below): production = 'block' (default),
- *   dev = 'meter' (test freely) via `forge variables set`. The €20 Marketplace
+ *   dev = 'meter' (test freely) via `forge variables set`. The €39 Marketplace
  *   listing goes live WITH the production release, so block has a working upgrade
  *   path in production — dev simply has no listing (normal). resolveTier() reads
  *   context.license.active → paying sites auto-resolve to Pro (unlimited).
  *
  * SCOPE — per-site, not per-user
  *   The Anthropic key and all KVS state are site-wide (one install = one shared
- *   key), so the free trial counter is per-site. Per-seat billing (if chosen for
- *   the €20 listing) lives at the Atlassian subscription layer, above this
- *   counter — resolveTier() only needs the binary license.active either way.
+ *   key), so the free trial counter is per-site. Per-seat billing (the planned
+ *   next pricing iteration, above 10 users) lives at the Atlassian subscription
+ *   layer, above this counter — resolveTier() only needs license.active either way.
  */
 
 import { kvs } from '@forge/kvs';
@@ -48,7 +50,7 @@ import { kvs } from '@forge/kvs';
 // The Free limit (3) is the single tunable threshold that bites in 'block' mode.
 export const TIERS = {
   free: { key: 'free', label: 'Free', limit: 3, price: null },
-  pro: { key: 'pro', label: 'Pro', limit: null, price: '€20/month' },
+  pro: { key: 'pro', label: 'Pro', limit: null, price: '€39/month' },
 };
 
 export const DEFAULT_TIER = 'free';

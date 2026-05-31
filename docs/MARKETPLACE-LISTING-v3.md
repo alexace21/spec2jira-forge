@@ -119,13 +119,15 @@ brings their own Anthropic key on every plan — the subscription covers the app
 | Edition | Price | What it includes |
 |---|---|---|
 | **Free** | €0 | 3 breakdowns per month. Full editor, push to Jira, dependency links — no feature gating, only a monthly volume cap. |
-| **Pro — Early access** | €20 / month (flat) | Unlimited breakdowns. Everything in Free with no monthly cap. |
+| **Pro — Early access** | €39 / month (flat) | Unlimited breakdowns. Everything in Free with no monthly cap. *(Planned next iteration: per-seat ~€5/user above 10 users.)* |
 
 **Portal notes:**
 - Set Free as the default edition so install → 3 free breakdowns works with no purchase.
 - The monthly cap resets on the 1st (UTC); enforcement is built into the app
   (`src/usage.js`), license-aware via `context.license.active`.
-- **[YOUR CALL]** Confirm the €20 flat price and the "Early access" label before publish.
+- **Pricing (DECIDED 2026-06-01):** €39/month flat early-access (was €20 — revised up:
+  value-based, not cost-based). Per-seat (~€5/user) above 10 users is the next
+  iteration. Frame introductory + grandfather early adopters.
 - Enforcement mode is per-environment: **production = block** (freemium funnel),
   development = meter. Set the production env variable before go-live.
 
@@ -225,7 +227,7 @@ These are the data-handling fields in the listing form (mandatory for cloud apps
 - [ ] Site live: landing, /docs, /privacy reachable at spec2jira.com (HTTPS).
 - [ ] Set production `ENFORCEMENT_MODE` (block) env variable.
 - [ ] Upload public version **3.0.0**; fill listing copy (§2), highlights, what's-new.
-- [ ] Configure pricing editions (§3): Free default + Pro €20.
+- [ ] Configure pricing editions (§3): Free default + Pro €39 (early access; per-seat above 10 users next).
 - [ ] Fill privacy/security listing fields (§4) + the questionnaire (§5).
 - [ ] Select **Atlassian standard EULA**.
 - [ ] Add screenshots (picker → editor → confirm/dashboard → Jira result) + an icon.
