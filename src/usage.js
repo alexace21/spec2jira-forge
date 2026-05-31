@@ -107,6 +107,13 @@ export function formatResetDate(iso) {
 export function resolveTier(context) {
   const lic = context && context.license;
   if (lic && lic.active === true) return TIERS.pro;
+  // FUTURE (migration-protections #2): when the €20-flat-unlimited → tiers+caps
+  // migration lands, grandfather early adopters here — an install whose
+  // firstSeenAt (getInstallMeta) predates the early-access cutoff should resolve
+  // to an unlimited grandfathered tier instead of Free. Deferred until the cutoff
+  // date exists (a launch-time decision, never a hardcode); the firstSeenAt
+  // signal is already captured today (recordFirstSeen). The async caller
+  // (checkQuota) would read the meta and pass it in, keeping this resolver pure.
   return TIERS[DEFAULT_TIER];
 }
 
@@ -171,6 +178,59 @@ export async function consumeQuota(period = currentPeriod()) {
   const count = (rec && typeof rec.count === 'number' ? rec.count : 0) + 1;
   await kvs.set(key, { count, updatedAt: new Date().toISOString() });
   return count;
+}
+
+// ── Install provenance — grandfathering signal ───────────────────────
+// A write-once record of when this install was FIRST actively seen.
+//
+// WHY this exists NOW, before the Marketplace listing: when the eventual
+// €20-flat-unlimited → tiers+caps migration happens, we promised to grandfather
+// early adopters (memory/migration-protections.md #2 — reframes the migration as
+// "early adopters earned a perk", not "we took unlimited away"). That promise can
+// only be honoured if we captured WHO WAS EARLY from day one — firstSeenAt cannot
+// be reconstructed retroactively. So we capture the irreplaceable SIGNAL now and
+// DEFER the reversible DECISION (the cutoff date + the resolveTier nuance) to
+// launch / migration time, when the cutoff is actually known. Hardcoding a cutoff
+// today would be premature; losing the signal today is unrecoverable.
+//
+// Pure structure (a timestamp), no LLM (POLICY §4 dispatch rule).
+const INSTALL_META_KEY = 'install:meta';
+
+/**
+ * Record the install's first-seen timestamp, exactly once (earliest wins).
+ *
+ * Idempotent get-or-set: safe to call from multiple entry points (app open +
+ * generate). A second call is a no-op that preserves the original timestamp, so
+ * the stored value is always the EARLIEST observation.
+ *
+ * Concurrency: like consumeQuota, KVS has no atomic compare-and-set, so two
+ * near-simultaneous first calls could both read empty and both write. Harmless —
+ * the timestamps differ by milliseconds and grandfathering compares against a
+ * cutoff months away, so a few-ms skew never changes the outcome.
+ *
+ * Callers wrap in try/catch and fail OPEN — a metering-storage glitch must never
+ * break the resolver that happens to host the capture.
+ *
+ * @returns {Promise<{firstSeenAt: string, created: boolean}>} the install meta;
+ *   `created` is true only on the call that first wrote it (for one-time logging).
+ */
+export async function recordFirstSeen(date = new Date()) {
+  const existing = await kvs.get(INSTALL_META_KEY);
+  if (existing && existing.firstSeenAt) return { ...existing, created: false };
+  const meta = { firstSeenAt: date.toISOString() };
+  await kvs.set(INSTALL_META_KEY, meta);
+  return { ...meta, created: true };
+}
+
+/**
+ * Read the install meta ({ firstSeenAt } or null). The reader for the FUTURE
+ * grandfather-aware resolveTier nuance (migration-protections #2): at the
+ * flat→tiers migration, an install whose firstSeenAt predates the early-access
+ * cutoff resolves to the grandfathered (unlimited) tier. Unused until then —
+ * intentionally, so the cutoff stays a launch-time decision, not a hardcode.
+ */
+export async function getInstallMeta() {
+  return (await kvs.get(INSTALL_META_KEY)) || null;
 }
 
 /**

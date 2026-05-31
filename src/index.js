@@ -54,6 +54,7 @@ import {
   TIERS,
   checkQuota,
   consumeQuota,
+  recordFirstSeen,
   pricingTable,
 } from './usage.js';
 
@@ -570,6 +571,19 @@ resolver.define('startGeneration', async ({ payload, context }) => {
     };
   }
 
+  // Record install provenance (grandfathering signal — see usage.js
+  // recordFirstSeen). A second durable capture point besides getUsage: it
+  // survives any future UI refactor that drops the usage badge. Idempotent
+  // (earliest wins) and fail-open — never block a generation over a metering glitch.
+  try {
+    const seen = await recordFirstSeen();
+    if (seen?.created) {
+      console.log(`[install] first seen at ${seen.firstSeenAt} (grandfathering signal recorded via startGeneration)`);
+    }
+  } catch (e) {
+    console.error(`[startGeneration] firstSeen record failed (non-fatal): ${String(e?.message || e)}`);
+  }
+
   // Tier/usage gate (P3a). Fail OPEN — a metering glitch must never block a
   // BYOK user who pays their own Anthropic bill. In 'meter' mode quota.allowed
   // is always true (we never block pre-paid-listing); the gate only bites once
@@ -939,6 +953,17 @@ resolver.define('getGenerationStatus', async ({ payload }) => {
  * benign null so the UI can simply hide the badge rather than error.
  */
 resolver.define('getUsage', async ({ context }) => {
+  // Capture the install's first-seen timestamp (grandfathering signal — see
+  // usage.js recordFirstSeen). Independent try/catch so a glitch in one never
+  // suppresses the other; getUsage runs on app open, the broadest capture point.
+  try {
+    const seen = await recordFirstSeen();
+    if (seen?.created) {
+      console.log(`[install] first seen at ${seen.firstSeenAt} (grandfathering signal recorded via getUsage)`);
+    }
+  } catch (e) {
+    console.error(`[getUsage] firstSeen record failed (non-fatal): ${String(e?.message || e)}`);
+  }
   try {
     const quota = await checkQuota(context);
     return { ...quota, pricing: pricingTable() };

@@ -21,7 +21,8 @@
 | Website | https://spec2jira.com |
 | Privacy policy | https://spec2jira.com/privacy |
 | Documentation | https://spec2jira.com/docs |
-| Support / security contact | support@spec2jira.com |
+| Support contact | support@spec2jira.com |
+| Security / vulnerability contact | security@spec2jira.com |
 | EULA | **Atlassian's standard EULA** (no custom terms) |
 
 > **Cross-product note:** the UI lives in Confluence (globalPage) but the push
@@ -139,7 +140,7 @@ These are the data-handling fields in the listing form (mandatory for cloud apps
 | Privacy policy URL | https://spec2jira.com/privacy |
 | Does the app store data outside the Atlassian cloud? | **No.** The app runs on Atlassian Forge and stores data only in Forge storage within the customer's instance. Its only external egress is to `api.anthropic.com`, using the customer's own Anthropic API key — Spec2JIRA operates no backend and stores nothing on its own systems. |
 | Does the app transmit data to third parties? | **Yes — one:** Anthropic. To generate a breakdown, the selected page content is sent to the Anthropic API (`api.anthropic.com`) authenticated with the **customer's own** API key; processing is governed by the customer's agreement with Anthropic. No other external egress. |
-| Security contact / vulnerability reporting | support@spec2jira.com **[YOUR CALL: consider a dedicated security@spec2jira.com mailbox]** |
+| Security contact / vulnerability reporting | security@spec2jira.com |
 | Data residency support | App logic runs on Atlassian Forge per the instance's region; AI processing occurs in the customer's Anthropic API region. No Spec2JIRA-operated datastore. |
 
 ---
@@ -183,7 +184,6 @@ These are the data-handling fields in the listing form (mandatory for cloud apps
 | `storage:app` | Forge KVS for settings + transient breakdown/session state. |
 | `search:confluence` | CQL page search in the page picker. |
 | `read:page:confluence` | Read the selected page body (Confluence v2 API). |
-| `read:confluence-content.summary`, `read:confluence-content.all` | Legacy v1 read fallback for page content. |
 | `read:jira-work` | Read project metadata (issue types, fields) before creating issues. |
 | `write:jira-work` | Create the Epic, stories, subtasks, and dependency links. |
 
@@ -208,7 +208,7 @@ These are the data-handling fields in the listing form (mandatory for cloud apps
   and the single egress endpoint above.
 
 **Vendor process — [YOUR CALL] confirm/complete before submitting**
-- Vulnerability reporting channel (security@ or support@ mailbox you monitor).
+- Vulnerability reporting channel: **security@spec2jira.com** (confirm the mailbox/alias is monitored — may forward to the same inbox as support@).
 - Incident-response / breach-notification process you commit to.
 - Who has access to the Atlassian developer account that deploys the app, and how it's
   protected (MFA on the Atlassian account).
