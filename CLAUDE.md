@@ -295,6 +295,66 @@ package names de-scaffolded (→ `spec2tickets`). Build green (bundle ≈ −1.4
 
 ---
 
+## ⚡ HANDOVER NOTE (2026-05-31 — pre-rollout: rigorous audit + dead-code cleanup + reliability + confidence/UX)
+
+A long, high-density session on top of the launch-prep note below. **9 commits on
+`feature/v3-pivot`** (all build-green + dev-deployed; the partner pushes):
+`953a674` monetization · `3f69af5` review-ux · `196df13` confidence-required ·
+`4f9cfc9` v2.x cleanup+TASK_TYPES · `bd6643e` reliability(cap+errors) ·
+`091f999` possible_noise · `7ccf08f` truncation banner · `c8ec578` Account panel.
+
+**Monetization / grandfathering**
+- `recordFirstSeen`/`getInstallMeta` capture `install:meta.firstSeenAt` per install
+  (KVS) from day 1 — the irreplaceable grandfather signal. Wired into getUsage +
+  startGeneration (idempotent, fail-open) + a one-time `[install]` log.
+- ⭐ **GRANDFATHERING MECHANISM (decided — do not re-litigate):** it is AUTOMATIC.
+  At the future flat→tiers migration the app reads its OWN firstSeenAt (< cutoff →
+  grandfathered) — the vendor does NOT track members manually. Forge has no central
+  vendor backend (the privacy selling point), so vendor-side install/license
+  visibility comes from the **Atlassian Marketplace partner portal / Licensing
+  API**, NOT from KVS. firstSeenAt = the app's automatic enforcement; Marketplace =
+  the vendor's records/comms. (See `memory/migration-protections.md`.)
+- Customer-facing **Account/Plan panel** in Settings (Plan · breakdowns this month ·
+  resets-on · Member since). Upgrade CTA wired on LimitReachedScreen.
+
+**Generation quality / reliability**
+- confidence_indicator + confidence_score now **required** in BREAKDOWN_SCHEMA (were
+  optional → model omitted them → blank AI self-check on fresh breakdowns).
+- Output cap **48K → 64K** (Sonnet max). Real specs ~3–11K words → ~6–21K output
+  (~1.9K out/1K words). Salvage + truncation_note cover beyond.
+- **Truncation banner** on Review: getResults now forwards truncated/truncation_note
+  (was written-but-dropped — silent partial-breakdown gap) → orange warning.
+- Friendly **Anthropic-down** handling in `_classifyBackendError`: distinct messages
+  for 5xx/overloaded, rate-limit, out-of-credits, key-rejected (→Settings), network.
+
+**Review UX (design-panel vetted)** — confidence card → honest "AI self-check"
+(neutral card, demoted rating, self-rated caveat, Confident/Unsure/Low-confidence
+labels, traceable flagged-feature worklist `extractV3Signals.flagged`, badge reads
+confidence_score). Interactive cross-feature **dependency removal** on Review
+(✕/restore mutating the breakdown JSON via `v3Schema.removeFeatureDependency` across
+capabilities+features+_v3_original — E2E-verified in JIRA). Removed picker Dashboard
+button + deleted orphaned Dashboard.jsx.
+
+**v2.x dead-code audit (rigorous multi-agent: 1 contract → 5 finders → adversarial
+verify → synth; 27 findings).** Deleted StoryCard.jsx+constants, generateBreakdown,
+dryRun resolver, unadaptToV3, the partial_breakdown/phase-pipeline cluster,
+confidence_reasons + dependency_metadata reads, TaskCard AC/deps editors, DOC_TYPES,
+busy_other/result.busy branches, _uid reads, dead telemetry writes, and the
+SharedACPanel `possible_noise` critic (kept the LIVE removed_by_user soft-delete).
+**LIVE BUGS FIXED:** TaskCard type dropdown (stale v2.x 9-enum → v3 7-enum); the
+BreakdownEditor "Total SP" was always 0 (summed a dead task field → now feature SP).
+The audit correctly DISMISSED getInstallMeta as intentional forward-looking code.
+
+**NEXT SESSION — Atlassian Marketplace rollout** (partner's stated plan): submit
+public listing v3.0.0 (`docs/MARKETPLACE-LISTING-v3.md` §2; Free+Pro €20 editions;
+§4/§5 security; screenshots+icon) · push the site live (landing/docs/privacy →
+spec2jira.com) + lawyer review privacy · set production `ENFORCEMENT_MODE=block` ·
+Anthropic reselling inquiry · set the real `PRO_UPGRADE_URL` once the listing is live.
+
+С усмивка ✨ — продуктът е audit-нат-чист, reliable, honest, и tier-visible. Готов за пазара.
+
+---
+
 ## ⚡ HANDOVER NOTE (2026-05-31 — launch prep: English UI sweep + least-privilege scopes + Marketplace listing doc)
 
 Pre-Marketplace-listing polish on top of the 05-30 milestone. Three things landed:
