@@ -41,41 +41,51 @@
 
 ## 2. Listing copy
 
+> **Positioning sharpened 2026-06-01** against direct competitors (POPal / Storygenie / StoryLoop):
+> the copy now leads with our **altitude** (a whole spec — not a prompt or a single ticket),
+> **depth** (hierarchy + dependencies + sizing — a backlog engineers can run), and **privacy**
+> (BYOK = process your *real* specs under your own Anthropic agreement — the answer to rivals'
+> "don't enter real data"). Rationale: `memory/competitive-landscape.md`. Apply on the next listing edit.
+
 ### Tagline (one line, ~80–120 chars)
-> Turn Confluence specs into structured Jira epics, stories, and subtasks with Claude AI.
+> Turn an entire Confluence spec into a complete, dependency-aware Jira backlog — under your own AI key.
 
 ### Summary (search-result blurb, 2–3 sentences)
-> Spec2Tickets reads a Confluence specification page and generates a complete Jira
-> breakdown — Epic, stories, subtasks, acceptance criteria, and dependency links —
-> using Anthropic's Claude. Runs entirely on Atlassian Forge with your own Anthropic
-> API key (BYOK): no servers, no GPU, no data routed through our infrastructure.
+> Most AI tools expand a one-line prompt or enrich a single ticket. Spec2Tickets reads an
+> *entire* Confluence specification and generates a complete Jira breakdown — Epic, stories,
+> subtasks, acceptance criteria, story points, and cross-feature dependency links — using
+> Anthropic's Claude. It runs entirely on Atlassian Forge with your own Anthropic API key
+> (BYOK), so you can process your real, confidential specs with no vendor backend in between.
 
 ### Full description ("More details")
 
-**Specifications in. Structured work out.**
+**An entire spec in. A complete backlog out.**
 
-Spec2Tickets turns a Confluence specification page into a ready-to-use Jira
-breakdown in about a minute or two. Point it at any spec, and Claude Sonnet 4.6
-produces an Epic, stories, subtasks, acceptance criteria, cross-feature
-dependency links, and quality signals — which you review and edit before anything
-reaches Jira.
+Most AI backlog tools start from a one-line prompt or enrich a single Jira ticket.
+Spec2Tickets works at a higher altitude: point it at a whole Confluence specification and
+Claude Sonnet 4.6 produces a complete, ready-to-work Jira breakdown — an Epic, stories,
+subtasks, acceptance criteria, story-point estimates, and cross-feature dependency links —
+which you review and edit before anything reaches Jira.
 
-**Why teams use it**
+**Why teams choose Spec2Tickets**
 
-- **Frontier-AI breakdown.** Claude analyzes the full spec and proposes a complete,
-  structured decomposition — not a keyword extract. Each story carries acceptance
-  criteria, a priority, a story-point estimate, and category labels.
-- **Human-in-the-loop review.** Every breakdown opens in an interactive editor.
-  Adjust stories, acceptance criteria, priority, story points, dependencies, and
-  labels — then approve. AI assists; humans decide. Nothing is created in Jira until
-  you push.
-- **Bring your own key (BYOK).** The app runs entirely on Atlassian Forge and calls
-  Claude with *your own* Anthropic API key. No backend to host, no GPU, no Docker —
-  and no content routed through Spec2JIRA servers. Your AI usage stays on your own
-  Anthropic account.
-- **Clean Jira output.** One Epic, stories with acceptance criteria and embedded task
-  checklists, subtasks, and Story-blocks-Story dependency links — created in your
-  project with one click, under your own Atlassian permissions.
+- **From your spec, not from scratch.** It reads your approved specification — not a prompt
+  you retype — so the backlog stays traceable to the source, with nothing important invented
+  or dropped. Large, dense specs included.
+- **Depth your engineers will thank you for.** Not a flat list: a real hierarchy (Epic →
+  stories → subtasks) with acceptance criteria, story points, priority, category labels, and
+  mapped blocks / is-blocked-by dependencies — a backlog your delivery team can actually pick
+  up and run.
+- **Your data, your key, your agreement.** Runs entirely on Atlassian Forge and calls Claude
+  with *your own* Anthropic API key. No vendor backend, no GPU, no content routed through our
+  servers — so you can run real, confidential specifications, governed by your own agreement
+  with Anthropic, not fictional placeholders.
+- **Human-in-the-loop review.** Every breakdown opens in an interactive editor: adjust stories,
+  acceptance criteria, dependencies, priority, story points, and labels, then approve. AI
+  assists; you decide. Nothing is created in Jira until you push.
+- **Clean, one-click Jira output.** One Epic, stories with acceptance criteria and embedded task
+  checklists, subtasks, and Story-blocks-Story links — created in your project under your own
+  Atlassian permissions.
 
 **How it works**
 
@@ -88,18 +98,20 @@ reaches Jira.
 4. **Push to Jira** — one Epic, stories, subtasks, and dependency links, created in
    your project with one click.
 
-**Privacy by design.** Your spec content flows directly from Atlassian Forge to the
-Anthropic API using your key. Spec2JIRA operates no backend and never receives your
-content on its own servers. See the full [Privacy Policy](https://spec2jira.com/privacy).
+**Privacy by design.** Because the app has no backend and uses your own Anthropic API key,
+your specification content goes straight from Atlassian Forge to Anthropic under your own
+agreement — so you can run real, confidential specs through it, not sanitized placeholders.
+Spec2JIRA operates no backend and never receives your content on its own servers. See the
+full [Privacy Policy](https://spec2jira.com/privacy).
 
 ### Feature highlights (the 3–4 highlight cards)
 
 | Title | Body |
 |---|---|
-| Frontier-AI breakdown | Claude Sonnet 4.6 turns a Confluence spec into an Epic, stories, subtasks, acceptance criteria, and dependency links in ~1–2 minutes. |
-| Human review & edit | An interactive editor for stories, ACs, priority, story points, and labels. Nothing reaches Jira until you approve. |
-| Bring your own key | Runs entirely on Atlassian Forge with your own Anthropic API key. No backend, no GPU, no data through our servers. |
-| One-click push to Jira | Epic + stories + subtasks + blocks/is-blocked-by links, created under your own Atlassian permissions. |
+| Spec → full backlog | An entire Confluence spec becomes an Epic, stories, subtasks, acceptance criteria, story points, and dependency links in ~1–2 minutes — not a flat list from a prompt. |
+| Depth your devs will thank you for | Real hierarchy + mapped blocks / is-blocked-by dependencies + sizing — a backlog your delivery team can pick up and run, not raw bullet points. |
+| Your data, your key | Runs entirely on Atlassian Forge with your own Anthropic API key and agreement. No vendor backend — run your real, confidential specs. |
+| Human review, one-click push | Edit stories, ACs, dependencies, priority, and points in an interactive editor; nothing reaches Jira until you approve. |
 
 ### What's new in 3.0.0 (release notes)
 
