@@ -2,6 +2,7 @@ import { useState, useMemo, useEffect } from 'react';
 import EditableField from './EditableField.jsx';
 import CapabilityCard from './CapabilityCard.jsx';
 import SharedACPanel from './SharedACPanel.jsx';
+import LabelsEditor from './LabelsEditor.jsx';
 
 export default function BreakdownEditor({ initialBreakdown, onPush, isPushing = false }) {
   const [breakdown, setBreakdown] = useState(() => JSON.parse(JSON.stringify(initialBreakdown)));
@@ -14,7 +15,9 @@ export default function BreakdownEditor({ initialBreakdown, onPush, isPushing = 
     const caps = breakdown.capabilities || [];
     const features = caps.flatMap((c) => c.features || []);
     const tasks = features.flatMap((f) => f.tasks || []);
-    const totalSP = tasks.reduce((s, t) => s + (t.estimate_story_points || 0), 0);
+    // Story points live on the feature in v3 (tasks carry none); mirror
+    // CapabilityCard's feature-level sum. Tasks are kept only for the count.
+    const totalSP = features.reduce((s, f) => s + (f.story_points || 0), 0);
     return {
       capCount: caps.length, featureCount: features.length,
       taskCount: tasks.length, totalSP,
@@ -28,7 +31,8 @@ export default function BreakdownEditor({ initialBreakdown, onPush, isPushing = 
   function addCapability() {
     setBreakdown((p) => ({ ...p, capabilities: [...p.capabilities, {
       name: 'New Capability', features: [{ name: 'New Feature', user_story: 'As a user, I want [goal], so that [benefit].',
-        acceptance_criteria: ['Acceptance criterion'], tasks: [{ type: 'API', summary: 'New task', estimate_story_points: 3, dependencies: [], priority: 'MEDIUM' }] }]
+        acceptance_criteria: ['Acceptance criterion'], priority: 'Medium', story_points: 3, complexity_score: 3,
+        tasks: [{ type: 'API', summary: 'New task' }] }]
     }] }));
   }
   function resetBreakdown() { setBreakdown(JSON.parse(JSON.stringify(initialBreakdown))); }
@@ -63,34 +67,13 @@ export default function BreakdownEditor({ initialBreakdown, onPush, isPushing = 
       return u;
     });
   }
-  function assignAllSuggestions() {
-    setBreakdown((p) => {
-      const u = JSON.parse(JSON.stringify(p));
-      for (const item of u.shared_acceptance_criteria?.items || []) {
-        // Skip flagged + removed items — only auto-assign clean regular ACs.
-        if (item.removed_by_user || item.quality_warning === 'possible_noise') continue;
-        if (!item.assigned_feature && item.suggested_feature) {
-          item.assigned_feature = item.suggested_feature;
-          _addACToFeature(u, item.suggested_feature, `${item.id}: ${item.text}`);
-        }
-      }
-      return u;
-    });
-  }
 
-  // Track 2 (Audit-X UI editorial control, 2026-05-09).
-  // Soft-delete: stamp removed_by_user=true; if item was assigned to a feature,
-  // unassign + remove from feature.AC (avoids ghost AC remaining in feature
-  // after item soft-deleted from panel). Restorable via "Restore" button
-  // в RemovedSubsection. State persists в breakdown JSON; на JIRA push,
-  // jira_client should skip removed_by_user items (defense-in-depth —
-  // currently they still exist as panel items so jira_client behavior depends
-  // on its current panel-item handling. Future axis: add `removed_by_user`
-  // filter to jira_client.push_breakdown if items leak through).
-  // M-1 self-review fix (2026-05-09): renamed от `_removed` (underscore =
-  // transient/internal convention) to `removed_by_user` (public — must
-  // survive JSON serialization for downstream consumers + future re-import
-  // flows).
+  // Soft-delete a shared AC: stamp removed_by_user=true; if it was assigned to a
+  // feature, unassign + remove it from that feature.acceptance_criteria (so no
+  // ghost AC lingers). The item stays in the breakdown JSON (restorable from the
+  // "Removed" subsection) but, being unassigned, is part of no feature and so is
+  // never pushed to JIRA. `removed_by_user` is a public field so it survives JSON
+  // serialization.
   function removeSharedACItem(sacId) {
     setBreakdown((p) => {
       const u = JSON.parse(JSON.stringify(p));
@@ -113,34 +96,8 @@ export default function BreakdownEditor({ initialBreakdown, onPush, isPushing = 
       const item = u.shared_acceptance_criteria?.items?.find((i) => i.id === sacId);
       if (!item) return p;
       delete item.removed_by_user;
-      // Note: item returns to its original section (regular OR flagged) based
-      // on whether quality_warning is still set. assigned_feature was cleared
-      // on remove; user reassigns if desired.
-      return u;
-    });
-  }
-
-  // Track 2 — restore from "Possible noise" subsection back to regular AC
-  // list. Clears Track 1 critic's quality_warning flag (false-positive
-  // recovery path — BA confirms item IS a real testable AC despite critic
-  // flag). Item moves visually from "Possible noise" group to regular AC
-  // list. Critic-decided drop record в Theme A dropped_items remains for
-  // forensic audit (BA override doesn't rewrite history).
-  function restoreSharedACFromNoise(sacId) {
-    setBreakdown((p) => {
-      const u = JSON.parse(JSON.stringify(p));
-      const item = u.shared_acceptance_criteria?.items?.find((i) => i.id === sacId);
-      if (!item) return p;
-      delete item.quality_warning;
-      delete item.quality_warning_reason;
-      // BA-override marker — useful in case downstream consumers (cross-spec
-      // measurement / Track 1 calibration analysis) want to count BA flips
-      // as critic false-positive signal.
-      // M-1 self-review fix (2026-05-09): renamed от `_ba_restored_from_noise`
-      // (underscore = transient/internal convention) to `restored_from_noise_flag`
-      // (public — must survive JSON serialization for cross-spec FP-rate
-      // measurement scripts to read it).
-      item.restored_from_noise_flag = true;
+      // Item returns to the regular AC list. assigned_feature was cleared on
+      // remove; the user reassigns it if desired.
       return u;
     });
   }
@@ -206,6 +163,12 @@ export default function BreakdownEditor({ initialBreakdown, onPush, isPushing = 
                 multiline className="text-sm leading-relaxed"
                 style={{ color: 'var(--s2j-text-light)' }} />
             </div>
+            <div>
+              <label className="text-[11px] font-medium uppercase tracking-wider mb-1 block"
+                style={{ color: 'var(--s2j-text-muted)' }}>Labels (pushed to the Epic)</label>
+              <LabelsEditor labels={breakdown.epic.labels || []}
+                onChange={(v) => updateEpic('labels', v)} />
+            </div>
           </div>
         )}
 
@@ -216,29 +179,27 @@ export default function BreakdownEditor({ initialBreakdown, onPush, isPushing = 
             availableFeatures={availableFeatures}
             onAssign={assignSharedAC}
             onUnassign={unassignSharedAC}
-            onAssignAll={assignAllSuggestions}
             onRemove={removeSharedACItem}
             onRestore={restoreSharedACItem}
-            onRestoreFromNoise={restoreSharedACFromNoise}
           />
         )}
 
-        {/* Capabilities */}
+        {/* Categories (each groups Stories; pushes as а single root JIRA Epic per Spec2Tickets v3.0.0) */}
         <div className="space-y-3">
           <div className="flex items-center justify-between">
             <h3 className="text-xs font-semibold uppercase tracking-wider"
               style={{ color: 'var(--s2j-text-muted)' }}>
-              Capabilities ({stats.capCount})
+              Categories ({stats.capCount})
             </h3>
             <button onClick={addCapability} className="text-xs transition-colors"
               style={{ color: 'var(--s2j-green)' }}
               onMouseEnter={e => e.target.style.color = 'var(--s2j-green-dark)'}
               onMouseLeave={e => e.target.style.color = 'var(--s2j-green)'}>
-              + Add Capability
+              + Add Category
             </button>
           </div>
           {breakdown.capabilities.map((cap, i) => (
-            <CapabilityCard key={cap._uid || i} capability={cap} index={i}
+            <CapabilityCard key={i} capability={cap} index={i}
               onUpdate={(u) => updateCapability(i, u)} onDelete={() => deleteCapability(i)} />
           ))}
         </div>

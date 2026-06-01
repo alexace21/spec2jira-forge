@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import EditableField from './EditableField.jsx';
 import TaskCard from './TaskCard.jsx';
+import LabelsEditor from './LabelsEditor.jsx';
 
 /**
  * FeatureCard — Editor for a single Feature (→ JIRA Story).
@@ -8,12 +9,12 @@ import TaskCard from './TaskCard.jsx';
  *
  * CG-2 confidence + CG-4 source_heading inline rendering (Layer 2 Trust
  * UX integration, 2026-05-07): when the breakdown carries CG-2 confidence
- * fields (per-Story trust score 0-100 + indicator ✓/⚠/✗ + concern reasons)
- * or CG-4 source_heading (provenance), this card surfaces them inline:
+ * fields (per-Story trust score 0-100 + indicator ✓/⚠/✗) or CG-4
+ * source_heading (provenance), this card surfaces them inline:
  *   - Collapsed header: confidence badge (indicator + score) с palette-
- *     mapped color cluster + native browser tooltip listing concerns.
- *   - Expanded: "Source:" line + "Confidence concerns:" bullet list under
- *     a dashed separator before the editable fields.
+ *     mapped color cluster + native browser tooltip explaining the stance.
+ *   - Expanded: "Source:" line under a dashed separator before the
+ *     editable fields.
  *
  * Backward compat: legacy breakdowns без these fields render exactly как
  * before — guarded by `hasConfidence` + truthy `sourceHeading` checks.
@@ -44,37 +45,63 @@ function _confidenceVisuals(indicator) {
   return null;
 }
 
+// complexity_score 1-5 → color cluster. Low (1-2) green, mid (3) neutral,
+// high (4-5) orange — the honest "these cards are not equal" signal.
+function _complexityVisuals(score) {
+  if (typeof score !== 'number') return null;
+  if (score <= 2) return { fg: 'var(--s2j-green-dark)', bg: 'var(--s2j-green-bg)', border: 'var(--s2j-green-border)' };
+  if (score === 3) return { fg: 'var(--s2j-text-light)', bg: 'var(--s2j-bg-section)', border: 'var(--s2j-border)' };
+  return { fg: 'var(--s2j-orange)', bg: 'var(--s2j-orange-bg)', border: 'var(--s2j-orange-border)' };
+}
+
+// priority High/Medium/Low → color cluster.
+function _priorityVisuals(priority) {
+  const k = String(priority || '').toLowerCase();
+  if (k === 'high') return { fg: 'var(--s2j-red)', bg: 'var(--s2j-red-bg)', border: 'var(--s2j-red-border)' };
+  if (k === 'medium') return { fg: 'var(--s2j-text-light)', bg: 'var(--s2j-bg-section)', border: 'var(--s2j-border)' };
+  if (k === 'low') return { fg: 'var(--s2j-text-muted)', bg: 'var(--s2j-bg-section)', border: 'var(--s2j-border)' };
+  return null;
+}
+
 export default function FeatureCard({ feature, index, onUpdate, onDelete }) {
   const [expanded, setExpanded] = useState(false);
 
   const taskCount = feature.tasks?.length || 0;
-  const totalSP = (feature.tasks || []).reduce(
-    (sum, t) => sum + (t.estimate_story_points || 0), 0
-  );
+
+  // Feature-level sizing signals (v3 — model-suggested, editable below). Replaces
+  // the old task story-point sum, which was always 0 in v3 (tasks carry no SP).
+  const complexity = feature.complexity_score;
+  const priority = feature.priority;
+  const storyPoints = feature.story_points;
+  const complexityVisuals = _complexityVisuals(complexity);
+  const priorityVisuals = _priorityVisuals(priority);
+
+  // Story points are constrained to Fibonacci (story-sized). Include the current
+  // value if it falls outside the set (legacy/edge) so it is never silently lost.
+  const SP_OPTIONS = [3, 5, 8, 13];
+  const spOptions =
+    typeof storyPoints === "number" && !SP_OPTIONS.includes(storyPoints)
+      ? [...SP_OPTIONS, storyPoints].sort((a, b) => a - b)
+      : SP_OPTIONS;
 
   // ── CG-2 confidence + CG-4 source_heading extraction ──
-  // All three fields are optional; legacy breakdowns без them render
-  // unchanged. `hasConfidence` requires BOTH a numeric score AND a
-  // valid indicator (defensive against partial-stamp scenarios).
-  const confidence = feature.confidence;
+  // All three fields are optional; legacy breakdowns without them render
+  // unchanged. `hasConfidence` requires BOTH a numeric score AND a valid
+  // indicator (defensive against partial-stamp scenarios).
+  //
+  // BUG FIX 2026-05-31: v3 emits `confidence_score` (src/prompts.js rule 9);
+  // v2.x used `confidence`. This read `feature.confidence` only, so in v3 it was
+  // always undefined -> hasConfidence false -> the per-feature ✓/⚠/✗ badge NEVER
+  // rendered, leaving the Review-screen "Manual/Review" counts untraceable to a
+  // feature. Read score-first with a legacy fallback.
+  const confidence = feature.confidence_score ?? feature.confidence;
   const confidenceIndicator = feature.confidence_indicator;
-  const confidenceConcerns = feature.confidence_reasons || [];
   const confidenceVisuals = _confidenceVisuals(confidenceIndicator);
   const hasConfidence =
     confidence != null && confidenceIndicator && confidenceVisuals;
   const sourceHeading = (
     feature.source_heading || feature._source_heading || ''
   ).trim();
-
-  // ── Phase 3.8 v3 dep-tracking extraction (Round 5 axis 2026-05-10) ──
-  // dependency_metadata stamped by _apply_v3_edges_to_breakdown ✓ tier
-  // (active feature.dependencies + parallel structured metadata). ⚠ tier
-  // edges live в feature.dependency_review_queue surfaced separately в
-  // Dashboard's DependencyReviewQueue component; this card surfaces only
-  // ✓ tier (auto-applied JIRA Story-blocks-Story link provenance).
-  // Legacy breakdowns без the field render unchanged (empty array shape
-  // skips the rendering block entirely).
-  const dependencyMetadata = feature.dependency_metadata || [];
 
   function updateField(field, value) { onUpdate({ ...feature, [field]: value }); }
 
@@ -90,10 +117,7 @@ export default function FeatureCard({ feature, index, onUpdate, onDelete }) {
   }
 
   function addTask() {
-    const newTask = {
-      type: 'API', summary: 'New task', description: 'Describe the unit of work.',
-      estimate_story_points: 3, dependencies: [], priority: 'MEDIUM',
-    };
+    const newTask = { type: 'API', summary: 'New task' };
     onUpdate({ ...feature, tasks: [...feature.tasks, newTask] });
     if (!expanded) setExpanded(true);
   }
@@ -142,14 +166,16 @@ export default function FeatureCard({ feature, index, onUpdate, onDelete }) {
           {/* CG-2 confidence badge — leads the right-side status cluster
               so BA's eye lands here first when scanning a long feature
               list for ⚠/✗ items needing attention. Native title tooltip
-              surfaces concerns on hover (no extra UI library). */}
+              explains the stance on hover (no extra UI library). */}
           {hasConfidence && (
             <span
               className="rounded-full px-2 py-0.5 text-[10px] font-semibold leading-none"
               title={
-                confidenceConcerns.length > 0
-                  ? `Concerns: ${confidenceConcerns.join('; ')}`
-                  : 'Auto-approve — no concerns flagged'
+                confidenceIndicator === '✓'
+                  ? 'Confident — clean extraction, little or no guesswork. A quick check is still worth it.'
+                  : confidenceIndicator === '⚠'
+                    ? 'Unsure — the AI inferred or assumed some details. Review this feature.'
+                    : 'Low confidence — the spec was vague or contradictory here. Manual review essential.'
               }
               style={{
                 background: confidenceVisuals.bg,
@@ -160,11 +186,32 @@ export default function FeatureCard({ feature, index, onUpdate, onDelete }) {
               {confidenceIndicator} {confidence}
             </span>
           )}
+          {complexityVisuals && (
+            <span
+              className="rounded-full px-2 py-0.5 text-[10px] font-semibold leading-none"
+              title={`Complexity ${complexity}/5 — 1 = trivial, 5 = very complex (inherent difficulty/risk, relative to this spec)`}
+              style={{ background: complexityVisuals.bg, color: complexityVisuals.fg, border: `1px solid ${complexityVisuals.border}` }}
+            >
+              C{complexity}
+            </span>
+          )}
+          {priorityVisuals && (
+            <span
+              className="rounded-full px-2 py-0.5 text-[10px] font-semibold leading-none"
+              title="Suggested delivery priority — adjust in the card"
+              style={{ background: priorityVisuals.bg, color: priorityVisuals.fg, border: `1px solid ${priorityVisuals.border}` }}
+            >
+              {priority}
+            </span>
+          )}
           <span>{taskCount} task{taskCount !== 1 ? 's' : ''}</span>
-          <span className="rounded px-1.5 py-0.5 font-mono"
-            style={{ background: 'var(--s2j-bg-section)', color: 'var(--s2j-text-light)' }}>
-            {totalSP} SP
-          </span>
+          {storyPoints != null && (
+            <span className="rounded px-1.5 py-0.5 font-mono"
+              title="Suggested story points — a starting estimate for the team to calibrate"
+              style={{ background: 'var(--s2j-bg-section)', color: 'var(--s2j-text-light)' }}>
+              {storyPoints} SP
+            </span>
+          )}
         </span>
 
         <span
@@ -185,71 +232,70 @@ export default function FeatureCard({ feature, index, onUpdate, onDelete }) {
       {/* Expanded Content */}
       {expanded && (
         <div className="px-3 pb-3 pt-2.5 space-y-3" style={{ borderTop: '1px solid var(--s2j-border)' }}>
-          {/* CG-4 source provenance + CG-2 confidence concerns — appears
-              ABOVE the editable fields so BA reading-order is:
-                1. Where did this Story come from? (provenance)
-                2. Why might it need attention? (concerns)
-                3. Now edit the fields.
-              Renders only when ≥1 of the two has content; legacy
-              breakdowns без both fields skip this block entirely. The
-              dashed bottom border separates non-editable metadata от
-              editable fields below. */}
-          {(sourceHeading || (hasConfidence && confidenceConcerns.length > 0) || dependencyMetadata.length > 0) && (
+          {/* CG-4 source provenance — appears ABOVE the editable fields so
+              BA reading-order is: where did this Story come from? → now edit
+              the fields. Renders only when source_heading has content; legacy
+              breakdowns без it skip this block entirely. The dashed bottom
+              border separates non-editable metadata от editable fields below. */}
+          {sourceHeading && (
             <div className="space-y-2 pb-2.5"
               style={{ borderBottom: '1px dashed var(--s2j-border)' }}>
-              {sourceHeading && (
-                <div className="flex items-start gap-2">
-                  <span className="text-[10px] font-medium uppercase tracking-wider shrink-0 pt-0.5"
-                    style={{ color: 'var(--s2j-text-muted)' }}>Source</span>
-                  <span className="text-[11px] leading-relaxed"
-                    style={{ color: 'var(--s2j-text-light)' }}>{sourceHeading}</span>
-                </div>
-              )}
-              {hasConfidence && confidenceConcerns.length > 0 && (
-                <div className="flex items-start gap-2">
-                  <span className="text-[10px] font-medium uppercase tracking-wider shrink-0 pt-0.5"
-                    style={{ color: 'var(--s2j-text-muted)' }}>Concerns</span>
-                  <ul className="flex-1 space-y-0.5"
-                    style={{ listStyle: 'none', margin: 0, padding: 0 }}>
-                    {confidenceConcerns.map((reason, i) => (
-                      <li key={i} className="text-[11px] leading-relaxed flex items-start gap-1.5"
-                        style={{ color: 'var(--s2j-text-light)' }}>
-                        <span className="shrink-0 pt-0.5"
-                          style={{ color: 'var(--s2j-text-muted)' }}>•</span>
-                        <span>{reason}</span>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              )}
-              {dependencyMetadata.length > 0 && (
-                <div className="flex items-start gap-2">
-                  <span className="text-[10px] font-medium uppercase tracking-wider shrink-0 pt-0.5"
-                    style={{ color: 'var(--s2j-text-muted)' }}
-                    title="Phase 3.8 v3 cross-feature workflow ordering — ✓ auto-approved (active JIRA Story-blocks-Story link)">
-                    Depends on
-                  </span>
-                  <ul className="flex-1 space-y-0.5"
-                    style={{ listStyle: 'none', margin: 0, padding: 0 }}>
-                    {dependencyMetadata.map((dep, i) => (
-                      <li key={i} className="text-[11px] leading-relaxed flex items-start gap-1.5"
-                        style={{ color: 'var(--s2j-text-light)' }}>
-                        <span className="shrink-0 pt-0.5"
-                          style={{ color: 'var(--s2j-green)' }}>{dep.confidence || '✓'}</span>
-                        <span className="flex-1">
-                          <span style={{ color: 'var(--s2j-text)' }}>{dep.target}</span>
-                          {dep.reason && (
-                            <span className="block text-[10px] italic mt-0.5"
-                              style={{ color: 'var(--s2j-text-muted)' }}>{dep.reason}</span>
-                          )}
-                        </span>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              )}
+              <div className="flex items-start gap-2">
+                <span className="text-[10px] font-medium uppercase tracking-wider shrink-0 pt-0.5"
+                  style={{ color: 'var(--s2j-text-muted)' }}>Source</span>
+                <span className="text-[11px] leading-relaxed"
+                  style={{ color: 'var(--s2j-text-light)' }}>{sourceHeading}</span>
+              </div>
             </div>
           )}
+          {/* Sizing — model-suggested, editable. complexity_score is the model's
+              honest INHERENT-difficulty rating (1-5, display-only); priority +
+              story points are starting suggestions the team calibrates before push. */}
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-2 pb-1">
+            <label className="flex items-center gap-1.5 text-[11px]" style={{ color: 'var(--s2j-text-muted)' }}>
+              <span className="font-medium uppercase tracking-wider">Priority</span>
+              <select
+                value={priority || 'Medium'}
+                onChange={(e) => updateField('priority', e.target.value)}
+                className="text-xs rounded px-1.5 py-0.5"
+                style={{ background: 'var(--s2j-bg)', color: 'var(--s2j-text)', border: '1px solid var(--s2j-border)' }}
+              >
+                <option value="High">High</option>
+                <option value="Medium">Medium</option>
+                <option value="Low">Low</option>
+              </select>
+            </label>
+            <label className="flex items-center gap-1.5 text-[11px]" style={{ color: 'var(--s2j-text-muted)' }}>
+              <span className="font-medium uppercase tracking-wider">Story Points</span>
+              <select
+                value={storyPoints ?? ''}
+                onChange={(e) => updateField('story_points', e.target.value === '' ? null : Number(e.target.value))}
+                className="text-xs rounded px-1.5 py-0.5"
+                style={{ background: 'var(--s2j-bg)', color: 'var(--s2j-text)', border: '1px solid var(--s2j-border)' }}
+              >
+                <option value="">—</option>
+                {spOptions.map((v) => (
+                  <option key={v} value={v}>{v}</option>
+                ))}
+              </select>
+            </label>
+            <span
+              className="text-[11px]"
+              style={{ color: 'var(--s2j-text-muted)' }}
+              title="Model's inherent-complexity rating. Scale: 1 = trivial · 2 = small · 3 = moderate · 4 = complex · 5 = very complex."
+            >
+              <span className="font-medium uppercase tracking-wider">Complexity</span>{' '}
+              <span style={{ color: 'var(--s2j-text)' }}>{complexity != null ? `${complexity}/5` : '—'}</span>
+            </span>
+          </div>
+
+          <div>
+            <label className="text-[11px] font-medium uppercase tracking-wider mb-1 block"
+              style={{ color: 'var(--s2j-text-muted)' }}>Labels</label>
+            <LabelsEditor labels={feature.labels || []}
+              onChange={(val) => updateField('labels', val)} />
+          </div>
+
           <div>
             <label className="text-[11px] font-medium uppercase tracking-wider mb-1 block"
               style={{ color: 'var(--s2j-text-muted)' }}>Feature Name</label>
@@ -311,7 +357,7 @@ export default function FeatureCard({ feature, index, onUpdate, onDelete }) {
                 style={{ color: 'var(--s2j-green)' }}>+ Add Task</button>
             </div>
             {feature.tasks.map((task, tIdx) => (
-              <TaskCard key={task._uid || tIdx} task={task} index={tIdx}
+              <TaskCard key={tIdx} task={task} index={tIdx}
                 onUpdate={(updated) => updateTask(tIdx, updated)}
                 onDelete={() => deleteTask(tIdx)} />
             ))}

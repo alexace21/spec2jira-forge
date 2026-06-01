@@ -1,0 +1,14 @@
+{
+  "name": "spec2jira-forge-v3-prototype",
+  "version": "0.1.0",
+  "description": "Spec2Tickets v3.0.0 Phase 1 prototype — Anthropic API structured-output breakdown generation. Standalone Node.js test harness (not Forge-deployed). See README.md для usage.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "test": "node test_prototype.js",
+    "smoke": "node test_prototype.js fixtures/sample_spec.md"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
