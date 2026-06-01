@@ -506,7 +506,7 @@ async function verifyAndRepairCycles(breakdown, apiKey, model) {
       if (f && Array.isArray(f.dependencies) && f.dependencies.includes(cut.cut_to)) {
         f.dependencies = f.dependencies.filter((d) => d !== cut.cut_to);
         resolves++;
-        console.log(`[cycle] cut "${cut.cut_from}" → "${cut.cut_to}" (${cut.reason || 'softer edge'})`);
+        console.log('[cycle] auto-resolved a dependency cycle (cut the softer edge)');
         concerns.push(
           `[RISK|low] Circular dependency auto-resolved: dropped the "${cut.cut_from}" → "${cut.cut_to}" blocker (${cut.reason || 'softer edge'}). Confirm the ordering.`,
         );

@@ -10,7 +10,6 @@
   },
   "dependencies": {
     "@forge/api": "^7.2.1",
-    "@forge/events": "^1.0.3",
     "@forge/kvs": "^1.6.4",
     "@forge/resolver": "1.7.1"
   }
