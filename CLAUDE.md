@@ -330,6 +330,77 @@ package names de-scaffolded (→ `spec2tickets`). Build green (bundle ≈ −1.4
 
 ---
 
+## ⚡ HANDOVER NOTE (2026-06-01 — Marketplace rejection recovery + full listing rebuild + RESUBMITTED)
+
+**The big reframe:** this was NOT a fresh Marketplace launch. The app (`e804f31f`,
+listed "Spec2Tickets for Confluence", vendor `spec2jira`) was **REJECTED by
+Atlassian's security BOT (2026-05-27): the remote host did not validate the Forge
+Invocation Token (FIT)** — impersonation risk inherent to the OLD self-hosted Qwen
+backend (`api.spec2jira.com`). The v3 BYOK/Forge pivot **architecturally eliminates
+it** (no remote host → nothing to validate a FIT; confirmed `manifest.yml` has no
+`remotes:`, only `permissions.external.fetch` → `api.anthropic.com`). Full record:
+`memory/marketplace-launch-state.md`.
+
+**Production (3 `forge deploy -e production --no-verify` today; prod was stuck on the
+rejected 3.0.0):**
+- Deploy 1 = the FIT fix (ship the no-backend v3 code).
+- Deploy 2 = removed dead `@forge/events` dep (the ONLY runtime vuln source; unused —
+  manifest has no consumers) → **0 runtime vulns** (`npm audit --omit=dev`).
+- Deploy 3 = tightened 2 content-derived logs so "Log End-User Data: No" is true
+  (`index.js:509` cycle-cut feature names → generic; `push_handler.js:776`
+  subtask-failure payload → Jira status/messages/field-names only). The other
+  content-touching line (`anthropic_client.js:540`) is a **user-facing returned error
+  detail, not a Forge log** — left intact.
+- `ENFORCEMENT_MODE=block` set + active (verified `usage.js:61` — anything ≠ 'meter'
+  ⇒ block). Marketplace Hub auto-created versions **4.0.0/4.1.0/4.2.0** from the 3
+  deploys; **4.2.0 = the final resubmitted build** (Forge prod is now "v4").
+- **Smoke-tested GREEN** E2E (Settings→Generate→Review→Push) on
+  **`alexacenov.atlassian.net`** (the partner's own clean site, Confluence+Jira).
+  `vs-overlord22.atlassian.net` in `forge install list` = **an Atlassian reviewer's
+  site** (partner has no access — confirmed via admin.atlassian.com); ignore it.
+
+**Marketplace listing v4.2.0 — rebuilt v3-accurate; hunted the self-hosted/Qwen
+narrative out of EVERY surface** (it hid in: tagline, summary, vendor "About", app
+"More details", Highlight 2, the description). Now consistent across **code ↔ privacy
+policy ↔ security questionnaire ↔ listing**:
+- App details de-staled; "compatible with Jira" checked; personal-data=No; analytics
+  empty. Vendor profile: new mission-led "About Spec2JIRA"; contact; **bank/payout**
+  (UniCredit Bulbank AD, SWIFT UNCRBGSF, Sofia 1000; Tax ID=EGN as individual).
+- **Privacy & Security questionnaire reconciled to the truth:** process-outside-
+  Atlassian=Yes (Anthropic content); **EEA transfer=Yes + GDPR mechanism=Yes (SCCs via
+  the customer's Anthropic DPA — lawyer-confirmed OK)**; Data Residency=**option 3**
+  (stores within Atlassian — matches the scope justification + privacy policy; NOT
+  "does not store"); log-sharing=No; scope justification filled (≤1000, 5 scopes +
+  "creates-only-never-deletes"); security contact `security@spec2jira.com` (monitored).
+- Version 4.2.0: More details rebuilt (Problem/Solution/Human-in-Loop/**BYOK** — no
+  Qwen/GPU); summary "Forge + BYOK rebuild on Anthropic Claude"; License "Commercial -
+  no charge" + **Bonterms standard EULA**; Highlights (H1 AI breakdown · **H2 "Your
+  Data, Your Key" BYOK + fresh Settings screenshot** · H3 confirm-screen signals —
+  *partner may polish the "Dashboard" title; the standalone Dashboard was removed in
+  v3*); **Compatibility = Confluence Cloud + Jira Cloud**; Links (docs/privacy +
+  standard agreement).
+- **RESUBMITTED** → new ECOHELP ticket pending → BOT re-scan. Expected to pass: FIT
+  (no remote host) + deps clean.
+
+**NEXT SESSION (partner's stated plan):**
+1. **When the new ECOHELP ticket opens → fill the required vendor questionnaires**
+   (partner returns for this).
+2. **Pro €39 pricing** — configured at the **APP level**, likely **gated until
+   approval** (a rejected app can't sell). Sequence so block-enforcement has an
+   upgrade path before the app is public (else free users dead-end at 3/mo — consider
+   temp `ENFORCEMENT_MODE=meter`). Resolve **flat-€39 vs Atlassian's per-user** model.
+   `memory/monetization-strategy.md`.
+3. ⭐ **POST-APPROVAL: wire `PRO_UPGRADE_URL` → real payment** on `LimitReachedScreen` +
+   the Account-panel CTA (currently info-only). `memory/marketplace-launch-state.md`.
+4. Spot-check all listing images are current English v3 (no old/Bulgarian/self-hosted
+   stragglers).
+
+С усмивка ✨ — отхвърлянето е архитектурно решено (не закърпено), listing-ът е честен
+и v3-чист навсякъде, production е smoke-нат зелен, и app-ът е подаден за повторно ревю.
+Готов за пазара — отново.
+
+---
+
 ## ⚡ HANDOVER NOTE (2026-05-31 — pre-rollout: rigorous audit + dead-code cleanup + reliability + confidence/UX)
 
 A long, high-density session on top of the launch-prep note below. **9 commits on

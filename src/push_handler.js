@@ -773,7 +773,9 @@ async function stepSubtasks(s) {
   s.cursor = end;
   console.log(`[push] subtasks chunk ${start}-${end}/${flat.length}: ${s.counts.subtasks_created} ok, ${s.counts.subtask_failures} failed`);
   if (s.counts.subtask_failures > 0 && s.failureDetails.subtasks[0]) {
-    console.warn(`[push] subtask failure sample: ${JSON.stringify(s.failureDetails.subtasks[0]?.batchError?.[0] || s.failureDetails.subtasks[0]).substring(0, 400)}`);
+    const je = s.failureDetails.subtasks[0]?.batchError?.[0];
+    const fields = Object.keys(je?.elementErrors?.errors || {});
+    console.warn(`[push] subtask failure — Jira status ${je?.status ?? 'unknown'}; messages: ${JSON.stringify(je?.elementErrors?.errorMessages || []).substring(0, 200)}; fields: ${fields.join(',')}`);
   }
   if (s.cursor >= flat.length) {
     s.cursor = 0;
