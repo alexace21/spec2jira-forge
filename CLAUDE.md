@@ -330,6 +330,47 @@ package names de-scaffolded (→ `spec2tickets`). Build green (bundle ≈ −1.4
 
 ---
 
+## ⚡ HANDOVER NOTE (2026-06-01 PM — competitive analysis + positioning + product-improvements roadmap)
+
+A **strategy/research** session (NO app-code changes; only docs + memory + listing copy). Direct-competitor
+analysis on the partner's request → positioning decisions → a forward product roadmap.
+
+**Competitive analysis (full report: `memory/competitive-landscape.md`).** Three Jira-native rivals profiled
+(a multi-agent **workflow** read all 12 POPal docs + pricing + reviews; the rest via Marketplace REST +
+partner screenshots/live trials):
+- **POPal** (Agilemove, `popal.plugins.epicstory`) — THE incumbent: 211 installs · 4.1/5 (11 reviews) ·
+  Jira **Cloud + DC** · ChatGPT · **hybrid vendor-paid + BYOK/private-LLM** · free ≤10 then ~$6/user/yr.
+  Issue-level (title+desc ONLY), test cases + **Selenium automation scripts**, Zephyr/Xray, Project Context +
+  layered prompts. Weak: slow (1-5 min), single-issue scope, support complaints, review-gate was flag-gated.
+- **Storygenie** (`au.com.storygenie`) — cheapest: 45 installs · multi-model · **free ≤10** then ~$4.50/user/yr ·
+  prompt→flat backlog · **no GDPR/SCC, "don't enter real data."**
+- **StoryLoop** (Formkraft) — newest: 13 installs · GitHub PR-loop · but test-cases **BROKEN** on trial · ~€42, no free.
+
+**Decisions (do NOT re-litigate):**
+- **Positioning = "spec-to-backlog engine"**: altitude (whole spec, not prompt/ticket) · depth (hierarchy +
+  dependencies + sizing) · privacy (BYOK = process your *real* spec under your own Anthropic agreement — the
+  answer to Storygenie's "don't enter real data"). Dev-delight = a buying argument to the BA/PO.
+  **`docs/MARKETPLACE-LISTING-v3.md` §2 sharpened to this** (apply on the NEXT listing edit; review still pending).
+- **Free tier stays 3/mo** (raise to 5 only on complaints). Do NOT match rivals' free-≤10-unlimited — our
+  value-per-breakdown is high + metric is per-breakdown; the mandatory **30-day Pro trial** is the "wow".
+- **⚠ CORRECTIONS:** "only we're BYOK" is FALSE — POPal offers BYOK/private-LLM too (sharper angle = Anthropic +
+  spec-level + customer DPA). The Managed-tier **"Anthropic reselling approval" premise is also wrong**: Commercial
+  Terms **A.1 permit "powering your own product"**; our pipeline ≠ reselling → **no special approval needed**
+  (formal reseller agreement optional only at ~6-figure API spend). Real work = our own DPA + zero-retention +
+  customer DPA. (`memory/monetization-strategy.md` updated.)
+
+**Forward roadmap → `docs/PRODUCT-IMPROVEMENTS-HANDOVER.md`** — build in a FRESH session on a NEW branch
+**`feature/product-improvements`** (isolated from launch/resubmit on `feature/v3-pivot`): P1 **Project Context /
+glossary injection** (table-stakes — both rivals have it) · P1/P2 **test-case generation** · P2 custom
+prompt/house-style · P2/P3 editor-UX · **P-next Managed (no-key) tier** (HYBRID — keep BYOK). NOT doing: in-Jira
+issue panel · per-dev-seat pricing. Future vision: capacity-sheet → sprint planning (spec→backlog→**plan**).
+New memory: `competitive-landscape.md`, `product-improvements.md`.
+
+**NEXT SESSION:** the launch/resubmit track below is unchanged; PLUS, when ready, spin up
+`feature/product-improvements` from the handover doc.
+
+---
+
 ## ⚡ HANDOVER NOTE (2026-06-01 — Marketplace rejection recovery + full listing rebuild + RESUBMITTED)
 
 **The big reframe:** this was NOT a fresh Marketplace launch. The app (`e804f31f`,
