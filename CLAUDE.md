@@ -35,6 +35,12 @@ load-bearing rules in one breath (full detail in POLICY.md):
   (rigorous mentor mode) · **refuse anti-patterns** (patch-specific, silent fail,
   big-everything call).
 - **Bulgarian in conversation; English in all user-facing strings + UI copy.**
+- ⭐ **Conductor model (§13, NEW 2026-06-02)** — Claude orchestrates ISOLATED agents for
+  all substantive work (analyze → design → proposal → confidence-vote → pitfalls/edge-cases
+  → implement → review + different-lens auditor), passing each the upstream output it needs
+  (§8) and reading their reports. Use the Workflow/Agent tools by DEFAULT (standing opt-in);
+  scale to the task (trivial verifiable steps skip the ceremony). The conductor owns the
+  policy; the agents apply it.
 
 ---
 
@@ -68,21 +74,24 @@ Settled. Do NOT reopen these in future sessions:
 - **BYOK** — the customer brings their own Anthropic API key (pays Anthropic for
   compute directly). No Spec2Tickets-operated backend.
 - **Pricing (MVP early access — REVISED 2026-06-01 UP from €20):** **Free = 3
-  breakdowns/month** (resets the 1st, UTC) · **Pro = €39/month flat, "Early Access"**
+  breakdowns/month** (resets the 1st, UTC) · **Pro = per-user €3.90/user/mo (Paid via Atlassian; 1-10 tier = €39 floor, declining taper), "Early Access"**
   → unlimited breakdowns. €39 (not €20) because pricing is value-based, not
   cost-based: under BYOK the subscription is pure app-value — a spec→JIRA breakdown
   saves ~1-3 h of BA/PO time (~€50-200 each), so €20 under-captured (~2-10% of the
   value) AND under-signalled (B2B buyers eliminate the cheapest option first). €29 is
   the floor; €20 is retired. Sold as the Marketplace subscription — `resolveTier()`
   reads `context.license.active` → active ⇒ Pro.
-- **NEXT pricing iteration — per-seat above 10 users.** Atlassian-native model = flat
-  ≤10 users, then per-user above (advanced apps run $10-30/user/mo); a €39 flat alone
-  under-prices large teams (a 200-user org pays the same as a 3-person team). So:
-  launch €39 flat early-access; THEN add ~€5/user above 10 → captures big-team value +
-  matches Marketplace norms. Frame **introductory + grandfather early adopters**
-  (`memory/migration-protections.md`) so the structure can evolve UP without churn.
+- **Pricing model — per-user (Paid via Atlassian), DECIDED 2026-06-01.** Atlassian forces
+  per-user tiers for cloud apps (no single flat fee). Base **€3.90/user/mo** → the **1-10
+  tier resolves to €39/mo** (our value anchor; floor = per-user × 10), with **declining**
+  rates above and a **steep taper above ~100 users** (Paid-via-Atlassian licenses the WHOLE
+  instance — all users, not just app users). The earlier "flat €39" and "~€5/user above 10"
+  are both retired (€5/user would break the €39 anchor / invert the discount). Premium peer to
+  StoryLoop (~€42 ≤10); deliberately above budget rivals (free ≤10). Frame **"Early Access" +
+  grandfather early adopters** (`memory/migration-protections.md`) so the curve can evolve
+  without churn. Details: `docs/MARKETPLACE-LISTING-v3.md` §3.
 - **`block` is correct.** Free → 3 → block → Pro is a sound freemium funnel: the free
-  trial acquires, the €39 flat early-access deal is the generous part. "Land-grab" =
+  trial acquires, the per-user Pro early-access deal (≤10 = €39) is the generous part. "Land-grab" =
   attractive PRICING + early-access framing + grandfathering
   (`memory/migration-protections.md`), NOT an unlimited free tier.
 - **`ENFORCEMENT_MODE` is per Forge environment** (`src/usage.js`, from `process.env`):
@@ -276,8 +285,8 @@ Spec2jira spec (39 feat / 162 subtask / dense deps) validated through chunked pu
 
 ✅ **P3a — tier enforcement** (`src/usage.js`): per-site monthly breakdown counter
 (KVS `usage:YYYY-MM`), license-aware `resolveTier`, `ENFORCEMENT_MODE` flag. Model:
-**Free 3/month + Pro €39/month flat (early access; per-seat above 10 users next)**
-(BYOK-only economics — customer pays Anthropic; the €39 buys the app).
+**Free 3/month + Pro per-user €3.90/user/mo (Paid via Atlassian; 1-10 tier = €39 floor, declining taper; "Early Access")**
+(BYOK-only economics — customer pays Anthropic; the subscription buys the app).
 `startGeneration` checks/consumes (fail-open,
 consume-on-success); `getUsage` feeds a usage badge on Ready; quota_exceeded →
 upgrade + reset date.
@@ -353,6 +362,10 @@ partner screenshots/live trials):
   **`docs/MARKETPLACE-LISTING-v3.md` §2 sharpened to this** (apply on the NEXT listing edit; review still pending).
 - **Free tier stays 3/mo** (raise to 5 only on complaints). Do NOT match rivals' free-≤10-unlimited — our
   value-per-breakdown is high + metric is per-breakdown; the mandatory **30-day Pro trial** is the "wow".
+- **PRICING MODEL → per-user (same session, after a forced Marketplace change):** marking the app
+  **"Paid via Atlassian"** forces per-user tiers (no flat fee) → Pro is now **€3.90/user/mo (1-10 tier =
+  €39 floor, declining taper)**, NOT flat €39. This is the Atlassian-native model we'd already planned —
+  it just arrived now. Listing §3/§6 + `memory/monetization-strategy.md` updated to match.
 - **⚠ CORRECTIONS:** "only we're BYOK" is FALSE — POPal offers BYOK/private-LLM too (sharper angle = Anthropic +
   spec-level + customer DPA). The Managed-tier **"Anthropic reselling approval" premise is also wrong**: Commercial
   Terms **A.1 permit "powering your own product"**; our pipeline ≠ reselling → **no special approval needed**
@@ -426,10 +439,10 @@ policy ↔ security questionnaire ↔ listing**:
 **NEXT SESSION (partner's stated plan):**
 1. **When the new ECOHELP ticket opens → fill the required vendor questionnaires**
    (partner returns for this).
-2. **Pro €39 pricing** — configured at the **APP level**, likely **gated until
+2. **Pro pricing — per-user €3.90/user (DECIDED 2026-06-01; Paid via Atlassian → 1-10 tier = €39 floor, declining taper).** Configured at the **APP level**, likely **gated until
    approval** (a rejected app can't sell). Sequence so block-enforcement has an
    upgrade path before the app is public (else free users dead-end at 3/mo — consider
-   temp `ENFORCEMENT_MODE=meter`). Resolve **flat-€39 vs Atlassian's per-user** model.
+   temp `ENFORCEMENT_MODE=meter`).
    `memory/monetization-strategy.md`.
 3. ⭐ **POST-APPROVAL: wire `PRO_UPGRADE_URL` → real payment** on `LimitReachedScreen` +
    the Account-panel CTA (currently info-only). `memory/marketplace-launch-state.md`.

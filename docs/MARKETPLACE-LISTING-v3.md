@@ -125,21 +125,30 @@ full [Privacy Policy](https://spec2jira.com/privacy).
 
 ## 3. Pricing editions
 
-Two paid editions configured per-instance (Marketplace handles billing; the customer
-brings their own Anthropic key on every plan — the subscription covers the app only).
+Two editions (Marketplace handles billing; the customer brings their own Anthropic key on
+every plan — the subscription covers the app only). **Pricing model: Paid via Atlassian,
+per-user** — Atlassian requires per-user tiers for cloud apps (no single flat fee); the base
+rate resolves the small-team price to our €39 value anchor (see Pricing notes below).
 
 | Edition | Price | What it includes |
 |---|---|---|
 | **Free** | €0 | 3 breakdowns per month. Full editor, push to Jira, dependency links — no feature gating, only a monthly volume cap. |
-| **Pro — Early access** | €39 / month (flat) | Unlimited breakdowns. Everything in Free with no monthly cap. *(Planned next iteration: per-seat ~€5/user above 10 users.)* |
+| **Pro — Early access** | **€3.90 / user / month** (Paid via Atlassian) | Unlimited breakdowns. Billed per Atlassian's user tiers — **1-10 users = €39/month** (floor; = per-user × 10), declining per-user above 10. Everything in Free, no monthly cap. |
 
 **Portal notes:**
 - Set Free as the default edition so install → 3 free breakdowns works with no purchase.
 - The monthly cap resets on the 1st (UTC); enforcement is built into the app
   (`src/usage.js`), license-aware via `context.license.active`.
-- **Pricing (DECIDED 2026-06-01):** €39/month flat early-access (was €20 — revised up:
-  value-based, not cost-based). Per-seat (~€5/user) above 10 users is the next
-  iteration. Frame introductory + grandfather early adopters.
+- **Pricing model (DECIDED 2026-06-01): Paid via Atlassian, per-user — base €3.90/user/month**,
+  so the **1-10 user tier resolves to €39/month** (our value anchor; floor = per-user × 10).
+  Set **declining** per-user rates at higher tiers (Atlassian "price guidance"); use a **steep
+  taper above ~100 users** because Paid-via-Atlassian licenses the *whole instance* (all users,
+  not just app users). Illustrative monthly curve: 1-10 €3.90 (=€39) · 11-100 ~€3.20 · 101-250
+  ~€2.20 · 251-1000 ~€1.20 · 1001+ ~€0.60↓. Premium peer to StoryLoop (~€42 ≤10); deliberately
+  above budget rivals (POPal/Storygenie free ≤10) — compete on value, not price. The earlier
+  "flat €39" / "~€5/user above 10" are retired (Atlassian forces per-user; €5/user would break
+  the €39 anchor / invert the volume discount). Frame **"Early Access"** + grandfather early
+  adopters (see `memory/migration-protections.md`).
 - Enforcement mode is per-environment: **production = block** (freemium funnel),
   development = meter. Set the production env variable before go-live.
 
@@ -239,7 +248,7 @@ These are the data-handling fields in the listing form (mandatory for cloud apps
 - [ ] Site live: landing, /docs, /privacy reachable at spec2jira.com (HTTPS).
 - [ ] Set production `ENFORCEMENT_MODE` (block) env variable.
 - [ ] Upload public version **3.0.0**; fill listing copy (§2), highlights, what's-new.
-- [ ] Configure pricing editions (§3): Free default + Pro €39 (early access; per-seat above 10 users next).
+- [ ] Configure pricing editions (§3): Free default + **Pro per-user €3.90/user** (Paid via Atlassian; 1-10 tier = €39 floor, declining taper; "Early Access").
 - [ ] Fill privacy/security listing fields (§4) + the questionnaire (§5).
 - [ ] Select **Atlassian standard EULA**.
 - [ ] Add screenshots (picker → editor → confirm/dashboard → Jira result) + an icon.
