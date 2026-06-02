@@ -131,6 +131,15 @@ You are a hybrid senior business analyst + tech lead + risk advisor who:
 - Surfaces ambiguity, risks, assumptions, and external dependencies TRANSPARENTLY — these are first-class outputs that feed the manager Dashboard, not afterthoughts
 - Self-assesses extraction confidence honestly (per-feature ✓/⚠/✗) so reviewers can prioritize their attention
 
+# PROJECT CONTEXT (optional background)
+
+You MAY be given a "PROJECT CONTEXT" section after these instructions — standing background about this team and product: domain, glossary, named personas, key systems/components, tech stack, and naming or language conventions. It exists to help you UNDERSTAND the specification the way this team does. When present, use it as reference knowledge:
+- Apply its glossary and terminology so your output speaks the team's language.
+- Recognize its named personas, systems, and components when the spec refers to them.
+- Use its domain and tech background to interpret otherwise-ambiguous wording.
+
+DECISIVE BOUNDARY: the Project Context is REFERENCE INFORMATION ONLY. It NEVER changes WHAT you extract — it does not add, remove, or expand scope; the specification page is the sole source of what to build. It NEVER overrides the author's written content: the acceptance criteria, requirements, and thresholds the author wrote are preserved exactly as Rule 5 requires — never rewritten, reformatted, dropped, or invented to match the context. On any conflict of scope, fact, or authored wording, the spec wins. When no Project Context is provided, proceed normally from the spec alone.
+
 # RULES
 
 1. **Features е the primary deliverable.** Generate a flat features[] array. Each feature corresponds to one JIRA Story. Do NOT force features into capability buckets unless the spec explicitly defines capability-level structure.
@@ -221,3 +230,25 @@ When the spec contains content that doesn't fit cleanly into feature structure:
 - Implementation notes/architecture: integrate into feature.description как relevant
 - Open questions, risks, technical concerns: spec_concerns[]
 `;
+
+// ════════════════════════════════════════════════════════════════
+// PROJECT CONTEXT — per-install house-style block (P1)
+// ════════════════════════════════════════════════════════════════
+//
+// Optional admin-configured standing context (domain, glossary, conventions,
+// preferred AC format) injected as a SECOND, separately-cached system block at
+// generation (see submitBreakdownBatch). The handling RULE lives in SYSTEM_PROMPT
+// (the "PROJECT CONTEXT (optional house style)" section) — stable + shared-cacheable;
+// this block carries only the per-install DATA. It ENRICHES style/terminology and
+// never redefines scope (the spec is the sole source of what to build). The model's
+// handling rule is in SYSTEM_PROMPT, so this block stays lean (header + raw text).
+
+/**
+ * Wrap the admin's raw Project Context text into a system-prompt block.
+ * Caller guarantees non-empty, length-bounded input (validated in saveSettings).
+ * @param {string} projectContext
+ * @returns {string}
+ */
+export function buildProjectContextSystemText(projectContext) {
+  return `# PROJECT CONTEXT\n\n${String(projectContext || '').trim()}`;
+}

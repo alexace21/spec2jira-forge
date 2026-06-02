@@ -44,6 +44,10 @@ import {
   fetchBatchResults,
   estimateCost,
   resolveDependencyCycle,
+  distillCategory,
+  trimToBudget,
+  DISTILL_CATEGORIES,
+  DISTILL_MAX_INPUT_CHARS,
   MODEL_PRIMARY,
   MODEL_FALLBACK,
 } from './anthropic_client.js';
@@ -64,6 +68,42 @@ const resolver = new Resolver();
 
 const SETTINGS_KEY = 'spec2jira_settings';
 
+// Max length of the optional admin-configured Project Context (house style /
+// glossary / conventions) injected into every generation (P1). Bounded so it stays
+// a concise standing context, not an unbounded document (POLICY §12), and never
+// drifts into a growing keyword/cue list (POLICY §5 — keep it ONE bounded field).
+// The UI mirrors this for fail-fast feedback; this server check is authoritative.
+// 12000: the 6-call decomposed distill produces a COMPLETE multi-category profile, and a
+// genuinely rich regulated domain (the bilingual 3-site sepsis CDS) merges to ~7.5K chars
+// of pure signal — 8000 left almost no headroom and risked silently trimming the LAST
+// category (Conventions: the counterintuitive rules + lineage carve-out). 12000 fits the
+// complete profile with room and still leaves a hand-editable draft; the aggregate store
+// size is guarded gracefully in saveSettings (a too-large write is rejected with a clear
+// message, never silently dropped).
+const PROJECT_CONTEXT_MAX_CHARS = 12000;
+
+// "Distill with Claude" is a 6-call CHUNKED pipeline (startDistillSession → distillStep ×6,
+// looped by the UI — mirrors the chunked JIRA push). Each call extracts ONE category from
+// the SAME full input with its own generous per-category token budget (DISTILL_CATEGORIES in
+// anthropic_client.js), so no category is starved by another — the fix for the single call's
+// depth-first category drops (validated 8/8 vs 5/8 in a 2026-06-02 Haiku bake-off). Each call
+// is small (~3-13s), well under the 25-sec resolver limit (gotcha #4). The 6 sections are
+// accumulated in KVS and merged at the last step, then bounded to PROJECT_CONTEXT_MAX_CHARS
+// (PROJECT_CONTEXT_MAX_CHARS, so the user can still hand-edit the draft).
+const DISTILL_SESSION_PREFIX = 'distill_session:';
+
+// Named Project Context profiles. A workspace can hold specs from multiple projects,
+// so a SINGLE global context would misapply across them (project A's glossary on a
+// project B spec = wrong output). Profiles let the user pick the right context per
+// generation. Per-profile + count caps bound each entry; the AGGREGATE serialized
+// size is guarded in saveSettings — 20 × 12000 chars (plus non-ASCII at 2-4 UTF-8
+// bytes/char) can approach the ~240KB KVS value cap, so the write is size-checked.
+const MAX_CONTEXT_PROFILES = 20;
+const CONTEXT_PROFILE_NAME_MAX = 60;
+// Aggregate settings-object byte ceiling (well under the ~240KB KVS value cap, leaving
+// headroom for the non-context fields). Checked in saveSettings before the write.
+const SETTINGS_MAX_BYTES = 200000;
+
 // KVS prefix for generation job state (Anthropic batch lifecycle).
 const JOB_KEY_PREFIX = 'job:';
 
@@ -71,6 +111,11 @@ const JOB_KEY_PREFIX = 'job:';
 // in-flight batch (getGenerationStatus) instead of showing Ready + spawning a
 // duplicate batch. Written by startGeneration; read by getGenerationStatus.
 const PAGE_JOB_PREFIX = 'pageJob:';
+
+// Per-page memory of the last-chosen Project Context profile, so re-generating the
+// same page pre-selects the same profile (the "easy" half of dynamic context).
+// Written by startGeneration (fail-soft); read by getContextProfiles.
+const PAGE_CONTEXT_PREFIX = 'pageCtx:';
 
 // NOTE: generation uses the Anthropic Message Batches API (polled via
 // pollJobStatus); push is a CHUNKED resolver (startPush + UI-looped pushStep,
@@ -91,6 +136,65 @@ async function getProjectKey(payloadKey) {
   return s.defaultProjectKey || null;
 }
 
+/**
+ * Normalize stored settings into a clean Project Context profiles array.
+ * Migrates a legacy P1 single `projectContext` string (read-time, non-destructive)
+ * into one "Default" profile so existing installs keep their context seamlessly.
+ * @returns {Array<{id:string,name:string,context:string}>}
+ */
+function normalizeContextProfiles(settings) {
+  const s = settings || {};
+  if (Array.isArray(s.contextProfiles)) {
+    return s.contextProfiles
+      .filter((p) => p && typeof p === 'object')
+      .map((p) => ({
+        id: String(p.id || ''),
+        name: String(p.name || ''),
+        context: String(p.context || ''),
+      }))
+      .filter((p) => p.id && (p.name || p.context));
+  }
+  const legacy = String(s.projectContext || '').trim();
+  if (legacy) return [{ id: 'default', name: 'Default', context: legacy }];
+  return [];
+}
+
+/**
+ * Validate the contextProfiles array from the Settings UI (server-authoritative).
+ * Returns { ok, value } where value is the cleaned array, or undefined when the
+ * field was not provided at all (leave existing profiles untouched). { ok:false,
+ * error } on a bad profile. Drops fully-empty rows; assigns/dedupes stable ids.
+ */
+function validateContextProfiles(raw) {
+  if (raw === undefined || raw === null) return { ok: true, value: undefined };
+  if (!Array.isArray(raw)) return { ok: false, error: 'Project Context profiles must be a list.' };
+  if (raw.length > MAX_CONTEXT_PROFILES) {
+    return { ok: false, error: `Too many Project Context profiles (max ${MAX_CONTEXT_PROFILES}).` };
+  }
+  const out = [];
+  const seenIds = new Set();
+  for (const p of raw) {
+    const name = String(p?.name || '').trim();
+    const context = String(p?.context || '').trim();
+    if (!name && !context) continue; // drop blank rows (e.g. an unfilled "add")
+    if (!name) return { ok: false, error: 'Each Project Context profile needs a name.' };
+    if (name.length > CONTEXT_PROFILE_NAME_MAX) {
+      return { ok: false, error: `Profile name too long (max ${CONTEXT_PROFILE_NAME_MAX} characters).` };
+    }
+    if (context.length > PROJECT_CONTEXT_MAX_CHARS) {
+      return {
+        ok: false,
+        error: `Profile "${name}" context is too long (${context.length}/${PROJECT_CONTEXT_MAX_CHARS}). Use "Distill with Claude" to condense it.`,
+      };
+    }
+    let id = String(p?.id || '').trim();
+    if (!id || seenIds.has(id)) id = `p${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+    seenIds.add(id);
+    out.push({ id, name, context });
+  }
+  return { ok: true, value: out };
+}
+
 // ════════════════════════════════════════════════════════════
 // SETTINGS RESOLVERS — BYOK Anthropic API key + JIRA project key
 // ════════════════════════════════════════════════════════════
@@ -108,6 +212,9 @@ resolver.define('getSettings', async () => {
     defaultProjectKey: s.defaultProjectKey || '',
     apiKeyConfigured: !!storedKey,
     apiKeyLastSetAt: s.apiKeyLastSetAt || null,
+    // Named Project Context profiles (full, with text) for the admin editor. Legacy
+    // single-field installs are migrated read-time into one "Default" profile.
+    contextProfiles: normalizeContextProfiles(s),
     // Optional advanced config — required custom fields JSON (raw string for
     // round-trip editing). Empty когато the project doesn't require custom fields.
     requiredCustomFieldsJson: s.requiredCustomFieldsJson || '',
@@ -143,7 +250,7 @@ function parseRequiredCustomFields(raw) {
  * defaultProjectKey е always validated + saved.
  */
 resolver.define('saveSettings', async ({ payload }) => {
-  const { anthropicApiKey, defaultProjectKey, requiredCustomFieldsJson } = payload || {};
+  const { anthropicApiKey, defaultProjectKey, requiredCustomFieldsJson, contextProfiles } = payload || {};
 
   // Validate project key
   const cleanProjectKey = (defaultProjectKey || '').trim().toUpperCase();
@@ -165,6 +272,12 @@ resolver.define('saveSettings', async ({ payload }) => {
     return { error: cfParse.error };
   }
 
+  // Validate Project Context profiles (server-authoritative; the UI mirrors the caps).
+  const cpParse = validateContextProfiles(contextProfiles);
+  if (!cpParse.ok) {
+    return { error: cpParse.error };
+  }
+
   // Conditionally update API key
   let apiKeyUpdated = false;
   const incomingKey = (anthropicApiKey || '').trim();
@@ -183,10 +296,32 @@ resolver.define('saveSettings', async ({ payload }) => {
     defaultProjectKey: cleanProjectKey,
     requiredCustomFieldsJson: cfRaw, // store raw string for UI round-trip
   };
+  // Persist profiles only when the UI sent them (undefined = not provided → leave
+  // as-is). Drop the legacy single-field once migrated forward into profiles.
+  if (cpParse.value !== undefined) {
+    next.contextProfiles = cpParse.value;
+    delete next.projectContext;
+  }
   if (apiKeyUpdated) {
     next.apiKeyLastSetAt = new Date().toISOString();
   }
-  await kvs.set(SETTINGS_KEY, next);
+
+  // Guard the AGGREGATE serialized size before writing: per-profile caps don't bound
+  // the total, and non-ASCII (e.g. Cyrillic/CJK in a multilingual context) is 2-4 UTF-8
+  // bytes/char, so a maxed config could exceed the ~240KB KVS value cap. Reject with a
+  // clear message rather than letting kvs.set throw and silently lose the edits (§11).
+  const sizeBytes = new TextEncoder().encode(JSON.stringify(next)).length;
+  if (sizeBytes > SETTINGS_MAX_BYTES) {
+    return {
+      error: `These settings are too large to store (${Math.round(sizeBytes / 1024)} KB; limit ~${Math.round(SETTINGS_MAX_BYTES / 1024)} KB). Shorten or remove some Project Context profiles and try again.`,
+    };
+  }
+  try {
+    await kvs.set(SETTINGS_KEY, next);
+  } catch (e) {
+    console.error(`[saveSettings] kvs.set failed: ${String(e?.message || e)}`);
+    return { error: 'Could not save settings (storage error). Try shortening your Project Context profiles, then save again.' };
+  }
 
   return { success: true, apiKeyUpdated };
 });
@@ -248,6 +383,180 @@ resolver.define('testConnection', async ({ payload }) => {
     code: codeMap[result.error] || 'UNEXPECTED',
     detail: result.detail,
   };
+});
+
+// ── "Distill with Claude" — 6-call CHUNKED pipeline ─────────────────────────────
+// Mirrors the chunked JIRA push (startPushSession/pushSessionStep): startDistillSession
+// validates + persists a KVS session; distillStep runs ONE focused category call per
+// invocation (the UI loops it 6×). One call per category gives each its own generous
+// token budget, so no category is starved by another — the fix for the single call's
+// depth-first category drops (8/8 vs 5/8, 2026-06-02 Haiku bake-off). Each call is small
+// (~3-13s), well under the 25-sec resolver limit. Consumes NO breakdown quota. The content
+// is NEVER logged (keeps "Log End-User Data: No" true).
+
+// Map a distillCategory backend error code → the UI's friendly ERROR_MESSAGES code.
+// Shared by both distill resolvers (same shape the old single-call resolver used).
+function mapDistillError(result) {
+  const codeMap = {
+    not_configured: 'NOT_CONFIGURED',
+    network_failure: 'BACKEND_UNREACHABLE',
+    auth_rejected: 'BACKEND_AUTH_FAILED',
+    insufficient_credits: 'INSUFFICIENT_CREDITS',
+    rate_limited: 'RATE_LIMITED',
+  };
+  return { error: result.error, code: codeMap[result.error] || 'UNEXPECTED', detail: result.detail };
+}
+
+/**
+ * startDistillSession — begin a 6-step distill. Validates + clips the input, persists a
+ * KVS session, and returns the session id + the category labels so the UI can show
+ * progress. The UI then loops distillStep(step=0..5) until { done: true }.
+ *
+ * Returns { sessionId, totalSteps, categories } OR { error, code, detail }.
+ */
+resolver.define('startDistillSession', async ({ payload }) => {
+  const text = (payload?.text || '').trim();
+  if (!text) return { error: 'empty', code: 'UNEXPECTED', detail: 'Nothing to distill.' };
+
+  const apiKey = await getStoredApiKey();
+  if (!apiKey) {
+    return { error: 'not_configured', code: 'NOT_CONFIGURED', detail: 'Anthropic API key not configured. Save your key first.' };
+  }
+
+  // Clip once, at session start, so every per-category call sees the SAME bounded input
+  // (the focused calls re-clip defensively too, but clipping here keeps the KVS session
+  // small and the input stable across steps).
+  const clipped = text.length > DISTILL_MAX_INPUT_CHARS;
+  const input = clipped ? text.slice(0, DISTILL_MAX_INPUT_CHARS) : text;
+
+  // newSessionId pattern mirrors push_handler.newSessionId (crypto.randomUUID with a
+  // Date.now()+random fallback — the resolver runtime allows timestamps; push sessions
+  // use them).
+  const sessionId =
+    typeof crypto !== 'undefined' && crypto.randomUUID
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+
+  const session = { input, clipped, sections: {}, createdAt: Date.now() };
+  await kvs.set(DISTILL_SESSION_PREFIX + sessionId, session);
+
+  console.log(`[distill] session ${sessionId} started (${input.length} chars${clipped ? ', input clipped' : ''}, ${DISTILL_CATEGORIES.length} steps)`);
+
+  return {
+    sessionId,
+    totalSteps: DISTILL_CATEGORIES.length,
+    categories: DISTILL_CATEGORIES.map((c) => c.label),
+  };
+});
+
+/**
+ * distillStep — run ONE category of a distill session. The UI loops this with
+ * step = 0..5. On the LAST step, merges all 6 sections (in category order) into one
+ * profile, bounds it to PROJECT_CONTEXT_MAX_CHARS via trimToBudget (so the user can still
+ * hand-edit the draft), deletes the session, and returns the profile.
+ *
+ * Returns one of:
+ *   - mid-pipeline: { done:false, step, totalSteps, label, nextLabel }
+ *   - final:        { done:true,  step, totalSteps, label, profile, truncated }
+ *   - per-step err: { error, code, detail, step, label }  (session kept so the UI can retry)
+ */
+resolver.define('distillStep', async ({ payload }) => {
+  const sessionId = payload?.sessionId;
+  const step = Number(payload?.step);
+  if (!sessionId) return { error: 'no_session', code: 'UNEXPECTED', detail: 'No distill session id.' };
+  if (!Number.isInteger(step) || step < 0 || step >= DISTILL_CATEGORIES.length) {
+    return { error: 'bad_step', code: 'UNEXPECTED', detail: `Invalid distill step ${payload?.step}.` };
+  }
+
+  const key = DISTILL_SESSION_PREFIX + sessionId;
+  const s = await kvs.get(key);
+  if (!s) {
+    return { error: 'session_not_found', code: 'UNEXPECTED', detail: 'Distill session expired or not found. Start over.' };
+  }
+
+  const apiKey = await getStoredApiKey();
+  if (!apiKey) {
+    return { error: 'not_configured', code: 'NOT_CONFIGURED', detail: 'Anthropic API key not configured. Save your key first.', step, label: DISTILL_CATEGORIES[step].label };
+  }
+
+  const category = DISTILL_CATEGORIES[step];
+
+  let result;
+  try {
+    result = await distillCategory({ text: s.input, category, apiKey });
+  } catch (e) {
+    console.error(`[distill] step ${step} (${category.key}) threw: ${String(e?.message || e)}`);
+    return { error: 'distill_exception', code: 'UNEXPECTED', detail: String(e?.message || e), step, label: category.label };
+  }
+  if (result.error) {
+    // Keep the session so the UI can retry THIS step with the same sessionId.
+    return { ...mapDistillError(result), step, label: category.label };
+  }
+
+  // Persist this section. Track per-section truncation so the UI can nudge "expand".
+  s.sections[category.key] = { text: result.section, truncated: !!result.truncated };
+  await kvs.set(key, s);
+
+  const isLast = step === DISTILL_CATEGORIES.length - 1;
+  if (!isLast) {
+    return {
+      done: false,
+      step,
+      totalSteps: DISTILL_CATEGORIES.length,
+      label: category.label,
+      nextLabel: DISTILL_CATEGORIES[step + 1].label,
+    };
+  }
+
+  // Last step → merge all sections in category order, bound to the store limit, clean up.
+  const ordered = DISTILL_CATEGORIES.map((c) => s.sections[c.key]).filter((x) => x && x.text);
+  let profile = ordered.map((x) => x.text).join('\n');
+  const anyTruncated = ordered.some((x) => x.truncated);
+  let trimmed = false;
+  if (profile.length > PROJECT_CONTEXT_MAX_CHARS) {
+    profile = trimToBudget(profile, PROJECT_CONTEXT_MAX_CHARS);
+    trimmed = true;
+  }
+  try { await kvs.delete(key); } catch (_) {}
+
+  // Length only — NEVER the content (privacy; keeps "Log End-User Data: No" true).
+  console.log(`[distill] session ${sessionId} merged ${ordered.length}/${DISTILL_CATEGORIES.length} sections → ${profile.length} chars${trimmed ? ', trimmed to fit' : ''}${anyTruncated ? ', a section hit its token cap' : ''}`);
+
+  return {
+    done: true,
+    step,
+    totalSteps: DISTILL_CATEGORIES.length,
+    label: category.label,
+    profile,
+    truncated: anyTruncated,    // a section hit its per-call token cap (slightly short, but complete-ish)
+    overflowTrimmed: trimmed,   // the MERGED profile exceeded the store bound → its TAIL was cut (honest, not "concise")
+  };
+});
+
+/**
+ * List Project Context profiles for the generation-flow selector (lean: id + name
+ * only — the context text stays server-side). Page-aware: returns the remembered
+ * selection for this page so a re-run pre-selects it. A remembered profile that was
+ * since deleted falls back to null (→ "None"); an explicit prior "none" is kept.
+ * Returns { profiles: [{id, name}], selectedProfileId: string|null }.
+ */
+resolver.define('getContextProfiles', async ({ payload }) => {
+  const s = await loadSettings();
+  const profiles = normalizeContextProfiles(s).map((p) => ({ id: p.id, name: p.name }));
+
+  let selectedProfileId = null;
+  const pageId = payload?.pageId;
+  if (pageId) {
+    try {
+      const remembered = await kvs.get(`${PAGE_CONTEXT_PREFIX}${String(pageId)}`);
+      const rid = remembered?.profileId;
+      if (rid === 'none') selectedProfileId = 'none';
+      else if (rid && profiles.some((p) => p.id === rid)) selectedProfileId = rid;
+    } catch (_) {
+      /* best-effort — selector just defaults to None */
+    }
+  }
+  return { profiles, selectedProfileId };
 });
 
 // ════════════════════════════════════════════════════════════
@@ -558,7 +867,7 @@ function dedupeSharedAcceptanceCriteria(breakdown) {
  *   modelMode: 'primary' (Sonnet 4.6, default) | 'fallback' (Haiku 4.5)
  */
 resolver.define('startGeneration', async ({ payload, context }) => {
-  const { pageId, modelMode } = payload || {};
+  const { pageId, modelMode, contextProfileId } = payload || {};
   if (!pageId) return { error: 'No page ID' };
 
   // Verify API key configured BEFORE fetching content (fail fast)
@@ -631,6 +940,14 @@ resolver.define('startGeneration', async ({ payload, context }) => {
   }
   const pageData = await pageFetch.json();
   const pageContent = pageData.body?.storage?.value || '';
+  // Capture the Confluence page version at generation time (v2 returns
+  // version: { number }). Threaded onto the job record → getResults so the UI can
+  // detect a breakdown generated against an older page version and offer Regenerate
+  // (stale-page banner). Number only — never content (keeps "Log End-User Data: No").
+  // Fail-soft: an absent/unparseable version yields undefined → the UI shows NO
+  // false "edited" banner on missing data (never breaks generation).
+  const pageVersion =
+    typeof pageData.version?.number === 'number' ? pageData.version.number : undefined;
   if (pageContent.length < 50) {
     return {
       error: 'page_too_small',
@@ -647,12 +964,34 @@ resolver.define('startGeneration', async ({ payload, context }) => {
     jobId,
     pageId: String(pageId),
     pageTitle,
+    pageVersion,
     status: 'pending',
     model,
     createdAt: new Date().toISOString(),
   });
   // Index page → this job so reopening mid-generation reconnects (not a new batch).
   await kvs.set(`${PAGE_JOB_PREFIX}${String(pageId)}`, { jobId });
+
+  // Resolve the SELECTED Project Context profile to enrich the generation. A
+  // workspace may span multiple projects, so the user picks which context applies —
+  // we never apply one silently (a wrong-project context is worse than none).
+  // Fail-soft: a settings/profile glitch must never block a BYOK generation; we just
+  // generate from the spec alone.
+  let projectContext = '';
+  try {
+    const settings = await loadSettings();
+    const profiles = normalizeContextProfiles(settings);
+    if (contextProfileId && contextProfileId !== 'none') {
+      const match = profiles.find((p) => p.id === contextProfileId);
+      if (match) projectContext = match.context || '';
+    }
+    // Remember the choice for this page so a re-run pre-selects it (the "easy" half).
+    if (contextProfileId) {
+      await kvs.set(`${PAGE_CONTEXT_PREFIX}${String(pageId)}`, { profileId: contextProfileId });
+    }
+  } catch (e) {
+    console.warn(`[startGeneration] context profile resolve failed (non-fatal): ${String(e?.message || e)}`);
+  }
 
   // Submit batch к Anthropic (returns batch_id immediately)
   const submitResult = await submitBreakdownBatch({
@@ -661,6 +1000,7 @@ resolver.define('startGeneration', async ({ payload, context }) => {
     customId: jobId,
     model,
     useCaching: true,
+    projectContext,
   });
 
   if (submitResult.error) {
@@ -687,6 +1027,7 @@ resolver.define('startGeneration', async ({ payload, context }) => {
     jobId,
     pageId: String(pageId),
     pageTitle,
+    pageVersion,
     status: 'batched',
     model,
     batchId: submitResult.batchId,
@@ -901,6 +1242,11 @@ resolver.define('getResults', async ({ payload }) => {
     breakdown: job.breakdown,
     usage: job.usage,
     model: job.model,
+    // The Confluence page version this breakdown was generated against (captured by
+    // startGeneration). The UI compares it to the page's CURRENT version on reconnect
+    // to surface a stale-page banner + Regenerate. undefined for breakdowns created
+    // before this was added → the UI treats unknown as "not stale" (no false banner).
+    pageVersion: job.pageVersion,
     // Forward the partial-recovery signal so the UI can warn the user that the
     // breakdown is incomplete (output hit the cap and was salvaged). Both are
     // undefined on a normal complete run.

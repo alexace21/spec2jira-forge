@@ -339,6 +339,75 @@ package names de-scaffolded (→ `spec2tickets`). Build green (bundle ≈ −1.4
 
 ---
 
+## ⚡ HANDOVER NOTE (2026-06-02 — P1 Project Context injection SHIPPED end-to-end + §13 review gate)
+
+A long, dense session on `feature/product-improvements` (dev only; NOT production — the launch
+track stays on `feature/v3-pivot`). Built the FIRST product-improvements roadmap item end-to-end,
+conducted via the agent model throughout. Dev = **v13.27.0**.
+
+**P1 — Project Context / glossary injection — DELIVERED + VALIDATED end-to-end** (distil → inject →
+generate → regenerate):
+- **Named profiles** (multi-project per workspace; cross-project race fixed via `contextLoadedForPageId`)
+  + a Ready-screen selector + per-page remembered pick. `src/index.js` (`normalizeContextProfiles`,
+  `getContextProfiles`, `startGeneration` resolves the profile), `AdminSettings.jsx` `ContextProfilesEditor`.
+- **"Distill with Claude" = a 6-call DECOMPOSED chunked pipeline** (`DISTILL_CATEGORIES` + `distillCategory`
+  in `anthropic_client.js`; `startDistillSession`/`distillStep` + KVS session in `index.js` — mirrors the
+  chunked JIRA push). Won an **8/8-vs-5/8 empirical Haiku bake-off** over a single call (which went
+  depth-first and DROPPED whole categories on rich input). Each call extracts ONE category (Domain /
+  Glossary / Personas / Tech / Regulatory / Conventions), <14s, merged + `trimToBudget`. Transport =
+  **sync Haiku** with per-category caps (confidence-voted over re-adding `@forge/events` — which would
+  regress the 0-vuln posture — and over sync-Sonnet/batch which timed out).
+- **Prompts are DOMAIN-AGNOSTIC** (the load-bearing correction). They were a **sepsis PATCH** (named
+  SIRS/qSOFA, enumerated the answer-key); the §13 audit caught it, generalized to abstract decisive-tests +
+  diverse few-shots + a composite-axis-compression fix. **Multi-run validated** on clinical + fintech +
+  logistics + the partner's own Spec2JIRA domain — **0 cross-domain bleed**.
+- **Injection:** `buildSystemContent` (2 cached system blocks) + `buildProjectContextSystemText` +
+  the SYSTEM_PROMPT "PROJECT CONTEXT" slot with a **DECISIVE BOUNDARY** (reference-only: enriches
+  vocabulary, NEVER changes scope / authored ACs). `PROJECT_CONTEXT_MAX_CHARS` 8000→**12000** (the
+  complete decomposed profile is ~7.5K on a rich domain; 8000 risked trimming the last category).
+- **END-TO-END VALIDATED on the REAL Spec2JIRA epic** (WITH vs WITHOUT, 2 independent judges + a
+  quantified pass): context **APPLIED** (created a Multi-Tenant-Isolation feature NO-context lacked;
+  elevated confidence-0.7 to the "never collapse" design tension; LoRA/Entity-Graph/AST naming) AND
+  **BOUNDARY clean** (37→35 = consolidation not scope-loss; all numeric ACs verbatim; the context's
+  design-tension insight stayed in `spec_concerns`, not scope). Value concentrates at the
+  architecture/vocabulary layer; self-evident content is a wash (honest finding). Accepted: BG ACs
+  mirror the spec language (good); a borderline Marketplace-listing-prep demotion = low-severity,
+  likely stochastic (N=1), accepted.
+
+**Regenerate UX** (opening a page with a prior breakdown was a dead-end — old breakdown, no way to
+regenerate): `handleRegenerate` + a **Regenerate button** (always on the review screen) + a
+**stale-page banner** (Confluence `version.number` stored at generation → compared on reconnect →
+"page edited since this breakdown") + **Start-over** on the generating screen + a **10-min heavy-load
+reassurance notice** (a slow Anthropic batch no longer reads as "broken"). `App.js` + `index.js`
+(version threaded job → `getResults`).
+
+**POLICY §13 — Conductor Model + NEW binding MANDATORY post-implementation review gate:** after ANY
+implementation change, run an **audit-review agent + a code-review agent** (combinable only if low
+complexity). Proven this session: the audit caught the sepsis-patch that the code-review passed ("SHIP").
+New memory: **`multi-run-prompt-validation`** (single-run over-claims on stochastic models — use 3+ runs
+rule-by-rule; it bit us twice this session).
+
+**NEXT — remaining product-improvements, BY ORDER** (re-Analyze each through the LENS at session start;
+full detail in `docs/PRODUCT-IMPROVEMENTS-HANDOVER.md`):
+1. **P1/P2 — Test-case generation** (next; table-stakes — both rivals have it, both do it poorly →
+   chance to beat them; per-Story "Generate test cases" as a distinct LLM call, `bulletList` ADF not
+   `taskList` (gotcha #11), surface failures loudly; likely Pro-tier).
+2. **P2 — Custom prompt / house-style** (output-style enum + one free-text note; partly subsumed by
+   Project Context already shipped).
+3. **P2/P3 — Editor UX** (per-feature inline regenerate — STARTED via the new Regenerate button —
+   bulk edits, clearer dependency editing, the open Forge scroll-to-top item).
+4. **P-next — Managed (no-key) tier** (pricing DECIDED 2026-06-02: Managed Pro €6.90/seat cap 10/seat
+   pooled vs BYOK Pro €3.90/seat unlimited; real work = DPA + zero-retention, not reselling approval).
+   AFTER the launch/resubmit.
+
+**PARALLEL launch track (separate, `feature/v3-pivot`):** Marketplace **v4.2.0 re-approval** pending
+Atlassian; post-approval → Pro €39 pricing config + wire `PRO_UPGRADE_URL` → payment.
+
+С усмивка ✨ — P1 е shipped, универсален, валидиран на реален epic, и review-gate-нат. Малкият feature
+се оказа цяла подсистема (distill→inject→generate→regenerate), но е честен и доказан end-to-end.
+
+---
+
 ## ⚡ HANDOVER NOTE (2026-06-01 PM — competitive analysis + positioning + product-improvements roadmap)
 
 A **strategy/research** session (NO app-code changes; only docs + memory + listing copy). Direct-competitor
@@ -366,6 +435,13 @@ partner screenshots/live trials):
   **"Paid via Atlassian"** forces per-user tiers (no flat fee) → Pro is now **€3.90/user/mo (1-10 tier =
   €39 floor, declining taper)**, NOT flat €39. This is the Atlassian-native model we'd already planned —
   it just arrived now. Listing §3/§6 + `memory/monetization-strategy.md` updated to match.
+- **TWO Pro tiers (DECIDED 2026-06-02):** **BYOK Pro €3.90/seat = UNLIMITED** (≤10 = €39 floor) ·
+  **Managed Pro €6.90/seat = fair-use 10 breakdowns/seat/mo POOLED** (≤10 = €69 floor; we pay compute
+  → capped). Cap=10 → ~64% net margin now (Forge 0% fee <$1M) / ~47% post-$1M; loss-proof even in the
+  all-max-64K pathological case. Chose 10 to future-proof (cap cuts later are customer-hostile). Managed
+  = post-launch (needs our DPA + zero-retention; reselling path cleared). Cost model + edge cases:
+  `docs/PRODUCT-IMPROVEMENTS-HANDOVER.md` + `memory/monetization-strategy.md`. Live resubmission ships
+  **Free + BYOK Pro €3.90** only.
 - **⚠ CORRECTIONS:** "only we're BYOK" is FALSE — POPal offers BYOK/private-LLM too (sharper angle = Anthropic +
   spec-level + customer DPA). The Managed-tier **"Anthropic reselling approval" premise is also wrong**: Commercial
   Terms **A.1 permit "powering your own product"**; our pipeline ≠ reselling → **no special approval needed**

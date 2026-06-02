@@ -102,6 +102,16 @@ approval:** under Managed WE become a processor of the customer's spec content �
 Anthropic DPA + zero-retention/no-train, (b) a DPA we offer customers, (c) updated privacy
 questionnaire/listing (process-outside-Atlassian = Anthropic under OUR account; subprocessor list).
 
+**Pricing (DECIDED 2026-06-02).** **Managed Pro = €6.90/seat/mo** with a **fair-use cap of 10
+breakdowns/seat/month (POOLED per instance)** — vs **BYOK Pro €3.90/seat unlimited**. (≤10 floors:
+€69 Managed / €39 BYOK.) Grounding: Sonnet 4.6 batched ≈ €0.10/breakdown typical, €0.25 large
+(32K out); per-seat billing dilutes cost across all seats (only ~15-35% generate). **Atlassian fee:
+Forge = 0% up to $1M lifetime (we keep 100%), then ~16-17%.** Worst-case capped cost ≈ 10 × €0.25 =
+€2.50/seat → net margin **~64% now / ~47% post-$1M**; ~85-90% expected. **Cap=10 is loss-proof even
+in the all-max-64K pathological case** (10×€0.46 = €4.60 < €6.90, positive in both phases). Chose 10
+(not 15/20) to future-proof: lowering a cap later is customer-hostile — start conservative, raise if
+needed. Cap reuses the `src/usage.js` counter (seat-scaled). Heavy users route to BYOK.
+
 **Why now.** Next release AFTER the launch/resubmit. Erases onboarding friction → conversion;
 matches the category norm; BYOK stays for privacy-max customers.
 

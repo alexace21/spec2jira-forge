@@ -268,8 +268,8 @@ audit against POLICY.
 ## 12. Call-size / token-budget monitoring
 
 Before merging any prompt change, render it with a realistic worst-case fixture and
-estimate tokens. Anthropic Sonnet 4.6 context is large (200K), so input is rarely
-the constraint — but **output** is capped (`MAX_OUTPUT_TOKENS=48000` in
+estimate tokens. Anthropic Sonnet 4.6 context is large (1M input), so input is rarely
+the constraint — but **output** is capped (`MAX_OUTPUT_TOKENS=64000` in
 anthropic_client.js; large specs need it; there's a truncation-salvage path). Use
 prompt caching (`cache_control: ephemeral`) on the stable SYSTEM_PROMPT. Under-use
 of budget is also a signal — a call artificially starved of examples/context is
@@ -277,6 +277,69 @@ leaving quality on the table.
 
 ---
 
+## 13. The Conductor model — agent-orchestrated delivery (binding, 2026-06-02)
+
+> Partner's directive (verbatim intent): *"Искам ти да бъдеш главния диригент. Нека
+> всичко което правим занапред — analyze, design, предложение за solution, confidence
+> vote на предложенията, анализ за подводни камъни и edge cases, review + auditor след
+> промени — се извършва от агенти, всеки с изолирана задача. Ти ще менажираш като им
+> задаваш задачите и четеш reports."*
+
+Claude is the **CONDUCTOR**, not the soloist. Substantive work is decomposed into
+**isolated agent tasks** — one bounded responsibility each — and Claude orchestrates:
+assigns the tasks, passes each agent the upstream outputs it needs, reads the reports,
+synthesizes, and makes the final calls. The conductor does NOT do the deep work alone
+when it can be delegated to a focused agent.
+
+**The phases — each an agent (or an agent panel):**
+1. **Analyze** — frame the real decision, constraints, priority ladder (§1).
+2. **Design** — candidate designs on a trade-off table (§1).
+3. **Solution proposal(s)** — one or more concrete proposals; diverse angles when the
+   space is wide.
+4. **Confidence vote** — independent judges score the proposals; the conductor reads
+   the *spread*, not just the winner.
+5. **Pitfalls / edge-cases** — a dedicated adversarial pass: what breaks, what's
+   unhandled, where the silent-miss path is.
+6. **Implement** — the change (conductor or an implementer agent).
+7. **Review + Auditor** — an N+1 review then an N+1+ **different-lens** auditor over
+   the change (§7); adversarially **verify** findings (skeptic agents, default-refuted)
+   before acting on them.
+
+**MANDATORY post-implementation review gate (binding, 2026-06-02 — partner directive):**
+after ANY implementation change, ALWAYS run BOTH (a) an **audit-review** agent — did it
+miss, skip, or sub-optimize anything vs the task, and is it a genuine GENERAL solution or
+a PATCH over-fitted to the one case in front of us? — AND (b) a **code-review** agent —
+correctness, quality, conventions, edge-cases, regressions. The two MAY be **combined
+into one agent ONLY when the change is small enough that combining does not raise task
+complexity**; keep them separate when either lens is substantial. This gate is not
+waivable for "small" changes. Proven 2026-06-02: the audit-review caught a distill-prompt
+set that was code-correct but a **sepsis PATCH** (a §5 violation — it had memorised one
+input's answer key); the code-review alone passed it ("SHIP"). One lens cannot see the
+other's failure — run both.
+
+**How:** use the **Workflow tool** to encode multi-phase / fan-out pipelines
+deterministically (the conductor reads the synthesized reports and intervenes between
+phases); use single **Agent** calls for one isolated phase. This **operationalizes**
+the existing philosophy (LENS §0, A→D→S §1, dispatch §4, Bug Y §5, verification §7) —
+it is the DELIVERY MODEL, not a replacement: the agents apply the policy; the conductor
+owns it. Proven 2026-06-02: a multi-agent review caught a HIGH cross-project race bug
+that a solo self-review pass had missed.
+
+**Information completeness between agents (§8):** when agent B needs agent A's output,
+the conductor hands it forward with the 4-part contract (item / location / decided
+peers / provenance). A starved downstream agent's silent miss is the worst failure —
+never let one reason without what an upstream agent already established.
+
+**Scale to the task (§3):** substantive work — features, fixes, designs, reviews,
+audits — runs through the agent phases. Trivial, independently-verifiable mechanical
+steps (a typo, a one-line rename, a pure function with exhaustive unit tests) don't
+need the full ceremony; use judgment, and when unsure lean toward orchestration (the
+partner's stated preference: more efficient, more detailed, higher quality). The opt-in
+is **STANDING** — do not wait to be re-asked each task.
+
+---
+
 *The four load-bearing sections, read in order: the LENS (§0) → A→D→S (§1) →
 dispatch rule (§4) → Bug Y + Prompt POLICY (§5–6). Everything else operationalizes
-these.*
+these — and §13 is HOW we now execute them: Claude conducting, isolated agents doing
+the bounded work.*

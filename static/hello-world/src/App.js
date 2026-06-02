@@ -183,6 +183,18 @@ function App() {
   const [error, setError] = useState(null);
   const [quotaInfo, setQuotaInfo] = useState(null);
 
+  // Project Context profiles (P1+): the available named contexts + the one selected
+  // for THIS page's generation. A workspace can span multiple projects, so the user
+  // picks which context applies. Default "none" = safe (never silently mis-apply);
+  // remembered per page after the first run.
+  const [contextProfiles, setContextProfiles] = useState([]);
+  const [selectedContextProfileId, setSelectedContextProfileId] = useState("none");
+  // The page id the loaded profiles/selection belong to. handleGenerate trusts
+  // selectedContextProfileId ONLY when this matches the current page — so a stale
+  // cross-project selection can never be submitted before the per-page load resolves
+  // (closes the async race; the backend trusts the client id, so this is the guard).
+  const [contextLoadedForPageId, setContextLoadedForPageId] = useState(null);
+
   // Usage/tier badge data (P3a) — shows the customer their monthly breakdown
   // count + reset date on the Ready screen, for transparency BEFORE they hit the
   // free-tier wall (not only after). Best-effort; fed by the getUsage resolver.
@@ -213,6 +225,36 @@ function App() {
     if (screen === "ready") loadUsage();
   }, [screen, loadUsage]);
 
+  // Load Project Context profiles + this page's remembered selection whenever we land
+  // on the Ready screen, so the user can pick the right context before generating (a
+  // workspace may span multiple projects). Best-effort — selector defaults to None.
+  useEffect(() => {
+    if (screen !== "ready") return;
+    let cancelled = false;
+    const pid = pageData?.page_id;
+    // Reset to the safe default IMMEDIATELY (before the async load) so a stale
+    // selection from a previously-opened page can never be shown or submitted for
+    // THIS page while getContextProfiles is in flight. The selection becomes
+    // trustworthy only once contextLoadedForPageId matches the current page.
+    setSelectedContextProfileId("none");
+    setContextLoadedForPageId(null);
+    (async () => {
+      try {
+        const resp = await invoke("getContextProfiles", { pageId: pid });
+        if (!cancelled && resp && !resp.error) {
+          setContextProfiles(resp.profiles || []);
+          setSelectedContextProfileId(resp.selectedProfileId || "none");
+          setContextLoadedForPageId(pid);
+        }
+      } catch (_) {
+        /* best-effort — selection stays None (safe) until a successful load */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [screen, pageData]);
+
   // Generation
   const [jobId, setJobId] = useState(null);
   const [jobStatus, setJobStatus] = useState(null);
@@ -232,6 +274,15 @@ function App() {
   // Confirmation flow
   const [dryRunResult, setDryRunResult] = useState(null);
   const [pendingBreakdown, setPendingBreakdown] = useState(null);
+
+  // Stale-page detection (2026-06-02). When a completed breakdown is reopened, we
+  // compare the Confluence page version it was generated against (from getResults)
+  // with the page's CURRENT version (from fetchPage). If the page was edited since
+  // (current > generated), this holds { generatedAt, current } → a non-blocking
+  // banner on the reviewing screen nudges Regenerate. null = not stale / unknown
+  // (older breakdowns with no stored version, or an unknown current version, must
+  // NEVER show a false "edited" banner).
+  const [staleBreakdown, setStaleBreakdown] = useState(null);
 
   const pollRef = useRef(null);
   const timerRef = useRef(null);
@@ -514,6 +565,9 @@ function App() {
             setError(full.error);
             setScreen("error");
           } else {
+            // A freshly-generated breakdown is current by definition — clear any
+            // stale flag lingering from a previous reconnect (e.g. after Regenerate).
+            setStaleBreakdown(null);
             setResults(v3AdaptResultPayload(full));
             setScreen("reviewing");
           }
@@ -561,6 +615,23 @@ function App() {
         // shape) OR under full.result (v2.x legacy compat). v3AdaptResultPayload
         // handles both + wraps в legacy capability shape для BreakdownEditor.
         if (full.result?.breakdown || full.breakdown) {
+          // Stale-page detection: compare the page version this breakdown was
+          // generated against (full.pageVersion, from getResults) with the page's
+          // CURRENT version (pageResult.version, from fetchPage). Only flag stale
+          // when BOTH are known numbers AND the page advanced (current > generated).
+          // When the stored version is missing (older breakdowns) OR the current
+          // version is unknown, clear the flag — never a false "edited" banner.
+          const generatedVersion = full.pageVersion;
+          const currentVersion = pageResult?.version;
+          if (
+            typeof generatedVersion === "number" &&
+            typeof currentVersion === "number" &&
+            currentVersion > generatedVersion
+          ) {
+            setStaleBreakdown({ generatedAt: generatedVersion, current: currentVersion });
+          } else {
+            setStaleBreakdown(null);
+          }
           setResults(v3AdaptResultPayload(full));
           setScreen("reviewing");
           return;
@@ -637,9 +708,15 @@ function App() {
     setElapsed(0);
     setJobStatus({ progress: 0, phase: "Starting..." });
 
+    // Trust the selection ONLY if the per-page context finished loading for THIS
+    // page; otherwise send "none" (safe). Closes the async race where a stale
+    // cross-project selection could be submitted before getContextProfiles resolves.
+    const effectiveProfileId =
+      contextLoadedForPageId === pageData.page_id ? selectedContextProfileId : "none";
     const result = await invoke("startGeneration", {
       pageId: pageData.page_id,
       modelMode: "primary",
+      contextProfileId: effectiveProfileId,
     });
 
     if (result.error === "quota_exceeded") {
@@ -666,7 +743,7 @@ function App() {
 
     setJobId(result.job_id);
     startPolling(result.job_id);
-  }, [pageData, startPolling]);
+  }, [pageData, startPolling, selectedContextProfileId, contextLoadedForPageId]);
 
   // ── Push: Step 1 — compute count summary client-side → confirming screen
   //
@@ -812,6 +889,29 @@ function App() {
     setScreen(pageData ? "ready" : "picker");
   }, [pageData]);
 
+  // handleRegenerate — re-run generation from the CURRENT page (2026-06-02). The
+  // problem: routeByPageStatus sends a reopened completed page straight to the
+  // reviewing screen (the OLD breakdown), bypassing Ready where Generate lives — so
+  // a user who edited the spec had no discoverable way to regenerate. This routes
+  // back to Ready (NOT auto-generate) on purpose: the user can re-pick the Project
+  // Context profile + see their usage BEFORE regenerating (the right control point).
+  // pageId/pageData stay bound so Ready renders. Non-destructive — the old job is NOT
+  // purged: a fresh generation supersedes it, and if the user bails the cached
+  // completed breakdown still resumes. Mirrors handleRetry's interval cleanup.
+  const handleRegenerate = useCallback(() => {
+    clearInterval(pollRef.current);
+    clearInterval(pushPollRef.current);
+    setResults(null);
+    setPendingBreakdown(null);
+    setJobId(null);
+    setJobStatus(null);
+    setDryRunResult(null);
+    setPushResult(null);
+    setStaleBreakdown(null);
+    setIsPushing(false);
+    setScreen("ready");
+  }, []);
+
   // handleNewPage — clear page binding, return to picker. Used от
   // PushedScreen "Generate Another" (post-push, user wants different
   // spec).
@@ -828,6 +928,8 @@ function App() {
     setDryRunResult(null);
     setPendingBreakdown(null);
     setIsPushing(false);
+    setSelectedContextProfileId("none");
+    setContextLoadedForPageId(null);
     setScreen("picker");
   }, []);
 
@@ -890,7 +992,7 @@ function App() {
           <BackButton
             onClick={handleNewPage}
             className=""
-            title="Discard in-progress edits and return to page picker (job result cached for 1h — re-click page to resume)"
+            title="Return to the page picker (this breakdown stays cached ~1h — re-click the page to resume it). To generate fresh from the current page instead, use the Regenerate button."
           />
           <span
             className="ml-3 text-[11px]"
@@ -898,8 +1000,75 @@ function App() {
           >
             {pageData?.title || "(reviewing)"}
           </span>
+          {/* Regenerate (2026-06-02) — the must-have path back to generation. A
+              reopened completed page lands here on the OLD breakdown (routeByPageStatus
+              bypasses Ready), so without this a user who edited the spec page had no
+              discoverable way to re-run. Routes to Ready (handleRegenerate) — NOT
+              auto-generate — so the user can re-pick the Project Context profile + see
+              their usage first. Always present; the stale banner below just makes it
+              salient when the page changed. Mirrors BackButton's muted-with-hover style;
+              ml-auto pins it to the far end of this flex-row top-bar. */}
+          <button
+            onClick={handleRegenerate}
+            className="text-xs flex items-center gap-1.5 ml-auto"
+            style={{
+              background: "none",
+              border: "none",
+              color: "var(--s2j-text-muted)",
+              cursor: "pointer",
+              padding: "4px 8px",
+              borderRadius: "4px",
+              transition: "all 0.15s",
+              marginRight: "-8px",
+            }}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.background = "var(--s2j-border)";
+              e.currentTarget.style.color = "var(--s2j-text)";
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.background = "none";
+              e.currentTarget.style.color = "var(--s2j-text-muted)";
+            }}
+            title="Re-run generation from the current page (picks up any edits you've made)"
+          >
+            ↻ Regenerate
+          </button>
         </div>
         <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
+          {/* Stale-page banner (2026-06-02) — the page's Confluence version advanced
+              since this breakdown was generated (set in routeByPageStatus). Non-blocking,
+              orange warning style matching the truncation banner (ConfirmScreen). Makes
+              the always-present Regenerate button salient + explains WHY. Only shows when
+              both versions are known and the page genuinely changed (never on missing
+              data). */}
+          {staleBreakdown && (
+            <div
+              className="shrink-0 mx-3 mt-3 rounded-lg p-3 flex items-start gap-2"
+              style={{
+                background: "var(--s2j-orange-bg)",
+                border: "1px solid var(--s2j-orange-border)",
+              }}
+            >
+              <span aria-hidden="true" style={{ flexShrink: 0 }}>⚠</span>
+              <div style={{ flex: 1 }}>
+                <p className="text-sm font-medium" style={{ color: "var(--s2j-text)" }}>
+                  This page was edited since this breakdown was generated
+                </p>
+                <p className="text-xs mt-0.5" style={{ color: "var(--s2j-text-light)" }}>
+                  Page version {staleBreakdown.generatedAt} → {staleBreakdown.current}.
+                  Regenerate to include your changes.
+                </p>
+              </div>
+              <button
+                onClick={handleRegenerate}
+                className="btn-primary text-xs shrink-0"
+                style={{ whiteSpace: "nowrap" }}
+                title="Re-run generation from the current page (picks up any edits you've made)"
+              >
+                ↻ Regenerate
+              </button>
+            </div>
+          )}
           <BreakdownEditor
             initialBreakdown={pendingBreakdown || results.breakdown}
             onPush={handlePush}
@@ -943,6 +1112,9 @@ function App() {
         <ReadyScreen
           pageData={pageData}
           usage={usage}
+          contextProfiles={contextProfiles}
+          selectedContextProfileId={selectedContextProfileId}
+          onSelectContextProfile={setSelectedContextProfileId}
           onGenerate={handleGenerate}
           onBack={handleNewPage}
         />
@@ -954,6 +1126,7 @@ function App() {
           jobStatus={jobStatus}
           elapsed={elapsed}
           onBack={handleNewPage}
+          onStartOver={handleRegenerate}
         />
       );
     case "confirming":
@@ -1037,6 +1210,9 @@ function Spinner({ size = 16 }) {
 function ReadyScreen({
   pageData,
   usage,
+  contextProfiles = [],
+  selectedContextProfileId = "none",
+  onSelectContextProfile,
   onGenerate,
   onBack,
 }) {
@@ -1116,6 +1292,49 @@ function ReadyScreen({
         Typical runtime: 60–150 seconds depending on spec size.
       </div>
 
+      {/* Project Context selector — pick which named context applies to THIS spec, so
+          a multi-project workspace never gets the wrong project's context injected. */}
+      {contextProfiles.length > 0 ? (
+        <div className="mb-4">
+          <label
+            className="text-sm font-medium block mb-1"
+            style={{ color: "var(--s2j-text)" }}
+          >
+            Project Context
+          </label>
+          <select
+            value={selectedContextProfileId}
+            onChange={(e) => onSelectContextProfile?.(e.target.value)}
+            style={{
+              width: "100%",
+              padding: "8px 12px",
+              fontSize: "0.875rem",
+              borderRadius: "6px",
+              border: "1px solid var(--s2j-border)",
+              background: "var(--s2j-bg)",
+              color: "var(--s2j-text)",
+              outline: "none",
+            }}
+          >
+            <option value="none">None — use the spec on its own</option>
+            {contextProfiles.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.name}
+              </option>
+            ))}
+          </select>
+          <p className="text-xs mt-1" style={{ color: "var(--s2j-text-muted)" }}>
+            Applies your project's domain &amp; glossary to this breakdown. Pick the
+            profile matching this spec's project; manage profiles in Settings.
+          </p>
+        </div>
+      ) : (
+        <p className="text-xs mb-4" style={{ color: "var(--s2j-text-muted)" }}>
+          Tip: add a Project Context in Settings to tailor breakdowns to your project's
+          domain, glossary, and conventions.
+        </p>
+      )}
+
       <div className="flex gap-3">
         <button
           onClick={onGenerate}
@@ -1130,7 +1349,7 @@ function ReadyScreen({
 
 // ── Generating ──────────────────────────────────────────────────
 
-function GeneratingScreen({ pageTitle, jobStatus, elapsed, onBack }) {
+function GeneratingScreen({ pageTitle, jobStatus, elapsed, onBack, onStartOver }) {
   const pct = Math.round((jobStatus?.progress || 0) * 100);
   return (
     <div className="p-6" style={SCREEN_MAX_WIDTH_STYLE}>
@@ -1183,6 +1402,37 @@ function GeneratingScreen({ pageTitle, jobStatus, elapsed, onBack }) {
         {fmtTime(elapsed)} elapsed
       </p>
 
+      {/* After ~10 min the bare spinner reads as "broken". Generation runs on
+          Anthropic's async Batch API (chosen for cost + to dodge the sync/event
+          timeouts — see gotcha #5), whose turnaround VARIES with Anthropic's
+          queue load (typical 6-8 min, but slower under heavy Claude load). This
+          reassurance appears only once we're past the usual window, so a slow
+          batch reads as "still working", not "stuck". elapsed is in seconds. */}
+      {elapsed >= 600 && (
+        <div
+          className="rounded-lg p-3 mb-4 flex items-start gap-2"
+          style={{
+            background: "var(--s2j-orange-bg)",
+            border: "1px solid var(--s2j-orange-border)",
+          }}
+        >
+          <span aria-hidden="true">⏳</span>
+          <div>
+            <p
+              className="text-xs font-medium mb-1"
+              style={{ color: "var(--s2j-text)" }}
+            >
+              Taking longer than usual — this is normal, nothing is broken
+            </p>
+            <p className="text-xs" style={{ color: "var(--s2j-text-light)" }}>
+              Generation runs on Anthropic's Batch API, which can slow down when
+              Claude is under heavy load. Your request is still processing and your
+              breakdown will finish on its own — it is not lost.
+            </p>
+          </div>
+        </div>
+      )}
+
       <div
         className="rounded-lg p-3"
         style={{
@@ -1201,6 +1451,24 @@ function GeneratingScreen({ pageTitle, jobStatus, elapsed, onBack }) {
           progress.
         </p>
       </div>
+      {onStartOver && (
+        <button
+          type="button"
+          onClick={onStartOver}
+          className="mt-3 text-xs"
+          style={{
+            color: "var(--s2j-text-muted)",
+            background: "none",
+            border: "none",
+            padding: 0,
+            cursor: "pointer",
+            textDecoration: "underline",
+          }}
+          title="Abandon this run and start over from the current page (e.g. you edited the spec after starting this generation)"
+        >
+          Started this before your latest edits? Start over
+        </button>
+      )}
     </div>
   );
 }

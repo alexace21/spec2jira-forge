@@ -21,7 +21,7 @@
 
 import { kvs } from '@forge/kvs';
 
-import { BREAKDOWN_SCHEMA, SYSTEM_PROMPT } from './prompts.js';
+import { BREAKDOWN_SCHEMA, SYSTEM_PROMPT, buildProjectContextSystemText } from './prompts.js';
 
 // ── Constants ──────────────────────────────────────────────
 
@@ -271,10 +271,43 @@ export function estimateCost(usage, model = MODEL_PRIMARY) {
 // API reference: https://docs.anthropic.com/en/api/creating-message-batches
 
 /**
+ * Assemble the `system` parameter for a breakdown call.
+ *
+ * Block 1 = the stable, shared SYSTEM_PROMPT (identical across every install →
+ * maximal prompt-cache reuse on the customer's key). Block 2 (only when the admin
+ * configured a Project Context) = the per-install house style. TWO cache
+ * breakpoints (POLICY §12): editing Project Context invalidates only the small
+ * second block; the large stable prompt keeps hitting cache. The model's handling
+ * rule for block 2 lives inside SYSTEM_PROMPT (stable), so block 2 carries data only.
+ *
+ * @param {string} projectContext - admin's raw context text ('' when unconfigured)
+ * @param {boolean} useCaching
+ * @returns {string|Array<object>} a plain string (no context) or a content-block array
+ */
+function buildSystemContent(projectContext, useCaching) {
+  const ctx = (projectContext || '').trim();
+
+  if (!useCaching) {
+    return ctx ? `${SYSTEM_PROMPT}\n\n${buildProjectContextSystemText(ctx)}` : SYSTEM_PROMPT;
+  }
+
+  const blocks = [{ type: 'text', text: SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } }];
+  if (ctx) {
+    blocks.push({
+      type: 'text',
+      text: buildProjectContextSystemText(ctx),
+      cache_control: { type: 'ephemeral' },
+    });
+  }
+  return blocks;
+}
+
+/**
  * Submit а 1-request batch to Anthropic. Returns batch_id immediately.
  *
- * @param {object} args - pageTitle, pageContent, model, useCaching, apiKeyOverride (the breakdown generation inputs)
+ * @param {object} args - pageTitle, pageContent, model, useCaching, apiKeyOverride, projectContext (the breakdown generation inputs)
  * @param {string} args.customId - custom_id for the request (typically our jobId)
+ * @param {string} [args.projectContext] - optional per-install house style injected as a 2nd cached system block
  * @returns {Promise<{batchId?, customId?, error?, detail?}>}
  */
 export async function submitBreakdownBatch({
@@ -284,6 +317,7 @@ export async function submitBreakdownBatch({
   model = MODEL_PRIMARY,
   useCaching = true,
   apiKeyOverride = null,
+  projectContext = '',
 }) {
   const apiKey = apiKeyOverride || (await getStoredApiKey());
   if (!apiKey) {
@@ -303,15 +337,7 @@ export async function submitBreakdownBatch({
     return { error: 'no_custom_id', detail: 'customId е required to identify the batch request.' };
   }
 
-  const systemContent = useCaching
-    ? [
-        {
-          type: 'text',
-          text: SYSTEM_PROMPT,
-          cache_control: { type: 'ephemeral' },
-        },
-      ]
-    : SYSTEM_PROMPT;
+  const systemContent = buildSystemContent(projectContext, useCaching);
 
   const requestBody = {
     requests: [
@@ -648,6 +674,221 @@ Identify the single softest edge to cut so the cycle is broken.`;
   } catch (_) {
     return { error: 'parse_failed', detail: String(text).slice(0, 200) };
   }
+}
+
+// ── Project Context distillation (tiny sync helper for Settings) ────────────────
+// A setup-time convenience: condense a user's raw paste (e.g. a long Confluence
+// page) or rough notes into a concise, bounded PROJECT CONTEXT profile. Distilling
+// meaning from free text is meaning-reading (§4) → an LLM call. It is small + fast
+// (well under the 25-sec resolver budget), runs on the customer's BYOK key, and does
+// NOT consume breakdown quota (it is not a generation). Output is bounded; the user
+// reviews/edits before saving (human-in-the-loop). The content is NEVER logged.
+
+export const DISTILL_MAX_INPUT_CHARS = 40000; // ~10K tokens — generous for a pasted page; bounds latency + cost (§12)
+
+// ── 6-call CHUNKED distill (replaces the single depth-first Haiku call) ──────────
+//
+// WHY chunked: a single Haiku call went depth-first and DROPPED whole categories on
+// rich inputs (it exhausted its budget elaborating the first few terms and never
+// reached Personas/Tech/Conventions — the silent, expensive miss). The fix, validated
+// in an 8/8-vs-5/8 empirical bake-off on a real Haiku model (2026-06-02): 6 sequential
+// FOCUSED calls, each extracting ONE category from the SAME full input. Each call is
+// small (~3-13s, well under the 25-sec resolver limit per gotcha #4) and gets its own
+// generous per-category token budget, so no category is starved by another. The UI
+// loops one resolver invocation per category (mirroring the chunked JIRA push:
+// startPushSession/pushSessionStep), accumulating sections in KVS, merged at the end.
+// trimToBudget enforces the final char bound; the content is NEVER logged.
+
+// Shared system preamble — prepended to EVERY category call (system = this + "\n\n" +
+// category.instruction). Carries the cross-category discipline (decisive test, no
+// invention, plain-text output) so each focused call still applies the durable-vs-scope
+// lens. The per-category instruction adds only what THAT category extracts.
+const DISTILL_SHARED_PREAMBLE = `You extract ONE category for a reusable PROJECT CONTEXT profile — a vocabulary/reference card later given to an automated spec-to-backlog engine so it speaks the team's language. It is REFERENCE only: NO requirements, NO scope, NO acceptance criteria.
+Capture each item as NAME + ROLE (one short clause) plus, ONLY when one exists, the single CRITICAL DISAMBIGUATING RULE the engine could not infer — a scope carve-out (applies to X, never Y), a unit trap / conversion factor, an abbreviation collision (one acronym, two meanings), or a lineage/ownership boundary.
+DECISIVE TEST: keep a fact only if it would still be true in a DIFFERENT spec of this same project (the domain, regulation, vocabulary, personas, conventions, systems, standing rules). DROP anything THIS spec merely chose (a cut-point, deadline, count, feature, step). Strip a spec-CHOSEN threshold; KEEP a number that IS the durable rule (a conversion factor, a fixed constant the spec does not restate).
+NEVER invent facts not in the input. Plain text only — NO markdown (no #, **, backticks, or - / * bullets). Output ONLY your one labelled line(s); no preamble, no closing remarks, no other labels.
+For any STANDARDIZED metric the domain refers to by name — a score, index, scale, rating, classification, code, grade, or tier (whatever the field calls it) — keep its NAME, a one-clause ROLE, and at most one critical disambiguating rule; COMPRESS AWAY the component criteria, sub-variables, point values, and cut-points it is computed from (the source document already carries those, and the downstream engine never needs them to name work).`;
+
+// The 6 categories, IN ORDER. Each call: system = DISTILL_SHARED_PREAMBLE + "\n\n" +
+// instruction; user = userAsk + the clipped input; max_tokens = maxTokens. The 6-call
+// CHUNKED STRUCTURE is the bake-off-validated win (8/8 vs 5/8) — that is what transfers.
+// The instructions are DOMAIN-AGNOSTIC by design (POLICY §5: abstract decisive-tests +
+// distinct-lesson few-shots, never a domain corpus / answer key); each says what KIND of
+// thing to extract so the pipeline works for ANY domain (CRM, logistics, fintech, clinical).
+export const DISTILL_CATEGORIES = [
+  {
+    key: 'domain',
+    label: 'Domain',
+    maxTokens: 500,
+    instruction: `Extract the DOMAIN section ONLY (3-5 sentences, end cleanly — never stop mid-sentence). Output starts with "Domain:". Give: the domain and what the system does, in one breath. Then fold in, ONLY where the input actually establishes them, the durable cross-cutting facts as short clauses — (a) any STANDING DESIGN TENSION the team deliberately balances: name BOTH poles, and that it is intentional, unresolved, and must never be collapsed to one side (it is a constraint the engine inherits, not a problem to solve); (b) any durable CROSS-CUTTING fact that shapes everything downstream — most often that SEVERAL parallel mechanisms run side by side, are independently configurable, and must ALL be honoured, never silently collapsed to a single canonical one. Capture only the tensions/facts the input genuinely states; if the input establishes none, give just the domain and what the system does. Do NOT list individual terms, personas, systems, regulations, or rules here — those belong to their own sections. Keep it tight.`,
+    userAsk: `Produce the Domain section only — concise, ending on a complete sentence.`,
+  },
+  {
+    key: 'glossary',
+    label: 'Glossary',
+    maxTokens: 800,
+    instruction: `Extract the GLOSSARY ONLY. Output starts with "Glossary:". List the load-bearing domain terms, named entities, and named standardized metrics, each as one short line: NAME = one-clause role + (where one exists) the ONE critical disambiguating rule the engine could not infer. Do NOT list human roles/personas here — they are captured in a separate Personas section; cover only terms, entities, and metrics.
+
+ABSOLUTE COMPRESSION RULE — this is the core of the job. Whenever the input refers to a STANDARDIZED metric by name — a score, index, scale, rating, classification, grade, code, or tier (whatever the domain calls it) — you are FORBIDDEN from reproducing the criteria it is computed from. Do NOT write the list of inputs/sub-variables it aggregates, the per-input weights or point values, the "≥N of …" trigger phrasing, the sub-scores, axes, dimensions, or subsystems it SPANS (e.g. "across six organ systems", "on each of N sub-dimensions"), its trigger or confirmation cut-point ("score >=N", "any single parameter at N", "aggregate change >=N for confirmation"), the threshold/cut-point numbers, or its internal scale structure. Those are reference criteria the source document already carries; the downstream engine never needs them to name a feature, and they exhaust the budget. Keep ONLY the metric's NAME, a one-clause ROLE, and at most one critical rule (when one exists). The same compression applies to any bundle, checklist, or protocol the input names: name it and give its role — never list its constituent elements as criteria.
+
+This is the SINGLE most important rule of this section: a glossary line that reproduces a metric's component variables, sub-scores, weights, or cut-point numbers is WRONG — even when they appear verbatim in the source. Compress to name + role + one critical rule. Four illustrations show the SAME lesson across DIFFERENT fields (they are illustrations of the lesson, NOT a list of terms to match):
+  - A non-clinical standardized metric: WRONG: "Risk Grade = weighted sum of credit-bureau score (35%), debt-to-income (30%), tenure (20%), prior defaults (15%); A/B/C/D/F bands." RIGHT: "Risk Grade = standardized creditworthiness tier driving the approval path; computed at application and re-pulled on material change, so a grade can move after submission."
+  - A clinical score (the SAME lesson — strip the criteria): WRONG: "SIRS = >=2 of temp <36 or >38, HR >90, RR >20, WBC abnormal; high sensitivity." RIGHT: "SIRS = inflammatory-response screen; high sensitivity / low specificity, superseded by a newer standard but still used at one site by local preference."
+  - A durable UNIT TRAP with a conversion CONSTANT (keep the constant; drop spec-chosen thresholds): "Lactate = blood lactate measure; UNIT TRAP — one legacy feed reports mg/dL, normalized at ingestion via mg/dL × 0.111 = mmol/L (keep the factor; the alert thresholds are spec-chosen, omit them)."
+  - A COMPOSITE score that spans several axes (do NOT enumerate the axes or the confirmation cut-point): WRONG: "Severity Index = 0-4 on each of six sub-dimensions (A, B, C, D, E, F); confirmed when the aggregate change is >=2." RIGHT: "Severity Index = composite severity rating used for confirmation; computed when downstream data lands, so it can re-grade an item retrospectively."
+
+Also preserve, when present: any ABBREVIATION COLLISION where one acronym means two different things in this domain — keep BOTH expansions and note any retirement/scope boundary so they are never conflated. Cover the genuinely load-bearing terms the input establishes — as many or as few as exist; do not pad to a target count, do not invent terms, and do not stop early while real terms remain. One terse line each.`,
+    userAsk: `Produce the Glossary section only, compressing every named standardized metric to name + role + one critical rule. Do not reproduce any metric's component criteria, weights, or cut-points.`,
+  },
+  {
+    key: 'personas',
+    label: 'Personas',
+    maxTokens: 450,
+    instruction: `Extract the PERSONAS ONLY. Output is a single line starting "Personas:" then EVERY distinct human ROLE named in the input, by its real name, semicolon-separated, each with one short role clause. Include operational staff, escalation/approval roles, any named leadership roles (give the role plus the area each owns), and any specialist or compliance/data-protection role the input names. Do not merge two distinct roles into one; do not stop early; do not invent roles the input does not name. Emit exactly as many as the input establishes.`,
+    userAsk: `Produce the Personas section only — every distinct named role.`,
+  },
+  {
+    key: 'tech',
+    label: 'Tech',
+    maxTokens: 500,
+    instruction: `Extract the TECH / SYSTEMS ONLY. Output starts with "Tech:". List EVERY named external system, product, vendor, platform, service, or integration in the input by its REAL proper name, semicolon-separated, and give EACH a short role clause in parentheses (what it is / what it feeds or consumes). Include every named source system, data feed, downstream consumer, third-party service, and reporting or regulatory interface the input names. Never replace a proper product/system name with a generic word, and never omit one. Do not infer or assume systems the input does not name. Exclude glossary terms, personas, and step-by-step data rates.`,
+    userAsk: `Produce the Tech section only — every named system/product/vendor by its real name, each with a one-clause role.`,
+  },
+  {
+    key: 'regulatory',
+    label: 'Regulatory',
+    maxTokens: 400,
+    instruction: `Extract the REGULATORY ONLY. Output starts with "Regulatory:". In one tight set of clauses, capture only what the input establishes: any product/regulatory CLASSIFICATION framing the system falls under (state it as the input frames it — do not assume a regime); the DATA-PROTECTION posture (access controls on sensitive/audit data, and any named data-protection or subject-rights role/process); any STATUTORY RETENTION rule (state the durable rule, KEEPING any fixed constant such as a mandated retention period); and the regulator or authority the system reports compliance to. Keep durable legal/compliance constants; drop procedural detail. If the input establishes no regulatory framing, output "Regulatory: none stated in the input."`,
+    userAsk: `Produce the Regulatory section only.`,
+  },
+  {
+    key: 'conventions',
+    label: 'Conventions',
+    maxTokens: 600,
+    instruction: `Extract the CONVENTIONS ONLY — the durable house-style and the STANDING counterintuitive rules the engine must always respect (NOT one-off procedure, timers, or data-rates). Output starts with "Conventions:". Do NOT repeat any term, score, metric, system, or persona already covered by the Glossary / Tech / Personas sections — this section is ONLY house-style and standing action-rules. Capture, compactly, only what the input establishes:
+(1) HOUSE-STYLE that persists across specs: working languages, any operational terms used verbatim in a particular language, spelling/naming conventions, and fixed state/status vocabularies.
+(2) STANDING COUNTERINTUITIVE rules — these are easy to miss and are the HIGHEST-VALUE rules to preserve, so hunt the input specifically for each KIND below and state EVERY one it contains (in the input's own terms):
+  - a rule that REVERSES a default or a prior behaviour — something that, against the obvious expectation, is NOT auto-undone, NOT auto-cancelled, or still applies despite a later contradicting signal (e.g. a scheduled re-check or hold that a subsequent normal/contradicting reading does NOT cancel);
+  - a DUAL-CONTROL or second-approval requirement (an action that needs a second person to confirm or co-sign);
+  - a SURFACE-vs-BLOCK policy (the system warns/cautions and logs but does NOT hard-block, leaving final judgment to a human);
+  - a LINEAGE / SUPERSESSION carve-out (this version replaces a prior one only IN PART, with specific elements deliberately RETAINED — never flatten to "replaces X"; capture this carve-out even when the only in-text trace of the prior version is a single retained or reversed rule — the "replaces only IN PART / these elements retained" boundary is itself the durable fact).
+State each rule the input actually contains as one short clause. Do not invent rules of a kind the input does not contain, and do not enumerate kinds that are absent.`,
+    userAsk: `Produce the Conventions section only — durable house-style plus any standing counterintuitive or lineage/supersession rules the input establishes.`,
+  },
+];
+
+/**
+ * Deterministically trim text to a hard character budget at a CLEAN boundary so the
+ * result never ends mid-word or mid-sentence (no meaningless half-finished fragment).
+ * Pure function — engineering's guarantee of the bound (POLICY §4: the model owns
+ * compression, we own the deterministic limit). Prefers the latest line break (a
+ * profile is one point per line), then a sentence end, then a word break; hard-cut
+ * only if none of those exists in the kept half (pathological separator-less text).
+ */
+export function trimToBudget(text, max) {
+  if (text.length <= max) return text;
+  const slice = text.slice(0, max);
+  const nl = slice.lastIndexOf('\n');
+  if (nl >= max * 0.5) return slice.slice(0, nl).trimEnd(); // drop the partial trailing line
+  const sentence = Math.max(
+    slice.lastIndexOf('. '),
+    slice.lastIndexOf('? '),
+    slice.lastIndexOf('! '),
+  );
+  if (sentence >= max * 0.5) return slice.slice(0, sentence + 1).trimEnd(); // keep terminal punctuation
+  const sp = slice.lastIndexOf(' ');
+  if (sp >= max * 0.5) return slice.slice(0, sp).trimEnd(); // never mid-word
+  return slice.trimEnd();
+}
+
+/**
+ * Run ONE focused distill call for a single category. The whole 6-call pipeline is
+ * orchestrated by the resolvers (startDistillSession/distillStep, mirroring the chunked
+ * JIRA push) — this is the per-category unit of work. system = the shared preamble + the
+ * category's instruction; user = the category's userAsk + the (clipped) full input. Runs
+ * on HAIKU (not Sonnet) + SYNC (not the async Batches API): a focused call is small
+ * (~3-13s) and fits comfortably inside the 25-sec resolver budget (gotcha #4), where sync
+ * Sonnet on the full input exceeded it and the Batches API was too slow (~11 min) for an
+ * interactive button. The result is a strong DRAFT — the user reviews + edits before save
+ * (human-in-the-loop, §7). The content is NEVER logged (keeps "Log End-User Data: No" true).
+ *
+ * @param {{text:string, category:object, apiKey:string, model?:string}} args
+ *   category = one DISTILL_CATEGORIES entry { key, label, maxTokens, instruction, userAsk }
+ * @returns {Promise<{section?:string, truncated?:boolean, error?:string, detail?:string}>}
+ */
+export async function distillCategory({ text, category, apiKey, model }) {
+  if (!apiKey) return { error: 'not_configured', detail: 'API key not configured.' };
+  if (!category || !category.instruction) return { error: 'bad_category', detail: 'No distill category provided.' };
+  const input = String(text || '').trim();
+  if (!input) return { error: 'empty', detail: 'No text to distill.' };
+
+  const clippedInput =
+    input.length > DISTILL_MAX_INPUT_CHARS ? input.slice(0, DISTILL_MAX_INPUT_CHARS) : input;
+
+  let response;
+  try {
+    response = await fetch(ANTHROPIC_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'anthropic-version': ANTHROPIC_VERSION,
+        'X-Api-Key': apiKey,
+      },
+      body: JSON.stringify({
+        // Haiku (not Sonnet): a single focused category call fits well inside the 25-sec
+        // resolver budget (gotcha #4); sync Sonnet on the full input exceeded it and the
+        // async batch was too slow (~11 min) for a button. Each result is a human-reviewed
+        // DRAFT (§7), so Haiku's quality suffices. Single revert lever if ever needed: model.
+        model: model || MODEL_FALLBACK,
+        max_tokens: category.maxTokens,
+        system: `${DISTILL_SHARED_PREAMBLE}\n\n${category.instruction}`,
+        messages: [
+          { role: 'user', content: `${category.userAsk}\n\nText:\n---\n${clippedInput}\n---` },
+        ],
+      }),
+    });
+  } catch (e) {
+    return { error: 'network_failure', detail: String(e?.message || e) };
+  }
+
+  if (response.status === 401) return { error: 'auth_rejected', detail: 'Anthropic rejected the API key.' };
+  if (response.status === 402) return { error: 'insufficient_credits', detail: 'Anthropic account has insufficient credits.' };
+  if (response.status === 429) return { error: 'rate_limited', detail: 'Anthropic rate limit exceeded.' };
+  if (!response.ok) {
+    const t = await response.text();
+    return { error: `anthropic_${response.status}`, detail: t.substring(0, 300) };
+  }
+
+  let data;
+  try {
+    data = await response.json();
+  } catch (e) {
+    return { error: 'parse_failed', detail: String(e?.message || e) };
+  }
+
+  let section = (data?.content?.[0]?.text || '').trim();
+  if (!section) return { error: 'empty_result', detail: `Distill returned no text for ${category.label}.` };
+  const truncated = data?.stop_reason === 'max_tokens';
+  if (truncated) {
+    // Hit the per-call token cap → the text ends mid-word/mid-sentence. Drop the partial
+    // trailing fragment so the section ends at a CLEAN boundary (POLICY §11 — never a
+    // half-finished line). Each section leads with its highest-value items, so only a
+    // marginal tail entry is lost. Domain-agnostic: prefer the last line break (list-style
+    // sections), else the last sentence end (prose sections).
+    const nl = section.lastIndexOf('\n');
+    if (nl > section.length * 0.5) {
+      section = section.slice(0, nl).trimEnd();
+    } else {
+      const s = Math.max(
+        section.lastIndexOf('. '), section.lastIndexOf('; '),
+        section.lastIndexOf('? '), section.lastIndexOf('! '),
+      );
+      if (s > section.length * 0.5) section = section.slice(0, s + 1).trimEnd();
+    }
+  }
+  // Length only — NEVER the content (privacy; keeps "Log End-User Data: No" true).
+  console.log(`[distill] category=${category.key} extracted (${section.length} chars${truncated ? ', hit token cap → trimmed to clean boundary' : ''})`);
+  return { section, truncated };
 }
 
 /**

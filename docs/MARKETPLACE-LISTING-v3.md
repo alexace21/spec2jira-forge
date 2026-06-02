@@ -133,7 +133,7 @@ rate resolves the small-team price to our €39 value anchor (see Pricing notes 
 | Edition | Price | What it includes |
 |---|---|---|
 | **Free** | €0 | 3 breakdowns per month. Full editor, push to Jira, dependency links — no feature gating, only a monthly volume cap. |
-| **Pro — Early access** | **€3.90 / user / month** (Paid via Atlassian) | Unlimited breakdowns. Billed per Atlassian's user tiers — **1-10 users = €39/month** (floor; = per-user × 10), declining per-user above 10. Everything in Free, no monthly cap. |
+| **Pro — Early access (BYOK)** | **€3.90 / user / month** (Paid via Atlassian) | Unlimited breakdowns. Billed per Atlassian's user tiers — **1-10 users = €39/month** (floor; = per-user × 10), declining per-user above 10. Everything in Free, no monthly cap. |
 
 **Portal notes:**
 - Set Free as the default edition so install → 3 free breakdowns works with no purchase.
@@ -149,6 +149,10 @@ rate resolves the small-team price to our €39 value anchor (see Pricing notes 
   "flat €39" / "~€5/user above 10" are retired (Atlassian forces per-user; €5/user would break
   the €39 anchor / invert the volume discount). Frame **"Early Access"** + grandfather early
   adopters (see `memory/migration-protections.md`).
+- **Planned (POST-LAUNCH) — a 2nd Pro tier "Managed (no-key)": €6.90/user/month, fair-use 10
+  breakdowns/user/month (pooled per instance)** — we run the AI (no BYOK). NOT in this resubmission
+  (needs our Anthropic DPA + zero-retention). The live listing ships **Free + BYOK Pro €3.90** only.
+  Rationale + cost model: `docs/PRODUCT-IMPROVEMENTS-HANDOVER.md`.
 - Enforcement mode is per-environment: **production = block** (freemium funnel),
   development = meter. Set the production env variable before go-live.
 

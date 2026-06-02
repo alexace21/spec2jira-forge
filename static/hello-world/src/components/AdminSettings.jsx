@@ -20,6 +20,12 @@ import { invoke } from "@forge/bridge";
  *   resetSettings() → { success }
  */
 
+// Mirrors of the server-authoritative caps in src/index.js — kept here only for the
+// live character counter + fail-fast UX on the Project Context profiles editor.
+const PROJECT_CONTEXT_MAX_CHARS = 12000;
+const MAX_CONTEXT_PROFILES = 20;
+const CONTEXT_PROFILE_NAME_MAX = 60;
+
 const ERROR_MESSAGES = {
   NOT_CONFIGURED:
     "No API key configured. Paste your Anthropic API key above + click Save Settings first.",
@@ -42,6 +48,7 @@ function getErrorText(result) {
 export default function AdminSettings() {
   const [anthropicApiKey, setAnthropicApiKey] = useState("");
   const [defaultProjectKey, setDefaultProjectKey] = useState("");
+  const [contextProfiles, setContextProfiles] = useState([]);
   const [apiKeyConfigured, setApiKeyConfigured] = useState(false);
   const [apiKeyLastSetAt, setApiKeyLastSetAt] = useState(null);
   const [requiredCustomFieldsJson, setRequiredCustomFieldsJson] = useState("");
@@ -60,6 +67,8 @@ export default function AdminSettings() {
         const settings = await invoke("getSettings");
         if (settings?.defaultProjectKey)
           setDefaultProjectKey(settings.defaultProjectKey);
+        if (Array.isArray(settings?.contextProfiles))
+          setContextProfiles(settings.contextProfiles);
         setApiKeyConfigured(!!settings?.apiKeyConfigured);
         setApiKeyLastSetAt(settings?.apiKeyLastSetAt || null);
         if (settings?.requiredCustomFieldsJson) {
@@ -153,6 +162,7 @@ export default function AdminSettings() {
     try {
       const payload = {
         defaultProjectKey: cleanProjectKey,
+        contextProfiles,
         requiredCustomFieldsJson: cfRaw,
       };
       if (trimmedKey) payload.anthropicApiKey = trimmedKey;
@@ -216,6 +226,7 @@ export default function AdminSettings() {
       await invoke("resetSettings");
       setAnthropicApiKey("");
       setDefaultProjectKey("");
+      setContextProfiles([]);
       setApiKeyConfigured(false);
       setApiKeyLastSetAt(null);
       setRequiredCustomFieldsJson("");
@@ -451,6 +462,17 @@ export default function AdminSettings() {
           />
         </Field>
 
+        {/* Project Context profiles — pick the right one at generation time (a
+            workspace may span multiple projects, so a single global context would
+            misapply across them). Each profile enriches terminology/interpretation;
+            it never changes scope or rewrites the spec's acceptance criteria. */}
+        <ContextProfilesEditor
+          profiles={contextProfiles}
+          setProfiles={setContextProfiles}
+          apiKeyConfigured={apiKeyConfigured}
+          onMessage={setMessage}
+        />
+
         {/* Advanced — optional required custom fields */}
         <div style={{ borderTop: "1px solid var(--s2j-border)", paddingTop: "16px" }}>
           <button
@@ -561,6 +583,485 @@ export default function AdminSettings() {
           Reset All Settings
         </button>
       </div>
+    </div>
+  );
+}
+
+// ── Project Context profiles editor ─────────────────────────────────────────
+// Manage N named contexts (domain/glossary/personas/conventions per project). Each
+// row: name + context textarea + "Distill with Claude" (condense a long paste) + live
+// counter + remove. The user later picks which profile applies per generation
+// (ReadyScreen), so a multi-project workspace never gets the wrong project's context.
+function ContextProfilesEditor({ profiles, setProfiles, apiKeyConfigured, onMessage }) {
+  const [distillingId, setDistillingId] = useState(null);
+  const [distillProgress, setDistillProgress] = useState(null); // { label, current, total } while a 6-step distill runs
+  const [distillFailure, setDistillFailure] = useState(null); // { id, sessionId, step, total } when a step errored (enables Retry)
+  const [expandedId, setExpandedId] = useState(null); // profile open in the focus-mode editor
+
+  // Close the expanded editor on Escape.
+  useEffect(() => {
+    if (!expandedId) return;
+    const onKey = (e) => {
+      if (e.key === "Escape") setExpandedId(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [expandedId]);
+
+  const update = (id, patch) =>
+    setProfiles((prev) => prev.map((p) => (p.id === id ? { ...p, ...patch } : p)));
+
+  const add = () => {
+    if (profiles.length >= MAX_CONTEXT_PROFILES) return;
+    const id = "p" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+    setProfiles((prev) => [...prev, { id, name: "", context: "" }]);
+  };
+
+  const remove = (id) => setProfiles((prev) => prev.filter((p) => p.id !== id));
+
+  // Distill is a 6-call CHUNKED pipeline (startDistillSession → distillStep ×6, looped
+  // here): each call extracts ONE category from the same full input with its own token
+  // budget, so no category is starved by another — the fix for the prior single call's
+  // depth-first category drops (8/8 vs 5/8 in a 2026-06-02 Haiku bake-off). Each call is
+  // small (~3-13s), well under the 25-sec resolver limit. It produces a strong DRAFT; the
+  // user reviews + deletes any residual spec-specifics before save (human-in-the-loop, §7).
+
+  // Run distillStep from `fromStep`..total-1 for an existing session. Used by both the
+  // initial run (fromStep=0) and a retry (fromStep=the step that failed). On a step error
+  // it stores a retry handle (the session survives server-side) and stops.
+  async function runDistillSteps(id, sessionId, fromStep, total) {
+    for (let step = fromStep; step < total; step++) {
+      let result;
+      try {
+        result = await invoke("distillStep", { sessionId, step });
+      } catch (e) {
+        setDistillFailure({ id, sessionId, step, total });
+        onMessage({ type: "error", text: e?.message || "Distill step failed" });
+        return;
+      }
+      if (result?.error) {
+        const label = result.label || `step ${step + 1}`;
+        setDistillFailure({ id, sessionId, step, total });
+        onMessage({
+          type: "error",
+          text: `${ERROR_MESSAGES[result.code] || result.detail || `Couldn't distill ${label}.`} You can retry from where it stopped, or start over.`,
+        });
+        return;
+      }
+      // Update the progress line. After a successful non-final step the NEXT category is
+      // about to run, so show that; on the final step we're done.
+      if (result?.done) {
+        update(id, { context: result.profile || "" });
+        const len = (result.profile || "").length;
+        onMessage({
+          type: "success",
+          text: `Distilled across ${total} passes to ${len.toLocaleString()} characters${result.overflowTrimmed ? " (the profile ran long and its end was trimmed to fit the size limit — review the earlier sections and trim any single-spec detail, then expand the end if needed)" : result.truncated ? " (kept intentionally concise — open the editor to expand if you want more detail)" : ""}. Review and delete any line true of only ONE spec (specific timings, limits, counts, or scope) — this profile is reused for ALL your specs — then click Save Settings.`,
+        });
+      } else {
+        setDistillProgress({
+          label: result?.nextLabel || result?.label || "",
+          current: step + 2, // the next step (1-indexed) that is about to run
+          total,
+        });
+      }
+    }
+  }
+
+  async function distill(id, text) {
+    const t = (text || "").trim();
+    if (!t) return;
+    if (!apiKeyConfigured) {
+      onMessage({
+        type: "error",
+        text: "Save your Anthropic API key first — then Claude can help shape your project context.",
+      });
+      return;
+    }
+    setDistillingId(id);
+    setDistillFailure(null);
+    onMessage(null);
+    try {
+      let start;
+      try {
+        start = await invoke("startDistillSession", { text: t });
+      } catch (e) {
+        onMessage({ type: "error", text: e?.message || "Distill failed" });
+        return;
+      }
+      if (start?.error || !start?.sessionId) {
+        onMessage({
+          type: "error",
+          text:
+            ERROR_MESSAGES[start?.code] ||
+            start?.detail ||
+            "Couldn't start the distill. Try again.",
+        });
+        return;
+      }
+      const total = start.totalSteps || 6;
+      const firstLabel = Array.isArray(start.categories) ? start.categories[0] : "";
+      setDistillProgress({ label: firstLabel, current: 1, total });
+      await runDistillSteps(id, start.sessionId, 0, total);
+    } finally {
+      setDistillingId(null);
+      setDistillProgress(null);
+    }
+  }
+
+  // Retry a distill that failed mid-pipeline: resume from the failed step with the SAME
+  // server-side session (already-completed sections are preserved there).
+  async function retryDistill() {
+    const f = distillFailure;
+    if (!f) return;
+    setDistillingId(f.id);
+    setDistillFailure(null);
+    onMessage(null);
+    setDistillProgress({ label: "", current: f.step + 1, total: f.total });
+    try {
+      await runDistillSteps(f.id, f.sessionId, f.step, f.total);
+    } finally {
+      setDistillingId(null);
+      setDistillProgress(null);
+    }
+  }
+
+  // Distill button label — shows live "{Category} (k/6)" progress while the 6-step
+  // pipeline runs (shared by the inline card + the focus-mode modal so they stay in sync).
+  const renderDistillLabel = (busy) => {
+    if (!busy) return "✨ Distill with Claude";
+    const p = distillProgress;
+    const text =
+      p && p.label
+        ? `Distilling… ${p.label} (${p.current}/${p.total})`
+        : p
+          ? `Distilling… (${p.current}/${p.total})`
+          : "Distilling…";
+    return (
+      <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+        <Spinner /> {text}
+      </span>
+    );
+  };
+
+  return (
+    <div>
+      <label
+        className="text-sm font-medium block mb-1"
+        style={{ color: "var(--s2j-text)" }}
+      >
+        Project Context profiles (optional)
+      </label>
+      <p className="text-xs mb-3" style={{ color: "var(--s2j-text-muted)" }}>
+        Standing background that helps Claude understand a project's specs the way your
+        team does — domain, glossary, personas, systems, tech, naming conventions. You
+        pick which profile applies each time you generate, so specs from different
+        projects get the right context. It enriches terminology and interpretation — it
+        never changes what gets built or rewrites your spec's acceptance criteria.
+        Because one profile is reused across ALL of a project's specs, keep only durable
+        facts — leave out anything true of a single spec (specific timings, limits,
+        counts, or scope). A concise brief distills more cleanly than a full spec.
+      </p>
+
+      {profiles.length === 0 && (
+        <p
+          className="text-xs mb-3 rounded-md p-3"
+          style={{
+            background: "var(--s2j-bg-section)",
+            border: "1px solid var(--s2j-border)",
+            color: "var(--s2j-text-muted)",
+          }}
+        >
+          No profiles yet. Add one per project to tailor breakdowns to its domain,
+          glossary, and conventions.
+        </p>
+      )}
+
+      <div className="space-y-4">
+        {profiles.map((p) => {
+          const len = (p.context || "").length;
+          const over = (p.context || "").trim().length > PROJECT_CONTEXT_MAX_CHARS;
+          const busy = distillingId === p.id;
+          return (
+            <div
+              key={p.id}
+              className="rounded-lg p-3"
+              style={{ border: "1px solid var(--s2j-border)", background: "var(--s2j-bg)" }}
+            >
+              <div className="flex items-center gap-2 mb-2">
+                <input
+                  type="text"
+                  value={p.name}
+                  onChange={(e) => update(p.id, { name: e.target.value })}
+                  placeholder="Profile name (e.g. Logistics Platform)"
+                  maxLength={CONTEXT_PROFILE_NAME_MAX}
+                  disabled={busy}
+                  style={{ ...inputStyle, fontWeight: 600 }}
+                />
+                <button
+                  type="button"
+                  onClick={() => remove(p.id)}
+                  className="text-xs shrink-0"
+                  style={{
+                    color: "var(--s2j-red)",
+                    background: "none",
+                    border: "none",
+                    cursor: "pointer",
+                    padding: "4px 6px",
+                  }}
+                  title="Remove this profile"
+                >
+                  Remove
+                </button>
+              </div>
+              <textarea
+                value={p.context}
+                onChange={(e) => update(p.id, { context: e.target.value })}
+                placeholder={
+                  "Domain: B2B logistics platform for freight forwarders.\n" +
+                  'Glossary: "shipment" = a booked freight order; "consignee" = the receiving party.\n' +
+                  "Personas: Ops Coordinator, Customs Broker, Account Manager.\n" +
+                  "Conventions: UK English; refer to services by their internal names."
+                }
+                rows={6}
+                disabled={busy}
+                style={{ ...inputStyle, resize: "vertical", lineHeight: 1.5, opacity: busy ? 0.6 : 1 }}
+                spellCheck={true}
+              />
+              <div className="flex items-center justify-between gap-3 mt-2">
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => distill(p.id, p.context)}
+                    disabled={distillingId !== null || !p.context.trim() || !apiKeyConfigured}
+                    className="btn-secondary"
+                    style={{
+                      fontSize: "0.8rem",
+                      opacity:
+                        distillingId !== null || !p.context.trim() || !apiKeyConfigured ? 0.5 : 1,
+                    }}
+                    title={
+                      !apiKeyConfigured
+                        ? "Save your Anthropic API key first, then Claude can shape this for you"
+                        : "Let Claude condense and structure this into a concise project context"
+                    }
+                  >
+                    {renderDistillLabel(busy)}
+                  </button>
+                  {distillFailure && distillFailure.id === p.id && distillingId === null && (
+                    <button
+                      type="button"
+                      onClick={retryDistill}
+                      className="text-xs"
+                      style={{
+                        color: "var(--s2j-blue)",
+                        background: "none",
+                        border: "none",
+                        cursor: "pointer",
+                        padding: 0,
+                        fontWeight: 500,
+                      }}
+                      title="Resume the distill from the step that failed"
+                    >
+                      Retry from step {distillFailure.step + 1}
+                    </button>
+                  )}
+                </div>
+                <div className="flex items-center gap-3">
+                  <button
+                    type="button"
+                    onClick={() => setExpandedId(p.id)}
+                    className="text-xs"
+                    style={{
+                      color: "var(--s2j-text-muted)",
+                      background: "none",
+                      border: "none",
+                      cursor: "pointer",
+                      padding: 0,
+                    }}
+                    title="Open a larger editor"
+                  >
+                    ⤢ Expand
+                  </button>
+                  <span
+                    className="text-xs"
+                    style={{ color: over ? "var(--s2j-red)" : "var(--s2j-text-muted)" }}
+                  >
+                    {len.toLocaleString()}/{PROJECT_CONTEXT_MAX_CHARS.toLocaleString()}
+                  </span>
+                </div>
+              </div>
+              {over && (
+                <p className="text-xs mt-2" style={{ color: "var(--s2j-text-muted)" }}>
+                  Over the {PROJECT_CONTEXT_MAX_CHARS.toLocaleString()}-character limit —
+                  pasted a whole page? Click <strong>Distill with Claude</strong> to
+                  condense it (you can edit the result before saving).
+                </p>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      {profiles.length < MAX_CONTEXT_PROFILES && (
+        <button
+          type="button"
+          onClick={add}
+          className="text-sm mt-3"
+          style={{
+            color: "var(--s2j-blue)",
+            background: "none",
+            border: "none",
+            cursor: "pointer",
+            padding: 0,
+            fontWeight: 500,
+          }}
+        >
+          + Add a project context
+        </button>
+      )}
+
+      {/* Focus-mode editor — a larger, centered surface over a blurred backdrop so a
+          long context is easier to read + edit (the post-distill review moment). */}
+      {expandedId &&
+        (() => {
+          const p = profiles.find((x) => x.id === expandedId);
+          if (!p) return null;
+          const len = (p.context || "").length;
+          const over = (p.context || "").trim().length > PROJECT_CONTEXT_MAX_CHARS;
+          const busy = distillingId === p.id;
+          return (
+            <div
+              onClick={() => setExpandedId(null)}
+              style={{
+                position: "fixed",
+                inset: 0,
+                zIndex: 1000,
+                background: "rgba(15, 23, 42, 0.55)",
+                backdropFilter: "blur(3px)",
+                WebkitBackdropFilter: "blur(3px)",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                padding: "24px",
+              }}
+            >
+              <div
+                onClick={(e) => e.stopPropagation()}
+                style={{
+                  background: "var(--s2j-bg)",
+                  border: "1px solid var(--s2j-border)",
+                  borderRadius: "10px",
+                  width: "100%",
+                  maxWidth: "820px",
+                  maxHeight: "85vh",
+                  display: "flex",
+                  flexDirection: "column",
+                  boxShadow: "0 16px 48px rgba(0,0,0,0.35)",
+                  padding: "18px 20px",
+                }}
+              >
+                <div className="flex items-center justify-between mb-3">
+                  <span className="text-sm font-semibold" style={{ color: "var(--s2j-text)" }}>
+                    {p.name || "Project context"}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setExpandedId(null)}
+                    title="Close (Esc)"
+                    style={{
+                      background: "none",
+                      border: "none",
+                      cursor: "pointer",
+                      color: "var(--s2j-text-muted)",
+                      fontSize: "1.1rem",
+                      lineHeight: 1,
+                      padding: "2px 6px",
+                    }}
+                  >
+                    ✕
+                  </button>
+                </div>
+                <textarea
+                  value={p.context}
+                  onChange={(e) => update(p.id, { context: e.target.value })}
+                  disabled={busy}
+                  autoFocus
+                  placeholder={
+                    "Domain: B2B logistics platform for freight forwarders.\n" +
+                    'Glossary: "shipment" = a booked freight order; "consignee" = the receiving party.\n' +
+                    "Personas: Ops Coordinator, Customs Broker, Account Manager.\n" +
+                    "Conventions: UK English; refer to services by their internal names."
+                  }
+                  style={{
+                    ...inputStyle,
+                    flex: 1,
+                    minHeight: "55vh",
+                    resize: "none",
+                    lineHeight: 1.6,
+                    opacity: busy ? 0.6 : 1,
+                  }}
+                  spellCheck={true}
+                />
+                <div className="flex items-center justify-between gap-3 mt-3">
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => distill(p.id, p.context)}
+                      disabled={distillingId !== null || !p.context.trim() || !apiKeyConfigured}
+                      className="btn-secondary"
+                      style={{
+                        fontSize: "0.8rem",
+                        opacity:
+                          distillingId !== null || !p.context.trim() || !apiKeyConfigured ? 0.5 : 1,
+                      }}
+                      title={
+                        !apiKeyConfigured
+                          ? "Save your Anthropic API key first, then Claude can shape this for you"
+                          : "Let Claude condense and structure this into a concise project context"
+                      }
+                    >
+                      {renderDistillLabel(busy)}
+                    </button>
+                    {distillFailure && distillFailure.id === p.id && distillingId === null && (
+                      <button
+                        type="button"
+                        onClick={retryDistill}
+                        className="text-xs"
+                        style={{
+                          color: "var(--s2j-blue)",
+                          background: "none",
+                          border: "none",
+                          cursor: "pointer",
+                          padding: 0,
+                          fontWeight: 500,
+                        }}
+                        title="Resume the distill from the step that failed"
+                      >
+                        Retry from step {distillFailure.step + 1}
+                      </button>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <span
+                      className="text-xs"
+                      style={{ color: over ? "var(--s2j-red)" : "var(--s2j-text-muted)" }}
+                    >
+                      {len.toLocaleString()}/{PROJECT_CONTEXT_MAX_CHARS.toLocaleString()}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setExpandedId(null)}
+                      className="btn-primary"
+                      style={{ fontSize: "0.8rem" }}
+                    >
+                      Done
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          );
+        })()}
     </div>
   );
 }
