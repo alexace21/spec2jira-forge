@@ -20,6 +20,12 @@ import { invoke } from "@forge/bridge";
  *   resetSettings() → { success }
  */
 
+// Mirrors of the server-authoritative caps in src/index.js — kept here only for the
+// live character counter + fail-fast UX on the Project Context profiles editor.
+const PROJECT_CONTEXT_MAX_CHARS = 12000;
+const MAX_CONTEXT_PROFILES = 20;
+const CONTEXT_PROFILE_NAME_MAX = 60;
+
 const ERROR_MESSAGES = {
   NOT_CONFIGURED:
     "No API key configured. Paste your Anthropic API key above + click Save Settings first.",
@@ -31,6 +37,12 @@ const ERROR_MESSAGES = {
     "Anthropic account has insufficient credits. Add credits at console.anthropic.com → Billing.",
   RATE_LIMITED:
     "Anthropic rate limit reached. Wait a moment and retry.",
+  // Managed (Advanced) server key not configured. Distill returns code
+  // NOT_CONFIGURED with error 'managed_unavailable' — for a Managed user the
+  // generic NOT_CONFIGURED text ("paste your key") is wrong, so handlers prefer
+  // the backend detail and fall back to this Managed-correct message.
+  MANAGED_UNAVAILABLE:
+    "The Managed service is temporarily unavailable (server key not configured). Contact support, or switch to BYOK and save your own Anthropic API key.",
 };
 
 function getErrorText(result) {
@@ -39,9 +51,20 @@ function getErrorText(result) {
   return result?.detail || "Connection test failed";
 }
 
+// Price lookups off the getUsage `pricing[]` array (single source of €-values — the
+// UI never hardcodes prices). accountPriceFor → a named tier's price; accountPrice →
+// the customer's OWN active tier price (null when absent).
+function accountPriceFor(account, key) {
+  return (account?.pricing || []).find((t) => t.key === key)?.price || null;
+}
+function accountPrice(account) {
+  return account?.tier ? accountPriceFor(account, account.tier) : null;
+}
+
 export default function AdminSettings() {
   const [anthropicApiKey, setAnthropicApiKey] = useState("");
   const [defaultProjectKey, setDefaultProjectKey] = useState("");
+  const [contextProfiles, setContextProfiles] = useState([]);
   const [apiKeyConfigured, setApiKeyConfigured] = useState(false);
   const [apiKeyLastSetAt, setApiKeyLastSetAt] = useState(null);
   const [requiredCustomFieldsJson, setRequiredCustomFieldsJson] = useState("");
@@ -60,6 +83,8 @@ export default function AdminSettings() {
         const settings = await invoke("getSettings");
         if (settings?.defaultProjectKey)
           setDefaultProjectKey(settings.defaultProjectKey);
+        if (Array.isArray(settings?.contextProfiles))
+          setContextProfiles(settings.contextProfiles);
         setApiKeyConfigured(!!settings?.apiKeyConfigured);
         setApiKeyLastSetAt(settings?.apiKeyLastSetAt || null);
         if (settings?.requiredCustomFieldsJson) {
@@ -117,8 +142,12 @@ export default function AdminSettings() {
       return;
     }
 
-    // Block save ako neither а key nor а pre-configured key exist
-    if (!trimmedKey && !apiKeyConfigured) {
+    // Block save ako neither а key nor а pre-configured key exist — UNLESS this is a
+    // Managed Pro (Advanced) install, where we run Claude with our key and the
+    // customer is not expected to provide one (they're only saving the project key
+    // + context here). isManaged is derived from getUsage's edition.
+    const isManaged = account?.edition === "advanced";
+    if (!isManaged && !trimmedKey && !apiKeyConfigured) {
       setMessage({
         type: "error",
         text: "Please paste your Anthropic API key. Get one from console.anthropic.com → API Keys.",
@@ -153,6 +182,7 @@ export default function AdminSettings() {
     try {
       const payload = {
         defaultProjectKey: cleanProjectKey,
+        contextProfiles,
         requiredCustomFieldsJson: cfRaw,
       };
       if (trimmedKey) payload.anthropicApiKey = trimmedKey;
@@ -216,6 +246,7 @@ export default function AdminSettings() {
       await invoke("resetSettings");
       setAnthropicApiKey("");
       setDefaultProjectKey("");
+      setContextProfiles([]);
       setApiKeyConfigured(false);
       setApiKeyLastSetAt(null);
       setRequiredCustomFieldsJson("");
@@ -271,6 +302,13 @@ export default function AdminSettings() {
     );
   }
 
+  // Managed Pro (Advanced edition) ⇒ WE run Claude with our key, so the customer
+  // needs NO Anthropic key. Hide the BYOK key input in that case + show a Managed
+  // notice. Only true when getUsage explicitly resolved 'advanced' — if account is
+  // null (best-effort load failed/unlicensed) we default to showing the BYOK input
+  // (the safe, today's behaviour). Distill also routes through the managed key then.
+  const isManaged = account?.edition === "advanced";
+
   return (
     <div className="p-8" style={{ maxWidth: "640px" }}>
       <h1
@@ -302,7 +340,17 @@ export default function AdminSettings() {
             <div className="flex items-center justify-between">
               <span style={{ color: "var(--s2j-text-muted)" }}>Plan</span>
               <span className="font-medium" style={{ color: "var(--s2j-text)" }}>
-                {account.tierLabel || "Free"}
+                {account.tierLabel || "—"}
+                {/* Price for the active PAID edition (from pricing[] — single source).
+                    Both BYOK Pro and Managed Pro show their price. */}
+                {accountPrice(account) ? (
+                  <span
+                    className="font-normal ml-1"
+                    style={{ color: "var(--s2j-text-muted)" }}
+                  >
+                    · {accountPrice(account)}
+                  </span>
+                ) : null}
               </span>
             </div>
             <div className="flex items-center justify-between">
@@ -312,7 +360,7 @@ export default function AdminSettings() {
               <span className="font-medium" style={{ color: "var(--s2j-text)" }}>
                 {account.unlimited
                   ? "Unlimited"
-                  : `${account.used ?? 0} / ${account.limit ?? 3}`}
+                  : `${account.used ?? 0} (fair-use)`}
               </span>
             </div>
             {!account.unlimited && account.resetsAtLabel && (
@@ -332,105 +380,184 @@ export default function AdminSettings() {
               </div>
             )}
           </div>
-          {account.tier !== "pro" && (
+          {/* Tier-aware footnote. Managed Pro: the cap is fair-use, and BYOK Pro is
+              the unlimited option. BYOK Pro (unlimited): nothing to add. */}
+          {account.tier === "managedPro" && (
             <p className="text-xs mt-3" style={{ color: "var(--s2j-text-muted)" }}>
-              Free includes 3 breakdowns per month. Upgrade to Pro for unlimited breakdowns.
+              Managed Pro runs Claude for you (no API key needed). The monthly limit is
+              a fair-use allowance{account.resetsAtLabel ? ` and resets on ${account.resetsAtLabel}` : ""}.{" "}
+              {accountPriceFor(account, "byokPro")
+                ? `For unlimited breakdowns, switch to BYOK Pro (${accountPriceFor(account, "byokPro")}) and use your own Anthropic key.`
+                : "For unlimited breakdowns, switch to BYOK Pro and use your own Anthropic key."}
             </p>
           )}
         </div>
       )}
 
-      {/* v3.0.0 BYOK info callout */}
-      <div
-        className="rounded-lg p-4 mb-6 text-sm"
-        style={{
-          background: "var(--s2j-blue-bg)",
-          border: "1px solid var(--s2j-blue-border)",
-          color: "var(--s2j-text)",
-        }}
-      >
-        <p className="mb-2">
-          <strong>Powered by Claude:</strong> Spec2Tickets uses Anthropic's Claude Sonnet 4.6 to analyze your specs. You provide your own Anthropic API key (BYOK); breakdowns run on Anthropic's infrastructure, never on Spec2Tickets servers.
-        </p>
-        <p className="mb-2">
-          <strong>Get an API key:</strong>{" "}
-          <a
-            href="https://console.anthropic.com/settings/keys"
-            target="_blank"
-            rel="noopener noreferrer"
-            style={{ color: "var(--s2j-blue)", textDecoration: "underline" }}
-          >
-            console.anthropic.com → Settings → API Keys
-          </a>{" "}
-          (sign up free; billed pay-as-you-go to your own Anthropic account).
-        </p>
-        <p>
-          <strong>Privacy:</strong> Your spec content flows directly from Forge to the Anthropic API using your key. Data falls under{" "}
-          <a
-            href="https://www.anthropic.com/legal/aup"
-            target="_blank"
-            rel="noopener noreferrer"
-            style={{ color: "var(--s2j-blue)", textDecoration: "underline" }}
-          >
-            Anthropic's Usage Policy
-          </a>
-          {" "}+ your own data processing agreement with Anthropic.
-        </p>
-      </div>
+      {/* Info callout — edition-aware. Managed Pro: we run Claude (no key needed).
+          Otherwise (BYOK Pro): the BYOK explainer + the two ways to use the app, so
+          an admin choosing how to run it understands both paths. */}
+      {isManaged ? (
+        <div
+          className="rounded-lg p-4 mb-6 text-sm"
+          style={{
+            background: "var(--s2j-green-bg)",
+            border: "1px solid var(--s2j-green-border)",
+            color: "var(--s2j-text)",
+          }}
+        >
+          <p className="mb-2">
+            <strong>Managed Pro — we run Claude for you.</strong> Your{" "}
+            {accountPriceFor(account, "managedPro") || "Managed Pro"} subscription
+            runs every breakdown on our Anthropic key, so there is{" "}
+            <strong>no API key to configure</strong>. Just set your default JIRA
+            project below and you're ready to generate.
+          </p>
+          <p>
+            Your monthly allowance is a fair-use limit. Want unlimited breakdowns and
+            to use your own Anthropic agreement? Switch to BYOK Pro
+            {accountPriceFor(account, "byokPro")
+              ? ` (${accountPriceFor(account, "byokPro")})`
+              : ""}{" "}
+            and paste your own key here.
+          </p>
+        </div>
+      ) : (
+        <div
+          className="rounded-lg p-4 mb-6 text-sm"
+          style={{
+            background: "var(--s2j-blue-bg)",
+            border: "1px solid var(--s2j-blue-border)",
+            color: "var(--s2j-text)",
+          }}
+        >
+          <p className="mb-2">
+            <strong>Powered by Claude:</strong> Spec2Tickets uses Anthropic's Claude
+            Sonnet 4.6 to analyze your specs. There are two ways to run it:
+          </p>
+          <ul className="mb-2" style={{ marginLeft: "16px", listStyle: "disc" }}>
+            <li className="mb-1">
+              <strong>Bring your own key (BYOK)</strong> — paste your Anthropic API
+              key below. BYOK Pro
+              {accountPriceFor(account, "byokPro")
+                ? ` (${accountPriceFor(account, "byokPro")})`
+                : ""}{" "}
+              gives unlimited breakdowns. Breakdowns run on your own Anthropic
+              account, never on Spec2Tickets servers.
+            </li>
+            <li>
+              <strong>Managed</strong> — no key needed; we run Claude for you.
+              Subscribe to Managed Pro
+              {accountPriceFor(account, "managedPro")
+                ? ` (${accountPriceFor(account, "managedPro")})`
+                : ""}{" "}
+              (the Advanced edition) from your Atlassian site admin.
+            </li>
+          </ul>
+          <p className="mb-2">
+            <strong>Get an API key:</strong>{" "}
+            <a
+              href="https://console.anthropic.com/settings/keys"
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{ color: "var(--s2j-blue)", textDecoration: "underline" }}
+            >
+              console.anthropic.com → Settings → API Keys
+            </a>{" "}
+            (sign up free; billed pay-as-you-go to your own Anthropic account).
+          </p>
+          <p>
+            <strong>Privacy:</strong> Under BYOK, your spec content flows directly
+            from Forge to the Anthropic API using your key. Data falls under{" "}
+            <a
+              href="https://www.anthropic.com/legal/aup"
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{ color: "var(--s2j-blue)", textDecoration: "underline" }}
+            >
+              Anthropic's Usage Policy
+            </a>
+            {" "}+ your own data processing agreement with Anthropic.
+          </p>
+        </div>
+      )}
 
       {/* Form */}
       <div className="space-y-5">
-        <Field
-          label="Anthropic API Key"
-          description={
-            apiKeyConfigured
-              ? `API key configured${apiKeyLastSetAt ? ` (last set ${new Date(apiKeyLastSetAt).toLocaleDateString()})` : ""}. Paste a new value to replace, or leave blank to keep current.`
-              : "Paste your Anthropic API key (sk-ant-...). Stored encrypted in Forge KVS, never visible to the UI after save."
-          }
-          required={!apiKeyConfigured}
-        >
-          <div className="flex gap-2">
-            <input
-              type="password"
-              value={anthropicApiKey}
-              onChange={handleApiKeyChange}
-              placeholder={apiKeyConfigured ? "•••••••• (configured)" : "sk-ant-api03-..."}
-              className="flex-1"
-              style={inputStyle}
-              autoComplete="off"
-            />
-            <button
-              onClick={handleTest}
-              disabled={testing || (!anthropicApiKey && !apiKeyConfigured)}
-              className="btn-secondary shrink-0"
-              style={{
-                opacity:
-                  testing || (!anthropicApiKey && !apiKeyConfigured)
-                    ? 0.5
-                    : 1,
-              }}
-            >
-              {testing ? "Testing..." : "Test Connection"}
-            </button>
+        {/* BYOK key input — shown for BYOK Pro. HIDDEN for Managed Pro (we run Claude
+            with our key; the customer has no key to enter). A Managed admin still
+            configures the JIRA project below. */}
+        {isManaged ? (
+          <div
+            className="rounded-lg p-3 text-sm"
+            style={{
+              background: "var(--s2j-bg-section)",
+              border: "1px solid var(--s2j-border)",
+              color: "var(--s2j-text-muted)",
+            }}
+          >
+            <p style={{ color: "var(--s2j-text)" }} className="font-medium mb-1">
+              No Anthropic API key needed
+            </p>
+            <p>
+              On Managed Pro we run Claude for you, so there is no key to configure.
+              To use your own key (and unlimited breakdowns) instead, switch to BYOK
+              Pro and this field will appear.
+            </p>
           </div>
-          {apiKeyConfigured && (
-            <button
-              onClick={handleClearKey}
-              disabled={clearing}
-              className="text-xs mt-2"
-              style={{
-                color: "var(--s2j-red)",
-                textDecoration: "underline",
-                background: "none",
-                border: "none",
-                cursor: clearing ? "default" : "pointer",
-                padding: 0,
-              }}
-            >
-              {clearing ? "Clearing..." : "Clear stored API key"}
-            </button>
-          )}
-        </Field>
+        ) : (
+          <Field
+            label="Anthropic API Key"
+            description={
+              apiKeyConfigured
+                ? `API key configured${apiKeyLastSetAt ? ` (last set ${new Date(apiKeyLastSetAt).toLocaleDateString()})` : ""}. Paste a new value to replace, or leave blank to keep current.`
+                : "Paste your Anthropic API key (sk-ant-...). Stored encrypted in Forge KVS, never visible to the UI after save."
+            }
+            required={!apiKeyConfigured}
+          >
+            <div className="flex gap-2">
+              <input
+                type="password"
+                value={anthropicApiKey}
+                onChange={handleApiKeyChange}
+                placeholder={apiKeyConfigured ? "•••••••• (configured)" : "sk-ant-api03-..."}
+                className="flex-1"
+                style={inputStyle}
+                autoComplete="off"
+              />
+              <button
+                onClick={handleTest}
+                disabled={testing || (!anthropicApiKey && !apiKeyConfigured)}
+                className="btn-secondary shrink-0"
+                style={{
+                  opacity:
+                    testing || (!anthropicApiKey && !apiKeyConfigured)
+                      ? 0.5
+                      : 1,
+                }}
+              >
+                {testing ? "Testing..." : "Test Connection"}
+              </button>
+            </div>
+            {apiKeyConfigured && (
+              <button
+                onClick={handleClearKey}
+                disabled={clearing}
+                className="text-xs mt-2"
+                style={{
+                  color: "var(--s2j-red)",
+                  textDecoration: "underline",
+                  background: "none",
+                  border: "none",
+                  cursor: clearing ? "default" : "pointer",
+                  padding: 0,
+                }}
+              >
+                {clearing ? "Clearing..." : "Clear stored API key"}
+              </button>
+            )}
+          </Field>
+        )}
 
         <Field
           label="Default JIRA Project Key"
@@ -450,6 +577,17 @@ export default function AdminSettings() {
             maxLength={10}
           />
         </Field>
+
+        {/* Project Context profiles — pick the right one at generation time (a
+            workspace may span multiple projects, so a single global context would
+            misapply across them). Each profile enriches terminology/interpretation;
+            it never changes scope or rewrites the spec's acceptance criteria. */}
+        <ContextProfilesEditor
+          profiles={contextProfiles}
+          setProfiles={setContextProfiles}
+          apiKeyConfigured={apiKeyConfigured || isManaged}
+          onMessage={setMessage}
+        />
 
         {/* Advanced — optional required custom fields */}
         <div style={{ borderTop: "1px solid var(--s2j-border)", paddingTop: "16px" }}>
@@ -561,6 +699,500 @@ export default function AdminSettings() {
           Reset All Settings
         </button>
       </div>
+    </div>
+  );
+}
+
+// ── Project Context profiles editor ─────────────────────────────────────────
+// Manage N named contexts (domain/glossary/personas/conventions per project). Each
+// row: name + context textarea + "Distill with Claude" (condense a long paste) + live
+// counter + remove. The user later picks which profile applies per generation
+// (ReadyScreen), so a multi-project workspace never gets the wrong project's context.
+// NOTE: `apiKeyConfigured` here is overloaded to mean "MAY DISTILL" — the parent
+// passes `apiKeyConfigured || isManaged`, because a Managed install has no BYOK key
+// but CAN distill (the backend calls Claude with our key). Every distill gate below
+// honours that. (§13 review fix — a future cleanup may rename the prop to canDistill.)
+function ContextProfilesEditor({ profiles, setProfiles, apiKeyConfigured, onMessage }) {
+  const [distillingId, setDistillingId] = useState(null);
+  const [distillProgress, setDistillProgress] = useState(null); // { label, current, total } while a 6-step distill runs
+  const [distillFailure, setDistillFailure] = useState(null); // { id, sessionId, step, total } when a step errored (enables Retry)
+  const [expandedId, setExpandedId] = useState(null); // profile open in the focus-mode editor
+
+  // Close the expanded editor on Escape.
+  useEffect(() => {
+    if (!expandedId) return;
+    const onKey = (e) => {
+      if (e.key === "Escape") setExpandedId(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [expandedId]);
+
+  const update = (id, patch) =>
+    setProfiles((prev) => prev.map((p) => (p.id === id ? { ...p, ...patch } : p)));
+
+  const add = () => {
+    if (profiles.length >= MAX_CONTEXT_PROFILES) return;
+    const id = "p" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+    setProfiles((prev) => [...prev, { id, name: "", context: "" }]);
+  };
+
+  const remove = (id) => setProfiles((prev) => prev.filter((p) => p.id !== id));
+
+  // Distill is a 6-call CHUNKED pipeline (startDistillSession → distillStep ×6, looped
+  // here): each call extracts ONE category from the same full input with its own token
+  // budget, so no category is starved by another — the fix for the prior single call's
+  // depth-first category drops (8/8 vs 5/8 in a 2026-06-02 Haiku bake-off). Each call is
+  // small (~3-13s), well under the 25-sec resolver limit. It produces a strong DRAFT; the
+  // user reviews + deletes any residual spec-specifics before save (human-in-the-loop, §7).
+
+  // Run distillStep from `fromStep`..total-1 for an existing session. Used by both the
+  // initial run (fromStep=0) and a retry (fromStep=the step that failed). On a step error
+  // it stores a retry handle (the session survives server-side) and stops.
+  async function runDistillSteps(id, sessionId, fromStep, total) {
+    for (let step = fromStep; step < total; step++) {
+      let result;
+      try {
+        result = await invoke("distillStep", { sessionId, step });
+      } catch (e) {
+        setDistillFailure({ id, sessionId, step, total });
+        onMessage({ type: "error", text: e?.message || "Distill step failed" });
+        return;
+      }
+      if (result?.error) {
+        const label = result.label || `step ${step + 1}`;
+        // Managed-unavailable: prefer the backend detail (it says "switch to BYOK"),
+        // NOT the generic NOT_CONFIGURED "paste your key" text — wrong for a Managed
+        // user who has no key by design.
+        const baseMsg =
+          result.error === "managed_unavailable"
+            ? result.detail || ERROR_MESSAGES.MANAGED_UNAVAILABLE
+            : ERROR_MESSAGES[result.code] ||
+              result.detail ||
+              `Couldn't distill ${label}.`;
+        setDistillFailure({ id, sessionId, step, total });
+        onMessage({
+          type: "error",
+          text: `${baseMsg} You can retry from where it stopped, or start over.`,
+        });
+        return;
+      }
+      // Update the progress line. After a successful non-final step the NEXT category is
+      // about to run, so show that; on the final step we're done.
+      if (result?.done) {
+        update(id, { context: result.profile || "" });
+        const len = (result.profile || "").length;
+        onMessage({
+          type: "success",
+          text: `Distilled across ${total} passes to ${len.toLocaleString()} characters${result.overflowTrimmed ? " (the profile ran long and its end was trimmed to fit the size limit — review the earlier sections and trim any single-spec detail, then expand the end if needed)" : result.truncated ? " (kept intentionally concise — open the editor to expand if you want more detail)" : ""}. Review and delete any line true of only ONE spec (specific timings, limits, counts, or scope) — this profile is reused for ALL your specs — then click Save Settings.`,
+        });
+      } else {
+        setDistillProgress({
+          label: result?.nextLabel || result?.label || "",
+          current: step + 2, // the next step (1-indexed) that is about to run
+          total,
+        });
+      }
+    }
+  }
+
+  async function distill(id, text) {
+    const t = (text || "").trim();
+    if (!t) return;
+    if (!apiKeyConfigured) {
+      onMessage({
+        type: "error",
+        text: "Save your Anthropic API key first — then Claude can help shape your project context.",
+      });
+      return;
+    }
+    setDistillingId(id);
+    setDistillFailure(null);
+    onMessage(null);
+    try {
+      let start;
+      try {
+        start = await invoke("startDistillSession", { text: t });
+      } catch (e) {
+        onMessage({ type: "error", text: e?.message || "Distill failed" });
+        return;
+      }
+      if (start?.error || !start?.sessionId) {
+        onMessage({
+          type: "error",
+          text:
+            start?.error === "managed_unavailable"
+              ? start.detail || ERROR_MESSAGES.MANAGED_UNAVAILABLE
+              : ERROR_MESSAGES[start?.code] ||
+                start?.detail ||
+                "Couldn't start the distill. Try again.",
+        });
+        return;
+      }
+      const total = start.totalSteps || 6;
+      const firstLabel = Array.isArray(start.categories) ? start.categories[0] : "";
+      setDistillProgress({ label: firstLabel, current: 1, total });
+      await runDistillSteps(id, start.sessionId, 0, total);
+    } finally {
+      setDistillingId(null);
+      setDistillProgress(null);
+    }
+  }
+
+  // Retry a distill that failed mid-pipeline: resume from the failed step with the SAME
+  // server-side session (already-completed sections are preserved there).
+  async function retryDistill() {
+    const f = distillFailure;
+    if (!f) return;
+    setDistillingId(f.id);
+    setDistillFailure(null);
+    onMessage(null);
+    setDistillProgress({ label: "", current: f.step + 1, total: f.total });
+    try {
+      await runDistillSteps(f.id, f.sessionId, f.step, f.total);
+    } finally {
+      setDistillingId(null);
+      setDistillProgress(null);
+    }
+  }
+
+  // Distill button label — shows live "{Category} (k/6)" progress while the 6-step
+  // pipeline runs (shared by the inline card + the focus-mode modal so they stay in sync).
+  const renderDistillLabel = (busy) => {
+    if (!busy) return "✨ Distill with Claude";
+    const p = distillProgress;
+    const text =
+      p && p.label
+        ? `Distilling… ${p.label} (${p.current}/${p.total})`
+        : p
+          ? `Distilling… (${p.current}/${p.total})`
+          : "Distilling…";
+    return (
+      <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+        <Spinner /> {text}
+      </span>
+    );
+  };
+
+  return (
+    <div>
+      <label
+        className="text-sm font-medium block mb-1"
+        style={{ color: "var(--s2j-text)" }}
+      >
+        Project Context profiles (optional)
+      </label>
+      <p className="text-xs mb-3" style={{ color: "var(--s2j-text-muted)" }}>
+        Standing background that helps Claude understand a project's specs the way your
+        team does — domain, glossary, personas, systems, tech, naming conventions. You
+        pick which profile applies each time you generate, so specs from different
+        projects get the right context. It enriches terminology and interpretation — it
+        never changes what gets built or rewrites your spec's acceptance criteria.
+        Because one profile is reused across ALL of a project's specs, keep only durable
+        facts — leave out anything true of a single spec (specific timings, limits,
+        counts, or scope). A concise brief distills more cleanly than a full spec.
+      </p>
+
+      {profiles.length === 0 && (
+        <p
+          className="text-xs mb-3 rounded-md p-3"
+          style={{
+            background: "var(--s2j-bg-section)",
+            border: "1px solid var(--s2j-border)",
+            color: "var(--s2j-text-muted)",
+          }}
+        >
+          No profiles yet. Add one per project to tailor breakdowns to its domain,
+          glossary, and conventions.
+        </p>
+      )}
+
+      <div className="space-y-4">
+        {profiles.map((p) => {
+          const len = (p.context || "").length;
+          const over = (p.context || "").trim().length > PROJECT_CONTEXT_MAX_CHARS;
+          const busy = distillingId === p.id;
+          return (
+            <div
+              key={p.id}
+              className="rounded-lg p-3"
+              style={{ border: "1px solid var(--s2j-border)", background: "var(--s2j-bg)" }}
+            >
+              <div className="flex items-center gap-2 mb-2">
+                <input
+                  type="text"
+                  value={p.name}
+                  onChange={(e) => update(p.id, { name: e.target.value })}
+                  placeholder="Profile name (e.g. Logistics Platform)"
+                  maxLength={CONTEXT_PROFILE_NAME_MAX}
+                  disabled={busy}
+                  style={{ ...inputStyle, fontWeight: 600 }}
+                />
+                <button
+                  type="button"
+                  onClick={() => remove(p.id)}
+                  className="text-xs shrink-0"
+                  style={{
+                    color: "var(--s2j-red)",
+                    background: "none",
+                    border: "none",
+                    cursor: "pointer",
+                    padding: "4px 6px",
+                  }}
+                  title="Remove this profile"
+                >
+                  Remove
+                </button>
+              </div>
+              <textarea
+                value={p.context}
+                onChange={(e) => update(p.id, { context: e.target.value })}
+                placeholder={
+                  "Domain: B2B logistics platform for freight forwarders.\n" +
+                  'Glossary: "shipment" = a booked freight order; "consignee" = the receiving party.\n' +
+                  "Personas: Ops Coordinator, Customs Broker, Account Manager.\n" +
+                  "Conventions: UK English; refer to services by their internal names."
+                }
+                rows={6}
+                disabled={busy}
+                style={{ ...inputStyle, resize: "vertical", lineHeight: 1.5, opacity: busy ? 0.6 : 1 }}
+                spellCheck={true}
+              />
+              <div className="flex items-center justify-between gap-3 mt-2">
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => distill(p.id, p.context)}
+                    disabled={distillingId !== null || !p.context.trim() || !apiKeyConfigured}
+                    className="btn-secondary"
+                    style={{
+                      fontSize: "0.8rem",
+                      opacity:
+                        distillingId !== null || !p.context.trim() || !apiKeyConfigured ? 0.5 : 1,
+                    }}
+                    title={
+                      !apiKeyConfigured
+                        ? "Save your Anthropic API key first, then Claude can shape this for you"
+                        : "Let Claude condense and structure this into a concise project context"
+                    }
+                  >
+                    {renderDistillLabel(busy)}
+                  </button>
+                  {distillFailure && distillFailure.id === p.id && distillingId === null && (
+                    <button
+                      type="button"
+                      onClick={retryDistill}
+                      className="text-xs"
+                      style={{
+                        color: "var(--s2j-blue)",
+                        background: "none",
+                        border: "none",
+                        cursor: "pointer",
+                        padding: 0,
+                        fontWeight: 500,
+                      }}
+                      title="Resume the distill from the step that failed"
+                    >
+                      Retry from step {distillFailure.step + 1}
+                    </button>
+                  )}
+                </div>
+                <div className="flex items-center gap-3">
+                  <button
+                    type="button"
+                    onClick={() => setExpandedId(p.id)}
+                    className="text-xs"
+                    style={{
+                      color: "var(--s2j-text-muted)",
+                      background: "none",
+                      border: "none",
+                      cursor: "pointer",
+                      padding: 0,
+                    }}
+                    title="Open a larger editor"
+                  >
+                    ⤢ Expand
+                  </button>
+                  <span
+                    className="text-xs"
+                    style={{ color: over ? "var(--s2j-red)" : "var(--s2j-text-muted)" }}
+                  >
+                    {len.toLocaleString()}/{PROJECT_CONTEXT_MAX_CHARS.toLocaleString()}
+                  </span>
+                </div>
+              </div>
+              {over && (
+                <p className="text-xs mt-2" style={{ color: "var(--s2j-text-muted)" }}>
+                  Over the {PROJECT_CONTEXT_MAX_CHARS.toLocaleString()}-character limit —
+                  pasted a whole page? Click <strong>Distill with Claude</strong> to
+                  condense it (you can edit the result before saving).
+                </p>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      {profiles.length < MAX_CONTEXT_PROFILES && (
+        <button
+          type="button"
+          onClick={add}
+          className="text-sm mt-3"
+          style={{
+            color: "var(--s2j-blue)",
+            background: "none",
+            border: "none",
+            cursor: "pointer",
+            padding: 0,
+            fontWeight: 500,
+          }}
+        >
+          + Add a project context
+        </button>
+      )}
+
+      {/* Focus-mode editor — a larger, centered surface over a blurred backdrop so a
+          long context is easier to read + edit (the post-distill review moment). */}
+      {expandedId &&
+        (() => {
+          const p = profiles.find((x) => x.id === expandedId);
+          if (!p) return null;
+          const len = (p.context || "").length;
+          const over = (p.context || "").trim().length > PROJECT_CONTEXT_MAX_CHARS;
+          const busy = distillingId === p.id;
+          return (
+            <div
+              onClick={() => setExpandedId(null)}
+              style={{
+                position: "fixed",
+                inset: 0,
+                zIndex: 1000,
+                background: "rgba(15, 23, 42, 0.55)",
+                backdropFilter: "blur(3px)",
+                WebkitBackdropFilter: "blur(3px)",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                padding: "24px",
+              }}
+            >
+              <div
+                onClick={(e) => e.stopPropagation()}
+                style={{
+                  background: "var(--s2j-bg)",
+                  border: "1px solid var(--s2j-border)",
+                  borderRadius: "10px",
+                  width: "100%",
+                  maxWidth: "820px",
+                  maxHeight: "85vh",
+                  display: "flex",
+                  flexDirection: "column",
+                  boxShadow: "0 16px 48px rgba(0,0,0,0.35)",
+                  padding: "18px 20px",
+                }}
+              >
+                <div className="flex items-center justify-between mb-3">
+                  <span className="text-sm font-semibold" style={{ color: "var(--s2j-text)" }}>
+                    {p.name || "Project context"}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setExpandedId(null)}
+                    title="Close (Esc)"
+                    style={{
+                      background: "none",
+                      border: "none",
+                      cursor: "pointer",
+                      color: "var(--s2j-text-muted)",
+                      fontSize: "1.1rem",
+                      lineHeight: 1,
+                      padding: "2px 6px",
+                    }}
+                  >
+                    ✕
+                  </button>
+                </div>
+                <textarea
+                  value={p.context}
+                  onChange={(e) => update(p.id, { context: e.target.value })}
+                  disabled={busy}
+                  autoFocus
+                  placeholder={
+                    "Domain: B2B logistics platform for freight forwarders.\n" +
+                    'Glossary: "shipment" = a booked freight order; "consignee" = the receiving party.\n' +
+                    "Personas: Ops Coordinator, Customs Broker, Account Manager.\n" +
+                    "Conventions: UK English; refer to services by their internal names."
+                  }
+                  style={{
+                    ...inputStyle,
+                    flex: 1,
+                    minHeight: "55vh",
+                    resize: "none",
+                    lineHeight: 1.6,
+                    opacity: busy ? 0.6 : 1,
+                  }}
+                  spellCheck={true}
+                />
+                <div className="flex items-center justify-between gap-3 mt-3">
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => distill(p.id, p.context)}
+                      disabled={distillingId !== null || !p.context.trim() || !apiKeyConfigured}
+                      className="btn-secondary"
+                      style={{
+                        fontSize: "0.8rem",
+                        opacity:
+                          distillingId !== null || !p.context.trim() || !apiKeyConfigured ? 0.5 : 1,
+                      }}
+                      title={
+                        !apiKeyConfigured
+                          ? "Save your Anthropic API key first, then Claude can shape this for you"
+                          : "Let Claude condense and structure this into a concise project context"
+                      }
+                    >
+                      {renderDistillLabel(busy)}
+                    </button>
+                    {distillFailure && distillFailure.id === p.id && distillingId === null && (
+                      <button
+                        type="button"
+                        onClick={retryDistill}
+                        className="text-xs"
+                        style={{
+                          color: "var(--s2j-blue)",
+                          background: "none",
+                          border: "none",
+                          cursor: "pointer",
+                          padding: 0,
+                          fontWeight: 500,
+                        }}
+                        title="Resume the distill from the step that failed"
+                      >
+                        Retry from step {distillFailure.step + 1}
+                      </button>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <span
+                      className="text-xs"
+                      style={{ color: over ? "var(--s2j-red)" : "var(--s2j-text-muted)" }}
+                    >
+                      {len.toLocaleString()}/{PROJECT_CONTEXT_MAX_CHARS.toLocaleString()}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setExpandedId(null)}
+                      className="btn-primary"
+                      style={{ fontSize: "0.8rem" }}
+                    >
+                      Done
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          );
+        })()}
     </div>
   );
 }

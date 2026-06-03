@@ -23,6 +23,13 @@ modules:
       resource: main
       resolver:
         function: resolver
+      # No unlicensedAccess: this is a Paid-via-Atlassian app, so by DEFAULT
+      # Atlassian admits only licensed users — and that is exactly what we want.
+      # The in-app perpetual Free tier was REMOVED 2026-06-03 (the 30-day Atlassian
+      # trial that Paid-via-Atlassian apps get for free already covers evaluation),
+      # so the unlicensedAccess hook it relied on (which only ever admitted
+      # Confluence GUESTS, never a clean "post-trial free user" — and rode on a
+      # spoofable guest-guard) is gone. Model is now trial → paid (BYOK/Managed Pro).
   # U3 part 33 (2026-05-09) — confluence:contentAction inline-on-page
   # entry surface. Closes "Apps menu navigation friction" partner UX
   # insight 2026-05-08 part 18 — user clicks "Generate Breakdown с
@@ -46,6 +53,8 @@ modules:
       resource: main
       resolver:
         function: resolver
+      # No unlicensedAccess — see the globalPage note. Licensed-only by default
+      # (Paid-via-Atlassian); the in-app Free tier was removed 2026-06-03.
   confluence:globalSettings:
     - key: spec2jira-settings
       resource: main
@@ -53,6 +62,10 @@ modules:
         function: resolver
       title: Spec2JIRA Settings
       useAsConfig: true
+      # NOTE: confluence:globalSettings does NOT support unlicensedAccess (a hard
+      # forge-lint error — verified 2026-06-03). Moot now: the app is licensed-only
+      # (the in-app Free tier was removed 2026-06-03), so no surface declares
+      # unlicensedAccess.
   function:
     # Single resolver handles ALL backend work in v3.0.1+:
     #   - Settings (BYOK API key), Confluence page fetch/search
@@ -117,3 +130,40 @@ app:
     memoryMB: 512
     architecture: arm64
   id: ari:cloud:ecosystem::app/e804f31f-1cbf-4f09-86c1-11e36f387fe7
+  # ── XCA (Cross-Context App) migration 2026-06-03 ─────────────────────
+  # Marketplace REQUIRES this: the app is compatible with BOTH Confluence +
+  # Jira, so Atlassian mandates it be a Cross-Context App ("multiple-app
+  # compatibility"), which MUST be "Paid via Atlassian" (the SOLE remaining
+  # v4.2.0 rejection reason — FIT/security already passed). Confluence =
+  # required (the Custom UI globalPage lives there; the app is non-functional
+  # without it). Jira = optional (touched only via the write:jira-work push).
+  # ⚠ The required app is IMMUTABLE once installs exist → Confluence is the
+  # correct AND locked-in choice (we have live Confluence installs). Verified
+  # against the live app-compatibility + migration docs 2026-06-03 (XCA still
+  # in Preview; Confluence/Jira/Compass only; @forge/api ≥5.1.1 — we have
+  # ^7.2.1). ⚠ EMPIRICALLY CONFIRMED 2026-06-03: the FIRST compatibility deploy is
+  # BLOCKED while the app has an install in a NON-required app (Jira) — Atlassian
+  # errors "Unable to deploy an app to an environment with an existing installation
+  # in an Atlassian app that is not the required Atlassian app." So on each env:
+  # `forge uninstall -p jira` FIRST → `forge deploy` → then reinstall Jira.
+  # Confluence (required) install + data ARE preserved. (An earlier "do NOT uninstall
+  # first / teardown-only" note was wrong — the live deploy is the authority.)
+  compatibility:
+    confluence:
+      required: true
+    jira:
+      required: false
+  # ── Paid-via-Atlassian + TWO editions (Standard/Advanced) ────────────
+  # The platform cap is EXACTLY two editions. editionsEnabled is MANDATORY for
+  # the two-price hybrid (licensing.enabled alone → a SINGLE price):
+  #   Standard = BYOK Pro    (€4.90/user, UNLIMITED — customer's own key)
+  #   Advanced = Managed Pro (€9.90/user, capped 10/USER/mo — we call Anthropic with OUR key)
+  # Runtime tells them apart via context.license.capabilitySet
+  # (capabilitystandard / capabilityadvanced) — see src/usage.js resolveTier.
+  # Prices/edition names are set in the vendor portal, NOT here. Evaluation is the
+  # 30-day Atlassian trial (auto-provided for Paid-via-Atlassian apps; reads as an
+  # active license at runtime) — the in-app perpetual Free 3/mo tier was REMOVED
+  # 2026-06-03, so there is no €0 edition and no unlicensedAccess surface.
+  licensing:
+    enabled: true
+    editionsEnabled: true

@@ -183,9 +183,21 @@ function App() {
   const [error, setError] = useState(null);
   const [quotaInfo, setQuotaInfo] = useState(null);
 
-  // Usage/tier badge data (P3a) — shows the customer their monthly breakdown
-  // count + reset date on the Ready screen, for transparency BEFORE they hit the
-  // free-tier wall (not only after). Best-effort; fed by the getUsage resolver.
+  // Project Context profiles (P1+): the available named contexts + the one selected
+  // for THIS page's generation. A workspace can span multiple projects, so the user
+  // picks which context applies. Default "none" = safe (never silently mis-apply);
+  // remembered per page after the first run.
+  const [contextProfiles, setContextProfiles] = useState([]);
+  const [selectedContextProfileId, setSelectedContextProfileId] = useState("none");
+  // The page id the loaded profiles/selection belong to. handleGenerate trusts
+  // selectedContextProfileId ONLY when this matches the current page — so a stale
+  // cross-project selection can never be submitted before the per-page load resolves
+  // (closes the async race; the backend trusts the client id, so this is the guard).
+  const [contextLoadedForPageId, setContextLoadedForPageId] = useState(null);
+
+  // Usage/tier badge data (P3a) — shows the customer their plan + (for Managed Pro)
+  // their monthly fair-use count + reset date on the Ready screen, for transparency
+  // before they hit the cap (not only after). Best-effort; fed by the getUsage resolver.
   const [usage, setUsage] = useState(null);
   const loadUsage = useCallback(async () => {
     try {
@@ -213,6 +225,36 @@ function App() {
     if (screen === "ready") loadUsage();
   }, [screen, loadUsage]);
 
+  // Load Project Context profiles + this page's remembered selection whenever we land
+  // on the Ready screen, so the user can pick the right context before generating (a
+  // workspace may span multiple projects). Best-effort — selector defaults to None.
+  useEffect(() => {
+    if (screen !== "ready") return;
+    let cancelled = false;
+    const pid = pageData?.page_id;
+    // Reset to the safe default IMMEDIATELY (before the async load) so a stale
+    // selection from a previously-opened page can never be shown or submitted for
+    // THIS page while getContextProfiles is in flight. The selection becomes
+    // trustworthy only once contextLoadedForPageId matches the current page.
+    setSelectedContextProfileId("none");
+    setContextLoadedForPageId(null);
+    (async () => {
+      try {
+        const resp = await invoke("getContextProfiles", { pageId: pid });
+        if (!cancelled && resp && !resp.error) {
+          setContextProfiles(resp.profiles || []);
+          setSelectedContextProfileId(resp.selectedProfileId || "none");
+          setContextLoadedForPageId(pid);
+        }
+      } catch (_) {
+        /* best-effort — selection stays None (safe) until a successful load */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [screen, pageData]);
+
   // Generation
   const [jobId, setJobId] = useState(null);
   const [jobStatus, setJobStatus] = useState(null);
@@ -232,6 +274,30 @@ function App() {
   // Confirmation flow
   const [dryRunResult, setDryRunResult] = useState(null);
   const [pendingBreakdown, setPendingBreakdown] = useState(null);
+
+  // Stale-page detection (2026-06-02). When a completed breakdown is reopened, we
+  // compare the Confluence page version it was generated against (from getResults)
+  // with the page's CURRENT version (from fetchPage). If the page was edited since
+  // (current > generated), this holds { generatedAt, current } → a non-blocking
+  // banner on the reviewing screen nudges Regenerate. null = not stale / unknown
+  // (older breakdowns with no stored version, or an unknown current version, must
+  // NEVER show a false "edited" banner).
+  const [staleBreakdown, setStaleBreakdown] = useState(null);
+
+  // In-app Settings access (2026-06-03). WHY this exists: the Forge
+  // confluence:globalSettings "Configure" page (which renders AdminSettings) is
+  // NOT reachable from Atlassian's centralized "Connected apps" admin — the classic
+  // UPM URL now redirects to "App management has moved" and the centralized admin
+  // exposes no Configure link. So the app must surface its OWN in-app Settings entry
+  // point (Setup / Ready / Picker screens), independent of the admin UI.
+  //   reinitNonce — bumped on closing in-app Settings; re-runs the init/config gate
+  //     (re-checks config → routes to picker if now configured) via the init useEffect's
+  //     dependency array.
+  //   settingsFromApp — TRUE only when Settings was opened from WITHIN the app (show a
+  //     "← Back" button above AdminSettings). FALSE on the globalSettings admin surface
+  //     (standalone, no Back). handleOpenSettings is the ONLY place that sets it TRUE.
+  const [reinitNonce, setReinitNonce] = useState(0);
+  const [settingsFromApp, setSettingsFromApp] = useState(false);
 
   const pollRef = useRef(null);
   const timerRef = useRef(null);
@@ -294,17 +360,31 @@ function App() {
           }
         }
 
-        // ═══ Gate 1 — Settings (v3.0.0 BYOK shape) ═══
-        // v2.x checked backendUrl + backendApiKey + lastTestOk; v3.0.0
-        // checks the BYOK Anthropic key + default JIRA project key. Both
-        // must be configured за app к be usable. Stale-cache concerns
-        // about Anthropic API health are deferred к actual generate-time
-        // (when failures surface как clear errors с specific causes);
-        // no automatic re-test на every app open (avoids а ~3 sec
-        // Anthropic round-trip at every mount).
-        const settings = await invoke("getSettings");
+        // ═══ Gate 1 — Settings (tier-aware, hybrid 2026-06-03) ═══
+        // v3.0.0 required a BYOK Anthropic key + a default JIRA project key. The
+        // hybrid makes the KEY requirement TIER-AWARE: Managed Pro (the Advanced
+        // edition) runs Claude on OUR key, so a Managed user has NO BYOK key by
+        // design — requiring one wrongly trapped them on the BYOK setup screen
+        // (the bug this fixes). BYOK Pro (Standard) still needs the customer's own
+        // key. Both editions still need a default JIRA project key (used by push).
+        // getUsage carries the license-resolved edition; fetched in PARALLEL with
+        // getSettings (no added latency) and fail-soft — on a metering glitch it is
+        // null, so we fall back to the BYOK key requirement (safe: at worst a
+        // Managed user is asked to open Settings; the key SOURCE is backend-resolved
+        // from the license regardless, so the wrong key is never actually used).
+        // Anthropic-health staleness stays deferred to generate-time (no re-test on
+        // every mount).
+        const [settings, mountUsage] = await Promise.all([
+          invoke("getSettings"),
+          invoke("getUsage").catch(() => null),
+        ]);
+        if (mountUsage && !mountUsage.error) setUsage(mountUsage);
+        const isManaged = mountUsage?.edition === "advanced";
 
-        if (!settings?.apiKeyConfigured || !settings?.defaultProjectKey) {
+        if (
+          (!isManaged && !settings?.apiKeyConfigured) ||
+          !settings?.defaultProjectKey
+        ) {
           setScreen("setup");
           return;
         }
@@ -455,7 +535,9 @@ function App() {
       clearInterval(timerRef.current);
       clearInterval(pushPollRef.current);
     };
-  }, []);
+    // reinitNonce: bumped by handleCloseSettings → re-runs the init/config gate after
+    // closing in-app Settings (re-checks config → routes to picker if now configured).
+  }, [reinitNonce]);
 
   // ── Timer ─────────────────────────────────────────────────────
   // The generating screen shows an elapsed-time counter — visible timing
@@ -514,6 +596,9 @@ function App() {
             setError(full.error);
             setScreen("error");
           } else {
+            // A freshly-generated breakdown is current by definition — clear any
+            // stale flag lingering from a previous reconnect (e.g. after Regenerate).
+            setStaleBreakdown(null);
             setResults(v3AdaptResultPayload(full));
             setScreen("reviewing");
           }
@@ -561,6 +646,23 @@ function App() {
         // shape) OR under full.result (v2.x legacy compat). v3AdaptResultPayload
         // handles both + wraps в legacy capability shape для BreakdownEditor.
         if (full.result?.breakdown || full.breakdown) {
+          // Stale-page detection: compare the page version this breakdown was
+          // generated against (full.pageVersion, from getResults) with the page's
+          // CURRENT version (pageResult.version, from fetchPage). Only flag stale
+          // when BOTH are known numbers AND the page advanced (current > generated).
+          // When the stored version is missing (older breakdowns) OR the current
+          // version is unknown, clear the flag — never a false "edited" banner.
+          const generatedVersion = full.pageVersion;
+          const currentVersion = pageResult?.version;
+          if (
+            typeof generatedVersion === "number" &&
+            typeof currentVersion === "number" &&
+            currentVersion > generatedVersion
+          ) {
+            setStaleBreakdown({ generatedAt: generatedVersion, current: currentVersion });
+          } else {
+            setStaleBreakdown(null);
+          }
           setResults(v3AdaptResultPayload(full));
           setScreen("reviewing");
           return;
@@ -637,18 +739,43 @@ function App() {
     setElapsed(0);
     setJobStatus({ progress: 0, phase: "Starting..." });
 
+    // Trust the selection ONLY if the per-page context finished loading for THIS
+    // page; otherwise send "none" (safe). Closes the async race where a stale
+    // cross-project selection could be submitted before getContextProfiles resolves.
+    const effectiveProfileId =
+      contextLoadedForPageId === pageData.page_id ? selectedContextProfileId : "none";
     const result = await invoke("startGeneration", {
       pageId: pageData.page_id,
       modelMode: "primary",
+      contextProfileId: effectiveProfileId,
     });
 
     if (result.error === "quota_exceeded") {
-      // Free-tier monthly limit reached (ENFORCEMENT_MODE = 'block'). This is a
-      // NORMAL state, not a failure — route to the dedicated limit screen, NOT
-      // the red "Something went wrong" error screen (which framed it as a bug
-      // and offered a pointless "Try again").
+      // Managed Pro fair-use cap reached (we run Claude + pay compute, so the
+      // monthly allowance is fair-use; payload carries fairUse=true). NORMAL state,
+      // not a failure — route to the dedicated limit screen, NOT the red "Something
+      // went wrong" error screen. (There is no Free tier; this can only be Managed.)
       setQuotaInfo(result);
       setScreen("limit_reached");
+      return;
+    }
+    if (result.error === "license_required") {
+      // Defensive (the 30-day Atlassian trial → paid model means licensed users
+      // shouldn't hit this). If the backend ever reports no active license, show its
+      // composed detail on the friendly limit screen rather than the red error screen.
+      setQuotaInfo(result);
+      setScreen("limit_reached");
+      return;
+    }
+    if (result.error === "managed_unavailable") {
+      // Managed Pro selected but our server key isn't configured (rare/transient).
+      // The backend composes an actionable detail (contact support OR switch to
+      // BYOK) — show it directly rather than the generic classifier wrapping.
+      setError(
+        result.detail ||
+          "The Managed service is temporarily unavailable. Please contact support, or switch to BYOK in Settings and use your own Anthropic API key.",
+      );
+      setScreen("error");
       return;
     }
     if (result.error) {
@@ -666,7 +793,7 @@ function App() {
 
     setJobId(result.job_id);
     startPolling(result.job_id);
-  }, [pageData, startPolling]);
+  }, [pageData, startPolling, selectedContextProfileId, contextLoadedForPageId]);
 
   // ── Push: Step 1 — compute count summary client-side → confirming screen
   //
@@ -742,6 +869,9 @@ function App() {
 
     try {
       const start = await invoke("startPush", { breakdown: pendingBreakdown });
+      // No push gate: every app user is licensed (30-day Atlassian trial → paid;
+      // unsubscribed users are blocked natively by Atlassian, never reaching here),
+      // so push proceeds. Any startPush error is a genuine failure → normal path.
       if (start.error) {
         fail(start, "Push failed to start");
         return;
@@ -812,6 +942,29 @@ function App() {
     setScreen(pageData ? "ready" : "picker");
   }, [pageData]);
 
+  // handleRegenerate — re-run generation from the CURRENT page (2026-06-02). The
+  // problem: routeByPageStatus sends a reopened completed page straight to the
+  // reviewing screen (the OLD breakdown), bypassing Ready where Generate lives — so
+  // a user who edited the spec had no discoverable way to regenerate. This routes
+  // back to Ready (NOT auto-generate) on purpose: the user can re-pick the Project
+  // Context profile + see their usage BEFORE regenerating (the right control point).
+  // pageId/pageData stay bound so Ready renders. Non-destructive — the old job is NOT
+  // purged: a fresh generation supersedes it, and if the user bails the cached
+  // completed breakdown still resumes. Mirrors handleRetry's interval cleanup.
+  const handleRegenerate = useCallback(() => {
+    clearInterval(pollRef.current);
+    clearInterval(pushPollRef.current);
+    setResults(null);
+    setPendingBreakdown(null);
+    setJobId(null);
+    setJobStatus(null);
+    setDryRunResult(null);
+    setPushResult(null);
+    setStaleBreakdown(null);
+    setIsPushing(false);
+    setScreen("ready");
+  }, []);
+
   // handleNewPage — clear page binding, return to picker. Used от
   // PushedScreen "Generate Another" (post-push, user wants different
   // spec).
@@ -828,6 +981,8 @@ function App() {
     setDryRunResult(null);
     setPendingBreakdown(null);
     setIsPushing(false);
+    setSelectedContextProfileId("none");
+    setContextLoadedForPageId(null);
     setScreen("picker");
   }, []);
 
@@ -837,10 +992,65 @@ function App() {
     setScreen("reviewing");
   }, []);
 
+  // In-app Settings open/close. handleOpenSettings is the ONLY place that flips
+  // settingsFromApp → TRUE (so AdminSettings gets a "← Back" button); the globalSettings
+  // admin surface routes to "admin" via the init gate with settingsFromApp left FALSE
+  // (standalone, no Back). handleCloseSettings re-runs the init/config gate (reinitNonce)
+  // so a just-configured app routes straight to the picker instead of back to Setup.
+  const handleOpenSettings = useCallback(() => {
+    setSettingsFromApp(true);
+    setScreen("admin");
+  }, []);
+  const handleCloseSettings = useCallback(() => {
+    setSettingsFromApp(false);
+    setScreen("loading");
+    setReinitNonce((n) => n + 1);
+  }, []);
+
   // ── Render ────────────────────────────────────────────────────
   // Admin page has its own full-screen component.
-  if (screen === "admin") return <AdminSettings />;
-  if (screen === "setup") return <SetupScreen message={error} />;
+  //   • Opened from WITHIN the app (settingsFromApp) → wrap with a "← Back" button so
+  //     the user can return to where they were (the only in-app way back to the app,
+  //     since the globalSettings Configure page is unreachable in the centralized admin).
+  //   • The globalSettings admin module (settingsFromApp === false) renders standalone,
+  //     no Back button — it IS the dedicated settings surface.
+  if (screen === "admin") {
+    if (!settingsFromApp) return <AdminSettings />;
+    // Opened from within the app: AdminSettings is maxWidth:640 + p-8 but NOT
+    // centered, so on the wide globalPage it floated left ("flies in the air") and
+    // the Back button sat detached. Wrap both in a centered 640px frame (matching
+    // AdminSettings' own width) and give the Back button px-8 (= AdminSettings' p-8
+    // left inset) so it aligns with the settings content.
+    return (
+      <div style={{ maxWidth: "640px", margin: "0 auto" }}>
+        <div className="px-8 pt-6">
+          <button
+            type="button"
+            onClick={handleCloseSettings}
+            style={{
+              background: "none",
+              border: "none",
+              color: "var(--s2j-blue)",
+              cursor: "pointer",
+              fontSize: "0.8125rem",
+              padding: 0,
+            }}
+          >
+            ← Back
+          </button>
+        </div>
+        <AdminSettings />
+      </div>
+    );
+  }
+  if (screen === "setup")
+    return (
+      <SetupScreen
+        message={error}
+        isManaged={usage?.edition === "advanced"}
+        onOpenSettings={handleOpenSettings}
+      />
+    );
 
   // Reviewing screen fills the panel (100vh). All others are top-aligned.
   // Track 2 (2026-05-09): top-left "Back to picker" affordance per partner
@@ -890,7 +1100,7 @@ function App() {
           <BackButton
             onClick={handleNewPage}
             className=""
-            title="Discard in-progress edits and return to page picker (job result cached for 1h — re-click page to resume)"
+            title="Return to the page picker (this breakdown stays cached ~1h — re-click the page to resume it). To generate fresh from the current page instead, use the Regenerate button."
           />
           <span
             className="ml-3 text-[11px]"
@@ -898,8 +1108,75 @@ function App() {
           >
             {pageData?.title || "(reviewing)"}
           </span>
+          {/* Regenerate (2026-06-02) — the must-have path back to generation. A
+              reopened completed page lands here on the OLD breakdown (routeByPageStatus
+              bypasses Ready), so without this a user who edited the spec page had no
+              discoverable way to re-run. Routes to Ready (handleRegenerate) — NOT
+              auto-generate — so the user can re-pick the Project Context profile + see
+              their usage first. Always present; the stale banner below just makes it
+              salient when the page changed. Mirrors BackButton's muted-with-hover style;
+              ml-auto pins it to the far end of this flex-row top-bar. */}
+          <button
+            onClick={handleRegenerate}
+            className="text-xs flex items-center gap-1.5 ml-auto"
+            style={{
+              background: "none",
+              border: "none",
+              color: "var(--s2j-text-muted)",
+              cursor: "pointer",
+              padding: "4px 8px",
+              borderRadius: "4px",
+              transition: "all 0.15s",
+              marginRight: "-8px",
+            }}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.background = "var(--s2j-border)";
+              e.currentTarget.style.color = "var(--s2j-text)";
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.background = "none";
+              e.currentTarget.style.color = "var(--s2j-text-muted)";
+            }}
+            title="Re-run generation from the current page (picks up any edits you've made)"
+          >
+            ↻ Regenerate
+          </button>
         </div>
         <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
+          {/* Stale-page banner (2026-06-02) — the page's Confluence version advanced
+              since this breakdown was generated (set in routeByPageStatus). Non-blocking,
+              orange warning style matching the truncation banner (ConfirmScreen). Makes
+              the always-present Regenerate button salient + explains WHY. Only shows when
+              both versions are known and the page genuinely changed (never on missing
+              data). */}
+          {staleBreakdown && (
+            <div
+              className="shrink-0 mx-3 mt-3 rounded-lg p-3 flex items-start gap-2"
+              style={{
+                background: "var(--s2j-orange-bg)",
+                border: "1px solid var(--s2j-orange-border)",
+              }}
+            >
+              <span aria-hidden="true" style={{ flexShrink: 0 }}>⚠</span>
+              <div style={{ flex: 1 }}>
+                <p className="text-sm font-medium" style={{ color: "var(--s2j-text)" }}>
+                  This page was edited since this breakdown was generated
+                </p>
+                <p className="text-xs mt-0.5" style={{ color: "var(--s2j-text-light)" }}>
+                  Page version {staleBreakdown.generatedAt} → {staleBreakdown.current}.
+                  Regenerate to include your changes.
+                </p>
+              </div>
+              <button
+                onClick={handleRegenerate}
+                className="btn-primary text-xs shrink-0"
+                style={{ whiteSpace: "nowrap" }}
+                title="Re-run generation from the current page (picks up any edits you've made)"
+              >
+                ↻ Regenerate
+              </button>
+            </div>
+          )}
           <BreakdownEditor
             initialBreakdown={pendingBreakdown || results.breakdown}
             onPush={handlePush}
@@ -933,9 +1210,14 @@ function App() {
         </Center>
       );
     case "picker":
+      // Settings affordance lives in PagePicker's header (top-right, opposite the
+      // title). WHY in-app at all: the globalSettings Configure page is unreachable in
+      // the centralized "Connected apps" admin, so the picker (the default entry point)
+      // must offer its own way into Settings.
       return (
         <PagePickerScreen
           onSelect={handlePageSelected}
+          onOpenSettings={handleOpenSettings}
         />
       );
     case "ready":
@@ -943,8 +1225,12 @@ function App() {
         <ReadyScreen
           pageData={pageData}
           usage={usage}
+          contextProfiles={contextProfiles}
+          selectedContextProfileId={selectedContextProfileId}
+          onSelectContextProfile={setSelectedContextProfileId}
           onGenerate={handleGenerate}
           onBack={handleNewPage}
+          onOpenSettings={handleOpenSettings}
         />
       );
     case "generating":
@@ -954,6 +1240,7 @@ function App() {
           jobStatus={jobStatus}
           elapsed={elapsed}
           onBack={handleNewPage}
+          onStartOver={handleRegenerate}
         />
       );
     case "confirming":
@@ -1037,19 +1324,51 @@ function Spinner({ size = 16 }) {
 function ReadyScreen({
   pageData,
   usage,
+  contextProfiles = [],
+  selectedContextProfileId = "none",
+  onSelectContextProfile,
   onGenerate,
   onBack,
+  onOpenSettings,
 }) {
-  const proPrice =
-    usage && (usage.pricing || []).find((t) => t.key === "pro")?.price;
+  // Prices come from getUsage's pricing[] (single source of truth — no hardcoded
+  // €-values in the UI). The hybrid has two paid editions: byokPro (unlimited, own
+  // key) + managedPro (we run it). Only byokProPrice is surfaced on this badge (the
+  // Managed → unlimited upsell); there is no Free tier to upsell from.
+  const byokProPrice = findPrice(usage, "byokPro");
   return (
     <div className="p-6" style={SCREEN_MAX_WIDTH_STYLE}>
-      {onBack && (
-        <BackButton
-          onClick={onBack}
-          title="Return to page picker (clears page selection; you can pick a different page)"
-        />
-      )}
+      <div className="flex items-center justify-between">
+        {onBack ? (
+          <BackButton
+            onClick={onBack}
+            title="Return to page picker (clears page selection; you can pick a different page)"
+          />
+        ) : (
+          <span />
+        )}
+        {/* In-app Settings access — the centralized admin has no Configure link, so the
+            app surfaces its own entry point here (manage Anthropic key, JIRA project,
+            Project Context profiles). */}
+        {onOpenSettings && (
+          <button
+            type="button"
+            onClick={onOpenSettings}
+            className="text-xs"
+            style={{
+              background: "none",
+              border: "none",
+              color: "var(--s2j-text-muted)",
+              cursor: "pointer",
+              padding: "4px 8px",
+              borderRadius: "4px",
+            }}
+            title="Open Spec2Tickets settings"
+          >
+            ⚙ Settings
+          </button>
+        )}
+      </div>
       <h2
         className="text-lg font-semibold mb-1"
         style={{ color: "var(--s2j-text)" }}
@@ -1076,20 +1395,24 @@ function ReadyScreen({
               </strong>{" "}
               · unlimited breakdowns
             </span>
-          ) : (
+          ) : usage.tier === "managedPro" ? (
+            // Managed Pro is CAPPED fair-use (we run Claude), not a free trial —
+            // describe it as the monthly fair-use allowance, not a raw cap number.
             <span>
               <strong style={{ color: "var(--s2j-text)" }}>
-                {usage.used} of {usage.limit}
+                {usage.tierLabel} plan
               </strong>{" "}
-              free breakdowns used this month · resets {usage.resetsAtLabel}
-              {usage.remaining === 0 && (
+              · {usage.used} breakdowns this month (fair-use allowance) · resets{" "}
+              {usage.resetsAtLabel}
+              {usage.remaining === 0 && byokProPrice && (
                 <span style={{ color: "var(--s2j-text)" }}>
                   {" "}
-                  · upgrade to Pro{proPrice ? ` (${proPrice})` : ""} for unlimited
+                  · for unlimited, switch to BYOK Pro ({byokProPrice}) with your own
+                  key
                 </span>
               )}
             </span>
-          )}
+          ) : null}
         </div>
       )}
 
@@ -1116,6 +1439,49 @@ function ReadyScreen({
         Typical runtime: 60–150 seconds depending on spec size.
       </div>
 
+      {/* Project Context selector — pick which named context applies to THIS spec, so
+          a multi-project workspace never gets the wrong project's context injected. */}
+      {contextProfiles.length > 0 ? (
+        <div className="mb-4">
+          <label
+            className="text-sm font-medium block mb-1"
+            style={{ color: "var(--s2j-text)" }}
+          >
+            Project Context
+          </label>
+          <select
+            value={selectedContextProfileId}
+            onChange={(e) => onSelectContextProfile?.(e.target.value)}
+            style={{
+              width: "100%",
+              padding: "8px 12px",
+              fontSize: "0.875rem",
+              borderRadius: "6px",
+              border: "1px solid var(--s2j-border)",
+              background: "var(--s2j-bg)",
+              color: "var(--s2j-text)",
+              outline: "none",
+            }}
+          >
+            <option value="none">None — use the spec on its own</option>
+            {contextProfiles.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.name}
+              </option>
+            ))}
+          </select>
+          <p className="text-xs mt-1" style={{ color: "var(--s2j-text-muted)" }}>
+            Applies your project's domain &amp; glossary to this breakdown. Pick the
+            profile matching this spec's project; manage profiles in Settings.
+          </p>
+        </div>
+      ) : (
+        <p className="text-xs mb-4" style={{ color: "var(--s2j-text-muted)" }}>
+          Tip: add a Project Context in Settings to tailor breakdowns to your project's
+          domain, glossary, and conventions.
+        </p>
+      )}
+
       <div className="flex gap-3">
         <button
           onClick={onGenerate}
@@ -1130,8 +1496,7 @@ function ReadyScreen({
 
 // ── Generating ──────────────────────────────────────────────────
 
-function GeneratingScreen({ pageTitle, jobStatus, elapsed, onBack }) {
-  const pct = Math.round((jobStatus?.progress || 0) * 100);
+function GeneratingScreen({ pageTitle, elapsed, onBack, onStartOver }) {
   return (
     <div className="p-6" style={SCREEN_MAX_WIDTH_STYLE}>
       {/* U2 part 33 (2026-05-09) — refactored to use shared BackButton.
@@ -1145,43 +1510,82 @@ function GeneratingScreen({ pageTitle, jobStatus, elapsed, onBack }) {
           title="Pipeline continues in background. Return to picker; you can come back to this page anytime to see progress."
         />
       )}
-      <div className="flex items-center gap-2 mb-1">
-        <Spinner size={18} />
+      {/* Centered status — a big INDETERMINATE spinner with the LIVE elapsed time in
+          the center. Generation runs on Anthropic's async Batch API, which gives NO
+          granular progress for a single breakdown (one opaque call: submit → process
+          → ended), so the old determinate bar sat near 0% then jumped to 100% — it
+          read as "broken". An honest spinner + timer conveys "working, here's how
+          long" without faking a percentage. */}
+      <div className="flex flex-col items-center text-center py-6">
+        <div className="relative mb-5" style={{ width: 96, height: 96 }}>
+          <div
+            className="absolute inset-0 rounded-full animate-spin"
+            style={{
+              border: "3px solid var(--s2j-border)",
+              borderTopColor: "var(--s2j-blue)",
+              animationDuration: "1.1s",
+            }}
+          />
+          <div className="absolute inset-0 flex items-center justify-center">
+            <span
+              className="text-xl font-mono font-semibold"
+              style={{ color: "var(--s2j-text)" }}
+            >
+              {fmtTime(elapsed)}
+            </span>
+          </div>
+        </div>
         <h2
-          className="text-lg font-semibold"
+          className="text-base font-semibold"
           style={{ color: "var(--s2j-text)" }}
         >
-          Generating breakdown
+          Your Confluence specification is being analyzed
         </h2>
+        {pageTitle && (
+          <p className="text-sm mt-0.5" style={{ color: "var(--s2j-text-light)" }}>
+            {pageTitle}
+          </p>
+        )}
+        <p
+          className="text-xs mt-2.5"
+          style={{ color: "var(--s2j-text-muted)", maxWidth: "26rem" }}
+        >
+          Building a structured JIRA breakdown — Stories, Subtasks, cross-feature
+          dependencies, and quality signals. This usually takes a few minutes; large
+          specs and busy periods take longer.
+        </p>
       </div>
-      <p className="text-sm mb-4" style={{ color: "var(--s2j-text-light)" }}>
-        {pageTitle}
-      </p>
 
-      {/* Progress bar */}
-      <div
-        className="w-full h-2 rounded-full overflow-hidden mb-2"
-        style={{ background: "var(--s2j-border)" }}
-      >
+      {/* After ~10 min the bare spinner reads as "broken". Generation runs on
+          Anthropic's async Batch API (chosen for cost + to dodge the sync/event
+          timeouts — see gotcha #5), whose turnaround VARIES with Anthropic's
+          queue load (typical 6-8 min, but slower under heavy Claude load). This
+          reassurance appears only once we're past the usual window, so a slow
+          batch reads as "still working", not "stuck". elapsed is in seconds. */}
+      {elapsed >= 600 && (
         <div
-          className="h-full rounded-full transition-all duration-500"
+          className="rounded-lg p-3 mb-4 flex items-start gap-2"
           style={{
-            width: `${Math.max(pct, 2)}%`,
-            background: "var(--s2j-blue)",
+            background: "var(--s2j-orange-bg)",
+            border: "1px solid var(--s2j-orange-border)",
           }}
-        />
-      </div>
-      <div className="flex justify-between text-sm mb-1">
-        <span style={{ color: "var(--s2j-text-light)" }}>
-          {jobStatus?.phase || "Starting..."}
-        </span>
-        <span className="font-semibold" style={{ color: "var(--s2j-blue)" }}>
-          {pct}%
-        </span>
-      </div>
-      <p className="text-xs mb-4" style={{ color: "var(--s2j-text-muted)" }}>
-        {fmtTime(elapsed)} elapsed
-      </p>
+        >
+          <span aria-hidden="true">⏳</span>
+          <div>
+            <p
+              className="text-xs font-medium mb-1"
+              style={{ color: "var(--s2j-text)" }}
+            >
+              Taking longer than usual — this is normal, nothing is broken
+            </p>
+            <p className="text-xs" style={{ color: "var(--s2j-text-light)" }}>
+              Generation runs on Anthropic's Batch API, which can slow down when
+              Claude is under heavy load. Your request is still processing and your
+              breakdown will finish on its own — it is not lost.
+            </p>
+          </div>
+        </div>
+      )}
 
       <div
         className="rounded-lg p-3"
@@ -1194,13 +1598,32 @@ function GeneratingScreen({ pageTitle, jobStatus, elapsed, onBack }) {
           className="text-xs font-medium mb-1"
           style={{ color: "var(--s2j-text)" }}
         >
-          You can close this panel
+          ☕ You can safely leave — we'll keep working
         </p>
         <p className="text-xs" style={{ color: "var(--s2j-text-light)" }}>
-          The pipeline continues in the background. Reopen via ••• menu to check
-          progress.
+          Close this tab, switch tasks, or come back tomorrow — your breakdown keeps
+          generating. Reopen this page (Apps → Spec2Tickets) and it will be waiting
+          for you, even if it took a while.
         </p>
       </div>
+      {onStartOver && (
+        <button
+          type="button"
+          onClick={onStartOver}
+          className="mt-3 text-xs"
+          style={{
+            color: "var(--s2j-text-muted)",
+            background: "none",
+            border: "none",
+            padding: 0,
+            cursor: "pointer",
+            textDecoration: "underline",
+          }}
+          title="Abandon this run and start over from the current page (e.g. you edited the spec after starting this generation)"
+        >
+          Started this before your latest edits? Start over
+        </button>
+      )}
     </div>
   );
 }
@@ -2185,31 +2608,84 @@ function PushedScreen({ result, onBack, onNew }) {
 
 // ── Error ───────────────────────────────────────────────────────
 
-// ── Free-tier limit reached ─────────────────────────────────────
-// A NORMAL freemium state (not an error) — friendly framing, no "Something went
-// wrong", no pointless "Try again", no support-as-primary. Shows the reset date
-// (the actionable info for a free user) + the Pro upgrade CTA.
+// ── Limit reached / subscription required ───────────────────────
+// A NORMAL state (not an error) — friendly framing, no "Something went wrong", no
+// pointless "Try again", no support-as-primary. There is no in-app Free tier (the
+// 30-day Atlassian trial covers evaluation; after it, an unsubscribed user is
+// blocked natively by Atlassian and never reaches the app). So this screen drives
+// just two situations (the routing sets `quota`):
 //
-// PRO_UPGRADE_URL — where "Upgrade to Pro" sends the user. The exact per-listing
-// Marketplace subscription deep link only exists once the paid listing is live
-// (P3b); until then we send them to the Atlassian admin hub, where app
-// subscriptions are managed (universal — no per-site / per-listing URL needed).
-// Set to null to fall back to info-only (no button — today's pre-CTA behaviour);
-// refine to the exact listing subscription URL once it is known.
-const PRO_UPGRADE_URL = "https://admin.atlassian.com/";
+//   1. Managed Pro fair-use cap hit (quota_exceeded, fairUse=true) — we run Claude
+//      and pay compute, so the monthly allowance is fair-use, not a trial wall. Path
+//      forward: switch to BYOK Pro (unlimited with the customer's own key).
+//   2. license_required (DEFENSIVE — shouldn't normally occur) — the backend reports
+//      no active license. Show its composed `detail`; the path forward is to manage
+//      the subscription in the Atlassian admin hub.
+//
+// The backend composes a correct `detail` for each (tier-aware) — we PREFER showing
+// it. Edition prices come from quota.pricing[] (single source — never hardcoded).
+//
+// UPGRADE_URL — where the CTA sends the user. The exact per-listing Marketplace
+// subscription deep link only exists once the paid listing is live (P3b); until then
+// we send them to the Atlassian admin hub, where app subscriptions are managed
+// (universal — no per-site / per-listing URL needed). Set to null to fall back to
+// info-only (no button); refine to the exact listing subscription URL once known.
+const UPGRADE_URL = "https://admin.atlassian.com/";
+
+// One edition row in the subscription card (label + price + one-line value prop).
+function EditionRow({ name, price, blurb }) {
+  if (!price) return null;
+  return (
+    <div className="flex items-baseline justify-between gap-3 py-1">
+      <div style={{ minWidth: 0 }}>
+        <span className="text-sm font-medium" style={{ color: "var(--s2j-text)" }}>
+          {name}
+        </span>
+        <span className="text-xs ml-2" style={{ color: "var(--s2j-text-light)" }}>
+          {blurb}
+        </span>
+      </div>
+      <span
+        className="text-sm font-semibold shrink-0"
+        style={{ color: "var(--s2j-text)" }}
+      >
+        {price}
+      </span>
+    </div>
+  );
+}
 
 function LimitReachedScreen({ quota, onBack }) {
-  const limit = quota?.limit ?? 3;
+  // Mode from the routing payload. license_required (defensive) → no active license;
+  // otherwise a quota_exceeded payload, which can only be the Managed Pro fair-use
+  // cap (there is no Free tier). Default to the fair-use framing.
+  const isLicenseRequired = quota?.error === "license_required";
+  const isFairUse = !isLicenseRequired;
+
+  const limit = quota?.limit;
   const resetsAt =
     quota?.resetsAtLabel ||
     (quota?.resetsAt ? String(quota.resetsAt).slice(0, 10) : null);
-  const proPrice =
-    quota?.upgradePrice ||
-    (quota?.pricing || []).find((t) => t.key === "pro")?.price;
+  const byokProPrice = findPrice(quota, "byokPro");
+  // Only surfaced in the license_required (no-plan) branch — fair-use already has a plan.
+  const managedProPrice = findPrice(quota, "managedPro");
+
+  // Headline + intro. Prefer the backend-composed `detail` for the body (it is
+  // already tier-correct and mentions the reset date / prices); fall back to a
+  // mode-specific sentence if it is ever absent.
+  const heading = isLicenseRequired
+    ? "Subscription required"
+    : "You've reached this month's fair-use limit";
+  const fallbackBody = isLicenseRequired
+    ? "An active subscription is required to use Spec2Tickets. Manage your subscription from your Atlassian site admin."
+    : limit
+      ? `You've used all ${limit} breakdowns in this month's fair-use allowance.`
+      : "You've used this month's fair-use allowance.";
+
   const openUpgrade = () => {
-    if (!PRO_UPGRADE_URL) return;
+    if (!UPGRADE_URL) return;
     try {
-      router.open(PRO_UPGRADE_URL);
+      router.open(UPGRADE_URL);
     } catch (_) {
       /* no-op if the bridge router is unavailable */
     }
@@ -2229,19 +2705,24 @@ function LimitReachedScreen({ quota, onBack }) {
         }}
       >
         <h2 className="text-lg font-semibold mb-1" style={{ color: "var(--s2j-text)" }}>
-          You've reached your free limit
+          {heading}
         </h2>
-        <p className="text-sm mb-1" style={{ color: "var(--s2j-text)" }}>
-          You've used all {limit} free breakdowns this month.
+        <p className="text-sm" style={{ color: "var(--s2j-text)" }}>
+          {quota?.detail || fallbackBody}
         </p>
-        {resetsAt && (
-          <p className="text-sm" style={{ color: "var(--s2j-text-light)" }}>
-            Your free quota resets on <strong>{resetsAt}</strong>.
+        {/* Reset date is the actionable info for a Managed user waiting out the
+            fair-use month rather than switching to BYOK. license_required has no
+            monthly reset (it's an account/subscription state, not a quota). */}
+        {isFairUse && !quota?.detail && resetsAt && (
+          <p className="text-sm mt-1" style={{ color: "var(--s2j-text-light)" }}>
+            Your fair-use allowance resets on <strong>{resetsAt}</strong>.
           </p>
         )}
       </div>
 
-      {proPrice && (
+      {/* Subscription card. Fair-use (Managed) routes to BYOK Pro ONLY (unlimited);
+          license_required (no plan) offers both editions to choose from. */}
+      {(byokProPrice || (isLicenseRequired && managedProPrice)) && (
         <div
           className="rounded-lg p-4 mb-4"
           style={{
@@ -2249,22 +2730,38 @@ function LimitReachedScreen({ quota, onBack }) {
             border: "1px solid var(--s2j-green-border)",
           }}
         >
-          <p className="text-sm font-medium mb-1" style={{ color: "var(--s2j-text)" }}>
-            Upgrade to Pro — {proPrice}
-          </p>
           <p
-            className="text-xs"
-            style={{
-              color: "var(--s2j-text-light)",
-              marginBottom: PRO_UPGRADE_URL ? 12 : 0,
-            }}
+            className="text-xs font-medium uppercase tracking-wider mb-2"
+            style={{ color: "var(--s2j-text-muted)" }}
           >
-            Unlimited breakdowns. You keep using your own Anthropic API key.
+            {isFairUse ? "For unlimited" : "Choose a plan"}
           </p>
-          {PRO_UPGRADE_URL && (
+
+          {isFairUse ? (
+            <EditionRow
+              name="BYOK Pro"
+              price={byokProPrice}
+              blurb="unlimited — use your own Anthropic key"
+            />
+          ) : (
             <>
-              <button onClick={openUpgrade} className="btn-primary">
-                Upgrade to Pro
+              <EditionRow
+                name="BYOK Pro"
+                price={byokProPrice}
+                blurb="unlimited — bring your own Anthropic key"
+              />
+              <EditionRow
+                name="Managed Pro"
+                price={managedProPrice}
+                blurb="we run Claude for you — no API key needed"
+              />
+            </>
+          )}
+
+          {UPGRADE_URL && (
+            <>
+              <button onClick={openUpgrade} className="btn-primary mt-3">
+                {isFairUse ? "Switch to BYOK Pro" : "Subscribe"}
               </button>
               <p
                 className="text-xs"
@@ -2354,14 +2851,16 @@ function ErrorScreen({ error, onRetry, onBackToPicker }) {
 }
 
 /**
- * SetupScreen — shown when Spec2Tickets is not yet configured.
- * Complements AdminSettings (does not repeat its content).
+ * SetupScreen — shown when Spec2Tickets is not yet configured. Complements
+ * AdminSettings (does not repeat its content). TIER-AWARE (hybrid 2026-06-03):
+ * Managed Pro (Advanced) runs Claude on our key, so it asks ONLY for a JIRA
+ * project key; BYOK Pro (Standard) also needs the customer's own Anthropic key.
  *
  * Surfaces to customer:
- *   - Prerequisite (BYOK): an Anthropic API key + a JIRA project key
+ *   - Prerequisite: a JIRA project key (+ an Anthropic API key for BYOK only)
  *   - Navigation path: how to reach Settings to configure them
  */
-function SetupScreen({ message }) {
+function SetupScreen({ message, isManaged = false, onOpenSettings }) {
   return (
     <div className="p-6" style={SCREEN_MAX_WIDTH_STYLE}>
       <div
@@ -2399,22 +2898,48 @@ function SetupScreen({ message }) {
           Spec2Tickets needs to be configured before first use.
         </p>
 
-        {/* v3.0.0 BYOK prerequisite — customer needs Anthropic key + JIRA project */}
-        <p className="text-sm mb-3" style={{ color: "var(--s2j-text)" }}>
-          <strong>You will need:</strong>
-          <br />
-          • An Anthropic API key (sign up at{" "}
-          <a
-            href="https://console.anthropic.com/settings/keys"
-            target="_blank"
-            rel="noopener noreferrer"
-            style={{ color: "var(--s2j-blue)", textDecoration: "underline" }}
+        {/* Prerequisite — TIER-AWARE (hybrid 2026-06-03). Managed Pro (Advanced)
+            runs Claude on OUR key → only the JIRA project key is needed; BYOK Pro
+            (Standard) also needs the customer's own Anthropic key. */}
+        {isManaged ? (
+          <p className="text-sm mb-3" style={{ color: "var(--s2j-text)" }}>
+            <strong>You will need:</strong>
+            <br />• A JIRA project key where the breakdown will be created
+            <br />
+            <span style={{ color: "var(--s2j-text-light)" }}>
+              No Anthropic API key needed — Managed Pro runs Claude with our key.
+            </span>
+          </p>
+        ) : (
+          <p className="text-sm mb-3" style={{ color: "var(--s2j-text)" }}>
+            <strong>You will need:</strong>
+            <br />
+            • An Anthropic API key (sign up at{" "}
+            <a
+              href="https://console.anthropic.com/settings/keys"
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{ color: "var(--s2j-blue)", textDecoration: "underline" }}
+            >
+              console.anthropic.com → API Keys
+            </a>
+            ; billed pay-as-you-go to your own Anthropic account)
+            <br />• A JIRA project key where the breakdown will be created
+          </p>
+        )}
+
+        {/* Primary call-to-action — open the app's OWN in-app Settings. This is the
+            reliable path: the globalSettings "Configure" page is unreachable in the
+            centralized admin (see App-level note). The "How to configure" steps below
+            remain as a secondary fallback for users who prefer the admin route. */}
+        {onOpenSettings && (
+          <button
+            onClick={onOpenSettings}
+            className="btn-primary justify-center mb-3"
           >
-            console.anthropic.com → API Keys
-          </a>
-          ; billed pay-as-you-go to your own Anthropic account)
-          <br />• A JIRA project key where the breakdown will be created
-        </p>
+            Open Settings
+          </button>
+        )}
 
         <div
           className="rounded p-3 text-xs leading-relaxed"
@@ -2436,11 +2961,15 @@ function SetupScreen({ message }) {
             3. Find <strong>Spec2Tickets Settings</strong> in the left sidebar
           </p>
           <p>
-            4. Paste your Anthropic API key + JIRA Project Key, then Test &amp;
-            Save
+            4.{" "}
+            {isManaged
+              ? "Set your JIRA Project Key, then Save"
+              : "Paste your Anthropic API key + JIRA Project Key, then Test & Save"}
           </p>
           <p style={{ marginTop: "6px", fontStyle: "italic" }}>
-            Powered by Claude Sonnet 4.6 — your spec content flows directly from Forge to the Anthropic API using your own key. No data on Spec2Tickets servers.
+            {isManaged
+              ? "Powered by Claude Sonnet 4.6 — Managed Pro runs it for you (no API key needed). Your spec content flows from Forge to the Anthropic API; nothing is stored on Spec2Tickets servers."
+              : "Powered by Claude Sonnet 4.6 — your spec content flows directly from Forge to the Anthropic API using your own key. No data on Spec2Tickets servers."}
           </p>
         </div>
       </div>
@@ -2449,6 +2978,17 @@ function SetupScreen({ message }) {
 }
 
 // ── Util ────────────────────────────────────────────────────────
+
+// Look up a tier's display price from a getUsage/quota pricing[] array. The
+// pricing table is the SINGLE source of €-values (composed server-side) — the UI
+// never hardcodes prices, so a price change in usage.js flows through everywhere.
+// Accepts the full usage/quota object OR a raw pricing array. Returns null if absent.
+function findPrice(usageOrPricing, key) {
+  const pricing = Array.isArray(usageOrPricing)
+    ? usageOrPricing
+    : usageOrPricing?.pricing;
+  return (pricing || []).find((t) => t.key === key)?.price || null;
+}
 
 function fmtTime(s) {
   if (!s || s < 0) return "0s";

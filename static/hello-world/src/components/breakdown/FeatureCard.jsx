@@ -2,6 +2,7 @@ import { useState } from 'react';
 import EditableField from './EditableField.jsx';
 import TaskCard from './TaskCard.jsx';
 import LabelsEditor from './LabelsEditor.jsx';
+import { parseConcernPrefix, SEVERITY_PALETTE, CONCERN_TYPE_LABEL } from '../../lib/v3Schema.js';
 
 /**
  * FeatureCard — Editor for a single Feature (→ JIRA Story).
@@ -246,6 +247,40 @@ export default function FeatureCard({ feature, index, onUpdate, onDelete }) {
                 <span className="text-[11px] leading-relaxed"
                   style={{ color: 'var(--s2j-text-light)' }}>{sourceHeading}</span>
               </div>
+            </div>
+          )}
+          {/* AI-flagged concerns for THIS feature — the "review in the editor"
+              target the Review screen's feature-concern count points to. Read-only,
+              verbatim, severity-colored (the per-feature analogue of the spec-level
+              concern cards). feature.concerns are "[TYPE|severity] text" strings
+              (parseConcernPrefix decodes them). Renders only when the feature has
+              concerns; clean features skip it. */}
+          {(feature.concerns || []).length > 0 && (
+            <div className="space-y-1.5 pb-1">
+              <span className="text-[11px] font-medium uppercase tracking-wider"
+                style={{ color: 'var(--s2j-text-muted)' }}>
+                AI flagged ({feature.concerns.length})
+              </span>
+              {feature.concerns.map((raw, i) => {
+                const { type, severity, text } = parseConcernPrefix(raw);
+                const palette = SEVERITY_PALETTE[severity] || SEVERITY_PALETTE.medium;
+                const typeLabel = CONCERN_TYPE_LABEL[type] || type;
+                return (
+                  <div key={i} className="rounded p-2"
+                    style={{ background: palette.bg, border: `1px solid ${palette.border}` }}>
+                    <div className="flex items-center gap-1.5 mb-0.5">
+                      <span className="text-[9px] font-bold uppercase tracking-wider px-1 py-0.5 rounded"
+                        style={{ background: palette.text, color: 'white' }}>
+                        {severity}
+                      </span>
+                      <span className="text-[11px] font-semibold" style={{ color: palette.text }}>
+                        {typeLabel}
+                      </span>
+                    </div>
+                    <p className="text-xs leading-relaxed" style={{ color: 'var(--s2j-text)' }}>{text}</p>
+                  </div>
+                );
+              })}
             </div>
           )}
           {/* Sizing — model-suggested, editable. complexity_score is the model's
