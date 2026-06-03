@@ -284,6 +284,21 @@ function App() {
   // NEVER show a false "edited" banner).
   const [staleBreakdown, setStaleBreakdown] = useState(null);
 
+  // In-app Settings access (2026-06-03). WHY this exists: the Forge
+  // confluence:globalSettings "Configure" page (which renders AdminSettings) is
+  // NOT reachable from Atlassian's centralized "Connected apps" admin — the classic
+  // UPM URL now redirects to "App management has moved" and the centralized admin
+  // exposes no Configure link. So the app must surface its OWN in-app Settings entry
+  // point (Setup / Ready / Picker screens), independent of the admin UI.
+  //   reinitNonce — bumped on closing in-app Settings; re-runs the init/config gate
+  //     (re-checks config → routes to picker if now configured) via the init useEffect's
+  //     dependency array.
+  //   settingsFromApp — TRUE only when Settings was opened from WITHIN the app (show a
+  //     "← Back" button above AdminSettings). FALSE on the globalSettings admin surface
+  //     (standalone, no Back). handleOpenSettings is the ONLY place that sets it TRUE.
+  const [reinitNonce, setReinitNonce] = useState(0);
+  const [settingsFromApp, setSettingsFromApp] = useState(false);
+
   const pollRef = useRef(null);
   const timerRef = useRef(null);
   const pushPollRef = useRef(null);
@@ -345,17 +360,31 @@ function App() {
           }
         }
 
-        // ═══ Gate 1 — Settings (v3.0.0 BYOK shape) ═══
-        // v2.x checked backendUrl + backendApiKey + lastTestOk; v3.0.0
-        // checks the BYOK Anthropic key + default JIRA project key. Both
-        // must be configured за app к be usable. Stale-cache concerns
-        // about Anthropic API health are deferred к actual generate-time
-        // (when failures surface как clear errors с specific causes);
-        // no automatic re-test на every app open (avoids а ~3 sec
-        // Anthropic round-trip at every mount).
-        const settings = await invoke("getSettings");
+        // ═══ Gate 1 — Settings (tier-aware, hybrid 2026-06-03) ═══
+        // v3.0.0 required a BYOK Anthropic key + a default JIRA project key. The
+        // hybrid makes the KEY requirement TIER-AWARE: Managed Pro (the Advanced
+        // edition) runs Claude on OUR key, so a Managed user has NO BYOK key by
+        // design — requiring one wrongly trapped them on the BYOK setup screen
+        // (the bug this fixes). BYOK Pro (Standard) still needs the customer's own
+        // key. Both editions still need a default JIRA project key (used by push).
+        // getUsage carries the license-resolved edition; fetched in PARALLEL with
+        // getSettings (no added latency) and fail-soft — on a metering glitch it is
+        // null, so we fall back to the BYOK key requirement (safe: at worst a
+        // Managed user is asked to open Settings; the key SOURCE is backend-resolved
+        // from the license regardless, so the wrong key is never actually used).
+        // Anthropic-health staleness stays deferred to generate-time (no re-test on
+        // every mount).
+        const [settings, mountUsage] = await Promise.all([
+          invoke("getSettings"),
+          invoke("getUsage").catch(() => null),
+        ]);
+        if (mountUsage && !mountUsage.error) setUsage(mountUsage);
+        const isManaged = mountUsage?.edition === "advanced";
 
-        if (!settings?.apiKeyConfigured || !settings?.defaultProjectKey) {
+        if (
+          (!isManaged && !settings?.apiKeyConfigured) ||
+          !settings?.defaultProjectKey
+        ) {
           setScreen("setup");
           return;
         }
@@ -506,7 +535,9 @@ function App() {
       clearInterval(timerRef.current);
       clearInterval(pushPollRef.current);
     };
-  }, []);
+    // reinitNonce: bumped by handleCloseSettings → re-runs the init/config gate after
+    // closing in-app Settings (re-checks config → routes to picker if now configured).
+  }, [reinitNonce]);
 
   // ── Timer ─────────────────────────────────────────────────────
   // The generating screen shows an elapsed-time counter — visible timing
@@ -961,10 +992,60 @@ function App() {
     setScreen("reviewing");
   }, []);
 
+  // In-app Settings open/close. handleOpenSettings is the ONLY place that flips
+  // settingsFromApp → TRUE (so AdminSettings gets a "← Back" button); the globalSettings
+  // admin surface routes to "admin" via the init gate with settingsFromApp left FALSE
+  // (standalone, no Back). handleCloseSettings re-runs the init/config gate (reinitNonce)
+  // so a just-configured app routes straight to the picker instead of back to Setup.
+  const handleOpenSettings = useCallback(() => {
+    setSettingsFromApp(true);
+    setScreen("admin");
+  }, []);
+  const handleCloseSettings = useCallback(() => {
+    setSettingsFromApp(false);
+    setScreen("loading");
+    setReinitNonce((n) => n + 1);
+  }, []);
+
   // ── Render ────────────────────────────────────────────────────
   // Admin page has its own full-screen component.
-  if (screen === "admin") return <AdminSettings />;
-  if (screen === "setup") return <SetupScreen message={error} />;
+  //   • Opened from WITHIN the app (settingsFromApp) → wrap with a "← Back" button so
+  //     the user can return to where they were (the only in-app way back to the app,
+  //     since the globalSettings Configure page is unreachable in the centralized admin).
+  //   • The globalSettings admin module (settingsFromApp === false) renders standalone,
+  //     no Back button — it IS the dedicated settings surface.
+  if (screen === "admin") {
+    if (!settingsFromApp) return <AdminSettings />;
+    return (
+      <>
+        <div className="px-6 pt-4" style={SCREEN_MAX_WIDTH_STYLE}>
+          <button
+            type="button"
+            onClick={handleCloseSettings}
+            style={{
+              background: "none",
+              border: "none",
+              color: "var(--s2j-blue)",
+              cursor: "pointer",
+              fontSize: "0.8125rem",
+              padding: 0,
+            }}
+          >
+            ← Back
+          </button>
+        </div>
+        <AdminSettings />
+      </>
+    );
+  }
+  if (screen === "setup")
+    return (
+      <SetupScreen
+        message={error}
+        isManaged={usage?.edition === "advanced"}
+        onOpenSettings={handleOpenSettings}
+      />
+    );
 
   // Reviewing screen fills the panel (100vh). All others are top-aligned.
   // Track 2 (2026-05-09): top-left "Back to picker" affordance per partner
@@ -1124,10 +1205,32 @@ function App() {
         </Center>
       );
     case "picker":
+      // PagePickerScreen is an imported component (not editable here) → the in-app
+      // Settings affordance is rendered BELOW it. WHY: the globalSettings Configure page
+      // is unreachable in the centralized admin, so the picker (the default entry point)
+      // must offer a way into Settings.
       return (
-        <PagePickerScreen
-          onSelect={handlePageSelected}
-        />
+        <>
+          <PagePickerScreen onSelect={handlePageSelected} />
+          <div className="px-6 pb-6" style={SCREEN_MAX_WIDTH_STYLE}>
+            <button
+              type="button"
+              onClick={handleOpenSettings}
+              className="text-xs"
+              style={{
+                background: "none",
+                border: "none",
+                color: "var(--s2j-text-muted)",
+                cursor: "pointer",
+                padding: "4px 8px",
+                borderRadius: "4px",
+              }}
+              title="Open Spec2Tickets settings"
+            >
+              ⚙ Settings
+            </button>
+          </div>
+        </>
       );
     case "ready":
       return (
@@ -1139,6 +1242,7 @@ function App() {
           onSelectContextProfile={setSelectedContextProfileId}
           onGenerate={handleGenerate}
           onBack={handleNewPage}
+          onOpenSettings={handleOpenSettings}
         />
       );
     case "generating":
@@ -1237,6 +1341,7 @@ function ReadyScreen({
   onSelectContextProfile,
   onGenerate,
   onBack,
+  onOpenSettings,
 }) {
   // Prices come from getUsage's pricing[] (single source of truth — no hardcoded
   // €-values in the UI). The hybrid has two paid editions: byokPro (unlimited, own
@@ -1245,12 +1350,37 @@ function ReadyScreen({
   const byokProPrice = findPrice(usage, "byokPro");
   return (
     <div className="p-6" style={SCREEN_MAX_WIDTH_STYLE}>
-      {onBack && (
-        <BackButton
-          onClick={onBack}
-          title="Return to page picker (clears page selection; you can pick a different page)"
-        />
-      )}
+      <div className="flex items-center justify-between">
+        {onBack ? (
+          <BackButton
+            onClick={onBack}
+            title="Return to page picker (clears page selection; you can pick a different page)"
+          />
+        ) : (
+          <span />
+        )}
+        {/* In-app Settings access — the centralized admin has no Configure link, so the
+            app surfaces its own entry point here (manage Anthropic key, JIRA project,
+            Project Context profiles). */}
+        {onOpenSettings && (
+          <button
+            type="button"
+            onClick={onOpenSettings}
+            className="text-xs"
+            style={{
+              background: "none",
+              border: "none",
+              color: "var(--s2j-text-muted)",
+              cursor: "pointer",
+              padding: "4px 8px",
+              borderRadius: "4px",
+            }}
+            title="Open Spec2Tickets settings"
+          >
+            ⚙ Settings
+          </button>
+        )}
+      </div>
       <h2
         className="text-lg font-semibold mb-1"
         style={{ color: "var(--s2j-text)" }}
@@ -2725,14 +2855,16 @@ function ErrorScreen({ error, onRetry, onBackToPicker }) {
 }
 
 /**
- * SetupScreen — shown when Spec2Tickets is not yet configured.
- * Complements AdminSettings (does not repeat its content).
+ * SetupScreen — shown when Spec2Tickets is not yet configured. Complements
+ * AdminSettings (does not repeat its content). TIER-AWARE (hybrid 2026-06-03):
+ * Managed Pro (Advanced) runs Claude on our key, so it asks ONLY for a JIRA
+ * project key; BYOK Pro (Standard) also needs the customer's own Anthropic key.
  *
  * Surfaces to customer:
- *   - Prerequisite (BYOK): an Anthropic API key + a JIRA project key
+ *   - Prerequisite: a JIRA project key (+ an Anthropic API key for BYOK only)
  *   - Navigation path: how to reach Settings to configure them
  */
-function SetupScreen({ message }) {
+function SetupScreen({ message, isManaged = false, onOpenSettings }) {
   return (
     <div className="p-6" style={SCREEN_MAX_WIDTH_STYLE}>
       <div
@@ -2770,22 +2902,48 @@ function SetupScreen({ message }) {
           Spec2Tickets needs to be configured before first use.
         </p>
 
-        {/* v3.0.0 BYOK prerequisite — customer needs Anthropic key + JIRA project */}
-        <p className="text-sm mb-3" style={{ color: "var(--s2j-text)" }}>
-          <strong>You will need:</strong>
-          <br />
-          • An Anthropic API key (sign up at{" "}
-          <a
-            href="https://console.anthropic.com/settings/keys"
-            target="_blank"
-            rel="noopener noreferrer"
-            style={{ color: "var(--s2j-blue)", textDecoration: "underline" }}
+        {/* Prerequisite — TIER-AWARE (hybrid 2026-06-03). Managed Pro (Advanced)
+            runs Claude on OUR key → only the JIRA project key is needed; BYOK Pro
+            (Standard) also needs the customer's own Anthropic key. */}
+        {isManaged ? (
+          <p className="text-sm mb-3" style={{ color: "var(--s2j-text)" }}>
+            <strong>You will need:</strong>
+            <br />• A JIRA project key where the breakdown will be created
+            <br />
+            <span style={{ color: "var(--s2j-text-light)" }}>
+              No Anthropic API key needed — Managed Pro runs Claude with our key.
+            </span>
+          </p>
+        ) : (
+          <p className="text-sm mb-3" style={{ color: "var(--s2j-text)" }}>
+            <strong>You will need:</strong>
+            <br />
+            • An Anthropic API key (sign up at{" "}
+            <a
+              href="https://console.anthropic.com/settings/keys"
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{ color: "var(--s2j-blue)", textDecoration: "underline" }}
+            >
+              console.anthropic.com → API Keys
+            </a>
+            ; billed pay-as-you-go to your own Anthropic account)
+            <br />• A JIRA project key where the breakdown will be created
+          </p>
+        )}
+
+        {/* Primary call-to-action — open the app's OWN in-app Settings. This is the
+            reliable path: the globalSettings "Configure" page is unreachable in the
+            centralized admin (see App-level note). The "How to configure" steps below
+            remain as a secondary fallback for users who prefer the admin route. */}
+        {onOpenSettings && (
+          <button
+            onClick={onOpenSettings}
+            className="btn-primary justify-center mb-3"
           >
-            console.anthropic.com → API Keys
-          </a>
-          ; billed pay-as-you-go to your own Anthropic account)
-          <br />• A JIRA project key where the breakdown will be created
-        </p>
+            Open Settings
+          </button>
+        )}
 
         <div
           className="rounded p-3 text-xs leading-relaxed"
@@ -2807,11 +2965,15 @@ function SetupScreen({ message }) {
             3. Find <strong>Spec2Tickets Settings</strong> in the left sidebar
           </p>
           <p>
-            4. Paste your Anthropic API key + JIRA Project Key, then Test &amp;
-            Save
+            4.{" "}
+            {isManaged
+              ? "Set your JIRA Project Key, then Save"
+              : "Paste your Anthropic API key + JIRA Project Key, then Test & Save"}
           </p>
           <p style={{ marginTop: "6px", fontStyle: "italic" }}>
-            Powered by Claude Sonnet 4.6 — your spec content flows directly from Forge to the Anthropic API using your own key. No data on Spec2Tickets servers.
+            {isManaged
+              ? "Powered by Claude Sonnet 4.6 — Managed Pro runs it for you (no API key needed). Your spec content flows from Forge to the Anthropic API; nothing is stored on Spec2Tickets servers."
+              : "Powered by Claude Sonnet 4.6 — your spec content flows directly from Forge to the Anthropic API using your own key. No data on Spec2Tickets servers."}
           </p>
         </div>
       </div>
