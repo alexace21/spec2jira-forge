@@ -195,9 +195,9 @@ function App() {
   // (closes the async race; the backend trusts the client id, so this is the guard).
   const [contextLoadedForPageId, setContextLoadedForPageId] = useState(null);
 
-  // Usage/tier badge data (P3a) — shows the customer their monthly breakdown
-  // count + reset date on the Ready screen, for transparency BEFORE they hit the
-  // free-tier wall (not only after). Best-effort; fed by the getUsage resolver.
+  // Usage/tier badge data (P3a) — shows the customer their plan + (for Managed Pro)
+  // their monthly fair-use count + reset date on the Ready screen, for transparency
+  // before they hit the cap (not only after). Best-effort; fed by the getUsage resolver.
   const [usage, setUsage] = useState(null);
   const loadUsage = useCallback(async () => {
     try {
@@ -720,11 +720,18 @@ function App() {
     });
 
     if (result.error === "quota_exceeded") {
-      // Quota reached (ENFORCEMENT_MODE = 'block'). NORMAL state, not a failure —
-      // route to the dedicated limit screen, NOT the red "Something went wrong"
-      // error screen. The payload's fairUse flag splits the messaging there: Free
-      // (fairUse=false) → subscribe to a paid edition; Managed Pro (fairUse=true) →
-      // switch to BYOK Pro for unlimited (the cap is fair-use, we pay compute).
+      // Managed Pro fair-use cap reached (we run Claude + pay compute, so the
+      // monthly allowance is fair-use; payload carries fairUse=true). NORMAL state,
+      // not a failure — route to the dedicated limit screen, NOT the red "Something
+      // went wrong" error screen. (There is no Free tier; this can only be Managed.)
+      setQuotaInfo(result);
+      setScreen("limit_reached");
+      return;
+    }
+    if (result.error === "license_required") {
+      // Defensive (the 30-day Atlassian trial → paid model means licensed users
+      // shouldn't hit this). If the backend ever reports no active license, show its
+      // composed detail on the friendly limit screen rather than the red error screen.
       setQuotaInfo(result);
       setScreen("limit_reached");
       return;
@@ -831,17 +838,9 @@ function App() {
 
     try {
       const start = await invoke("startPush", { breakdown: pendingBreakdown });
-      // Push gate (hybrid model): Free includes Generate + Review but NOT the JIRA
-      // push (asUser() is forbidden for unlicensed installs — gotcha #3). Route to
-      // the friendly subscription screen, NOT the red error screen. quotaInfo carries
-      // the backend's tier-aware detail + pricing[] so LimitReachedScreen shows both
-      // editions. isPushing must clear so the user isn't stuck on a spinner.
-      if (start.error === "push_requires_license") {
-        setQuotaInfo(start);
-        setScreen("limit_reached");
-        setIsPushing(false);
-        return;
-      }
+      // No push gate: every app user is licensed (30-day Atlassian trial → paid;
+      // unsubscribed users are blocked natively by Atlassian, never reaching here),
+      // so push proceeds. Any startPush error is a genuine failure → normal path.
       if (start.error) {
         fail(start, "Push failed to start");
         return;
@@ -1240,10 +1239,10 @@ function ReadyScreen({
   onBack,
 }) {
   // Prices come from getUsage's pricing[] (single source of truth — no hardcoded
-  // €-values in the UI). The old single "pro" key no longer exists; the hybrid has
-  // two paid editions: byokPro (unlimited, own key) + managedPro (we run it).
+  // €-values in the UI). The hybrid has two paid editions: byokPro (unlimited, own
+  // key) + managedPro (we run it). Only byokProPrice is surfaced on this badge (the
+  // Managed → unlimited upsell); there is no Free tier to upsell from.
   const byokProPrice = findPrice(usage, "byokPro");
-  const managedProPrice = findPrice(usage, "managedPro");
   return (
     <div className="p-6" style={SCREEN_MAX_WIDTH_STYLE}>
       {onBack && (
@@ -1280,7 +1279,7 @@ function ReadyScreen({
             </span>
           ) : usage.tier === "managedPro" ? (
             // Managed Pro is CAPPED fair-use (we run Claude), not a free trial —
-            // describe it as the monthly fair-use allowance, not "free breakdowns".
+            // describe it as the monthly fair-use allowance, not a raw cap number.
             <span>
               <strong style={{ color: "var(--s2j-text)" }}>
                 {usage.tierLabel} plan
@@ -1295,22 +1294,7 @@ function ReadyScreen({
                 </span>
               )}
             </span>
-          ) : (
-            <span>
-              <strong style={{ color: "var(--s2j-text)" }}>
-                {usage.used} of {usage.limit}
-              </strong>{" "}
-              free breakdowns used this month · resets {usage.resetsAtLabel}
-              {usage.remaining === 0 && (byokProPrice || managedProPrice) && (
-                <span style={{ color: "var(--s2j-text)" }}>
-                  {" "}
-                  · upgrade for unlimited
-                  {byokProPrice ? ` — BYOK Pro ${byokProPrice}` : ""}
-                  {managedProPrice ? ` or Managed Pro ${managedProPrice}` : ""}
-                </span>
-              )}
-            </span>
-          )}
+          ) : null}
         </div>
       )}
 
@@ -2499,17 +2483,18 @@ function PushedScreen({ result, onBack, onNew }) {
 // ── Error ───────────────────────────────────────────────────────
 
 // ── Limit reached / subscription required ───────────────────────
-// A NORMAL freemium state (not an error) — friendly framing, no "Something went
-// wrong", no pointless "Try again", no support-as-primary. Drives THREE situations
-// from one screen (the routing sets `quota`):
+// A NORMAL state (not an error) — friendly framing, no "Something went wrong", no
+// pointless "Try again", no support-as-primary. There is no in-app Free tier (the
+// 30-day Atlassian trial covers evaluation; after it, an unsubscribed user is
+// blocked natively by Atlassian and never reaches the app). So this screen drives
+// just two situations (the routing sets `quota`):
 //
-//   1. Free monthly quota exhausted (quota_exceeded, fairUse=false) — used all 3
-//      free breakdowns. Path forward: subscribe to BYOK Pro OR Managed Pro.
-//   2. Managed Pro fair-use cap hit (quota_exceeded, fairUse=true) — we run Claude
-//      and pay compute, so the cap is fair-use, not a trial wall. Path forward:
-//      switch to BYOK Pro (unlimited with the customer's own key), NOT "buy higher".
-//   3. Push gate (push_requires_license) — a Free user generated + reviewed but
-//      Free can't create issues in JIRA. Path forward: subscribe to either edition.
+//   1. Managed Pro fair-use cap hit (quota_exceeded, fairUse=true) — we run Claude
+//      and pay compute, so the monthly allowance is fair-use, not a trial wall. Path
+//      forward: switch to BYOK Pro (unlimited with the customer's own key).
+//   2. license_required (DEFENSIVE — shouldn't normally occur) — the backend reports
+//      no active license. Show its composed `detail`; the path forward is to manage
+//      the subscription in the Atlassian admin hub.
 //
 // The backend composes a correct `detail` for each (tier-aware) — we PREFER showing
 // it. Edition prices come from quota.pricing[] (single source — never hardcoded).
@@ -2545,31 +2530,31 @@ function EditionRow({ name, price, blurb }) {
 }
 
 function LimitReachedScreen({ quota, onBack }) {
-  // Mode from the routing payload. push_requires_license → push gate; otherwise a
-  // quota_exceeded payload, split by fairUse (Managed cap vs Free trial).
-  const isPushGate = quota?.error === "push_requires_license";
-  const isFairUse = !isPushGate && !!quota?.fairUse;
+  // Mode from the routing payload. license_required (defensive) → no active license;
+  // otherwise a quota_exceeded payload, which can only be the Managed Pro fair-use
+  // cap (there is no Free tier). Default to the fair-use framing.
+  const isLicenseRequired = quota?.error === "license_required";
+  const isFairUse = !isLicenseRequired;
 
-  const limit = quota?.limit ?? 3;
+  const limit = quota?.limit;
   const resetsAt =
     quota?.resetsAtLabel ||
     (quota?.resetsAt ? String(quota.resetsAt).slice(0, 10) : null);
-  const byokProPrice = quota?.upgradePrice || findPrice(quota, "byokPro");
+  const byokProPrice = findPrice(quota, "byokPro");
+  // Only surfaced in the license_required (no-plan) branch — fair-use already has a plan.
   const managedProPrice = findPrice(quota, "managedPro");
 
   // Headline + intro. Prefer the backend-composed `detail` for the body (it is
   // already tier-correct and mentions the reset date / prices); fall back to a
   // mode-specific sentence if it is ever absent.
-  const heading = isPushGate
-    ? "Subscribe to push to JIRA"
-    : isFairUse
-      ? "You've reached this month's fair-use limit"
-      : "You've reached your free limit";
-  const fallbackBody = isPushGate
-    ? "Free includes Generate + Review. Subscribe to BYOK Pro or Managed Pro to create the issues in JIRA."
-    : isFairUse
+  const heading = isLicenseRequired
+    ? "Subscription required"
+    : "You've reached this month's fair-use limit";
+  const fallbackBody = isLicenseRequired
+    ? "An active subscription is required to use Spec2Tickets. Manage your subscription from your Atlassian site admin."
+    : limit
       ? `You've used all ${limit} breakdowns in this month's fair-use allowance.`
-      : `You've used all ${limit} free breakdowns this month.`;
+      : "You've used this month's fair-use allowance.";
 
   const openUpgrade = () => {
     if (!UPGRADE_URL) return;
@@ -2599,18 +2584,19 @@ function LimitReachedScreen({ quota, onBack }) {
         <p className="text-sm" style={{ color: "var(--s2j-text)" }}>
           {quota?.detail || fallbackBody}
         </p>
-        {/* Reset date is the actionable info for a Free/Managed user who is waiting
-            it out rather than subscribing. The push gate has no monthly reset. */}
-        {!isPushGate && !quota?.detail && resetsAt && (
+        {/* Reset date is the actionable info for a Managed user waiting out the
+            fair-use month rather than switching to BYOK. license_required has no
+            monthly reset (it's an account/subscription state, not a quota). */}
+        {isFairUse && !quota?.detail && resetsAt && (
           <p className="text-sm mt-1" style={{ color: "var(--s2j-text-light)" }}>
-            Your quota resets on <strong>{resetsAt}</strong>.
+            Your fair-use allowance resets on <strong>{resetsAt}</strong>.
           </p>
         )}
       </div>
 
       {/* Subscription card. Fair-use (Managed) routes to BYOK Pro ONLY (unlimited);
-          Free quota + push gate offer BOTH editions. */}
-      {(byokProPrice || managedProPrice) && (
+          license_required (no plan) offers both editions to choose from. */}
+      {(byokProPrice || (isLicenseRequired && managedProPrice)) && (
         <div
           className="rounded-lg p-4 mb-4"
           style={{

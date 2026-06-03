@@ -53,7 +53,7 @@ function getErrorText(result) {
 
 // Price lookups off the getUsage `pricing[]` array (single source of €-values — the
 // UI never hardcodes prices). accountPriceFor → a named tier's price; accountPrice →
-// the customer's OWN active tier price (null for Free / when absent).
+// the customer's OWN active tier price (null when absent).
 function accountPriceFor(account, key) {
   return (account?.pricing || []).find((t) => t.key === key)?.price || null;
 }
@@ -340,9 +340,9 @@ export default function AdminSettings() {
             <div className="flex items-center justify-between">
               <span style={{ color: "var(--s2j-text-muted)" }}>Plan</span>
               <span className="font-medium" style={{ color: "var(--s2j-text)" }}>
-                {account.tierLabel || "Free"}
+                {account.tierLabel || "—"}
                 {/* Price for the active PAID edition (from pricing[] — single source).
-                    Free has no price; unlimited BYOK Pro still shows its price. */}
+                    Both BYOK Pro and Managed Pro show their price. */}
                 {accountPrice(account) ? (
                   <span
                     className="font-normal ml-1"
@@ -360,9 +360,7 @@ export default function AdminSettings() {
               <span className="font-medium" style={{ color: "var(--s2j-text)" }}>
                 {account.unlimited
                   ? "Unlimited"
-                  : account.tier === "managedPro"
-                  ? `${account.used ?? 0} (fair-use)`
-                  : `${account.used ?? 0} / ${account.limit ?? 3}`}
+                  : `${account.used ?? 0} (fair-use)`}
               </span>
             </div>
             {!account.unlimited && account.resetsAtLabel && (
@@ -382,25 +380,8 @@ export default function AdminSettings() {
               </div>
             )}
           </div>
-          {/* Tier-aware footnote. Free: the path to unlimited + the push caveat
-              (Free is Generate + Review only). Managed Pro: the cap is fair-use, and
-              BYOK Pro is the unlimited option. BYOK Pro (unlimited): nothing to add. */}
-          {account.tier === "free" && (
-            <p className="text-xs mt-3" style={{ color: "var(--s2j-text-muted)" }}>
-              Free includes 3 breakdowns per month and Generate + Review.{" "}
-              {accountPriceFor(account, "byokPro") || accountPriceFor(account, "managedPro")
-                ? `Subscribe to push to JIRA and lift the limit — BYOK Pro${
-                    accountPriceFor(account, "byokPro")
-                      ? ` (${accountPriceFor(account, "byokPro")})`
-                      : ""
-                  } for unlimited with your own key, or Managed Pro${
-                    accountPriceFor(account, "managedPro")
-                      ? ` (${accountPriceFor(account, "managedPro")})`
-                      : ""
-                  } where we run Claude for you.`
-                : "Subscribe to BYOK Pro or Managed Pro to push to JIRA and lift the limit."}
-            </p>
-          )}
+          {/* Tier-aware footnote. Managed Pro: the cap is fair-use, and BYOK Pro is
+              the unlimited option. BYOK Pro (unlimited): nothing to add. */}
           {account.tier === "managedPro" && (
             <p className="text-xs mt-3" style={{ color: "var(--s2j-text-muted)" }}>
               Managed Pro runs Claude for you (no API key needed). The monthly limit is
@@ -414,8 +395,8 @@ export default function AdminSettings() {
       )}
 
       {/* Info callout — edition-aware. Managed Pro: we run Claude (no key needed).
-          Otherwise (Free / BYOK Pro): the BYOK explainer + the two ways to use the
-          app, so an admin choosing how to run it understands both paths. */}
+          Otherwise (BYOK Pro): the BYOK explainer + the two ways to use the app, so
+          an admin choosing how to run it understands both paths. */}
       {isManaged ? (
         <div
           className="rounded-lg p-4 mb-6 text-sm"
@@ -457,12 +438,12 @@ export default function AdminSettings() {
           <ul className="mb-2" style={{ marginLeft: "16px", listStyle: "disc" }}>
             <li className="mb-1">
               <strong>Bring your own key (BYOK)</strong> — paste your Anthropic API
-              key below. Free includes 3 breakdowns/month
+              key below. BYOK Pro
               {accountPriceFor(account, "byokPro")
-                ? `; BYOK Pro (${accountPriceFor(account, "byokPro")}) is unlimited`
-                : "; BYOK Pro is unlimited"}
-              . Breakdowns run on your own Anthropic account, never on Spec2Tickets
-              servers.
+                ? ` (${accountPriceFor(account, "byokPro")})`
+                : ""}{" "}
+              gives unlimited breakdowns. Breakdowns run on your own Anthropic
+              account, never on Spec2Tickets servers.
             </li>
             <li>
               <strong>Managed</strong> — no key needed; we run Claude for you.
@@ -503,7 +484,7 @@ export default function AdminSettings() {
 
       {/* Form */}
       <div className="space-y-5">
-        {/* BYOK key input — Free + BYOK Pro. HIDDEN for Managed Pro (we run Claude
+        {/* BYOK key input — shown for BYOK Pro. HIDDEN for Managed Pro (we run Claude
             with our key; the customer has no key to enter). A Managed admin still
             configures the JIRA project below. */}
         {isManaged ? (

@@ -23,18 +23,13 @@ modules:
       resource: main
       resolver:
         function: resolver
-      # unlicensedAccess admits Confluence GUEST users (authenticated, no paid
-      # license) to this surface. ⚠ Verified 2026-06-03 (live docs): by DEFAULT
-      # Atlassian BLOCKS non-licensed users, and `unlicensed` means GUESTS
-      # specifically — NOT a general "post-trial free user" hook. Whether the
-      # in-app Free tier (3/mo) is reachable for regular users of an UNSUBSCRIBED
-      # install is an OPEN question → MUST be confirmed with a dev no-license
-      # install (see docs/XCA-MIGRATION-AND-PRICING-TODO.md). Kept here as the
-      # documented non-licensed-access hook (valid + harmless on this module).
-      # Separately: asUser() is FORBIDDEN for unlicensed users (gotcha #3) → the
-      # JIRA push is license-gated regardless (Free = Generate + Review only).
-      unlicensedAccess:
-        - unlicensed
+      # No unlicensedAccess: this is a Paid-via-Atlassian app, so by DEFAULT
+      # Atlassian admits only licensed users — and that is exactly what we want.
+      # The in-app perpetual Free tier was REMOVED 2026-06-03 (the 30-day Atlassian
+      # trial that Paid-via-Atlassian apps get for free already covers evaluation),
+      # so the unlicensedAccess hook it relied on (which only ever admitted
+      # Confluence GUESTS, never a clean "post-trial free user" — and rode on a
+      # spoofable guest-guard) is gone. Model is now trial → paid (BYOK/Managed Pro).
   # U3 part 33 (2026-05-09) — confluence:contentAction inline-on-page
   # entry surface. Closes "Apps menu navigation friction" partner UX
   # insight 2026-05-08 part 18 — user clicks "Generate Breakdown с
@@ -58,10 +53,8 @@ modules:
       resource: main
       resolver:
         function: resolver
-      # unlicensedAccess (Confluence GUEST users) — see the globalPage note + the
-      # OPEN Free-tier-reachability question (docs/XCA-MIGRATION-AND-PRICING-TODO.md).
-      unlicensedAccess:
-        - unlicensed
+      # No unlicensedAccess — see the globalPage note. Licensed-only by default
+      # (Paid-via-Atlassian); the in-app Free tier was removed 2026-06-03.
   confluence:globalSettings:
     - key: spec2jira-settings
       resource: main
@@ -70,10 +63,9 @@ modules:
       title: Spec2JIRA Settings
       useAsConfig: true
       # NOTE: confluence:globalSettings does NOT support unlicensedAccess (a hard
-      # forge-lint error — verified 2026-06-03). If non-licensed access to a
-      # BYOK-key entry is ever needed for the Free tier, it must come via a
-      # globalPage onboarding step (globalPage DOES support unlicensedAccess),
-      # not here. See docs/XCA-MIGRATION-AND-PRICING-TODO.md (Free-tier question).
+      # forge-lint error — verified 2026-06-03). Moot now: the app is licensed-only
+      # (the in-app Free tier was removed 2026-06-03), so no surface declares
+      # unlicensedAccess.
   function:
     # Single resolver handles ALL backend work in v3.0.1+:
     #   - Settings (BYOK API key), Confluence page fetch/search
@@ -149,8 +141,13 @@ app:
   # correct AND locked-in choice (we have live Confluence installs). Verified
   # against the live app-compatibility + migration docs 2026-06-03 (XCA still
   # in Preview; Confluence/Jira/Compass only; @forge/api ≥5.1.1 — we have
-  # ^7.2.1). Do NOT uninstall Jira before deploying — that ordering rule is
-  # for TEARDOWN only; Confluence installs + data are preserved automatically.
+  # ^7.2.1). ⚠ EMPIRICALLY CONFIRMED 2026-06-03: the FIRST compatibility deploy is
+  # BLOCKED while the app has an install in a NON-required app (Jira) — Atlassian
+  # errors "Unable to deploy an app to an environment with an existing installation
+  # in an Atlassian app that is not the required Atlassian app." So on each env:
+  # `forge uninstall -p jira` FIRST → `forge deploy` → then reinstall Jira.
+  # Confluence (required) install + data ARE preserved. (An earlier "do NOT uninstall
+  # first / teardown-only" note was wrong — the live deploy is the authority.)
   compatibility:
     confluence:
       required: true
@@ -163,9 +160,10 @@ app:
   #   Advanced = Managed Pro (€9.90/user, capped 10/USER/mo — we call Anthropic with OUR key)
   # Runtime tells them apart via context.license.capabilitySet
   # (capabilitystandard / capabilityadvanced) — see src/usage.js resolveTier.
-  # Prices/edition names are set in the vendor portal, NOT here. A €0 Free
-  # edition cannot coexist with paid editions → Free is delivered IN-APP
-  # (unlicensedAccess below + the usage.js 3/mo counter).
+  # Prices/edition names are set in the vendor portal, NOT here. Evaluation is the
+  # 30-day Atlassian trial (auto-provided for Paid-via-Atlassian apps; reads as an
+  # active license at runtime) — the in-app perpetual Free 3/mo tier was REMOVED
+  # 2026-06-03, so there is no €0 edition and no unlicensedAccess surface.
   licensing:
     enabled: true
     editionsEnabled: true

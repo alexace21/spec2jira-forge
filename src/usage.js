@@ -3,19 +3,17 @@
  *
  * WHAT THIS IS
  *   A small, deterministic layer that meters "breakdowns" (= successful
- *   generations) per calendar month, per site installation, and resolves the
- *   active subscription tier. Pure orchestration over Forge KVS — NO LLM call
- *   (POLICY §4 dispatch rule: counting + threshold compare is *structure*, not
- *   meaning-reading → a pure function, never a model call).
+ *   generations) per calendar month and resolves the active subscription tier.
+ *   Pure orchestration over Forge KVS — NO LLM call (POLICY §4 dispatch rule:
+ *   counting + threshold compare is *structure*, not meaning-reading → a pure
+ *   function, never a model call).
  *
- * THE MODEL — hybrid, two Paid-via-Atlassian editions + an in-app Free trial
- * (XCA resubmit, partner decisions 2026-06-02/03; supersedes the flat €39 model):
- *   - Free:        3 breakdowns / month, in-app, PERPETUAL. Resets the 1st (UTC).
- *                  Served to UNLICENSED installs (manifest unlicensedAccess) —
- *                  there is no €0 Atlassian edition (a free edition cannot coexist
- *                  with paid ones). BYOK only. Generate + Review only: the JIRA
- *                  push is gated behind a license because asUser() is forbidden
- *                  for unlicensed users (see index.js / manifest gotcha #3).
+ * THE MODEL — trial → paid, two Paid-via-Atlassian editions (simplified
+ * 2026-06-03: the in-app perpetual Free 3/mo tier was REMOVED). Evaluation is
+ * covered by the 30-day Atlassian trial that Paid-via-Atlassian apps get for free
+ * (a trial reads as an ACTIVE license at runtime → resolves to a paid tier), so a
+ * separate in-app free path — and the unverified/spoofable unlicensed-access
+ * surface it rode on — is obsolete:
  *   - BYOK Pro:    "Standard" edition, €4.90/user/mo → UNLIMITED. The customer's
  *                  own Anthropic key pays compute, so unlimited is no cost
  *                  liability for us; the subscription is pure app-value.
@@ -23,6 +21,11 @@
  *                  with OUR key, so usage = our cost). Fair-use 10 breakdowns/
  *                  user/mo (MANAGED_USER_CAP), metered PER USER, NOT pooled (no
  *                  runtime seat count) — loss-proof per seat. See below.
+ *   - Unlicensed:  a minimal DEFENSIVE tier (limit 0, blocked) for the
+ *                  no-active-license case. Not a product offering — by default
+ *                  Atlassian blocks non-licensed users from a Paid-via-Atlassian
+ *                  app surface, so this is a backstop the resolvers turn into a
+ *                  clean "subscribe or start a trial" prompt, never a raw error.
  *
  *   Edition discrimination is by license.capabilitySet (capabilityStandard /
  *   capabilityAdvanced) — see resolveTier. An active license with no recognised
@@ -31,20 +34,21 @@
  *   ⚠ "Unlimited" is safe ONLY for BYOK (customer pays compute). Managed is
  *   capped precisely because WE pay — never give Managed an unlimited tier.
  *
- * ENFORCEMENT MODE
- *   'block' = hard-block when an install reaches its tier's monthly limit,
+ * ENFORCEMENT MODE — governs the MANAGED per-user fair-use cap
+ *   'block' = hard-block when a Managed user reaches the per-user monthly cap,
  *             returning a quota_exceeded payload (LimitReachedScreen).
  *   'meter' = track only, never block.
  *   PER-ENVIRONMENT: production = 'block' (default when unset), dev = 'meter'
  *   via `forge variables set`. Editions are tested in dev via
  *   `forge install --license Standard|Advanced` (no env override needed).
  *
- * SCOPE — per-site counter; per-USER billing is above this layer
+ * SCOPE — per-USER Managed counter; per-USER billing is above this layer
  *   The Anthropic key + all KVS state are site-wide (one install = one shared
- *   key), so the FREE + BYOK counters are per-site. MANAGED meters PER USER
- *   (accountId), because the license object exposes NO seat count at runtime
- *   (verified @forge/api runtime.d.ts) → 10×seats is uncomputable, so per-user is
- *   the loss-bounded shape (10/seat is loss-proof regardless of instance size).
+ *   key), so the BYOK tier is unlimited (counted only for analytics). MANAGED
+ *   meters PER USER (accountId), because the license object exposes NO seat count
+ *   at runtime (verified @forge/api runtime.d.ts) → 10×seats is uncomputable, so
+ *   per-user is the loss-bounded shape (10/seat is loss-proof regardless of
+ *   instance size).
  */
 
 import { kvs } from '@forge/kvs';
@@ -66,13 +70,12 @@ export const MANAGED_USER_CAP =
     : 10;
 
 // ── Tier model — single source of truth ─────────────────────────────
-// `limit`: breakdowns per calendar month, per site. `null` = unlimited.
+// `limit`: breakdowns per calendar month. `null` = unlimited, `0` = blocked.
 // `edition`: the Paid-via-Atlassian edition that maps to this tier — 'standard'
-//   = BYOK Pro, 'advanced' = Managed Pro, null = Free (unlicensed/in-app).
+//   = BYOK Pro, 'advanced' = Managed Pro, null = Unlicensed (no edition).
 // `price`: the Marketplace SUBSCRIPTION price shown in the UI (NOT API cost —
 //          under BYOK the customer pays Anthropic; the subscription buys the app).
 export const TIERS = {
-  free: { key: 'free', label: 'Free', limit: 3, price: null, edition: null },
   byokPro: {
     key: 'byokPro',
     label: 'BYOK Pro',
@@ -87,9 +90,19 @@ export const TIERS = {
     price: '€9.90/user/mo',
     edition: 'advanced',
   },
+  // Defensive backstop for the no-active-license case (no trial, no subscription).
+  // Not a product offering — the resolvers turn this into a clean "subscribe or
+  // start a trial" prompt (license_required) rather than a raw 401 / silent fail.
+  unlicensed: {
+    key: 'unlicensed',
+    label: 'Unlicensed',
+    limit: 0, // blocked — no breakdowns without an active license/trial
+    price: null,
+    edition: null,
+  },
 };
 
-export const DEFAULT_TIER = 'free';
+export const DEFAULT_TIER = 'unlicensed';
 
 // Per Forge environment so dev tests freely while production enforces:
 //   forge variables set --environment development ENFORCEMENT_MODE meter
@@ -139,7 +152,7 @@ export function formatResetDate(iso) {
  * reliable runtime source for capabilitySet — the resolver `context.license` has
  * historically exposed only a thin active flag on some code paths. Sync call,
  * valid only inside an invocation, so wrapped fail-open with a fallback to the
- * passed context.license, then null (⇒ Free). It also reflects the dev
+ * passed context.license, then null (⇒ unlicensed). It also reflects the dev
  * `forge install --license Standard|Advanced` override, which is how we test.
  */
 function resolveLicense(context) {
@@ -156,10 +169,14 @@ function resolveLicense(context) {
  * Resolve the active tier from a Forge license object. PURE (the async caller
  * obtains the license and passes it) so it is unit-testable in isolation.
  *
- *   capabilityAdvanced   ⇒ Managed Pro (we pay Anthropic; capped pool)
+ *   capabilityAdvanced   ⇒ Managed Pro (we pay Anthropic; per-user cap)
  *   capabilityStandard   ⇒ BYOK Pro    (customer's key; unlimited)
  *   active, unknown set  ⇒ BYOK Pro    (SAFE default — never bill us by accident)
- *   no active license    ⇒ Free        (3/mo, in-app, BYOK)
+ *   no active license    ⇒ Unlicensed  (blocked — no trial, no subscription)
+ *
+ * A 30-day Atlassian trial reads as an ACTIVE license, so a trialling user
+ * resolves to BYOK/Managed Pro normally; only a truly unlicensed install (no
+ * subscription AND no trial) falls through to the blocked Unlicensed tier.
  *
  * capabilitySet is typed 'capabilityStandard'|'capabilityAdvanced' by @forge/api,
  * but compared case-INSENSITIVELY to defend against documented casing drift.
@@ -184,9 +201,9 @@ export function resolveTier(license) {
 
 /**
  * Convenience: the active tier for THIS invocation, license-resolved. Used by the
- * resolvers for (a) the Anthropic key source (Managed/Advanced ⇒ our key) and
- * (b) the push gate (Free/unlicensed ⇒ asUser() is forbidden, so the JIRA push
- * requires an active license/trial). Sync-license read; fail-open via resolveLicense.
+ * resolvers for the Anthropic key source (Managed/Advanced ⇒ our key, else BYOK)
+ * and for the defensive license_required gate (unlicensed ⇒ no trial/subscription).
+ * Sync-license read; fail-open via resolveLicense.
  */
 export function getActiveTier(context) {
   return resolveTier(resolveLicense(context));
@@ -197,9 +214,10 @@ export function getActiveTier(context) {
 /**
  * The KVS key a tier meters against for the period. Managed Pro (we pay compute)
  * meters PER USER (`:u:<accountId>`) — each seat its own allowance (MANAGED_USER_CAP).
- * Free + BYOK meter PER SITE (the 3/mo trial is one shared site counter; BYOK is
- * unlimited, counted only for analytics). accountId is server-trusted
- * (backend-prioritised in the resolver context, never the client payload).
+ * Every other tier meters against the PER-SITE key (BYOK is unlimited, counted
+ * only for analytics; Unlicensed never consumes — it is blocked first). accountId
+ * is server-trusted (backend-prioritised in the resolver context, never the
+ * client payload).
  */
 function usageKeyFor(tier, context, period) {
   if (tier && tier.key === 'managedPro') {
@@ -218,7 +236,14 @@ async function readCountByKey(key) {
  * Read-only quota snapshot — does NOT consume. Drives both the pre-submit gate
  * and the getUsage resolver (UI badge / upgrade nudge).
  *
- * Unlimited tiers (limit === null) are never over-limit and always allowed.
+ *   - BYOK Pro (unlimited, limit === null)  → always allowed.
+ *   - Managed Pro (per-user cap)            → allowed while used < cap, governed
+ *                                             by ENFORCEMENT_MODE ('meter' = track
+ *                                             only, never block).
+ *   - Unlicensed (limit 0)                  → never allowed (defensive backstop;
+ *                                             not affected by ENFORCEMENT_MODE,
+ *                                             which governs only the Managed cap).
+ *
  * Callers wrap in try/catch and fail OPEN (see startGeneration) — a metering
  * glitch must never block a BYOK user who pays their own Anthropic bill.
  */
@@ -230,8 +255,17 @@ export async function checkQuota(context) {
   const usageKey = usageKeyFor(tier, context, period);
   const used = await readCountByKey(usageKey);
   const unlimited = tier.limit === null;
+  const blocked = tier.limit === 0; // Unlicensed — defensive, always disallowed
   const remaining = unlimited ? null : Math.max(0, tier.limit - used);
   const overLimit = unlimited ? false : used >= tier.limit;
+  // ENFORCEMENT_MODE governs ONLY the Managed per-user cap. The Unlicensed backstop
+  // (limit 0) is always disallowed — a dev 'meter' env must not admit an unlicensed
+  // user. Unlimited (BYOK) is always allowed.
+  const allowed = unlimited
+    ? true
+    : blocked
+      ? false
+      : ENFORCEMENT_MODE !== 'block' || used < tier.limit;
   return {
     tier: tier.key,
     tierLabel: tier.label,
@@ -245,7 +279,7 @@ export async function checkQuota(context) {
     resetsAt,
     resetsAtLabel: formatResetDate(resetsAt),
     overLimit,
-    allowed: unlimited || ENFORCEMENT_MODE !== 'block' || used < tier.limit,
+    allowed,
     enforcementMode: ENFORCEMENT_MODE,
     // Managed's cap is FAIR-USE (we pay compute), NOT a free-trial limit — an
     // over-limit Managed user is routed to BYOK (unlimited), not "subscribe".
@@ -331,10 +365,12 @@ export async function getInstallMeta() {
 }
 
 /**
- * Pricing table for the UI upgrade CTA. English (user-facing copy per POLICY).
+ * Pricing table for the UI upgrade CTA — the two paid editions only (Unlicensed
+ * is a defensive backstop, not a product offering). English (user-facing copy
+ * per POLICY).
  */
 export function pricingTable() {
-  return [TIERS.free, TIERS.byokPro, TIERS.managedPro].map((t) => ({
+  return [TIERS.byokPro, TIERS.managedPro].map((t) => ({
     key: t.key,
     label: t.label,
     limit: t.limit, // null = unlimited

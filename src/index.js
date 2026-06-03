@@ -66,7 +66,7 @@ import {
 // ── Managed-vs-BYOK Anthropic key resolution (hybrid tiers, 2026-06-03) ──
 // Managed Pro (Advanced edition) ⇒ WE call Anthropic with OUR key, stored as an
 // ENCRYPTED Forge env var (`forge variables set --encrypt MANAGED_ANTHROPIC_KEY ...`).
-// BYOK Pro / Free ⇒ the customer's own stored key. An Anthropic batch is bound to
+// BYOK Pro ⇒ the customer's own stored key. An Anthropic batch is bound to
 // the key that created it, so the SOURCE ('managed'|'byok') is recorded on the job
 // at submit and reused at poll — never re-resolved from a license that may have
 // changed (e.g. a trial expiring) mid-batch.
@@ -75,40 +75,31 @@ async function anthropicKeyForSource(source) {
   return getStoredApiKey();
 }
 
-/** Resolve { apiKey, keySource, tier } for THIS invocation from the license. */
+/**
+ * Resolve { apiKey, keySource, tier } for THIS invocation from the license.
+ * keySource is purely tier-driven: Advanced edition (Managed Pro) ⇒ our key,
+ * everything else ⇒ the customer's BYOK key. The license is backend-trusted, and
+ * every accessing user is now licensed (the in-app Free / guest-access path was
+ * removed 2026-06-03), so the old best-effort guest-guard on the spoofable
+ * client-supplied accountType is gone — Managed exposure is bounded by the
+ * backend-trusted per-user accountId cap (MANAGED_USER_CAP) in checkQuota.
+ */
 async function resolveAnthropicKey(context) {
   const tier = getActiveTier(context);
-  let keySource = tier.edition === 'advanced' ? 'managed' : 'byok';
-  // Guest/non-seat guard (§13 abuse fix — BEST-EFFORT, DEV-VERIFY pending): the
-  // Managed key is OURS, so prefer to spend it only for a licensed seat. A
-  // Confluence guest/anonymous user on a Managed instance (reachable via
-  // unlicensedAccess) should NOT burn our key → downgrade to BYOK (no key →
-  // not_configured, correct for a guest). ⚠ accountType is NOT reliably
-  // backend-trusted — in @forge/resolver only accountId + license are
-  // backend-prioritised; accountType arrives via the frontend ProductContext, so a
-  // client could send 'licensed'. So this guard is BEST-EFFORT; the REAL bound is
-  // (a) the license/tier is backend-trusted (a guest cannot fake a Managed instance)
-  // and (b) the per-user accountId cap IS backend-trusted, so even an evaded guard
-  // caps our exposure at one accountId × MANAGED_USER_CAP (~€4.60/mo). Downgrade
-  // when accountType is present & ≠ 'licensed'. ⚠ DEV-VERIFY guest accountType.
-  if (
-    keySource === 'managed' &&
-    context && context.accountType &&
-    context.accountType !== 'licensed'
-  ) {
-    keySource = 'byok';
-  }
+  const keySource = tier.edition === 'advanced' ? 'managed' : 'byok';
   const apiKey = await anthropicKeyForSource(keySource);
   return { apiKey, keySource, tier };
 }
 
 /**
- * Tier-aware quota_exceeded payload. Free → subscribe to a paid edition; Managed
- * Pro (fairUse) → it's a fair-use cap (we pay compute), so route to BYOK
- * (unlimited with the customer's own key), NOT "subscribe to a higher tier".
+ * Managed-Pro fair-use cap payload. The cap is fair-use (we pay compute), so the
+ * user is routed to BYOK (unlimited with their own key) or to higher-volume
+ * Managed access — NOT "subscribe to a higher tier". This is the ONLY
+ * quota_exceeded case now (the in-app Free 3/mo tier was removed 2026-06-03;
+ * BYOK is unlimited and never hits this; Unlicensed is handled by license_required).
  */
 function buildQuotaExceeded(quota) {
-  const base = {
+  return {
     error: 'quota_exceeded',
     tier: quota.tier,
     tierLabel: quota.tierLabel,
@@ -117,18 +108,24 @@ function buildQuotaExceeded(quota) {
     resetsAt: quota.resetsAt,
     resetsAtLabel: quota.resetsAtLabel,
     pricing: pricingTable(),
-    fairUse: !!quota.fairUse,
+    fairUse: true,
+    detail: `You've reached this month's fair-use limit (${quota.limit} breakdowns on ${quota.tierLabel}) — it resets ${quota.resetsAtLabel}. Need more this month? Contact us at support@spec2jira.com about higher-volume Managed access, or switch to BYOK Pro (use your own Anthropic key) for unlimited right away.`,
   };
-  if (quota.fairUse) {
-    return {
-      ...base,
-      detail: `You've reached this month's fair-use limit (${quota.limit} breakdowns on ${quota.tierLabel}) — it resets ${quota.resetsAtLabel}. Need more this month? Contact us at support@spec2jira.com about higher-volume Managed access, or switch to BYOK Pro (use your own Anthropic key) for unlimited right away.`,
-    };
-  }
+}
+
+/**
+ * Defensive license_required payload (tier === 'unlicensed' — no subscription and
+ * no active trial). A Paid-via-Atlassian app is licensed-only by default, so this
+ * is a backstop that turns the no-license case into a clean "subscribe or start a
+ * trial" prompt rather than a raw error. Carries the pricing table so the UI can
+ * present the two editions.
+ */
+function buildLicenseRequired() {
   return {
-    ...base,
-    upgradePrice: TIERS.byokPro.price,
-    detail: `You've used all ${quota.limit} free breakdowns this month. Subscribe to BYOK Pro (${TIERS.byokPro.price}, unlimited with your own key) or Managed Pro (${TIERS.managedPro.price}, we run it for you). Your free quota resets ${quota.resetsAtLabel}.`,
+    error: 'license_required',
+    detail:
+      'This app requires an active subscription or trial. Subscribe to BYOK Pro or Managed Pro.',
+    pricing: pricingTable(),
   };
 }
 
@@ -499,7 +496,7 @@ resolver.define('startDistillSession', async ({ payload, context }) => {
 
   // §13 security-review fix: Managed distill spends OUR key but has no breakdown
   // counter of its own → gate it on the per-USER fair-use cap (MANAGED_USER_CAP) so
-  // it cannot run on our key once this user is over their monthly cap. BYOK/Free
+  // it cannot run on our key once this user is over their monthly cap. BYOK
   // distill on the customer's own key → no gate. Fail-OPEN on a check glitch (never
   // block a payer). NOTE (accepted 2026-06-03, partner decision): distill UNDER the
   // cap is gated-but-not-consumed — a low-risk residual (cheap Haiku, requires a
@@ -964,8 +961,23 @@ resolver.define('startGeneration', async ({ payload, context }) => {
   const { pageId, modelMode, contextProfileId } = payload || {};
   if (!pageId) return { error: 'No page ID' };
 
-  // Resolve the Anthropic key by tier (Managed/Advanced ⇒ our key; BYOK/Free ⇒
-  // the customer's). Done BEFORE the content fetch (fail fast) AND before the
+  // Defensive license gate (NEW 2026-06-03). A Paid-via-Atlassian app admits only
+  // licensed users by default, so this should never fire in practice — but if a
+  // truly-unlicensed invocation reaches the backend (no subscription, no trial),
+  // return a clean license_required prompt instead of a misleading not_configured
+  // ("no BYOK key" — wrong; the real issue is no license). Fail-open: a license-read
+  // glitch must not block a paying user (the key check + Atlassian's platform gate
+  // are the backstops).
+  try {
+    if (getActiveTier(context).key === 'unlicensed') {
+      return buildLicenseRequired();
+    }
+  } catch (e) {
+    console.error(`[startGeneration] license check failed (failing open): ${String(e?.message || e)}`);
+  }
+
+  // Resolve the Anthropic key by tier (Managed/Advanced ⇒ our key; else the
+  // customer's BYOK key). Done BEFORE the content fetch (fail fast) AND before the
   // quota gate, so a Managed user — who has no BYOK key by design — is never
   // wrongly told to "configure a key". keySource is stored on the job below so
   // the poll leg reuses the SAME key the batch was created with.
@@ -998,10 +1010,11 @@ resolver.define('startGeneration', async ({ payload, context }) => {
   }
 
   // Tier/usage gate (P3a). Fail OPEN — a metering glitch must never block a user.
-  // Free (unlicensed) → 3/mo trial; BYOK Pro → unlimited; Managed Pro → per-user
-  // fair-use cap. In 'meter' mode quota.allowed is always true. The
-  // counter is consumed AFTER a successful batch submit below, so a failed submit
-  // never burns quota.
+  // BYOK Pro → unlimited; Managed Pro → per-user fair-use cap (quota_exceeded when
+  // over, governed by ENFORCEMENT_MODE — 'meter' never blocks). Unlicensed is
+  // already short-circuited above (license_required), so a !allowed here is the
+  // Managed cap. The counter is consumed AFTER a successful batch submit below, so
+  // a failed submit never burns quota.
   let quota = null;
   try {
     quota = await checkQuota(context);
@@ -1093,7 +1106,7 @@ resolver.define('startGeneration', async ({ payload, context }) => {
     model,
     useCaching: true,
     projectContext,
-    apiKeyOverride: apiKey, // Managed ⇒ our key; BYOK/Free ⇒ customer's (see resolveAnthropicKey)
+    apiKeyOverride: apiKey, // Managed ⇒ our key; BYOK ⇒ customer's (see resolveAnthropicKey)
   });
 
   if (submitResult.error) {
@@ -1482,31 +1495,18 @@ resolver.define('purgeJob', async ({ payload }) => {
  *
  * Returns { ok, sessionId, phase, totals } OR { error, detail }.
  */
-resolver.define('startPush', async ({ payload, context }) => {
+resolver.define('startPush', async ({ payload }) => {
   const { breakdown, projectKey: payloadProjectKey } = payload || {};
   if (!breakdown) {
     return { error: 'no_breakdown', detail: 'No breakdown payload provided' };
   }
 
-  // Push gate: the JIRA push uses asUser().requestJira (gotcha #3), which is
-  // FORBIDDEN for unlicensed users — so a Free/unlicensed install can Generate +
-  // Review but needs an active license/trial to push. Free (no active license) ⇒
-  // a clean upgrade prompt instead of a raw 401. Fail-open: a license-read glitch
-  // must not block a paying user (the asUser call still 401s a truly-unlicensed
-  // user as the backstop).
-  try {
-    if (getActiveTier(context).key === 'free') {
-      return {
-        error: 'push_requires_license',
-        detail:
-          'Pushing to JIRA requires a subscription or an active trial. Free includes Generate + Review — subscribe to BYOK Pro or Managed Pro to create the issues in JIRA.',
-        pricing: pricingTable(),
-      };
-    }
-  } catch (e) {
-    console.error(`[startPush] license check failed (failing open): ${String(e?.message || e)}`);
-  }
-
+  // No license gate here: every accessing user is licensed (the in-app Free /
+  // unlicensed-access path was removed 2026-06-03 — evaluation is the 30-day
+  // Atlassian trial, which reads as an active license). The JIRA push uses
+  // asUser().requestJira (gotcha #3); a truly-unlicensed user can't reach this
+  // surface at all (Atlassian's platform gate), and startGeneration already
+  // returns license_required defensively upstream.
   const projectKey = await getProjectKey(payloadProjectKey);
   if (!projectKey) {
     return {
@@ -1547,10 +1547,10 @@ resolver.define('startPush', async ({ payload, context }) => {
  * OR { error, detail }.
  */
 resolver.define('pushStep', async ({ payload }) => {
-  // No license gate here (unlike startPush): a pushStep session exists ONLY if
-  // startPush already passed the license gate and created it in KVS. A Free user
-  // cannot reach a valid session; a forged sessionId returns session_not_found, and
-  // asUser() is the ultimate 401 backstop. Preserve this invariant if a second
+  // A pushStep session exists ONLY if startPush created it in KVS, and the app is
+  // licensed-only (Paid-via-Atlassian default) so every caller here is a licensed
+  // user. A forged sessionId returns session_not_found, and asUser() is the ultimate
+  // 401 backstop. Preserve this session-only-from-startPush invariant if a second
   // session creator is ever added (§13 review note).
   const sessionId = payload?.sessionId;
   if (!sessionId) return { error: 'no_session', detail: 'No session id provided.' };
