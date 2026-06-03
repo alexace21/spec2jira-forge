@@ -142,11 +142,23 @@ export function adaptToLegacyShape(v3) {
 export function extractV3Signals(breakdown) {
   // Accept both legacy-shaped (с _v3_original) and native v3
   const v3 = breakdown?._v3_original || breakdown || {};
-  const features = Array.isArray(v3.features)
-    ? v3.features
-    : Array.isArray(breakdown?.capabilities)
-      ? breakdown.capabilities.flatMap((c) => c.features || [])
-      : [];
+  // Per-feature signals MUST read the CURRENT edited shape, not the frozen
+  // _v3_original snapshot — else editor deletions/edits don't reflect in the Review
+  // "AI self-check" (a staleness bug found 2026-06-04). The editor mutates
+  // breakdown.capabilities (the adapter preserves every feature field, incl.
+  // concerns/confidence), so read that FIRST; native-v3 features next; the frozen
+  // _v3_original.features only as a last resort. This mirrors flattenBreakdown's
+  // precedence (push_handler.js) so the displayed signals and the actual push agree
+  // by construction. Top-level fields (metadata / spec_concerns / epic, read via `v3`
+  // below) are NOT per-feature — they stay on the frozen snapshot (the model's
+  // self-assessment of the generated breakdown, which the editor cannot change).
+  const features = Array.isArray(breakdown?.capabilities)
+    ? breakdown.capabilities.flatMap((c) => c.features || [])
+    : Array.isArray(breakdown?.features)
+      ? breakdown.features
+      : Array.isArray(v3.features)
+        ? v3.features
+        : [];
 
   // Counts
   let totalTasks = 0;
