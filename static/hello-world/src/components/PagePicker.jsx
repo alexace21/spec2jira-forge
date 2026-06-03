@@ -25,7 +25,12 @@ import { invoke } from "@forge/bridge";
 const SEARCH_DEBOUNCE_MS = 350;
 const SEARCH_MIN_QUERY_LEN = 2;
 
-function PagePickerScreen({ onSelect }) {
+// Atlassian Marketplace listing URL (where customers leave a review). The public
+// listing isn't live until the app is approved, so this is a placeholder the partner
+// sets to the real listing's reviews URL post-approval (like PRO_UPGRADE_URL).
+const MARKETPLACE_REVIEW_URL = "https://marketplace.atlassian.com/";
+
+function PagePickerScreen({ onSelect, onOpenSettings }) {
   const [recent, setRecent] = useState([]);
   const [recentLoaded, setRecentLoaded] = useState(false);
 
@@ -145,12 +150,34 @@ function PagePickerScreen({ onSelect }) {
 
   return (
     <div className="p-6" style={{ maxWidth: "720px", margin: "0 auto" }}>
-      <h1
-        className="text-xl font-semibold mb-1"
-        style={{ color: "var(--s2j-text)" }}
-      >
-        Spec2Tickets
-      </h1>
+      {/* Title left, Settings top-right (flex) — the in-app entry into AdminSettings,
+          since the globalSettings Configure page is unreachable in the centralized admin. */}
+      <div className="flex items-start justify-between gap-3 mb-1">
+        <h1
+          className="text-xl font-semibold"
+          style={{ color: "var(--s2j-text)" }}
+        >
+          Spec2Tickets
+        </h1>
+        {onOpenSettings && (
+          <button
+            type="button"
+            onClick={onOpenSettings}
+            className="text-xs shrink-0"
+            style={{
+              background: "none",
+              border: "none",
+              color: "var(--s2j-text-muted)",
+              cursor: "pointer",
+              padding: "4px 8px",
+              borderRadius: "4px",
+            }}
+            title="Open Spec2Tickets settings"
+          >
+            ⚙ Settings
+          </button>
+        )}
+      </div>
       <p className="text-sm mb-6" style={{ color: "var(--s2j-text-light)" }}>
         Pick a Confluence page to generate a JIRA breakdown.
       </p>
@@ -336,6 +363,37 @@ function PagePickerScreen({ onSelect }) {
           Start typing above to search, or paste a page ID to begin.
         </p>
       )}
+
+      {/* ── Feedback / review nudge ─────────────────────────────
+          Gentle prompt to report bugs (support email) or leave a Marketplace review
+          — drives the feedback loop + adoption (reviews lift the listing). The review
+          link is wired post-approval (the public listing isn't live yet). */}
+      <div
+        className="mt-10 pt-4 text-xs leading-relaxed"
+        style={{
+          borderTop: "1px solid var(--s2j-border)",
+          color: "var(--s2j-text-muted)",
+        }}
+      >
+        <span className="font-medium" style={{ color: "var(--s2j-text-light)" }}>
+          Help us keep improving Spec2Tickets.
+        </span>{" "}
+        Found a bug or have an idea? Email{" "}
+        <a href="mailto:support@spec2jira.com" style={{ color: "var(--s2j-blue)" }}>
+          support@spec2jira.com
+        </a>{" "}
+        — we read every message. Enjoying it?{" "}
+        <a
+          href={MARKETPLACE_REVIEW_URL}
+          target="_blank"
+          rel="noopener noreferrer"
+          style={{ color: "var(--s2j-blue)" }}
+        >
+          Leave a quick review
+        </a>{" "}
+        on the Atlassian Marketplace — it takes a minute and helps other teams find
+        us. 🙏
+      </div>
     </div>
   );
 }

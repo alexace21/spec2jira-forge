@@ -1016,9 +1016,14 @@ function App() {
   //     no Back button — it IS the dedicated settings surface.
   if (screen === "admin") {
     if (!settingsFromApp) return <AdminSettings />;
+    // Opened from within the app: AdminSettings is maxWidth:640 + p-8 but NOT
+    // centered, so on the wide globalPage it floated left ("flies in the air") and
+    // the Back button sat detached. Wrap both in a centered 640px frame (matching
+    // AdminSettings' own width) and give the Back button px-8 (= AdminSettings' p-8
+    // left inset) so it aligns with the settings content.
     return (
-      <>
-        <div className="px-6 pt-4" style={SCREEN_MAX_WIDTH_STYLE}>
+      <div style={{ maxWidth: "640px", margin: "0 auto" }}>
+        <div className="px-8 pt-6">
           <button
             type="button"
             onClick={handleCloseSettings}
@@ -1035,7 +1040,7 @@ function App() {
           </button>
         </div>
         <AdminSettings />
-      </>
+      </div>
     );
   }
   if (screen === "setup")
@@ -1205,32 +1210,15 @@ function App() {
         </Center>
       );
     case "picker":
-      // PagePickerScreen is an imported component (not editable here) → the in-app
-      // Settings affordance is rendered BELOW it. WHY: the globalSettings Configure page
-      // is unreachable in the centralized admin, so the picker (the default entry point)
-      // must offer a way into Settings.
+      // Settings affordance lives in PagePicker's header (top-right, opposite the
+      // title). WHY in-app at all: the globalSettings Configure page is unreachable in
+      // the centralized "Connected apps" admin, so the picker (the default entry point)
+      // must offer its own way into Settings.
       return (
-        <>
-          <PagePickerScreen onSelect={handlePageSelected} />
-          <div className="px-6 pb-6" style={SCREEN_MAX_WIDTH_STYLE}>
-            <button
-              type="button"
-              onClick={handleOpenSettings}
-              className="text-xs"
-              style={{
-                background: "none",
-                border: "none",
-                color: "var(--s2j-text-muted)",
-                cursor: "pointer",
-                padding: "4px 8px",
-                borderRadius: "4px",
-              }}
-              title="Open Spec2Tickets settings"
-            >
-              ⚙ Settings
-            </button>
-          </div>
-        </>
+        <PagePickerScreen
+          onSelect={handlePageSelected}
+          onOpenSettings={handleOpenSettings}
+        />
       );
     case "ready":
       return (
@@ -1508,8 +1496,7 @@ function ReadyScreen({
 
 // ── Generating ──────────────────────────────────────────────────
 
-function GeneratingScreen({ pageTitle, jobStatus, elapsed, onBack, onStartOver }) {
-  const pct = Math.round((jobStatus?.progress || 0) * 100);
+function GeneratingScreen({ pageTitle, elapsed, onBack, onStartOver }) {
   return (
     <div className="p-6" style={SCREEN_MAX_WIDTH_STYLE}>
       {/* U2 part 33 (2026-05-09) — refactored to use shared BackButton.
@@ -1523,43 +1510,51 @@ function GeneratingScreen({ pageTitle, jobStatus, elapsed, onBack, onStartOver }
           title="Pipeline continues in background. Return to picker; you can come back to this page anytime to see progress."
         />
       )}
-      <div className="flex items-center gap-2 mb-1">
-        <Spinner size={18} />
+      {/* Centered status — a big INDETERMINATE spinner with the LIVE elapsed time in
+          the center. Generation runs on Anthropic's async Batch API, which gives NO
+          granular progress for a single breakdown (one opaque call: submit → process
+          → ended), so the old determinate bar sat near 0% then jumped to 100% — it
+          read as "broken". An honest spinner + timer conveys "working, here's how
+          long" without faking a percentage. */}
+      <div className="flex flex-col items-center text-center py-6">
+        <div className="relative mb-5" style={{ width: 96, height: 96 }}>
+          <div
+            className="absolute inset-0 rounded-full animate-spin"
+            style={{
+              border: "3px solid var(--s2j-border)",
+              borderTopColor: "var(--s2j-blue)",
+              animationDuration: "1.1s",
+            }}
+          />
+          <div className="absolute inset-0 flex items-center justify-center">
+            <span
+              className="text-xl font-mono font-semibold"
+              style={{ color: "var(--s2j-text)" }}
+            >
+              {fmtTime(elapsed)}
+            </span>
+          </div>
+        </div>
         <h2
-          className="text-lg font-semibold"
+          className="text-base font-semibold"
           style={{ color: "var(--s2j-text)" }}
         >
-          Generating breakdown
+          Your Confluence specification is being analyzed
         </h2>
+        {pageTitle && (
+          <p className="text-sm mt-0.5" style={{ color: "var(--s2j-text-light)" }}>
+            {pageTitle}
+          </p>
+        )}
+        <p
+          className="text-xs mt-2.5"
+          style={{ color: "var(--s2j-text-muted)", maxWidth: "26rem" }}
+        >
+          Building a structured JIRA breakdown — Stories, Subtasks, cross-feature
+          dependencies, and quality signals. This usually takes a few minutes; large
+          specs and busy periods take longer.
+        </p>
       </div>
-      <p className="text-sm mb-4" style={{ color: "var(--s2j-text-light)" }}>
-        {pageTitle}
-      </p>
-
-      {/* Progress bar */}
-      <div
-        className="w-full h-2 rounded-full overflow-hidden mb-2"
-        style={{ background: "var(--s2j-border)" }}
-      >
-        <div
-          className="h-full rounded-full transition-all duration-500"
-          style={{
-            width: `${Math.max(pct, 2)}%`,
-            background: "var(--s2j-blue)",
-          }}
-        />
-      </div>
-      <div className="flex justify-between text-sm mb-1">
-        <span style={{ color: "var(--s2j-text-light)" }}>
-          {jobStatus?.phase || "Starting..."}
-        </span>
-        <span className="font-semibold" style={{ color: "var(--s2j-blue)" }}>
-          {pct}%
-        </span>
-      </div>
-      <p className="text-xs mb-4" style={{ color: "var(--s2j-text-muted)" }}>
-        {fmtTime(elapsed)} elapsed
-      </p>
 
       {/* After ~10 min the bare spinner reads as "broken". Generation runs on
           Anthropic's async Batch API (chosen for cost + to dodge the sync/event
@@ -1603,11 +1598,12 @@ function GeneratingScreen({ pageTitle, jobStatus, elapsed, onBack, onStartOver }
           className="text-xs font-medium mb-1"
           style={{ color: "var(--s2j-text)" }}
         >
-          You can close this panel
+          ☕ You can safely leave — we'll keep working
         </p>
         <p className="text-xs" style={{ color: "var(--s2j-text-light)" }}>
-          The pipeline continues in the background. Reopen via ••• menu to check
-          progress.
+          Close this tab, switch tasks, or come back tomorrow — your breakdown keeps
+          generating. Reopen this page (Apps → Spec2Tickets) and it will be waiting
+          for you, even if it took a while.
         </p>
       </div>
       {onStartOver && (
