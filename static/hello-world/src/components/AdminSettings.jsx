@@ -37,12 +37,28 @@ const ERROR_MESSAGES = {
     "Anthropic account has insufficient credits. Add credits at console.anthropic.com → Billing.",
   RATE_LIMITED:
     "Anthropic rate limit reached. Wait a moment and retry.",
+  // Managed (Advanced) server key not configured. Distill returns code
+  // NOT_CONFIGURED with error 'managed_unavailable' — for a Managed user the
+  // generic NOT_CONFIGURED text ("paste your key") is wrong, so handlers prefer
+  // the backend detail and fall back to this Managed-correct message.
+  MANAGED_UNAVAILABLE:
+    "The Managed service is temporarily unavailable (server key not configured). Contact support, or switch to BYOK and save your own Anthropic API key.",
 };
 
 function getErrorText(result) {
   const mapped = ERROR_MESSAGES[result?.code];
   if (mapped) return mapped;
   return result?.detail || "Connection test failed";
+}
+
+// Price lookups off the getUsage `pricing[]` array (single source of €-values — the
+// UI never hardcodes prices). accountPriceFor → a named tier's price; accountPrice →
+// the customer's OWN active tier price (null for Free / when absent).
+function accountPriceFor(account, key) {
+  return (account?.pricing || []).find((t) => t.key === key)?.price || null;
+}
+function accountPrice(account) {
+  return account?.tier ? accountPriceFor(account, account.tier) : null;
 }
 
 export default function AdminSettings() {
@@ -126,8 +142,12 @@ export default function AdminSettings() {
       return;
     }
 
-    // Block save ako neither а key nor а pre-configured key exist
-    if (!trimmedKey && !apiKeyConfigured) {
+    // Block save ako neither а key nor а pre-configured key exist — UNLESS this is a
+    // Managed Pro (Advanced) install, where we run Claude with our key and the
+    // customer is not expected to provide one (they're only saving the project key
+    // + context here). isManaged is derived from getUsage's edition.
+    const isManaged = account?.edition === "advanced";
+    if (!isManaged && !trimmedKey && !apiKeyConfigured) {
       setMessage({
         type: "error",
         text: "Please paste your Anthropic API key. Get one from console.anthropic.com → API Keys.",
@@ -282,6 +302,13 @@ export default function AdminSettings() {
     );
   }
 
+  // Managed Pro (Advanced edition) ⇒ WE run Claude with our key, so the customer
+  // needs NO Anthropic key. Hide the BYOK key input in that case + show a Managed
+  // notice. Only true when getUsage explicitly resolved 'advanced' — if account is
+  // null (best-effort load failed/unlicensed) we default to showing the BYOK input
+  // (the safe, today's behaviour). Distill also routes through the managed key then.
+  const isManaged = account?.edition === "advanced";
+
   return (
     <div className="p-8" style={{ maxWidth: "640px" }}>
       <h1
@@ -314,6 +341,16 @@ export default function AdminSettings() {
               <span style={{ color: "var(--s2j-text-muted)" }}>Plan</span>
               <span className="font-medium" style={{ color: "var(--s2j-text)" }}>
                 {account.tierLabel || "Free"}
+                {/* Price for the active PAID edition (from pricing[] — single source).
+                    Free has no price; unlimited BYOK Pro still shows its price. */}
+                {accountPrice(account) ? (
+                  <span
+                    className="font-normal ml-1"
+                    style={{ color: "var(--s2j-text-muted)" }}
+                  >
+                    · {accountPrice(account)}
+                  </span>
+                ) : null}
               </span>
             </div>
             <div className="flex items-center justify-between">
@@ -323,6 +360,8 @@ export default function AdminSettings() {
               <span className="font-medium" style={{ color: "var(--s2j-text)" }}>
                 {account.unlimited
                   ? "Unlimited"
+                  : account.tier === "managedPro"
+                  ? `${account.used ?? 0} (fair-use)`
                   : `${account.used ?? 0} / ${account.limit ?? 3}`}
               </span>
             </div>
@@ -343,105 +382,201 @@ export default function AdminSettings() {
               </div>
             )}
           </div>
-          {account.tier !== "pro" && (
+          {/* Tier-aware footnote. Free: the path to unlimited + the push caveat
+              (Free is Generate + Review only). Managed Pro: the cap is fair-use, and
+              BYOK Pro is the unlimited option. BYOK Pro (unlimited): nothing to add. */}
+          {account.tier === "free" && (
             <p className="text-xs mt-3" style={{ color: "var(--s2j-text-muted)" }}>
-              Free includes 3 breakdowns per month. Upgrade to Pro for unlimited breakdowns.
+              Free includes 3 breakdowns per month and Generate + Review.{" "}
+              {accountPriceFor(account, "byokPro") || accountPriceFor(account, "managedPro")
+                ? `Subscribe to push to JIRA and lift the limit — BYOK Pro${
+                    accountPriceFor(account, "byokPro")
+                      ? ` (${accountPriceFor(account, "byokPro")})`
+                      : ""
+                  } for unlimited with your own key, or Managed Pro${
+                    accountPriceFor(account, "managedPro")
+                      ? ` (${accountPriceFor(account, "managedPro")})`
+                      : ""
+                  } where we run Claude for you.`
+                : "Subscribe to BYOK Pro or Managed Pro to push to JIRA and lift the limit."}
+            </p>
+          )}
+          {account.tier === "managedPro" && (
+            <p className="text-xs mt-3" style={{ color: "var(--s2j-text-muted)" }}>
+              Managed Pro runs Claude for you (no API key needed). The monthly limit is
+              a fair-use allowance{account.resetsAtLabel ? ` and resets on ${account.resetsAtLabel}` : ""}.{" "}
+              {accountPriceFor(account, "byokPro")
+                ? `For unlimited breakdowns, switch to BYOK Pro (${accountPriceFor(account, "byokPro")}) and use your own Anthropic key.`
+                : "For unlimited breakdowns, switch to BYOK Pro and use your own Anthropic key."}
             </p>
           )}
         </div>
       )}
 
-      {/* v3.0.0 BYOK info callout */}
-      <div
-        className="rounded-lg p-4 mb-6 text-sm"
-        style={{
-          background: "var(--s2j-blue-bg)",
-          border: "1px solid var(--s2j-blue-border)",
-          color: "var(--s2j-text)",
-        }}
-      >
-        <p className="mb-2">
-          <strong>Powered by Claude:</strong> Spec2Tickets uses Anthropic's Claude Sonnet 4.6 to analyze your specs. You provide your own Anthropic API key (BYOK); breakdowns run on Anthropic's infrastructure, never on Spec2Tickets servers.
-        </p>
-        <p className="mb-2">
-          <strong>Get an API key:</strong>{" "}
-          <a
-            href="https://console.anthropic.com/settings/keys"
-            target="_blank"
-            rel="noopener noreferrer"
-            style={{ color: "var(--s2j-blue)", textDecoration: "underline" }}
-          >
-            console.anthropic.com → Settings → API Keys
-          </a>{" "}
-          (sign up free; billed pay-as-you-go to your own Anthropic account).
-        </p>
-        <p>
-          <strong>Privacy:</strong> Your spec content flows directly from Forge to the Anthropic API using your key. Data falls under{" "}
-          <a
-            href="https://www.anthropic.com/legal/aup"
-            target="_blank"
-            rel="noopener noreferrer"
-            style={{ color: "var(--s2j-blue)", textDecoration: "underline" }}
-          >
-            Anthropic's Usage Policy
-          </a>
-          {" "}+ your own data processing agreement with Anthropic.
-        </p>
-      </div>
+      {/* Info callout — edition-aware. Managed Pro: we run Claude (no key needed).
+          Otherwise (Free / BYOK Pro): the BYOK explainer + the two ways to use the
+          app, so an admin choosing how to run it understands both paths. */}
+      {isManaged ? (
+        <div
+          className="rounded-lg p-4 mb-6 text-sm"
+          style={{
+            background: "var(--s2j-green-bg)",
+            border: "1px solid var(--s2j-green-border)",
+            color: "var(--s2j-text)",
+          }}
+        >
+          <p className="mb-2">
+            <strong>Managed Pro — we run Claude for you.</strong> Your{" "}
+            {accountPriceFor(account, "managedPro") || "Managed Pro"} subscription
+            runs every breakdown on our Anthropic key, so there is{" "}
+            <strong>no API key to configure</strong>. Just set your default JIRA
+            project below and you're ready to generate.
+          </p>
+          <p>
+            Your monthly allowance is a fair-use limit. Want unlimited breakdowns and
+            to use your own Anthropic agreement? Switch to BYOK Pro
+            {accountPriceFor(account, "byokPro")
+              ? ` (${accountPriceFor(account, "byokPro")})`
+              : ""}{" "}
+            and paste your own key here.
+          </p>
+        </div>
+      ) : (
+        <div
+          className="rounded-lg p-4 mb-6 text-sm"
+          style={{
+            background: "var(--s2j-blue-bg)",
+            border: "1px solid var(--s2j-blue-border)",
+            color: "var(--s2j-text)",
+          }}
+        >
+          <p className="mb-2">
+            <strong>Powered by Claude:</strong> Spec2Tickets uses Anthropic's Claude
+            Sonnet 4.6 to analyze your specs. There are two ways to run it:
+          </p>
+          <ul className="mb-2" style={{ marginLeft: "16px", listStyle: "disc" }}>
+            <li className="mb-1">
+              <strong>Bring your own key (BYOK)</strong> — paste your Anthropic API
+              key below. Free includes 3 breakdowns/month
+              {accountPriceFor(account, "byokPro")
+                ? `; BYOK Pro (${accountPriceFor(account, "byokPro")}) is unlimited`
+                : "; BYOK Pro is unlimited"}
+              . Breakdowns run on your own Anthropic account, never on Spec2Tickets
+              servers.
+            </li>
+            <li>
+              <strong>Managed</strong> — no key needed; we run Claude for you.
+              Subscribe to Managed Pro
+              {accountPriceFor(account, "managedPro")
+                ? ` (${accountPriceFor(account, "managedPro")})`
+                : ""}{" "}
+              (the Advanced edition) from your Atlassian site admin.
+            </li>
+          </ul>
+          <p className="mb-2">
+            <strong>Get an API key:</strong>{" "}
+            <a
+              href="https://console.anthropic.com/settings/keys"
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{ color: "var(--s2j-blue)", textDecoration: "underline" }}
+            >
+              console.anthropic.com → Settings → API Keys
+            </a>{" "}
+            (sign up free; billed pay-as-you-go to your own Anthropic account).
+          </p>
+          <p>
+            <strong>Privacy:</strong> Under BYOK, your spec content flows directly
+            from Forge to the Anthropic API using your key. Data falls under{" "}
+            <a
+              href="https://www.anthropic.com/legal/aup"
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{ color: "var(--s2j-blue)", textDecoration: "underline" }}
+            >
+              Anthropic's Usage Policy
+            </a>
+            {" "}+ your own data processing agreement with Anthropic.
+          </p>
+        </div>
+      )}
 
       {/* Form */}
       <div className="space-y-5">
-        <Field
-          label="Anthropic API Key"
-          description={
-            apiKeyConfigured
-              ? `API key configured${apiKeyLastSetAt ? ` (last set ${new Date(apiKeyLastSetAt).toLocaleDateString()})` : ""}. Paste a new value to replace, or leave blank to keep current.`
-              : "Paste your Anthropic API key (sk-ant-...). Stored encrypted in Forge KVS, never visible to the UI after save."
-          }
-          required={!apiKeyConfigured}
-        >
-          <div className="flex gap-2">
-            <input
-              type="password"
-              value={anthropicApiKey}
-              onChange={handleApiKeyChange}
-              placeholder={apiKeyConfigured ? "•••••••• (configured)" : "sk-ant-api03-..."}
-              className="flex-1"
-              style={inputStyle}
-              autoComplete="off"
-            />
-            <button
-              onClick={handleTest}
-              disabled={testing || (!anthropicApiKey && !apiKeyConfigured)}
-              className="btn-secondary shrink-0"
-              style={{
-                opacity:
-                  testing || (!anthropicApiKey && !apiKeyConfigured)
-                    ? 0.5
-                    : 1,
-              }}
-            >
-              {testing ? "Testing..." : "Test Connection"}
-            </button>
+        {/* BYOK key input — Free + BYOK Pro. HIDDEN for Managed Pro (we run Claude
+            with our key; the customer has no key to enter). A Managed admin still
+            configures the JIRA project below. */}
+        {isManaged ? (
+          <div
+            className="rounded-lg p-3 text-sm"
+            style={{
+              background: "var(--s2j-bg-section)",
+              border: "1px solid var(--s2j-border)",
+              color: "var(--s2j-text-muted)",
+            }}
+          >
+            <p style={{ color: "var(--s2j-text)" }} className="font-medium mb-1">
+              No Anthropic API key needed
+            </p>
+            <p>
+              On Managed Pro we run Claude for you, so there is no key to configure.
+              To use your own key (and unlimited breakdowns) instead, switch to BYOK
+              Pro and this field will appear.
+            </p>
           </div>
-          {apiKeyConfigured && (
-            <button
-              onClick={handleClearKey}
-              disabled={clearing}
-              className="text-xs mt-2"
-              style={{
-                color: "var(--s2j-red)",
-                textDecoration: "underline",
-                background: "none",
-                border: "none",
-                cursor: clearing ? "default" : "pointer",
-                padding: 0,
-              }}
-            >
-              {clearing ? "Clearing..." : "Clear stored API key"}
-            </button>
-          )}
-        </Field>
+        ) : (
+          <Field
+            label="Anthropic API Key"
+            description={
+              apiKeyConfigured
+                ? `API key configured${apiKeyLastSetAt ? ` (last set ${new Date(apiKeyLastSetAt).toLocaleDateString()})` : ""}. Paste a new value to replace, or leave blank to keep current.`
+                : "Paste your Anthropic API key (sk-ant-...). Stored encrypted in Forge KVS, never visible to the UI after save."
+            }
+            required={!apiKeyConfigured}
+          >
+            <div className="flex gap-2">
+              <input
+                type="password"
+                value={anthropicApiKey}
+                onChange={handleApiKeyChange}
+                placeholder={apiKeyConfigured ? "•••••••• (configured)" : "sk-ant-api03-..."}
+                className="flex-1"
+                style={inputStyle}
+                autoComplete="off"
+              />
+              <button
+                onClick={handleTest}
+                disabled={testing || (!anthropicApiKey && !apiKeyConfigured)}
+                className="btn-secondary shrink-0"
+                style={{
+                  opacity:
+                    testing || (!anthropicApiKey && !apiKeyConfigured)
+                      ? 0.5
+                      : 1,
+                }}
+              >
+                {testing ? "Testing..." : "Test Connection"}
+              </button>
+            </div>
+            {apiKeyConfigured && (
+              <button
+                onClick={handleClearKey}
+                disabled={clearing}
+                className="text-xs mt-2"
+                style={{
+                  color: "var(--s2j-red)",
+                  textDecoration: "underline",
+                  background: "none",
+                  border: "none",
+                  cursor: clearing ? "default" : "pointer",
+                  padding: 0,
+                }}
+              >
+                {clearing ? "Clearing..." : "Clear stored API key"}
+              </button>
+            )}
+          </Field>
+        )}
 
         <Field
           label="Default JIRA Project Key"
@@ -469,7 +604,7 @@ export default function AdminSettings() {
         <ContextProfilesEditor
           profiles={contextProfiles}
           setProfiles={setContextProfiles}
-          apiKeyConfigured={apiKeyConfigured}
+          apiKeyConfigured={apiKeyConfigured || isManaged}
           onMessage={setMessage}
         />
 
@@ -592,6 +727,10 @@ export default function AdminSettings() {
 // row: name + context textarea + "Distill with Claude" (condense a long paste) + live
 // counter + remove. The user later picks which profile applies per generation
 // (ReadyScreen), so a multi-project workspace never gets the wrong project's context.
+// NOTE: `apiKeyConfigured` here is overloaded to mean "MAY DISTILL" — the parent
+// passes `apiKeyConfigured || isManaged`, because a Managed install has no BYOK key
+// but CAN distill (the backend calls Claude with our key). Every distill gate below
+// honours that. (§13 review fix — a future cleanup may rename the prop to canDistill.)
 function ContextProfilesEditor({ profiles, setProfiles, apiKeyConfigured, onMessage }) {
   const [distillingId, setDistillingId] = useState(null);
   const [distillProgress, setDistillProgress] = useState(null); // { label, current, total } while a 6-step distill runs
@@ -641,10 +780,19 @@ function ContextProfilesEditor({ profiles, setProfiles, apiKeyConfigured, onMess
       }
       if (result?.error) {
         const label = result.label || `step ${step + 1}`;
+        // Managed-unavailable: prefer the backend detail (it says "switch to BYOK"),
+        // NOT the generic NOT_CONFIGURED "paste your key" text — wrong for a Managed
+        // user who has no key by design.
+        const baseMsg =
+          result.error === "managed_unavailable"
+            ? result.detail || ERROR_MESSAGES.MANAGED_UNAVAILABLE
+            : ERROR_MESSAGES[result.code] ||
+              result.detail ||
+              `Couldn't distill ${label}.`;
         setDistillFailure({ id, sessionId, step, total });
         onMessage({
           type: "error",
-          text: `${ERROR_MESSAGES[result.code] || result.detail || `Couldn't distill ${label}.`} You can retry from where it stopped, or start over.`,
+          text: `${baseMsg} You can retry from where it stopped, or start over.`,
         });
         return;
       }
@@ -692,9 +840,11 @@ function ContextProfilesEditor({ profiles, setProfiles, apiKeyConfigured, onMess
         onMessage({
           type: "error",
           text:
-            ERROR_MESSAGES[start?.code] ||
-            start?.detail ||
-            "Couldn't start the distill. Try again.",
+            start?.error === "managed_unavailable"
+              ? start.detail || ERROR_MESSAGES.MANAGED_UNAVAILABLE
+              : ERROR_MESSAGES[start?.code] ||
+                start?.detail ||
+                "Couldn't start the distill. Try again.",
         });
         return;
       }

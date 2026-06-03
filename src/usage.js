@@ -8,49 +8,85 @@
  *   (POLICY §4 dispatch rule: counting + threshold compare is *structure*, not
  *   meaning-reading → a pure function, never a model call).
  *
- * THE MODEL (BYOK MVP launch — partner decision 2026-05-30; price revised 2026-06-01)
- *   - Free: 3 breakdowns / month, resets the 1st of each month (UTC). A trial.
- *   - Pro:  €39 / month flat ("Early Access") → UNLIMITED breakdowns.
- *   Two tiers, one flat paid price for launch. Rationale: pricing is value-based,
- *   not cost-based — under BYOK the customer pays Anthropic for compute, so the
- *   subscription is pure app-value (a breakdown saves ~1-3 h of BA/PO time). €20
- *   under-captured (~2-10% of value) + under-signalled; €39 is the early-access
- *   floor. NEXT iteration: per-seat above 10 users (~€5/user) — Atlassian-native
- *   model, captures big-team value. Frame introductory + grandfather early adopters.
+ * THE MODEL — hybrid, two Paid-via-Atlassian editions + an in-app Free trial
+ * (XCA resubmit, partner decisions 2026-06-02/03; supersedes the flat €39 model):
+ *   - Free:        3 breakdowns / month, in-app, PERPETUAL. Resets the 1st (UTC).
+ *                  Served to UNLICENSED installs (manifest unlicensedAccess) —
+ *                  there is no €0 Atlassian edition (a free edition cannot coexist
+ *                  with paid ones). BYOK only. Generate + Review only: the JIRA
+ *                  push is gated behind a license because asUser() is forbidden
+ *                  for unlicensed users (see index.js / manifest gotcha #3).
+ *   - BYOK Pro:    "Standard" edition, €4.90/user/mo → UNLIMITED. The customer's
+ *                  own Anthropic key pays compute, so unlimited is no cost
+ *                  liability for us; the subscription is pure app-value.
+ *   - Managed Pro: "Advanced" edition, €9.90/user/mo → CAPPED (we call Anthropic
+ *                  with OUR key, so usage = our cost). Fair-use 10 breakdowns/
+ *                  user/mo (MANAGED_USER_CAP), metered PER USER, NOT pooled (no
+ *                  runtime seat count) — loss-proof per seat. See below.
  *
- *   ⚠ "Unlimited" is safe ONLY while BYOK. When the future "vendor-pays" model
- *   lands (we pay the API, pending Anthropic reselling approval), unlimited
- *   becomes an unbounded-cost liability and MUST revert to a usage cap / metered
- *   pricing. Do not carry flat-unlimited into the vendor-pays era unchanged.
+ *   Edition discrimination is by license.capabilitySet (capabilityStandard /
+ *   capabilityAdvanced) — see resolveTier. An active license with no recognised
+ *   set ⇒ BYOK Pro (the SAFE default: unlimited, customer-key, never bills us).
+ *
+ *   ⚠ "Unlimited" is safe ONLY for BYOK (customer pays compute). Managed is
+ *   capped precisely because WE pay — never give Managed an unlimited tier.
  *
  * ENFORCEMENT MODE
- *   'block' = hard-block when a free site reaches its monthly limit, returning a
- *             quota_exceeded payload (LimitReachedScreen shows reset date + Pro).
+ *   'block' = hard-block when an install reaches its tier's monthly limit,
+ *             returning a quota_exceeded payload (LimitReachedScreen).
  *   'meter' = track only, never block.
+ *   PER-ENVIRONMENT: production = 'block' (default when unset), dev = 'meter'
+ *   via `forge variables set`. Editions are tested in dev via
+ *   `forge install --license Standard|Advanced` (no env override needed).
  *
- *   PER-ENVIRONMENT (see ENFORCEMENT_MODE below): production = 'block' (default),
- *   dev = 'meter' (test freely) via `forge variables set`. The €39 Marketplace
- *   listing goes live WITH the production release, so block has a working upgrade
- *   path in production — dev simply has no listing (normal). resolveTier() reads
- *   context.license.active → paying sites auto-resolve to Pro (unlimited).
- *
- * SCOPE — per-site, not per-user
- *   The Anthropic key and all KVS state are site-wide (one install = one shared
- *   key), so the free trial counter is per-site. Per-seat billing (the planned
- *   next pricing iteration, above 10 users) lives at the Atlassian subscription
- *   layer, above this counter — resolveTier() only needs license.active either way.
+ * SCOPE — per-site counter; per-USER billing is above this layer
+ *   The Anthropic key + all KVS state are site-wide (one install = one shared
+ *   key), so the FREE + BYOK counters are per-site. MANAGED meters PER USER
+ *   (accountId), because the license object exposes NO seat count at runtime
+ *   (verified @forge/api runtime.d.ts) → 10×seats is uncomputable, so per-user is
+ *   the loss-bounded shape (10/seat is loss-proof regardless of instance size).
  */
 
 import { kvs } from '@forge/kvs';
+import { getAppContext } from '@forge/api';
+
+// ── Managed Pro per-user fair-use cap ────────────────────────────────
+// Managed Pro meters PER USER per month (each seat its own allowance), NOT pooled
+// per instance — the Forge License object exposes NO seat count at runtime
+// (verified @forge/api runtime.d.ts 2026-06-03), so 10×seats is uncomputable, and
+// per-user is the loss-bounded shape that needs no seat count: 10 × worst-case
+// €0.46 = €4.60 < €9.90/seat revenue → ≥54% margin at the cap, any instance size;
+// and abuse is self-funding (each extra seat is paid revenue). Market research
+// (2026-06-03) confirmed 10 is GENEROUS — typical use 1-3/mo, power 5-8/mo — so it
+// rarely binds; heavy users → BYOK or a future Managed-Plus. Env-tunable for
+// signal-driven adaptation: `forge variables set ... MANAGED_USER_CAP <n>`.
+export const MANAGED_USER_CAP =
+  Number.parseInt(process.env.MANAGED_USER_CAP, 10) > 0
+    ? Number.parseInt(process.env.MANAGED_USER_CAP, 10)
+    : 10;
 
 // ── Tier model — single source of truth ─────────────────────────────
 // `limit`: breakdowns per calendar month, per site. `null` = unlimited.
-// `price`: the Marketplace SUBSCRIPTION price (NOT API cost — under BYOK the
-//          customer pays Anthropic directly; the subscription buys the app).
-// The Free limit (3) is the single tunable threshold that bites in 'block' mode.
+// `edition`: the Paid-via-Atlassian edition that maps to this tier — 'standard'
+//   = BYOK Pro, 'advanced' = Managed Pro, null = Free (unlicensed/in-app).
+// `price`: the Marketplace SUBSCRIPTION price shown in the UI (NOT API cost —
+//          under BYOK the customer pays Anthropic; the subscription buys the app).
 export const TIERS = {
-  free: { key: 'free', label: 'Free', limit: 3, price: null },
-  pro: { key: 'pro', label: 'Pro', limit: null, price: '€39/month' },
+  free: { key: 'free', label: 'Free', limit: 3, price: null, edition: null },
+  byokPro: {
+    key: 'byokPro',
+    label: 'BYOK Pro',
+    limit: null, // unlimited — customer's own key pays compute
+    price: '€4.90/user/mo',
+    edition: 'standard',
+  },
+  managedPro: {
+    key: 'managedPro',
+    label: 'Managed Pro',
+    limit: MANAGED_USER_CAP, // we pay compute → per-USER fair-use cap (see above)
+    price: '€9.90/user/mo',
+    edition: 'advanced',
+  },
 };
 
 export const DEFAULT_TIER = 'free';
@@ -96,33 +132,85 @@ export function formatResetDate(iso) {
   return `${MONTH_NAMES[d.getUTCMonth()]} ${d.getUTCDate()}, ${d.getUTCFullYear()}`;
 }
 
-// ── Tier resolution ──────────────────────────────────────────────────
+// ── License + tier resolution ────────────────────────────────────────
 
 /**
- * Resolve the active tier from the resolver `context`.
- * A live Atlassian license → Pro (unlimited); otherwise Free. When the app is
- * not yet paid-listed, context.license is absent → Free (the safe default), so
- * this is correct both before and after the paid listing goes live.
- *
- * @param {object} context - Forge resolver context (may carry `.license`).
+ * Obtain the authoritative Forge license. getAppContext() (@forge/api) is the
+ * reliable runtime source for capabilitySet — the resolver `context.license` has
+ * historically exposed only a thin active flag on some code paths. Sync call,
+ * valid only inside an invocation, so wrapped fail-open with a fallback to the
+ * passed context.license, then null (⇒ Free). It also reflects the dev
+ * `forge install --license Standard|Advanced` override, which is how we test.
  */
-export function resolveTier(context) {
-  const lic = context && context.license;
-  if (lic && lic.active === true) return TIERS.pro;
-  // FUTURE (migration-protections #2): when the €20-flat-unlimited → tiers+caps
-  // migration lands, grandfather early adopters here — an install whose
-  // firstSeenAt (getInstallMeta) predates the early-access cutoff should resolve
-  // to an unlimited grandfathered tier instead of Free. Deferred until the cutoff
-  // date exists (a launch-time decision, never a hardcode); the firstSeenAt
-  // signal is already captured today (recordFirstSeen). The async caller
-  // (checkQuota) would read the meta and pass it in, keeping this resolver pure.
-  return TIERS[DEFAULT_TIER];
+function resolveLicense(context) {
+  try {
+    const appCtx = getAppContext();
+    if (appCtx && appCtx.license) return appCtx.license;
+  } catch (e) {
+    // Not in an invocation context (e.g. a unit test) — fall back below.
+  }
+  return (context && context.license) || null;
+}
+
+/**
+ * Resolve the active tier from a Forge license object. PURE (the async caller
+ * obtains the license and passes it) so it is unit-testable in isolation.
+ *
+ *   capabilityAdvanced   ⇒ Managed Pro (we pay Anthropic; capped pool)
+ *   capabilityStandard   ⇒ BYOK Pro    (customer's key; unlimited)
+ *   active, unknown set  ⇒ BYOK Pro    (SAFE default — never bill us by accident)
+ *   no active license    ⇒ Free        (3/mo, in-app, BYOK)
+ *
+ * capabilitySet is typed 'capabilityStandard'|'capabilityAdvanced' by @forge/api,
+ * but compared case-INSENSITIVELY to defend against documented casing drift.
+ *
+ * FUTURE (migration-protections #2): grandfather early adopters here — an install
+ * whose firstSeenAt (getInstallMeta) predates the early-access cutoff resolves to
+ * an unlimited grandfathered tier. Deferred until the cutoff date exists (a
+ * launch-time decision, never a hardcode); firstSeenAt is captured today
+ * (recordFirstSeen). The async caller would read the meta and pass it in.
+ *
+ * @param {object|null} license - a Forge License object (see resolveLicense).
+ */
+export function resolveTier(license) {
+  const active = !!(
+    license && (license.active === true || license.isActive === true)
+  );
+  if (!active) return TIERS[DEFAULT_TIER];
+  const cap = String(license.capabilitySet || '').toLowerCase();
+  if (cap === 'capabilityadvanced') return TIERS.managedPro;
+  return TIERS.byokPro;
+}
+
+/**
+ * Convenience: the active tier for THIS invocation, license-resolved. Used by the
+ * resolvers for (a) the Anthropic key source (Managed/Advanced ⇒ our key) and
+ * (b) the push gate (Free/unlicensed ⇒ asUser() is forbidden, so the JIRA push
+ * requires an active license/trial). Sync-license read; fail-open via resolveLicense.
+ */
+export function getActiveTier(context) {
+  return resolveTier(resolveLicense(context));
 }
 
 // ── Counter primitives ───────────────────────────────────────────────
 
-async function readCount(period) {
-  const rec = await kvs.get(`${USAGE_KEY_PREFIX}${period}`);
+/**
+ * The KVS key a tier meters against for the period. Managed Pro (we pay compute)
+ * meters PER USER (`:u:<accountId>`) — each seat its own allowance (MANAGED_USER_CAP).
+ * Free + BYOK meter PER SITE (the 3/mo trial is one shared site counter; BYOK is
+ * unlimited, counted only for analytics). accountId is server-trusted
+ * (backend-prioritised in the resolver context, never the client payload).
+ */
+function usageKeyFor(tier, context, period) {
+  if (tier && tier.key === 'managedPro') {
+    const acct = (context && context.accountId) || 'unknown';
+    return `${USAGE_KEY_PREFIX}${period}:u:${acct}`;
+  }
+  return `${USAGE_KEY_PREFIX}${period}`;
+}
+
+async function readCountByKey(key) {
+  const rec = await kvs.get(key);
   return rec && typeof rec.count === 'number' ? rec.count : 0;
 }
 
@@ -136,26 +224,32 @@ async function readCount(period) {
  */
 export async function checkQuota(context) {
   const now = new Date();
-  const tier = resolveTier(context);
+  const tier = resolveTier(resolveLicense(context));
   const period = currentPeriod(now);
   const resetsAt = periodResetsAt(now);
-  const used = await readCount(period);
+  const usageKey = usageKeyFor(tier, context, period);
+  const used = await readCountByKey(usageKey);
   const unlimited = tier.limit === null;
   const remaining = unlimited ? null : Math.max(0, tier.limit - used);
   const overLimit = unlimited ? false : used >= tier.limit;
   return {
     tier: tier.key,
     tierLabel: tier.label,
+    edition: tier.edition, // 'standard'|'advanced'|null — for tier-aware messaging
     limit: tier.limit, // null = unlimited
     unlimited,
     used,
     remaining,
     period,
+    usageKey, // KVS key this tier meters against (per-user for Managed) → consumeQuota
     resetsAt,
     resetsAtLabel: formatResetDate(resetsAt),
     overLimit,
     allowed: unlimited || ENFORCEMENT_MODE !== 'block' || used < tier.limit,
     enforcementMode: ENFORCEMENT_MODE,
+    // Managed's cap is FAIR-USE (we pay compute), NOT a free-trial limit — an
+    // over-limit Managed user is routed to BYOK (unlimited), not "subscribe".
+    fairUse: tier.key === 'managedPro',
   };
 }
 
@@ -171,11 +265,12 @@ export async function checkQuota(context) {
  * costs us nothing. If 'block' ever needs hard correctness, swap to a
  * transactional / custom-entity counter.
  *
- * @param {string} period - billing period (defaults to the current month).
+ * @param {string} usageKey - the KVS key to increment (from checkQuota().usageKey;
+ *   per-user for Managed, per-site otherwise). Falls back to the per-site key.
  * @returns {Promise<number>} the new count.
  */
-export async function consumeQuota(period = currentPeriod()) {
-  const key = `${USAGE_KEY_PREFIX}${period}`;
+export async function consumeQuota(usageKey) {
+  const key = usageKey || `${USAGE_KEY_PREFIX}${currentPeriod()}`;
   const rec = await kvs.get(key);
   const count = (rec && typeof rec.count === 'number' ? rec.count : 0) + 1;
   await kvs.set(key, { count, updatedAt: new Date().toISOString() });
@@ -239,10 +334,11 @@ export async function getInstallMeta() {
  * Pricing table for the UI upgrade CTA. English (user-facing copy per POLICY).
  */
 export function pricingTable() {
-  return [TIERS.free, TIERS.pro].map((t) => ({
+  return [TIERS.free, TIERS.byokPro, TIERS.managedPro].map((t) => ({
     key: t.key,
     label: t.label,
     limit: t.limit, // null = unlimited
     price: t.price,
+    edition: t.edition,
   }));
 }

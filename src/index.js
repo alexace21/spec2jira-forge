@@ -60,7 +60,77 @@ import {
   recordFirstSeen,
   formatResetDate,
   pricingTable,
+  getActiveTier,
 } from './usage.js';
+
+// ── Managed-vs-BYOK Anthropic key resolution (hybrid tiers, 2026-06-03) ──
+// Managed Pro (Advanced edition) ⇒ WE call Anthropic with OUR key, stored as an
+// ENCRYPTED Forge env var (`forge variables set --encrypt MANAGED_ANTHROPIC_KEY ...`).
+// BYOK Pro / Free ⇒ the customer's own stored key. An Anthropic batch is bound to
+// the key that created it, so the SOURCE ('managed'|'byok') is recorded on the job
+// at submit and reused at poll — never re-resolved from a license that may have
+// changed (e.g. a trial expiring) mid-batch.
+async function anthropicKeyForSource(source) {
+  if (source === 'managed') return process.env.MANAGED_ANTHROPIC_KEY || null;
+  return getStoredApiKey();
+}
+
+/** Resolve { apiKey, keySource, tier } for THIS invocation from the license. */
+async function resolveAnthropicKey(context) {
+  const tier = getActiveTier(context);
+  let keySource = tier.edition === 'advanced' ? 'managed' : 'byok';
+  // Guest/non-seat guard (§13 abuse fix — BEST-EFFORT, DEV-VERIFY pending): the
+  // Managed key is OURS, so prefer to spend it only for a licensed seat. A
+  // Confluence guest/anonymous user on a Managed instance (reachable via
+  // unlicensedAccess) should NOT burn our key → downgrade to BYOK (no key →
+  // not_configured, correct for a guest). ⚠ accountType is NOT reliably
+  // backend-trusted — in @forge/resolver only accountId + license are
+  // backend-prioritised; accountType arrives via the frontend ProductContext, so a
+  // client could send 'licensed'. So this guard is BEST-EFFORT; the REAL bound is
+  // (a) the license/tier is backend-trusted (a guest cannot fake a Managed instance)
+  // and (b) the per-user accountId cap IS backend-trusted, so even an evaded guard
+  // caps our exposure at one accountId × MANAGED_USER_CAP (~€4.60/mo). Downgrade
+  // when accountType is present & ≠ 'licensed'. ⚠ DEV-VERIFY guest accountType.
+  if (
+    keySource === 'managed' &&
+    context && context.accountType &&
+    context.accountType !== 'licensed'
+  ) {
+    keySource = 'byok';
+  }
+  const apiKey = await anthropicKeyForSource(keySource);
+  return { apiKey, keySource, tier };
+}
+
+/**
+ * Tier-aware quota_exceeded payload. Free → subscribe to a paid edition; Managed
+ * Pro (fairUse) → it's a fair-use cap (we pay compute), so route to BYOK
+ * (unlimited with the customer's own key), NOT "subscribe to a higher tier".
+ */
+function buildQuotaExceeded(quota) {
+  const base = {
+    error: 'quota_exceeded',
+    tier: quota.tier,
+    tierLabel: quota.tierLabel,
+    used: quota.used,
+    limit: quota.limit,
+    resetsAt: quota.resetsAt,
+    resetsAtLabel: quota.resetsAtLabel,
+    pricing: pricingTable(),
+    fairUse: !!quota.fairUse,
+  };
+  if (quota.fairUse) {
+    return {
+      ...base,
+      detail: `You've reached this month's fair-use limit (${quota.limit} breakdowns on ${quota.tierLabel}) — it resets ${quota.resetsAtLabel}. Need more this month? Contact us at support@spec2jira.com about higher-volume Managed access, or switch to BYOK Pro (use your own Anthropic key) for unlimited right away.`,
+    };
+  }
+  return {
+    ...base,
+    upgradePrice: TIERS.byokPro.price,
+    detail: `You've used all ${quota.limit} free breakdowns this month. Subscribe to BYOK Pro (${TIERS.byokPro.price}, unlimited with your own key) or Managed Pro (${TIERS.managedPro.price}, we run it for you). Your free quota resets ${quota.resetsAtLabel}.`,
+  };
+}
 
 const resolver = new Resolver();
 
@@ -414,13 +484,35 @@ function mapDistillError(result) {
  *
  * Returns { sessionId, totalSteps, categories } OR { error, code, detail }.
  */
-resolver.define('startDistillSession', async ({ payload }) => {
+resolver.define('startDistillSession', async ({ payload, context }) => {
   const text = (payload?.text || '').trim();
   if (!text) return { error: 'empty', code: 'UNEXPECTED', detail: 'Nothing to distill.' };
 
-  const apiKey = await getStoredApiKey();
+  // Distill (Project Context) is an Anthropic call too — resolve the key by tier
+  // so Managed installs (no BYOK key) distill with OUR key, BYOK with theirs.
+  const { apiKey, keySource } = await resolveAnthropicKey(context);
   if (!apiKey) {
-    return { error: 'not_configured', code: 'NOT_CONFIGURED', detail: 'Anthropic API key not configured. Save your key first.' };
+    return keySource === 'managed'
+      ? { error: 'managed_unavailable', code: 'NOT_CONFIGURED', detail: 'The Managed service is temporarily unavailable (server key not configured). Contact support, or switch to BYOK and save your own key.' }
+      : { error: 'not_configured', code: 'NOT_CONFIGURED', detail: 'Anthropic API key not configured. Save your key first.' };
+  }
+
+  // §13 security-review fix: Managed distill spends OUR key but has no breakdown
+  // counter of its own → gate it on the per-USER fair-use cap (MANAGED_USER_CAP) so
+  // it cannot run on our key once this user is over their monthly cap. BYOK/Free
+  // distill on the customer's own key → no gate. Fail-OPEN on a check glitch (never
+  // block a payer). NOTE (accepted 2026-06-03, partner decision): distill UNDER the
+  // cap is gated-but-not-consumed — a low-risk residual (cheap Haiku, requires a
+  // paid seat); add a dedicated distill cap only if abuse is ever observed.
+  if (keySource === 'managed') {
+    try {
+      const q = await checkQuota(context);
+      if (!q.allowed) {
+        return { error: 'managed_unavailable', code: 'NOT_CONFIGURED', detail: `Managed fair-use limit reached for this period — distill is paused until ${q.resetsAtLabel}. For unlimited, switch to BYOK Pro (your own key).` };
+      }
+    } catch (e) {
+      console.error(`[distill] managed pool check failed (allowing): ${String(e?.message || e)}`);
+    }
   }
 
   // Clip once, at session start, so every per-category call sees the SAME bounded input
@@ -460,7 +552,7 @@ resolver.define('startDistillSession', async ({ payload }) => {
  *   - final:        { done:true,  step, totalSteps, label, profile, truncated }
  *   - per-step err: { error, code, detail, step, label }  (session kept so the UI can retry)
  */
-resolver.define('distillStep', async ({ payload }) => {
+resolver.define('distillStep', async ({ payload, context }) => {
   const sessionId = payload?.sessionId;
   const step = Number(payload?.step);
   if (!sessionId) return { error: 'no_session', code: 'UNEXPECTED', detail: 'No distill session id.' };
@@ -474,9 +566,11 @@ resolver.define('distillStep', async ({ payload }) => {
     return { error: 'session_not_found', code: 'UNEXPECTED', detail: 'Distill session expired or not found. Start over.' };
   }
 
-  const apiKey = await getStoredApiKey();
+  const { apiKey, keySource } = await resolveAnthropicKey(context);
   if (!apiKey) {
-    return { error: 'not_configured', code: 'NOT_CONFIGURED', detail: 'Anthropic API key not configured. Save your key first.', step, label: DISTILL_CATEGORIES[step].label };
+    return keySource === 'managed'
+      ? { error: 'managed_unavailable', code: 'NOT_CONFIGURED', detail: 'The Managed service is temporarily unavailable (server key not configured). Contact support or switch to BYOK.', step, label: DISTILL_CATEGORIES[step].label }
+      : { error: 'not_configured', code: 'NOT_CONFIGURED', detail: 'Anthropic API key not configured. Save your key first.', step, label: DISTILL_CATEGORIES[step].label };
   }
 
   const category = DISTILL_CATEGORIES[step];
@@ -870,14 +964,24 @@ resolver.define('startGeneration', async ({ payload, context }) => {
   const { pageId, modelMode, contextProfileId } = payload || {};
   if (!pageId) return { error: 'No page ID' };
 
-  // Verify API key configured BEFORE fetching content (fail fast)
-  const apiKey = await getStoredApiKey();
+  // Resolve the Anthropic key by tier (Managed/Advanced ⇒ our key; BYOK/Free ⇒
+  // the customer's). Done BEFORE the content fetch (fail fast) AND before the
+  // quota gate, so a Managed user — who has no BYOK key by design — is never
+  // wrongly told to "configure a key". keySource is stored on the job below so
+  // the poll leg reuses the SAME key the batch was created with.
+  const { apiKey, keySource } = await resolveAnthropicKey(context);
   if (!apiKey) {
-    return {
-      error: 'not_configured',
-      detail:
-        'Anthropic API key not configured. Ask your Confluence admin к open Settings → Spec2Tickets and provide an Anthropic API key.',
-    };
+    return keySource === 'managed'
+      ? {
+          error: 'managed_unavailable',
+          detail:
+            'The Managed service is temporarily unavailable (server key not configured). Please contact support, or switch to BYOK in Settings and use your own Anthropic API key.',
+        }
+      : {
+          error: 'not_configured',
+          detail:
+            'Anthropic API key not configured. Ask your Confluence admin to open Settings → Spec2Tickets and provide an Anthropic API key.',
+        };
   }
 
   // Record install provenance (grandfathering signal — see usage.js
@@ -893,28 +997,16 @@ resolver.define('startGeneration', async ({ payload, context }) => {
     console.error(`[startGeneration] firstSeen record failed (non-fatal): ${String(e?.message || e)}`);
   }
 
-  // Tier/usage gate (P3a). Fail OPEN — a metering glitch must never block a
-  // BYOK user who pays their own Anthropic bill. In 'meter' mode quota.allowed
-  // is always true (we never block pre-paid-listing); the gate only bites once
-  // ENFORCEMENT_MODE flips to 'block' (P3b, after the Marketplace paid listing).
-  // The counter is consumed AFTER a successful batch submit below, so a failed
-  // submit never burns the customer's quota.
+  // Tier/usage gate (P3a). Fail OPEN — a metering glitch must never block a user.
+  // Free (unlicensed) → 3/mo trial; BYOK Pro → unlimited; Managed Pro → per-user
+  // fair-use cap. In 'meter' mode quota.allowed is always true. The
+  // counter is consumed AFTER a successful batch submit below, so a failed submit
+  // never burns quota.
   let quota = null;
   try {
     quota = await checkQuota(context);
     if (!quota.allowed) {
-      return {
-        error: 'quota_exceeded',
-        tier: quota.tier,
-        tierLabel: quota.tierLabel,
-        used: quota.used,
-        limit: quota.limit,
-        resetsAt: quota.resetsAt,
-        resetsAtLabel: quota.resetsAtLabel,
-        upgradePrice: TIERS.pro.price,
-        pricing: pricingTable(),
-        detail: `You've used all ${quota.limit} free breakdowns this month. Upgrade to ${TIERS.pro.label} — ${TIERS.pro.price} for unlimited breakdowns. Your free quota resets on ${quota.resetsAtLabel}.`,
-      };
+      return buildQuotaExceeded(quota);
     }
   } catch (e) {
     console.error(`[startGeneration] quota check failed (failing open): ${String(e?.message || e)}`);
@@ -1001,6 +1093,7 @@ resolver.define('startGeneration', async ({ payload, context }) => {
     model,
     useCaching: true,
     projectContext,
+    apiKeyOverride: apiKey, // Managed ⇒ our key; BYOK/Free ⇒ customer's (see resolveAnthropicKey)
   });
 
   if (submitResult.error) {
@@ -1035,6 +1128,9 @@ resolver.define('startGeneration', async ({ payload, context }) => {
     createdAt: new Date().toISOString(),
     submittedAt: new Date().toISOString(),
     expiresAt: submitResult.expiresAt,
+    keySource, // 'managed'|'byok' — the poll/fetch/cycle-repair legs MUST reuse
+    //            the SAME key the batch was created with (Anthropic batches are
+    //            scoped to the creating key). See pollJobStatus.
   });
 
   // Consume one unit of quota — only now that the batch submitted successfully
@@ -1044,12 +1140,12 @@ resolver.define('startGeneration', async ({ payload, context }) => {
   let usageInfo = null;
   if (quota) {
     try {
-      const used = await consumeQuota(quota.period);
+      const used = await consumeQuota(quota.usageKey);
       usageInfo = {
         tier: quota.tier,
         used,
         limit: quota.limit,
-        remaining: Math.max(0, quota.limit - used),
+        remaining: quota.limit === null ? null : Math.max(0, quota.limit - used),
         resetsAt: quota.resetsAt,
       };
     } catch (e) {
@@ -1081,6 +1177,12 @@ resolver.define('pollJobStatus', async ({ payload }) => {
     return { error: 'not_found', detail: `Job ${jobId} not found (may have been purged)` };
   }
 
+  // Reuse the SAME key the batch was created with (Anthropic batches are scoped
+  // to their creating key): Managed jobs poll/fetch/repair with OUR key, BYOK
+  // with the customer's. job.keySource is stamped at submit; jobs created before
+  // this change carry no keySource → default to 'byok' (back-compatible).
+  const jobApiKey = await anthropicKeyForSource(job.keySource || 'byok');
+
   // Terminal states return immediately
   if (job.status === 'completed' || job.status === 'failed') {
     return job;
@@ -1088,7 +1190,20 @@ resolver.define('pollJobStatus', async ({ payload }) => {
 
   // Active batch states — poll Anthropic for current status
   if (job.status === 'batched' && job.batchId) {
-    const pollResult = await pollBatchStatus(job.batchId);
+    // §13 review fix: a Managed job whose server key vanished mid-flight
+    // (rotated/unset) must NOT fall through to the customer's BYOK key —
+    // anthropicKeyForSource('managed') → null, and pollBatchStatus/fetchBatchResults
+    // do `apiKeyOverride || getStoredApiKey()`. Soft-fail (stay 'batched', show a
+    // message, retry next cycle → self-heals when the key is restored) instead of a
+    // silent wrong-key poll. POLICY §11: never a silent wrong-key path.
+    if (job.keySource === 'managed' && !jobApiKey) {
+      return {
+        ...job,
+        phase: 'Managed service temporarily unavailable (server key unset) — retrying. If this persists, please contact support.',
+      };
+    }
+
+    const pollResult = await pollBatchStatus(job.batchId, jobApiKey);
 
     if (pollResult.error) {
       console.error(
@@ -1137,6 +1252,7 @@ resolver.define('pollJobStatus', async ({ payload }) => {
       const fetchResult = await fetchBatchResults(
         pollResult.resultsUrl,
         jobId, // custom_id ≡ jobId
+        jobApiKey, // Managed ⇒ our key (same as submit); BYOK ⇒ customer's
       );
 
       if (fetchResult.error) {
@@ -1175,8 +1291,8 @@ resolver.define('pollJobStatus', async ({ payload }) => {
       // unresolved ones as spec_concerns. A silent cycle breaks downstream sprint
       // sequencing and creates false confidence (§11). Fail-safe — non-fatal.
       try {
-        const cycleApiKey = await getStoredApiKey();
-        await verifyAndRepairCycles(breakdown, cycleApiKey, fetchResult.model);
+        // Cycle-repair LLM call reuses the job's key (Managed ⇒ our key, same as submit).
+        await verifyAndRepairCycles(breakdown, jobApiKey, fetchResult.model);
       } catch (e) {
         console.error(`[pollJobStatus] cycle repair failed (non-fatal): ${String(e?.message || e)}`);
       }
@@ -1366,10 +1482,29 @@ resolver.define('purgeJob', async ({ payload }) => {
  *
  * Returns { ok, sessionId, phase, totals } OR { error, detail }.
  */
-resolver.define('startPush', async ({ payload }) => {
+resolver.define('startPush', async ({ payload, context }) => {
   const { breakdown, projectKey: payloadProjectKey } = payload || {};
   if (!breakdown) {
     return { error: 'no_breakdown', detail: 'No breakdown payload provided' };
+  }
+
+  // Push gate: the JIRA push uses asUser().requestJira (gotcha #3), which is
+  // FORBIDDEN for unlicensed users — so a Free/unlicensed install can Generate +
+  // Review but needs an active license/trial to push. Free (no active license) ⇒
+  // a clean upgrade prompt instead of a raw 401. Fail-open: a license-read glitch
+  // must not block a paying user (the asUser call still 401s a truly-unlicensed
+  // user as the backstop).
+  try {
+    if (getActiveTier(context).key === 'free') {
+      return {
+        error: 'push_requires_license',
+        detail:
+          'Pushing to JIRA requires a subscription or an active trial. Free includes Generate + Review — subscribe to BYOK Pro or Managed Pro to create the issues in JIRA.',
+        pricing: pricingTable(),
+      };
+    }
+  } catch (e) {
+    console.error(`[startPush] license check failed (failing open): ${String(e?.message || e)}`);
   }
 
   const projectKey = await getProjectKey(payloadProjectKey);
@@ -1412,6 +1547,11 @@ resolver.define('startPush', async ({ payload }) => {
  * OR { error, detail }.
  */
 resolver.define('pushStep', async ({ payload }) => {
+  // No license gate here (unlike startPush): a pushStep session exists ONLY if
+  // startPush already passed the license gate and created it in KVS. A Free user
+  // cannot reach a valid session; a forged sessionId returns session_not_found, and
+  // asUser() is the ultimate 401 backstop. Preserve this invariant if a second
+  // session creator is ever added (§13 review note).
   const sessionId = payload?.sessionId;
   if (!sessionId) return { error: 'no_session', detail: 'No session id provided.' };
 

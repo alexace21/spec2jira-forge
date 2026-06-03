@@ -23,6 +23,18 @@ modules:
       resource: main
       resolver:
         function: resolver
+      # unlicensedAccess admits Confluence GUEST users (authenticated, no paid
+      # license) to this surface. ⚠ Verified 2026-06-03 (live docs): by DEFAULT
+      # Atlassian BLOCKS non-licensed users, and `unlicensed` means GUESTS
+      # specifically — NOT a general "post-trial free user" hook. Whether the
+      # in-app Free tier (3/mo) is reachable for regular users of an UNSUBSCRIBED
+      # install is an OPEN question → MUST be confirmed with a dev no-license
+      # install (see docs/XCA-MIGRATION-AND-PRICING-TODO.md). Kept here as the
+      # documented non-licensed-access hook (valid + harmless on this module).
+      # Separately: asUser() is FORBIDDEN for unlicensed users (gotcha #3) → the
+      # JIRA push is license-gated regardless (Free = Generate + Review only).
+      unlicensedAccess:
+        - unlicensed
   # U3 part 33 (2026-05-09) — confluence:contentAction inline-on-page
   # entry surface. Closes "Apps menu navigation friction" partner UX
   # insight 2026-05-08 part 18 — user clicks "Generate Breakdown с
@@ -46,6 +58,10 @@ modules:
       resource: main
       resolver:
         function: resolver
+      # unlicensedAccess (Confluence GUEST users) — see the globalPage note + the
+      # OPEN Free-tier-reachability question (docs/XCA-MIGRATION-AND-PRICING-TODO.md).
+      unlicensedAccess:
+        - unlicensed
   confluence:globalSettings:
     - key: spec2jira-settings
       resource: main
@@ -53,6 +69,11 @@ modules:
         function: resolver
       title: Spec2JIRA Settings
       useAsConfig: true
+      # NOTE: confluence:globalSettings does NOT support unlicensedAccess (a hard
+      # forge-lint error — verified 2026-06-03). If non-licensed access to a
+      # BYOK-key entry is ever needed for the Free tier, it must come via a
+      # globalPage onboarding step (globalPage DOES support unlicensedAccess),
+      # not here. See docs/XCA-MIGRATION-AND-PRICING-TODO.md (Free-tier question).
   function:
     # Single resolver handles ALL backend work in v3.0.1+:
     #   - Settings (BYOK API key), Confluence page fetch/search
@@ -117,3 +138,34 @@ app:
     memoryMB: 512
     architecture: arm64
   id: ari:cloud:ecosystem::app/e804f31f-1cbf-4f09-86c1-11e36f387fe7
+  # ── XCA (Cross-Context App) migration 2026-06-03 ─────────────────────
+  # Marketplace REQUIRES this: the app is compatible with BOTH Confluence +
+  # Jira, so Atlassian mandates it be a Cross-Context App ("multiple-app
+  # compatibility"), which MUST be "Paid via Atlassian" (the SOLE remaining
+  # v4.2.0 rejection reason — FIT/security already passed). Confluence =
+  # required (the Custom UI globalPage lives there; the app is non-functional
+  # without it). Jira = optional (touched only via the write:jira-work push).
+  # ⚠ The required app is IMMUTABLE once installs exist → Confluence is the
+  # correct AND locked-in choice (we have live Confluence installs). Verified
+  # against the live app-compatibility + migration docs 2026-06-03 (XCA still
+  # in Preview; Confluence/Jira/Compass only; @forge/api ≥5.1.1 — we have
+  # ^7.2.1). Do NOT uninstall Jira before deploying — that ordering rule is
+  # for TEARDOWN only; Confluence installs + data are preserved automatically.
+  compatibility:
+    confluence:
+      required: true
+    jira:
+      required: false
+  # ── Paid-via-Atlassian + TWO editions (Standard/Advanced) ────────────
+  # The platform cap is EXACTLY two editions. editionsEnabled is MANDATORY for
+  # the two-price hybrid (licensing.enabled alone → a SINGLE price):
+  #   Standard = BYOK Pro    (€4.90/user, UNLIMITED — customer's own key)
+  #   Advanced = Managed Pro (€9.90/user, capped 10/USER/mo — we call Anthropic with OUR key)
+  # Runtime tells them apart via context.license.capabilitySet
+  # (capabilitystandard / capabilityadvanced) — see src/usage.js resolveTier.
+  # Prices/edition names are set in the vendor portal, NOT here. A €0 Free
+  # edition cannot coexist with paid editions → Free is delivered IN-APP
+  # (unlicensedAccess below + the usage.js 3/mo counter).
+  licensing:
+    enabled: true
+    editionsEnabled: true

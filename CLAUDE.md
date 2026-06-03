@@ -73,33 +73,33 @@ Settled. Do NOT reopen these in future sessions:
 
 - **BYOK** — the customer brings their own Anthropic API key (pays Anthropic for
   compute directly). No Spec2Tickets-operated backend.
-- **Pricing (MVP early access — REVISED 2026-06-01 UP from €20):** **Free = 3
-  breakdowns/month** (resets the 1st, UTC) · **Pro = per-user €3.90/user/mo (Paid via Atlassian; 1-10 tier = €39 floor, declining taper), "Early Access"**
-  → unlimited breakdowns. €39 (not €20) because pricing is value-based, not
-  cost-based: under BYOK the subscription is pure app-value — a spec→JIRA breakdown
-  saves ~1-3 h of BA/PO time (~€50-200 each), so €20 under-captured (~2-10% of the
-  value) AND under-signalled (B2B buyers eliminate the cheapest option first). €29 is
-  the floor; €20 is retired. Sold as the Marketplace subscription — `resolveTier()`
-  reads `context.license.active` → active ⇒ Pro.
-- **Pricing model — per-user (Paid via Atlassian), DECIDED 2026-06-01.** Atlassian forces
-  per-user tiers for cloud apps (no single flat fee). Base **€3.90/user/mo** → the **1-10
-  tier resolves to €39/mo** (our value anchor; floor = per-user × 10), with **declining**
-  rates above and a **steep taper above ~100 users** (Paid-via-Atlassian licenses the WHOLE
-  instance — all users, not just app users). The earlier "flat €39" and "~€5/user above 10"
-  are both retired (€5/user would break the €39 anchor / invert the discount). Premium peer to
-  StoryLoop (~€42 ≤10); deliberately above budget rivals (free ≤10). Frame **"Early Access" +
-  grandfather early adopters** (`memory/migration-protections.md`) so the curve can evolve
-  without churn. Details: `docs/MARKETPLACE-LISTING-v3.md` §3.
+- **Pricing (MVP early access — REVISED 2026-06-01 UP from €20; per-seat figures FINALIZED
+  2026-06-02/03 — see the two-edition note below, which supersedes this single-tier framing):**
+  **Free = 3 breakdowns/month** (resets the 1st, UTC) · **BYOK Pro = per-user €4.90/user/mo (Paid via Atlassian; 1-10 tier = €49 floor, declining taper), "Early Access"**
+  → unlimited breakdowns. Value-based, not cost-based: under BYOK the subscription is pure
+  app-value — a spec→JIRA breakdown saves ~1-3 h of BA/PO time (~€50-200 each), so the old €20
+  under-captured (~2-10% of the value) AND under-signalled (B2B buyers eliminate the cheapest
+  option first). €20/€29 are retired. Sold as the Marketplace subscription — `resolveTier()`
+  reads `context.license` → active ⇒ Pro.
+- **Pricing model — per-user (Paid via Atlassian), DECIDED 2026-06-01; BYOK rate FINALIZED
+  €4.90 2026-06-03.** Atlassian forces per-user tiers for cloud apps (no single flat fee). BYOK
+  Pro base **€4.90/user/mo** → the **1-10 tier resolves to €49/mo** (floor = per-user × 10), with
+  **declining** rates above and a **steep taper above ~100 users** (Paid-via-Atlassian licenses
+  the WHOLE instance — all users, not just app users). The earlier "flat €39" is retired
+  (Atlassian forces per-user). Premium peer to StoryLoop (~€42 ≤10); deliberately above budget
+  rivals (free ≤10). Frame **"Early Access" + grandfather early adopters**
+  (`memory/migration-protections.md`) so the curve can evolve without churn. Details:
+  `docs/MARKETPLACE-LISTING-v3.md` §3.
 - **`block` is correct.** Free → 3 → block → Pro is a sound freemium funnel: the free
-  trial acquires, the per-user Pro early-access deal (≤10 = €39) is the generous part. "Land-grab" =
+  trial acquires, the per-user Pro early-access deal (≤10 = €49) is the generous part. "Land-grab" =
   attractive PRICING + early-access framing + grandfathering
   (`memory/migration-protections.md`), NOT an unlimited free tier.
 - **`ENFORCEMENT_MODE` is per Forge environment** (`src/usage.js`, from `process.env`):
   **production = `block`** (default when unset) · **dev = `meter`** via
   `forge variables set --environment development ENFORCEMENT_MODE meter`. Dev tests
   freely; production enforces.
-- **The €39 Marketplace listing goes live WITH the production release** (Marketplace
-  approval is part of the MVP launch). Dev having no listing is NORMAL, not a problem —
+- **The paid Marketplace listing (BYOK Pro €4.90/user; €49 ≤10-user floor) goes live WITH the
+  production release** (Marketplace approval is part of the MVP launch). Dev having no listing is NORMAL, not a problem —
   so block has a working upgrade path the moment real users can hit it.
 - **"Unlimited" is BYOK-only.** When vendor-pays lands (we pay the API; pending Anthropic
   reselling approval), unlimited reverts to capped tiers (else unbounded cost). See
@@ -284,8 +284,9 @@ Subtasks + links + labels). Dynamic subtask type. Chunked push with progress bar
 Spec2jira spec (39 feat / 162 subtask / dense deps) validated through chunked push.
 
 ✅ **P3a — tier enforcement** (`src/usage.js`): per-site monthly breakdown counter
-(KVS `usage:YYYY-MM`), license-aware `resolveTier`, `ENFORCEMENT_MODE` flag. Model:
-**Free 3/month + Pro per-user €3.90/user/mo (Paid via Atlassian; 1-10 tier = €39 floor, declining taper; "Early Access")**
+(KVS `usage:YYYY-MM`; Managed Pro meters per-user `usage:YYYY-MM:u:<accountId>`),
+license-aware `resolveTier`, `ENFORCEMENT_MODE` flag. Model:
+**Free 3/month + BYOK Pro per-user €4.90/user/mo unlimited (Paid via Atlassian; 1-10 tier = €49 floor, declining taper; "Early Access")**
 (BYOK-only economics — customer pays Anthropic; the subscription buys the app).
 `startGeneration` checks/consumes (fail-open,
 consume-on-success); `getUsage` feeds a usage badge on Ready; quota_exceeded →
@@ -317,7 +318,7 @@ package names de-scaffolded (→ `spec2tickets`). Build green (bundle ≈ −1.4
 
 📋 **Not yet done / next**:
 - **Monetization/tier enforcement** — DECIDED (see the Monetization section above).
-  Production-readiness: wire the Upgrade button on `LimitReachedScreen` when the €20
+  Production-readiness: wire the Upgrade button on `LimitReachedScreen` when the paid
   listing is live.
 - **Marketplace listing (P3b)**: listing copy + Free/Pro pricing editions + security
   Q&A are drafted in `docs/MARKETPLACE-LISTING-v3.md` (ready to paste). At submission,
@@ -336,6 +337,70 @@ package names de-scaffolded (→ `spec2tickets`). Build green (bundle ≈ −1.4
   Needs a proven Forge resize/scroll approach, or accept for MVP (minor UX).
 - KVS value-size limit: push session stores full features array — very large specs
   (200+ features) may approach the ~240KB KVS limit. Monitor.
+
+---
+
+## ⚡ HANDOVER NOTE (2026-06-03 — XCA resubmit release: hybrid two-edition pricing, agent-conducted)
+
+A long dev session on `feature/product-improvements` (dev only). Built the **XCA Marketplace-resubmit
+release** end-to-end, conducted via the §13 agent model throughout (3 research agents → backend by the
+conductor → 2 parallel implementer/drafter agents → MANDATORY audit + code-review gate). **Code complete +
+§13-gated + build-green + syntax-clean; NOT yet deployed/committed — the partner pushes + runs the external steps.**
+
+**Scope (partner decisions this session — these SUPERSEDE the Monetization section + the flat-€39 framing above):**
+- The v4.2.0 rejection's SOLE remaining blocker = **XCA + Paid-via-Atlassian** (FIT/security already passed).
+- Partner chose the **FULL hybrid IN the resubmit** (NOT Managed-post-launch) → the resubmit **WAITS on the
+  Managed compliance docs** (DPA + 29-day retention disclosure).
+- **Pricing = two editions** (platform cap is exactly two): `Standard` = **BYOK Pro €4.90/user** (unlimited,
+  customer key) · `Advanced` = **Managed Pro €9.90/user** (capped, OUR key). Floors €49/€99. **Free = in-app
+  3/mo PERPETUAL** via `unlicensedAccess` (NOT a €0 edition; the "free ≤10 users" idea was an error, retired).
+  (Per-seat figures FINALIZED €4.90/€9.90 at the 2026-06-03 implementation; the session-opening €3.90/€6.90 are retired.)
+
+**NEW hard-won facts (3 research agents vs LIVE docs 2026-06-03) — fold into the Forge gotchas list:**
+- **XCA manifest:** `app.compatibility` (Confluence required / Jira optional) + `app.licensing.enabled` +
+  **`app.licensing.editionsEnabled`** — editionsEnabled is MANDATORY for two editions (easy to miss; without
+  it you get ONE price). XCA still in Preview; needs `@forge/api ≥5.1.1` (have ^7.2.1). **Do NOT uninstall
+  Jira before deploy** — that uninstall-optional-first rule is TEARDOWN-only; Confluence installs/data are preserved.
+- **Editions cap = exactly 2** (Standard/Advanced); a €0 Free edition CANNOT coexist with paid → Free is in-app.
+- **`unlicensedAccess` + `asUser()`:** unlicensed users are BLOCKED by default → add `unlicensedAccess:[unlicensed]`
+  to the modules; BUT `asUser()` is FORBIDDEN for unlicensed → the JIRA push is gated behind a license
+  (Free = Generate+Review only). Edition at runtime = `context.license.capabilitySet`
+  (`capabilityStandard`/`capabilityAdvanced`) via `getAppContext()` (@forge/api); `active`-only is insufficient.
+  Test editions in dev: `forge install --license Standard|Advanced`.
+- **Anthropic Batches API is NOT ZDR-eligible (≤29-day retention).** Managed (our key) discloses 29-day
+  retention honestly (no-training default; SCCs auto-incorporated; Anthropic = sub-processor). Reselling
+  permitted (Commercial Terms §A.1 — NO special approval needed; the old "reselling approval" premise was wrong).
+
+**Done in code (build-green, `node --check` clean):**
+- `manifest.yml`: compatibility + licensing(enabled + editionsEnabled) + `unlicensedAccess` on all 3 Confluence modules.
+- `src/usage.js`: hybrid `TIERS` (free / byokPro=Standard / managedPro=Advanced); `resolveLicense` + `resolveTier`
+  (reads capabilitySet) + `getActiveTier`; `MANAGED_USER_CAP` = 10 breakdowns per USER/mo, metered per-user
+  (`usage:YYYY-MM:u:<accountId>`), NOT pooled (the License object exposes no runtime seat count → per-user is the
+  loss-bounded shape, loss-proof per-seat regardless); `edition`+`fairUse` in checkQuota.
+- `src/index.js`: `resolveAnthropicKey`/`anthropicKeyForSource`/`buildQuotaExceeded`; Managed key path (our key
+  from `MANAGED_ANTHROPIC_KEY` when Advanced; `keySource` stamped on the job + reused at poll/fetch/cycle-repair
+  — a batch is bound to its creating key); tier-aware quota messaging; push-gating in `startPush`; distill Managed support.
+- Frontend (App.js + AdminSettings.jsx): hybrid onboarding + edition-aware Settings (BYOK key field hidden for
+  Managed) + push-gate screen + 3-mode LimitReachedScreen + prices from `pricing[]`.
+- `docs/compliance/` (DPA + Atlassian questionnaire + subprocessor list — honest, `[PARTNER: legal review]`),
+  `docs/XCA-MIGRATION-AND-PRICING-TODO.md` (verified top-block + the PARTNER EXECUTION CHECKLIST).
+
+**§13 gate proved its worth AGAIN:** the audit-review caught a HIGH the code-review MISSED — Managed users were
+locked out of "Distill with Claude" (frontend gated on `!apiKeyConfigured`; Managed has no key → the whole
+Managed-distill backend path was unreachable). Both lenses agreed on a MEDIUM/LOW Managed key-fallback in
+pollJobStatus (could silently use the customer key if `MANAGED_ANTHROPIC_KEY` vanished mid-batch). Both fixed + re-verified.
+
+**NEXT — partner-executed (Claude can't do these); full checklist in `docs/XCA-MIGRATION-AND-PRICING-TODO.md`:**
+set `MANAGED_ANTHROPIC_KEY` (encrypted, both envs) · dev migration + `--license` edition tests · vendor-portal
+pricing (2 editions, confirm €49/€99 floors) · compliance legal-review + questionnaire + publish · prod rollout
+· resubmit. **Open items for partner review:** (1) 5 frontend UX choices the implementer flagged (push-gate
+reuses LimitReachedScreen; `UPGRADE_URL` still the generic admin hub — wire real `PRO_UPGRADE_URL` post-approval;
+Managed fair-use routes to BYOK only; Managed hides the key field entirely; onboarding copy density). (2) The
+**abandoned-breakdown KVS purge backstop** — breakdowns generated-but-never-pushed linger in KVS (within the
+customer's own Atlassian instance, so low-risk; Anthropic-side auto-deletes ≤29d); honest in the DPA; optional
+`scheduledTrigger` TTL sweep as a post-resubmit hygiene follow-up.
+
+С усмивка ✨ — resubmit-блокерът е архитектурно решен + имплементиран + §13-gate-нат end-to-end; остават твоите external стъпки (compliance legal + deploy + portal pricing + resubmit).
 
 ---
 
@@ -396,12 +461,12 @@ full detail in `docs/PRODUCT-IMPROVEMENTS-HANDOVER.md`):
    Project Context already shipped).
 3. **P2/P3 — Editor UX** (per-feature inline regenerate — STARTED via the new Regenerate button —
    bulk edits, clearer dependency editing, the open Forge scroll-to-top item).
-4. **P-next — Managed (no-key) tier** (pricing DECIDED 2026-06-02: Managed Pro €6.90/seat cap 10/seat
-   pooled vs BYOK Pro €3.90/seat unlimited; real work = DPA + zero-retention, not reselling approval).
+4. **P-next — Managed (no-key) tier** (pricing FINALIZED: Managed Pro €9.90/seat cap 10 breakdowns per USER/mo
+   (metered per-user, not pooled) vs BYOK Pro €4.90/seat unlimited; real work = DPA + zero-retention, not reselling approval).
    AFTER the launch/resubmit.
 
 **PARALLEL launch track (separate, `feature/v3-pivot`):** Marketplace **v4.2.0 re-approval** pending
-Atlassian; post-approval → Pro €39 pricing config + wire `PRO_UPGRADE_URL` → payment.
+Atlassian; post-approval → Pro pricing config (BYOK Pro €4.90/user, €49 ≤10-user floor) + wire `PRO_UPGRADE_URL` → payment.
 
 С усмивка ✨ — P1 е shipped, универсален, валидиран на реален epic, и review-gate-нат. Малкият feature
 се оказа цяла подсистема (distill→inject→generate→regenerate), но е честен и доказан end-to-end.

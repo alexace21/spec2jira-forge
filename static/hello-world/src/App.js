@@ -720,12 +720,24 @@ function App() {
     });
 
     if (result.error === "quota_exceeded") {
-      // Free-tier monthly limit reached (ENFORCEMENT_MODE = 'block'). This is a
-      // NORMAL state, not a failure — route to the dedicated limit screen, NOT
-      // the red "Something went wrong" error screen (which framed it as a bug
-      // and offered a pointless "Try again").
+      // Quota reached (ENFORCEMENT_MODE = 'block'). NORMAL state, not a failure —
+      // route to the dedicated limit screen, NOT the red "Something went wrong"
+      // error screen. The payload's fairUse flag splits the messaging there: Free
+      // (fairUse=false) → subscribe to a paid edition; Managed Pro (fairUse=true) →
+      // switch to BYOK Pro for unlimited (the cap is fair-use, we pay compute).
       setQuotaInfo(result);
       setScreen("limit_reached");
+      return;
+    }
+    if (result.error === "managed_unavailable") {
+      // Managed Pro selected but our server key isn't configured (rare/transient).
+      // The backend composes an actionable detail (contact support OR switch to
+      // BYOK) — show it directly rather than the generic classifier wrapping.
+      setError(
+        result.detail ||
+          "The Managed service is temporarily unavailable. Please contact support, or switch to BYOK in Settings and use your own Anthropic API key.",
+      );
+      setScreen("error");
       return;
     }
     if (result.error) {
@@ -819,6 +831,17 @@ function App() {
 
     try {
       const start = await invoke("startPush", { breakdown: pendingBreakdown });
+      // Push gate (hybrid model): Free includes Generate + Review but NOT the JIRA
+      // push (asUser() is forbidden for unlicensed installs — gotcha #3). Route to
+      // the friendly subscription screen, NOT the red error screen. quotaInfo carries
+      // the backend's tier-aware detail + pricing[] so LimitReachedScreen shows both
+      // editions. isPushing must clear so the user isn't stuck on a spinner.
+      if (start.error === "push_requires_license") {
+        setQuotaInfo(start);
+        setScreen("limit_reached");
+        setIsPushing(false);
+        return;
+      }
       if (start.error) {
         fail(start, "Push failed to start");
         return;
@@ -1216,8 +1239,11 @@ function ReadyScreen({
   onGenerate,
   onBack,
 }) {
-  const proPrice =
-    usage && (usage.pricing || []).find((t) => t.key === "pro")?.price;
+  // Prices come from getUsage's pricing[] (single source of truth — no hardcoded
+  // €-values in the UI). The old single "pro" key no longer exists; the hybrid has
+  // two paid editions: byokPro (unlimited, own key) + managedPro (we run it).
+  const byokProPrice = findPrice(usage, "byokPro");
+  const managedProPrice = findPrice(usage, "managedPro");
   return (
     <div className="p-6" style={SCREEN_MAX_WIDTH_STYLE}>
       {onBack && (
@@ -1252,16 +1278,35 @@ function ReadyScreen({
               </strong>{" "}
               · unlimited breakdowns
             </span>
+          ) : usage.tier === "managedPro" ? (
+            // Managed Pro is CAPPED fair-use (we run Claude), not a free trial —
+            // describe it as the monthly fair-use allowance, not "free breakdowns".
+            <span>
+              <strong style={{ color: "var(--s2j-text)" }}>
+                {usage.tierLabel} plan
+              </strong>{" "}
+              · {usage.used} breakdowns this month (fair-use allowance) · resets{" "}
+              {usage.resetsAtLabel}
+              {usage.remaining === 0 && byokProPrice && (
+                <span style={{ color: "var(--s2j-text)" }}>
+                  {" "}
+                  · for unlimited, switch to BYOK Pro ({byokProPrice}) with your own
+                  key
+                </span>
+              )}
+            </span>
           ) : (
             <span>
               <strong style={{ color: "var(--s2j-text)" }}>
                 {usage.used} of {usage.limit}
               </strong>{" "}
               free breakdowns used this month · resets {usage.resetsAtLabel}
-              {usage.remaining === 0 && (
+              {usage.remaining === 0 && (byokProPrice || managedProPrice) && (
                 <span style={{ color: "var(--s2j-text)" }}>
                   {" "}
-                  · upgrade to Pro{proPrice ? ` (${proPrice})` : ""} for unlimited
+                  · upgrade for unlimited
+                  {byokProPrice ? ` — BYOK Pro ${byokProPrice}` : ""}
+                  {managedProPrice ? ` or Managed Pro ${managedProPrice}` : ""}
                 </span>
               )}
             </span>
@@ -2453,31 +2498,83 @@ function PushedScreen({ result, onBack, onNew }) {
 
 // ── Error ───────────────────────────────────────────────────────
 
-// ── Free-tier limit reached ─────────────────────────────────────
+// ── Limit reached / subscription required ───────────────────────
 // A NORMAL freemium state (not an error) — friendly framing, no "Something went
-// wrong", no pointless "Try again", no support-as-primary. Shows the reset date
-// (the actionable info for a free user) + the Pro upgrade CTA.
+// wrong", no pointless "Try again", no support-as-primary. Drives THREE situations
+// from one screen (the routing sets `quota`):
 //
-// PRO_UPGRADE_URL — where "Upgrade to Pro" sends the user. The exact per-listing
-// Marketplace subscription deep link only exists once the paid listing is live
-// (P3b); until then we send them to the Atlassian admin hub, where app
-// subscriptions are managed (universal — no per-site / per-listing URL needed).
-// Set to null to fall back to info-only (no button — today's pre-CTA behaviour);
-// refine to the exact listing subscription URL once it is known.
-const PRO_UPGRADE_URL = "https://admin.atlassian.com/";
+//   1. Free monthly quota exhausted (quota_exceeded, fairUse=false) — used all 3
+//      free breakdowns. Path forward: subscribe to BYOK Pro OR Managed Pro.
+//   2. Managed Pro fair-use cap hit (quota_exceeded, fairUse=true) — we run Claude
+//      and pay compute, so the cap is fair-use, not a trial wall. Path forward:
+//      switch to BYOK Pro (unlimited with the customer's own key), NOT "buy higher".
+//   3. Push gate (push_requires_license) — a Free user generated + reviewed but
+//      Free can't create issues in JIRA. Path forward: subscribe to either edition.
+//
+// The backend composes a correct `detail` for each (tier-aware) — we PREFER showing
+// it. Edition prices come from quota.pricing[] (single source — never hardcoded).
+//
+// UPGRADE_URL — where the CTA sends the user. The exact per-listing Marketplace
+// subscription deep link only exists once the paid listing is live (P3b); until then
+// we send them to the Atlassian admin hub, where app subscriptions are managed
+// (universal — no per-site / per-listing URL needed). Set to null to fall back to
+// info-only (no button); refine to the exact listing subscription URL once known.
+const UPGRADE_URL = "https://admin.atlassian.com/";
+
+// One edition row in the subscription card (label + price + one-line value prop).
+function EditionRow({ name, price, blurb }) {
+  if (!price) return null;
+  return (
+    <div className="flex items-baseline justify-between gap-3 py-1">
+      <div style={{ minWidth: 0 }}>
+        <span className="text-sm font-medium" style={{ color: "var(--s2j-text)" }}>
+          {name}
+        </span>
+        <span className="text-xs ml-2" style={{ color: "var(--s2j-text-light)" }}>
+          {blurb}
+        </span>
+      </div>
+      <span
+        className="text-sm font-semibold shrink-0"
+        style={{ color: "var(--s2j-text)" }}
+      >
+        {price}
+      </span>
+    </div>
+  );
+}
 
 function LimitReachedScreen({ quota, onBack }) {
+  // Mode from the routing payload. push_requires_license → push gate; otherwise a
+  // quota_exceeded payload, split by fairUse (Managed cap vs Free trial).
+  const isPushGate = quota?.error === "push_requires_license";
+  const isFairUse = !isPushGate && !!quota?.fairUse;
+
   const limit = quota?.limit ?? 3;
   const resetsAt =
     quota?.resetsAtLabel ||
     (quota?.resetsAt ? String(quota.resetsAt).slice(0, 10) : null);
-  const proPrice =
-    quota?.upgradePrice ||
-    (quota?.pricing || []).find((t) => t.key === "pro")?.price;
+  const byokProPrice = quota?.upgradePrice || findPrice(quota, "byokPro");
+  const managedProPrice = findPrice(quota, "managedPro");
+
+  // Headline + intro. Prefer the backend-composed `detail` for the body (it is
+  // already tier-correct and mentions the reset date / prices); fall back to a
+  // mode-specific sentence if it is ever absent.
+  const heading = isPushGate
+    ? "Subscribe to push to JIRA"
+    : isFairUse
+      ? "You've reached this month's fair-use limit"
+      : "You've reached your free limit";
+  const fallbackBody = isPushGate
+    ? "Free includes Generate + Review. Subscribe to BYOK Pro or Managed Pro to create the issues in JIRA."
+    : isFairUse
+      ? `You've used all ${limit} breakdowns in this month's fair-use allowance.`
+      : `You've used all ${limit} free breakdowns this month.`;
+
   const openUpgrade = () => {
-    if (!PRO_UPGRADE_URL) return;
+    if (!UPGRADE_URL) return;
     try {
-      router.open(PRO_UPGRADE_URL);
+      router.open(UPGRADE_URL);
     } catch (_) {
       /* no-op if the bridge router is unavailable */
     }
@@ -2497,19 +2594,23 @@ function LimitReachedScreen({ quota, onBack }) {
         }}
       >
         <h2 className="text-lg font-semibold mb-1" style={{ color: "var(--s2j-text)" }}>
-          You've reached your free limit
+          {heading}
         </h2>
-        <p className="text-sm mb-1" style={{ color: "var(--s2j-text)" }}>
-          You've used all {limit} free breakdowns this month.
+        <p className="text-sm" style={{ color: "var(--s2j-text)" }}>
+          {quota?.detail || fallbackBody}
         </p>
-        {resetsAt && (
-          <p className="text-sm" style={{ color: "var(--s2j-text-light)" }}>
-            Your free quota resets on <strong>{resetsAt}</strong>.
+        {/* Reset date is the actionable info for a Free/Managed user who is waiting
+            it out rather than subscribing. The push gate has no monthly reset. */}
+        {!isPushGate && !quota?.detail && resetsAt && (
+          <p className="text-sm mt-1" style={{ color: "var(--s2j-text-light)" }}>
+            Your quota resets on <strong>{resetsAt}</strong>.
           </p>
         )}
       </div>
 
-      {proPrice && (
+      {/* Subscription card. Fair-use (Managed) routes to BYOK Pro ONLY (unlimited);
+          Free quota + push gate offer BOTH editions. */}
+      {(byokProPrice || managedProPrice) && (
         <div
           className="rounded-lg p-4 mb-4"
           style={{
@@ -2517,22 +2618,38 @@ function LimitReachedScreen({ quota, onBack }) {
             border: "1px solid var(--s2j-green-border)",
           }}
         >
-          <p className="text-sm font-medium mb-1" style={{ color: "var(--s2j-text)" }}>
-            Upgrade to Pro — {proPrice}
-          </p>
           <p
-            className="text-xs"
-            style={{
-              color: "var(--s2j-text-light)",
-              marginBottom: PRO_UPGRADE_URL ? 12 : 0,
-            }}
+            className="text-xs font-medium uppercase tracking-wider mb-2"
+            style={{ color: "var(--s2j-text-muted)" }}
           >
-            Unlimited breakdowns. You keep using your own Anthropic API key.
+            {isFairUse ? "For unlimited" : "Choose a plan"}
           </p>
-          {PRO_UPGRADE_URL && (
+
+          {isFairUse ? (
+            <EditionRow
+              name="BYOK Pro"
+              price={byokProPrice}
+              blurb="unlimited — use your own Anthropic key"
+            />
+          ) : (
             <>
-              <button onClick={openUpgrade} className="btn-primary">
-                Upgrade to Pro
+              <EditionRow
+                name="BYOK Pro"
+                price={byokProPrice}
+                blurb="unlimited — bring your own Anthropic key"
+              />
+              <EditionRow
+                name="Managed Pro"
+                price={managedProPrice}
+                blurb="we run Claude for you — no API key needed"
+              />
+            </>
+          )}
+
+          {UPGRADE_URL && (
+            <>
+              <button onClick={openUpgrade} className="btn-primary mt-3">
+                {isFairUse ? "Switch to BYOK Pro" : "Subscribe"}
               </button>
               <p
                 className="text-xs"
@@ -2717,6 +2834,17 @@ function SetupScreen({ message }) {
 }
 
 // ── Util ────────────────────────────────────────────────────────
+
+// Look up a tier's display price from a getUsage/quota pricing[] array. The
+// pricing table is the SINGLE source of €-values (composed server-side) — the UI
+// never hardcodes prices, so a price change in usage.js flows through everywhere.
+// Accepts the full usage/quota object OR a raw pricing array. Returns null if absent.
+function findPrice(usageOrPricing, key) {
+  const pricing = Array.isArray(usageOrPricing)
+    ? usageOrPricing
+    : usageOrPricing?.pricing;
+  return (pricing || []).find((t) => t.key === key)?.price || null;
+}
 
 function fmtTime(s) {
   if (!s || s < 0) return "0s";
