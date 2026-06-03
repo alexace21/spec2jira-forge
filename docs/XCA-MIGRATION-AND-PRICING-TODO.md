@@ -17,33 +17,52 @@ and IMPLEMENTED the code. **Scope grew per partner decision: the resubmit ships 
   customer's key) · `Advanced` = **Managed Pro €9.90/user** (we call Anthropic with OUR key; capped).
   Floors €49/€99 (price × the fixed 1-10 band). Runtime tells them apart via
   `context.license.capabilitySet` (`capabilityStandard`/`capabilityAdvanced`) read via `getAppContext()`.
-- **Free = in-app 3/mo, PERPETUAL** (NOT a €0 edition — those can't coexist with paid editions).
-  Served to unlicensed installs via the manifest `unlicensedAccess: [unlicensed]` property.
-- **Push gated behind a license:** `asUser()` is FORBIDDEN for unlicensed users → Free = Generate +
-  Review only; the JIRA push needs an active license/trial.
+- **Trial → paid; NO in-app Free tier (SIMPLIFIED 2026-06-03).** The earlier "in-app 3/mo PERPETUAL Free
+  via `unlicensedAccess`" design was DROPPED — evaluation is the standard **30-day Atlassian trial** that
+  Paid-via-Atlassian apps get for free (a trial reads as an ACTIVE license at runtime → resolves to a paid
+  tier). Unlicensed users are simply **blocked natively by Atlassian** (Paid-via-Atlassian default), with a
+  defensive `license_required` backstop in the resolvers turning that into a clean "subscribe or start a
+  trial" prompt. There is **NO `unlicensedAccess`** on any module anymore.
+- **No push-gate.** The earlier `push_requires_license` / guest-guard (`accountType`) gating was REMOVED
+  along with the Free path — every accessing user is licensed (or trialling), so `asUser()` always works;
+  Managed cost exposure is bounded purely by the per-user `MANAGED_USER_CAP` (10/USER/mo, metered per-user).
 - **Managed retention:** the Batches API is NOT ZDR-eligible → **disclose ≤29-day retention** (+ no-
   training default + auto-incorporated SCCs + a customer DPA). Reselling is permitted (Commercial Terms
   §A.1) — **no special approval needed** (the old "reselling approval" premise was wrong).
 
 **DONE in code (dev, `feature/product-improvements`)**
 - ✅ `manifest.yml`: `app.compatibility` (Confluence req / Jira opt) + `app.licensing.enabled` +
-  **`app.licensing.editionsEnabled`** + `unlicensedAccess` on the 3 Confluence modules.
-- ✅ `src/usage.js`: hybrid tiers (free / byokPro=Standard / managedPro=Advanced); `capabilitySet`
-  resolution; `getActiveTier`; `MANAGED_USER_CAP` = 10 breakdowns per USER/mo (metered per-user
-  `usage:YYYY-MM:u:<accountId>`, not pooled — the License object exposes no runtime seat count).
+  **`app.licensing.editionsEnabled`**. `unlicensedAccess` on the Confluence modules was **REMOVED 2026-06-03**
+  (no in-app Free tier → licensed-only; the app is admitted only to licensed/trial users by default).
+- ✅ `src/usage.js`: tiers (byokPro=Standard / managedPro=Advanced / unlicensed=defensive-blocked-backstop);
+  `capabilitySet` resolution; `getActiveTier`; `MANAGED_USER_CAP` = 10 breakdowns per USER/mo (metered per-user
+  `usage:YYYY-MM:u:<accountId>`, not pooled — the License object exposes no runtime seat count). The in-app
+  Free 3/mo tier was **REMOVED 2026-06-03**.
 - ✅ `src/index.js`: Managed key path (our key from `MANAGED_ANTHROPIC_KEY` env var when Advanced;
   `keySource` stamped on the job + reused at poll/fetch/cycle-repair); tier-aware quota messaging;
-  push-gating in `startPush`; distill Managed-key support.
-- ⏳ Frontend (hybrid onboarding + push-gate UI + Managed settings) + compliance docs (`docs/compliance/`): in progress.
+  defensive `license_required` backstop (unlicensed); distill Managed-key support. The push-gate
+  (`push_requires_license`) + guest-guard (`accountType`) were **REMOVED 2026-06-03** — every user is
+  licensed, so `asUser()` push always works.
+- ✅ Frontend (App.js + AdminSettings.jsx): edition-aware onboarding + Managed settings (BYOK key field hidden
+  for Managed) + LimitReachedScreen with prices from `pricing[]` (Managed at-cap → BYOK). The separate push-gate
+  UI was dropped with the push-gate. Compliance docs (`docs/compliance/`): drafted, pending partner legal review.
 
 **CORRECTIONS to the original plan below (verified)**
-1. **Do NOT uninstall Jira before deploying.** That uninstall-optional-first rule is for TEARDOWN only;
-   Confluence installs + data are preserved automatically by the compatibility migration.
+1. **Uninstall Jira FIRST, then deploy (EMPIRICALLY CONFIRMED 2026-06-03 — the live deploy was BLOCKED).**
+   The FIRST XCA-compatibility deploy fails while the app has an install in the NON-required app (Jira):
+   Atlassian errors *"Unable to deploy an app to an environment with an existing installation in an Atlassian
+   app that is not the required Atlassian app."* So the corrected per-env sequence is `forge uninstall -p jira`
+   → `forge deploy -e <env> --no-verify` → `forge install --upgrade` (Confluence) + `forge install -p jira`
+   (reconnect). Confluence (required) install + data ARE preserved. ⚠ **This RESTORES the original Part A
+   "uninstall Jira first" step** — an interim note here that said the OPPOSITE ("do NOT uninstall first /
+   teardown-only") was WRONG; the live deploy is the authority.
 2. **`editionsEnabled: true` is REQUIRED** (Part A only had `licensing.enabled`) — else you get ONE
    price, not two editions.
 3. **`@forge/api ≥ 5.1.1`** + latest CLI required for XCA — we have `^7.2.1` ✅.
-4. **Part B "Free for ≤10 users" is SUPERSEDED** (fixed in Part B below). Free = in-app 3/mo; the 1-10
-   band is the PAID floor (€49 BYOK / €99 Managed), not free.
+4. **No in-app Free tier (SIMPLIFIED 2026-06-03 — supersedes BOTH "Free ≤10 users" AND "Free = in-app 3/mo").**
+   The model is trial → paid: evaluation is the 30-day Atlassian trial; unlicensed users are blocked natively
+   (no `unlicensedAccess`). The 1-10 band is the PAID floor (€49 BYOK / €99 Managed). The Part B "Free = in-app
+   3/mo" framing below is now also retired (kept for history).
 5. **Managed seat-scaled (10×seats) cap is unenforceable at runtime** — the License object exposes NO
    seat count. So Managed meters **PER USER**: `MANAGED_USER_CAP` = 10 breakdowns per USER/mo
    (`usage:YYYY-MM:u:<accountId>`, env-tunable), NOT pooled per instance — per-user needs no seat count
@@ -51,10 +70,17 @@ and IMPLEMENTED the code. **Scope grew per partner decision: the resubmit ships 
 
 **PARTNER EXECUTION CHECKLIST (external — Claude can't do these)**
 - [ ] Set the Managed key (encrypted) in BOTH envs: `forge variables set --encrypt MANAGED_ANTHROPIC_KEY <our-key>`.
-- [ ] DEV: `forge deploy -e development --no-verify` → `forge install --upgrade -e development` (Confluence + Jira; expect licensing re-consent). Test editions: `forge install -e development --license Standard` / `--license Advanced`; verify Free (no license) = Generate+Review with push BLOCKED.
+- [ ] DEV (uninstall Jira FIRST — the compatibility deploy is BLOCKED otherwise, see correction #1):
+  `forge uninstall -e development -p jira` → `forge deploy -e development --no-verify` →
+  `forge install --upgrade -e development -p Confluence` + `forge install -e development -p jira` (reconnect;
+  expect licensing re-consent). Test editions: `forge install -e development --license Standard` / `--license
+  Advanced`. Verify a no-license install is **blocked natively by Atlassian** (its subscribe/trial prompt; the
+  app does NOT render — no in-app Free path). Confirm a licensed/trial user can Generate → Review → Push.
 - [ ] Vendor portal pricing: Cloud → two editions — Standard €4.90/user, Advanced €9.90/user; confirm the €49/€99 floors fall out of the 1-10 band.
 - [ ] Compliance: legal-review + publish the customer DPA; reconcile the Atlassian privacy questionnaire to the Managed truth (≤29-day retention, SCCs, Anthropic sub-processor); publish the sub-processor list. (Drafts under `docs/compliance/`.)
-- [ ] PROD: `forge deploy -e production --no-verify` → `forge install --upgrade -e production` (Confluence + Jira) → smoke-test → set prod `MANAGED_ANTHROPIC_KEY`.
+- [ ] PROD (uninstall Jira FIRST, same as DEV): `forge uninstall -e production -p jira` →
+  `forge deploy -e production --no-verify` → `forge install --upgrade -e production -p Confluence` +
+  `forge install -e production -p jira` → smoke-test → set prod `MANAGED_ANTHROPIC_KEY`.
 - [ ] Resubmit → new ECOHELP ticket.
 - ℹ️ ZDR is NOT pursued (we disclose 29-day Batches retention) → **no Anthropic ZDR request needed**.
 
@@ -141,6 +167,11 @@ data as before"). No reinstall of Confluence needed.
 ---
 
 ## Part B — Paid-via-Atlassian pricing (config + metering rethink)
+
+> ⚠ **(PARTIALLY SUPERSEDED — kept for history.)** The per-user "Paid via Atlassian" conclusion and the
+> €49/€99 floors are correct and final (see the top block). But the **"Free = in-app 3/mo PERPETUAL"**
+> framing in this section is **RETIRED 2026-06-03** — there is NO in-app Free tier; evaluation is the 30-day
+> Atlassian trial and unlicensed users are blocked natively (correction #4). Read the top block as authoritative.
 
 XCA **forces "Paid via Atlassian"** → which in Atlassian cloud is **per-user** (the app license
 matches the host product's user tier). **Flat €39 is NOT available** under this model.

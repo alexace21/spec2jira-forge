@@ -125,35 +125,37 @@ full [Privacy Policy](https://spec2jira.com/privacy).
 
 ## 3. Pricing editions
 
-Two editions (Marketplace handles billing; the customer brings their own Anthropic key on
-every plan — the subscription covers the app only). **Pricing model: Paid via Atlassian,
-per-user** — Atlassian requires per-user tiers for cloud apps (no single flat fee); the base
-rate resolves the small-team (1-10 user) price to a €49 floor (see Pricing notes below).
+Two paid editions (Marketplace handles billing). **Pricing model: Paid via Atlassian, per-user** —
+Atlassian requires per-user tiers for cloud apps (no single flat fee); the base rate resolves the
+small-team (1-10 user) price to the floors below. **Evaluation is the standard 30-day Atlassian
+trial** (auto-provided for Paid-via-Atlassian apps) — there is **no in-app free tier**; an unlicensed
+user is admitted only as a trial or paid subscriber.
 
 | Edition | Price | What it includes |
 |---|---|---|
-| **Free** | €0 | 3 breakdowns per month. Full editor, push to Jira, dependency links — no feature gating, only a monthly volume cap. |
-| **Pro — Early access (BYOK)** | **€4.90 / user / month** (Paid via Atlassian) | Unlimited breakdowns. Billed per Atlassian's user tiers — **1-10 users = €49/month** (floor; = per-user × 10), declining per-user above 10. Everything in Free, no monthly cap. |
+| **BYOK Pro — "Standard"** | **€4.90 / user / month** (Paid via Atlassian) | **Unlimited** breakdowns. The customer brings their own Anthropic key (the subscription covers the app only — process your real spec under your own Anthropic agreement). Billed per Atlassian's user tiers — **1-10 users = €49/month** (floor; = per-user × 10), declining per-user above 10. |
+| **Managed Pro — "Advanced"** | **€9.90 / user / month** (Paid via Atlassian) | **We run the AI — no key to manage.** Fair-use **10 breakdowns per user / month** (metered per user, not pooled). Everything in BYOK Pro. **1-10 users = €99/month** floor (= per-user × 10), declining above 10. |
 
 **Portal notes:**
-- Set Free as the default edition so install → 3 free breakdowns works with no purchase.
-- The monthly cap resets on the 1st (UTC); enforcement is built into the app
-  (`src/usage.js`), license-aware via `context.license.active`.
-- **Pricing model (Paid via Atlassian, per-user — base €4.90/user/month)**,
-  so the **1-10 user tier resolves to €49/month** (floor = per-user × 10).
+- Two editions require `app.licensing.editionsEnabled: true` in the manifest (a single price otherwise).
+  Edition is resolved at runtime via `context.license.capabilitySet` (`capabilityStandard` → BYOK Pro,
+  `capabilityAdvanced` → Managed Pro) — see `src/usage.js` `resolveTier`. There is **no €0 Free edition**
+  (a free edition cannot coexist with paid ones, and the in-app Free tier was removed 2026-06-03).
+- **Managed Pro** fair-use cap = 10/user/month, env-tunable (`MANAGED_USER_CAP`); enforced in `block` mode.
+  A Managed user at the cap is routed to BYOK Pro (unlimited), not "subscribe to a higher tier". The cap
+  resets on the 1st (UTC). BYOK Pro is uncapped (the customer's own key pays compute).
+- **Pricing model (Paid via Atlassian, per-user — base €4.90 BYOK / €9.90 Managed)**,
+  so the **1-10 user tiers resolve to €49 / €99** (floor = per-user × 10).
   Set **declining** per-user rates at higher tiers (Atlassian "price guidance"); use a **steep
   taper above ~100 users** because Paid-via-Atlassian licenses the *whole instance* (all users,
-  not just app users). Illustrative monthly curve: 1-10 €4.90 (=€49) · 11-100 ~€4.00 · 101-250
-  ~€2.80 · 251-1000 ~€1.50 · 1001+ ~€0.80↓. Premium peer to StoryLoop (~€42 ≤10); deliberately
-  above budget rivals (POPal/Storygenie free ≤10) — compete on value, not price. The earlier
-  "flat €39" is retired (Atlassian forces per-user). Frame **"Early Access"** + grandfather early
-  adopters (see `memory/migration-protections.md`).
-- **Planned (POST-LAUNCH) — a 2nd Pro tier "Managed (no-key)": €9.90/user/month, fair-use 10
-  breakdowns PER USER per month (metered per-user, not pooled — no runtime seat count)** — we run
-  the AI (no BYOK). NOT in this resubmission (needs our Anthropic DPA + zero-retention). The live
-  listing ships **Free + BYOK Pro €4.90** only. Rationale + cost model:
-  `docs/PRODUCT-IMPROVEMENTS-HANDOVER.md`.
-- Enforcement mode is per-environment: **production = block** (freemium funnel),
+  not just app users). Illustrative BYOK curve: 1-10 €4.90 (=€49) · 11-100 ~€4.00 · 101-250
+  ~€2.80 · 251-1000 ~€1.50 · 1001+ ~€0.80↓ (Managed tracks ~2× above). Premium peer to StoryLoop
+  (~€42 ≤10); deliberately above budget rivals (POPal/Storygenie free ≤10) — compete on value, not
+  price. The earlier "flat €39" is retired (Atlassian forces per-user). Frame **"Early Access"** +
+  grandfather early adopters (see `memory/migration-protections.md`).
+- **Managed Pro compliance gate:** Managed processes content under OUR Anthropic key → it ships WITH the
+  customer DPA + the ≤29-day Batches retention disclosure + sub-processor list (see `docs/compliance/`).
+- Enforcement mode is per-environment: **production = block** (the Managed fair-use cap),
   development = meter. Set the production env variable before go-live.
 
 ---
@@ -252,7 +254,7 @@ These are the data-handling fields in the listing form (mandatory for cloud apps
 - [ ] Site live: landing, /docs, /privacy reachable at spec2jira.com (HTTPS).
 - [ ] Set production `ENFORCEMENT_MODE` (block) env variable.
 - [ ] Upload public version **3.0.0**; fill listing copy (§2), highlights, what's-new.
-- [ ] Configure pricing editions (§3): Free default + **Pro per-user €4.90/user** (Paid via Atlassian; 1-10 tier = €49 floor, declining taper; "Early Access").
+- [ ] Configure pricing editions (§3): two paid editions, **Paid via Atlassian** — **BYOK Pro "Standard" €4.90/user** (unlimited; 1-10 = €49 floor) + **Managed Pro "Advanced" €9.90/user** (fair-use 10/user/mo; 1-10 = €99 floor), declining taper above 10. **No Free edition** — evaluation is the 30-day Atlassian trial. (Requires `editionsEnabled: true`.)
 - [ ] Fill privacy/security listing fields (§4) + the questionnaire (§5).
 - [ ] Select **Atlassian standard EULA**.
 - [ ] Add screenshots (picker → editor → confirm/dashboard → Jira result) + an icon.

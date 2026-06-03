@@ -2,21 +2,26 @@
 
 > **Purpose.** A single-session, checkbox-by-checkbox runbook to confirm **absolutely everything**
 > on the **dev site** before the Marketplace resubmission of the XCA (Cross-Context App) migration +
-> hybrid pricing (BYOK Pro / Managed Pro / in-app Free). One solo developer (the product owner)
+> hybrid pricing (BYOK Pro / Managed Pro). One solo developer (the product owner)
 > follows this top-to-bottom in one sitting. Nothing here touches production until the final gate.
+>
+> **Model note (2026-06-03 — the in-app Free tier was REMOVED).** There is NO in-app Free 3/mo tier,
+> NO `unlicensedAccess`, NO guest-guard (`accountType`), and NO push-gate (`push_requires_license`) —
+> all removed. The app is **licensed-only**: Paid-via-Atlassian admits only licensed users by default,
+> and the free **evaluation** is the standard **30-day Atlassian trial** (which reads as an active
+> license at runtime → resolves to a paid tier). A truly unlicensed user is simply blocked by Atlassian
+> (with a defensive `license_required` backstop in the resolvers). Model = **trial → paid**.
 >
 > **What is being verified (the release under test):**
 > - **XCA manifest**: `app.compatibility` (Confluence required / Jira optional) + `app.licensing.enabled` +
->   `app.licensing.editionsEnabled` + `unlicensedAccess: [unlicensed]` on `confluence:globalPage` and
->   `confluence:contentAction` (NOT on `globalSettings` — unsupported). `@forge/api ^7.2.1`.
+>   `app.licensing.editionsEnabled`. **No `unlicensedAccess`** on any module (licensed-only). `@forge/api ^7.2.1`.
 > - **Two paid editions**: `Standard` = **BYOK Pro €4.90/seat, UNLIMITED** (customer's own Anthropic key) ·
 >   `Advanced` = **Managed Pro €9.90/seat, cap 10 breakdowns/USER/month** (OUR key from `MANAGED_ANTHROPIC_KEY`).
->   **Free** = no active license, **3/mo per-site** in-app, BYOK. Floors ≤10 users: **€49 / €99** (portal-set).
+>   Evaluation = the **30-day Atlassian trial** (no in-app Free tier). Floors ≤10 users: **€49 / €99** (portal-set).
 > - **Tier resolution** by `context.license.capabilitySet` (`capabilityStandard`→BYOK Pro,
->   `capabilityAdvanced`→Managed Pro, none→Free) via `getAppContext()` (`src/usage.js` `resolveTier`).
-> - **Per-user metering**: Managed counter `usage:YYYY-MM:u:<accountId>`; Free/BYOK `usage:YYYY-MM`.
-> - **Guest-guard** (best-effort): a non-`'licensed'` `accountType` on a Managed install is downgraded to BYOK.
-> - **Push-gating**: Free/unlicensed → `push_requires_license`; licensed → Jira issues created.
+>   `capabilityAdvanced`→Managed Pro, active-but-unknown→BYOK Pro safe default, no active license→Unlicensed
+>   blocked) via `getAppContext()` (`src/usage.js` `resolveTier`).
+> - **Per-user metering**: Managed counter `usage:YYYY-MM:u:<accountId>`; BYOK `usage:YYYY-MM`.
 >
 > **Environment under test**
 > - Dev site: **`spec2jira-dev.atlassian.net`** (Confluence + Jira) · Jira project key: **`SDTY`** (SCRUM-DEV).
@@ -28,8 +33,8 @@
 > - Logged into the Forge CLI (`forge whoami`) as the app owner.
 > - Local **Node 24.x** (must match the `nodejs24.x` runtime; gotcha #2) and `@forge/cli@latest`.
 > - **Two** Atlassian accounts you can log into `spec2jira-dev.atlassian.net` with: your **admin** account
->   and **one more licensed user** (needed for the per-user Managed metering test, Section 7). A
->   **guest/unlicensed** identity is also needed for Section 5 (a free Confluence guest invite works).
+>   and **one more licensed user** (needed for the per-user Managed metering test, Section 7). (No
+>   guest/unlicensed identity is needed anymore — the Free/guest path was removed.)
 > - **Two Anthropic API keys**: (a) a **BYOK** key to paste into Settings, and (b) **our Managed key**
 >   for `MANAGED_ANTHROPIC_KEY`. (They can be the same key for dev testing, but using two makes the
 >   "whose key was spent" question unambiguous in the Anthropic console.)
@@ -39,8 +44,9 @@
 > Steps tagged **⭐ CRITICAL EMPIRICAL** resolve open uncertainties that *cannot* be known except by
 > running them on a live install — **do not skip or assume these.**
 >
-> **The 4 ⭐CRITICAL items you must not skip:** §4 Free-tier reachability under XCA · §5 Guest-guard
-> `accountType` · §6 `accountId` non-null on the Custom-UI bridge · §7 per-user Managed metering (two users).
+> **The 2 ⭐CRITICAL items you must not skip:** §6 `accountId` non-null on the Custom-UI bridge ·
+> §7 per-user Managed metering (two users). (The former §4 Free-tier reachability and §5 guest-guard
+> `accountType` items are REMOVED — moot after the Free-tier drop; the unlicensed path no longer exists.)
 
 ---
 
@@ -61,10 +67,16 @@
   **Expected:** build succeeds; `static/hello-world/build` is freshly written (it is gitignored, so always rebuild).
   **Why it matters:** `forge deploy` ships whatever is in `build/`; a stale bundle ships stale UI / hides JSX errors.
 
-- [ ] **0.4** Deploy code to dev.
-  `cd "C:\Software Engineer\Success\Spec2Tickets\spec2jira-forge"; forge deploy -e development --no-verify`.
-  **Expected:** "Deployed … to the development environment." No fatal errors.
-  **Why it matters:** `--no-verify` is required because the linter false-positives `resolver:` on `globalPage` (gotcha #13). Section 1 still runs `forge lint` separately to confirm the *real* errors are clean.
+- [ ] **0.4** Deploy code to dev — **uninstall Jira FIRST** (XCA-compatibility migration gotcha).
+  ⚠ **EMPIRICALLY CONFIRMED 2026-06-03:** the FIRST compatibility deploy is BLOCKED while the app has an install
+  in a NON-required app (Jira). Atlassian errors: *"Unable to deploy an app to an environment with an existing
+  installation in an Atlassian app that is not the required Atlassian app."* So the corrected per-env sequence is:
+  `cd "C:\Software Engineer\Success\Spec2Tickets\spec2jira-forge"` →
+  `forge uninstall -e development -p Jira -s spec2jira-dev.atlassian.net` →
+  `forge deploy -e development --no-verify`.
+  (Confluence — the required app — install + data ARE preserved; you reconnect Jira in §0.7.)
+  **Expected:** the Jira uninstall succeeds, then "Deployed … to the development environment." No fatal errors.
+  **Why it matters:** without the Jira uninstall first the compatibility deploy hard-fails (verified live). `--no-verify` is required because the linter false-positives `resolver:` on `globalPage` (gotcha #13); Section 1 still runs `forge lint` separately to confirm the *real* errors are clean.
 
 - [ ] **0.5** Set the Managed key (encrypted) in dev.
   `forge variables set --encrypt -e development MANAGED_ANTHROPIC_KEY <our-anthropic-key>`.
@@ -74,14 +86,15 @@
 - [ ] **0.6** Set dev enforcement to `meter` for free-running tests, *then* be ready to flip to `block`.
   `forge variables set -e development ENFORCEMENT_MODE meter`.
   **Expected:** set. `forge variables list -e development` shows `ENFORCEMENT_MODE = meter`.
-  **Why it matters:** `meter` lets you exercise flows without dead-ending at the 3/mo cap; you will deliberately switch to `block` in Section 7 to test enforcement. (Unset ⇒ `block` per `usage.js`.)
+  **Why it matters:** `ENFORCEMENT_MODE` now governs only the **Managed per-user fair-use cap** (10/USER/mo); `meter` lets a Managed user exceed it without dead-ending while you exercise flows. You will deliberately switch to `block` in Section 7 to test the cap. (Unset ⇒ `block` per `usage.js`.)
 
-- [ ] **0.7** Install the app on the dev site for **BOTH** products.
-  `forge install -e development -p Confluence -s spec2jira-dev.atlassian.net` then
+- [ ] **0.7** Install the app on the dev site for **BOTH** products (Confluence upgrade + Jira reconnect).
+  Confluence (the required app, preserved through the deploy) — upgrade for the new licensing consent:
+  `forge install --upgrade -e development -p Confluence -s spec2jira-dev.atlassian.net`.
+  Jira (uninstalled in §0.4) — reconnect the optional product:
   `forge install -e development -p Jira -s spec2jira-dev.atlassian.net`.
-  (If already installed, use `forge install --upgrade -e development -p Confluence` / `-p Jira`.)
   **Expected:** both succeed; a **licensing/scope re-consent prompt** is expected on the licensing-enabled manifest — accept it.
-  **Why it matters:** the UI is a Confluence globalPage but push uses `requestJira` — both installs are mandatory (gotcha #10); the manifest now also carries `licensing.enabled` so consent changes.
+  **Why it matters:** the UI is a Confluence globalPage but push uses `requestJira` — both installs are mandatory (gotcha #10); the manifest now also carries `licensing.enabled` so consent changes. (Jira is a fresh install because the XCA-migration deploy required uninstalling it first, §0.4.)
 
 - [ ] **0.8** List installs and note the current deployed version.
   `forge install list` and `forge deployments list -e development` (or check the Developer Console).
@@ -94,18 +107,18 @@
 
 - [ ] **1.1** Run the linter and read the output carefully.
   `forge lint`.
-  **Expected:** **no errors** — specifically **no "`unlicensedAccess` is not supported on `confluence:globalSettings`"** and no compatibility/licensing schema errors. The only acceptable noise is the known false-positive about `resolver:` on `globalPage` (gotcha #13), which is why deploy uses `--no-verify`.
-  **Why it matters:** `unlicensedAccess` on `globalSettings` is a hard lint error; it must live only on `globalPage` + `contentAction`. A clean lint is part of the resubmit gate.
+  **Expected:** **no errors** — no compatibility/licensing schema errors. The only acceptable noise is the known false-positive about `resolver:` on `globalPage` (gotcha #13), which is why deploy uses `--no-verify`.
+  **Why it matters:** a clean lint is part of the resubmit gate. (The app declares **no `unlicensedAccess`** on any module — see §1.3 — so the old "`unlicensedAccess` not supported on `globalSettings`" hard error cannot occur.)
 
 - [ ] **1.2** Confirm the compatibility + licensing block in the deployed manifest.
   Open `manifest.yml` and confirm `app.compatibility.confluence.required: true`, `app.compatibility.jira.required: false`, `app.licensing.enabled: true`, `app.licensing.editionsEnabled: true`.
   **Expected:** all four present exactly as above.
   **Why it matters:** `editionsEnabled` is what yields **two** editions (not one price); Confluence-required is **immutable once installs exist** — it must be correct now.
 
-- [ ] **1.3** Confirm `unlicensedAccess: [unlicensed]` placement.
-  In `manifest.yml`, confirm it appears under `confluence:globalPage` and `confluence:contentAction`, and is **absent** from `confluence:globalSettings`.
-  **Expected:** present on the two surfaces, absent on settings.
-  **Why it matters:** this is the manifest half of the Free-tier reachability question (§4) — and the lint-safe configuration.
+- [ ] **1.3** Confirm there is **no `unlicensedAccess`** anywhere in the manifest.
+  In `manifest.yml`, confirm **no** module (`confluence:globalPage`, `confluence:contentAction`, `confluence:globalSettings`) declares `unlicensedAccess`.
+  **Expected:** the property is absent everywhere — the app is licensed-only.
+  **Why it matters:** the in-app Free tier was removed 2026-06-03, so there is no unlicensed surface; Atlassian admits only licensed users (or trial users) to a Paid-via-Atlassian app by default. (This also makes the §1.1 globalSettings lint error structurally impossible.)
 
 - [ ] **1.4** Confirm there is **no remote host** (FIT/security regression guard).
   Confirm `manifest.yml` has **no `remotes:`** block and `permissions.external.fetch` egresses only to `https://api.anthropic.com`.
@@ -136,15 +149,15 @@
   **Expected:** plan reads **"Managed Pro"** with a **fair-use allowance** wording (e.g. "10 breakdowns this month (fair-use allowance)").
   **Why it matters:** proves `capabilityAdvanced` → `managedPro`, and that the UI distinguishes the fair-use cap from a free-trial cap.
 
-- [ ] **2.3** Install with **no** license (Free / unlicensed).
+- [ ] **2.3** Install with **no** license (unlicensed — the defensive backstop, not a product offering).
   `forge install --upgrade -e development -p Confluence -s spec2jira-dev.atlassian.net` (omit `--license`).
-  Reload the app → Account panel.
-  **Expected:** plan reads **"Free"** with "**N free breakdowns used this month**" and a reset date.
-  **Why it matters:** proves no-active-license → `free` (the default), the in-app trial baseline.
+  Reload the app.
+  **Expected:** the app does **not** render its normal flow — Atlassian shows its native subscribe/trial prompt for the Paid-via-Atlassian app, and any resolver call returns the defensive `license_required` (a clean "subscribe or start a trial" prompt, never a raw 401).
+  **Why it matters:** proves no-active-license → the blocked `unlicensed` tier (`resolveTier` default) — there is NO in-app Free path. A real evaluator uses the 30-day Atlassian trial instead, which reads as an active license (test that via the `--license` overrides in §2.1/§2.2).
 
 - [ ] **2.4** (Sanity) Confirm an *unknown* capability resolves to BYOK Pro, not Managed.
   Trust the code path if you cannot synthesize an unknown set: `resolveTier` returns `byokPro` for any active license whose `capabilitySet` is neither standard nor advanced (the safe default — never bills us).
-  **Expected:** documented behavior confirmed by reading `src/usage.js:175-183`.
+  **Expected:** documented behavior confirmed by reading `resolveTier` in `src/usage.js` (active + unknown `capabilitySet` ⇒ `byokPro`).
   **Why it matters:** a casing/naming drift in the capability set must never accidentally hand out our Managed key.
 
 ---
@@ -157,8 +170,8 @@
   **Why it matters:** prices must trace to `TIERS` in `usage.js` (single source of truth), so a price change is one edit — not a UI hunt.
 
 - [ ] **3.2** Verify the **LimitReached / upgrade** screen shows both edition rows with correct prices.
-  Trigger it (Free at cap in `block` mode — see §7 — or the push gate §9) and read the two `EditionRow`s.
-  **Expected:** two rows: **BYOK Pro €4.90** (unlimited, own key) and **Managed Pro €9.90** (we run it). Prices match `pricingTable()`.
+  Trigger it by driving a **Managed** user to the per-user fair-use cap in `block` mode (§7.5), and read the two `EditionRow`s.
+  **Expected:** two rows: **BYOK Pro €4.90** (unlimited, own key) and **Managed Pro €9.90** (we run it). Prices match `pricingTable()`. (A Managed-at-cap user is routed to BYOK Pro for unlimited — `fairUse: true`.)
   **Why it matters:** this is the conversion surface; wrong/hardcoded prices here mis-sell the editions.
 
 - [ ] **3.3** Confirm the prices in code equal the portal prices you will set.
@@ -168,59 +181,23 @@
 
 ---
 
-## Section 4 — ⭐ CRITICAL EMPIRICAL — Free-tier reachability under XCA
+## Section 4 — REMOVED (moot after the Free-tier drop)
 
-> **Open uncertainty this resolves:** with the app now licensing-enabled, can a **regular logged-in
-> Confluence user on a NO-license install** open the app, reach a place to enter a BYOK key, and run
-> the 3/mo Free generation — or does Atlassian block non-licensed users by default? `unlicensedAccess:
-> [unlicensed]` admits *guests* specifically; whether ordinary users of an unsubscribed install get in
-> is **not knowable except by trying it.**
-
-- [ ] **4.1** ⭐ Ensure the dev install has **no** license (from §2.3) and open the app as your **admin** user.
-  Navigate to the Spec2Tickets global page.
-  **Expected:** the app **loads** (does not show an Atlassian "you need a license" wall).
-  **Why it matters:** if even an admin is walled on an unlicensed install, perpetual-Free is not deliverable and needs a fallback (onboarding globalPage) — a resubmit-shaping finding.
-
-- [ ] **4.2** ⭐ As a **regular (non-admin) licensed Confluence user** on the unlicensed install, open the app.
-  Log in as your second user; open the global page.
-  **Expected:** the app loads and the Account panel shows **Free** (3/mo).
-  **Why it matters:** confirms ordinary product users — not just admins/guests — reach the Free tier under XCA licensing.
-
-- [ ] **4.3** ⭐ Reach a BYOK key entry as a Free user.
-  Settings is a `globalSettings` (admin-config) module **without** `unlicensedAccess`. Confirm the *intended* Free path: admin sets the BYOK key once in Settings; regular Free users then generate. If a non-admin Free user has **no** way to provide a key, note it.
-  **Expected:** an admin can open Settings → Spec2Tickets and save an Anthropic key on the unlicensed install; Free generation then works for users on that site.
-  **Why it matters:** `globalSettings` cannot carry `unlicensedAccess` (§1.3) — if Free depends on per-user key entry, it would need a globalPage onboarding step. This step decides whether that fallback is required.
-
-- [ ] **4.4** ⭐ Run a Free generation end to end (Generate + Review only).
-  With a BYOK key saved and no license, pick the spec page → Generate → wait for the batch → Review.
-  **Expected:** a breakdown is produced and reviewable; **no** push button success (push is gated — §9).
-  **Why it matters:** proves the Free value proposition (Generate + Review) actually works on a real unlicensed install — the heart of the freemium funnel.
+> **Was:** "⭐ CRITICAL EMPIRICAL — Free-tier reachability under XCA". **REMOVED 2026-06-03.**
+> The in-app Free 3/mo tier and the `unlicensedAccess` surface it rode on no longer exist — the app is
+> licensed-only (evaluation = the 30-day Atlassian trial). There is no unlicensed-user path to reach, so
+> nothing here to verify. The "is an unlicensed user blocked?" question is now covered by §2.3 (Atlassian
+> blocks them natively; the resolver returns the defensive `license_required`).
 
 ---
 
-## Section 5 — ⭐ CRITICAL EMPIRICAL — Guest-guard (`accountType`)
+## Section 5 — REMOVED (moot after the Free-tier drop)
 
-> **Open uncertainty this resolves:** the Managed-key guest-guard downgrades to BYOK when
-> `context.accountType` is present **and ≠ 'licensed'`. But `accountType` arrives via the frontend
-> ProductContext and is **not reliably backend-trusted**; it may be absent or always `'licensed'`.
-> Only a live guest on an Advanced install tells us what actually arrives.
-
-- [ ] **5.1** ⭐ Put the dev install on the **Advanced (Managed)** license (§2.2) and have `MANAGED_ANTHROPIC_KEY` set (§0.5).
-  Confirm Account panel = Managed Pro as your admin.
-  **Expected:** Managed Pro active.
-  **Why it matters:** the guard only matters on a Managed instance (where our key is at stake).
-
-- [ ] **5.2** ⭐ As a **Confluence guest / unlicensed** identity on this Managed install, open the app and attempt a Generate.
-  (Invite a free guest to the dev site, or use an account without a product license.) Then immediately read `forge logs -e development --since 10m`.
-  **Expected (decision tree):**
-    - If `accountType` **arrives and ≠ 'licensed'** → the guard fires, `keySource` downgrades to **byok**; with no BYOK key the guest gets `not_configured` (NOT a Managed generation) — **guard works**.
-    - If `accountType` is **absent or 'licensed'** for the guest → the guard does **not** fire; the only real bound is the per-user `accountId` cap (§6/§7). **Record this explicitly** as the residual exposure.
-  **Why it matters:** decides whether the best-effort guard is effective or whether the per-user cap is the sole protection for our Managed spend.
-
-- [ ] **5.3** ⭐ Add a one-line temporary debug log if `accountType` is opaque.
-  In `resolveAnthropicKey` (`src/index.js:79`), temporarily add `console.log('[keydbg] accountType=', context?.accountType, 'accountId=', context?.accountId, 'keySource=', keySource)`, redeploy (`--no-verify`), repeat 5.2, then **remove it and redeploy**.
-  **Expected:** the log prints the actual `accountType`/`accountId`/`keySource` for the guest invocation.
-  **Why it matters:** turns an assumption into a recorded fact; the log must be removed before resubmit ("Log End-User Data: No" — accountId/type are identifiers, keep them out of shipped logs).
+> **Was:** "⭐ CRITICAL EMPIRICAL — Guest-guard (`accountType`)". **REMOVED 2026-06-03.**
+> The guest-guard (downgrade-to-BYOK on a non-`'licensed'` `accountType`) was deleted along with the
+> Free/guest path — every accessing user is now licensed, so there is no guest to guard against. Managed
+> exposure is bounded purely by the backend-trusted per-user `accountId` cap (`MANAGED_USER_CAP`), verified
+> in §6 (the counter key) and §7 (the two-user cap). `accountType` is no longer read anywhere.
 
 ---
 
@@ -237,28 +214,23 @@
   **Why it matters:** this is the direct, no-code-change proof that the per-user counter is real for Managed.
 
 - [ ] **6.2** ⭐ Cross-check via logs.
-  After a Managed generation, `forge logs -e development --since 10m` and find the usage activity / any `[keydbg]` line from §5.3.
+  After a Managed generation, `forge logs -e development --since 10m` and find the usage activity.
   **Expected:** the accountId in the key matches the logged-in user; consistent across calls within the session.
   **Why it matters:** confirms `accountId` is stable and server-trusted, not a per-call random or client value.
 
-- [ ] **6.3** ⭐ Confirm Free/BYOK do **not** key per-user.
-  On a Free or Standard install, inspect `getUsage().usageKey`.
+- [ ] **6.3** ⭐ Confirm BYOK does **not** key per-user.
+  On a **Standard** (BYOK Pro) install, inspect `getUsage().usageKey`.
   **Expected:** `usage:YYYY-MM` (no `:u:` suffix).
-  **Why it matters:** Free/BYOK are per-site by design; a stray per-user key there would mis-meter the shared trial.
+  **Why it matters:** BYOK is per-site by design (one shared key, unlimited); a stray per-user key there would mis-meter the site-wide analytics counter. Only Managed (we pay) keys per-user.
 
 ---
 
-## Section 7 — Metering behavior (Free cap, BYOK unlimited, Managed per-user 10)
+## Section 7 — Metering behavior (BYOK unlimited, Managed per-user 10)
 
 - [ ] **7.1** Flip dev enforcement to **block** for this section.
   `forge variables set -e development ENFORCEMENT_MODE block`.
   **Expected:** set. (Remember to flip back to `meter` after, or leave `block` if you are done testing — it is the prod default anyway.)
-  **Why it matters:** the cap only hard-blocks in `block` mode; `meter` would let the 4th through.
-
-- [ ] **7.2** **Free 3/mo cap blocks the 4th.** On a no-license install (BYOK key saved), run **4** generations as the same site.
-  **Expected:** generations 1–3 succeed; the **4th** returns `quota_exceeded` → the **LimitReached** screen with the reset date and both edition offers.
-  **Why it matters:** proves the freemium ceiling actually enforces in prod-equivalent mode.
-  *(Reset trick if you over-consumed earlier in the month: the counter key is `usage:YYYY-MM`; you can verify the count via `getUsage().used` rather than needing to clear it.)*
+  **Why it matters:** the Managed per-user cap only hard-blocks in `block` mode; `meter` would let the 11th through.
 
 - [ ] **7.3** **BYOK Pro is unlimited.** On the **Standard** install, run more than 3 generations.
   **Expected:** no `quota_exceeded`; `getUsage` shows `unlimited: true`, `limit: null`; usage is counted only for analytics.
@@ -272,11 +244,11 @@
 
 - [ ] **7.5** ⭐ **Managed at cap → fair-use message (contact us / BYOK).** Drive one Managed user to `MANAGED_USER_CAP` (10), or temporarily lower it: `forge variables set -e development MANAGED_USER_CAP 2`, redeploy, hit the cap, then **restore to 10**.
   **Expected:** at cap, `quota_exceeded` with **`fairUse: true`** and copy that says *contact us about higher-volume Managed access, or switch to BYOK Pro for unlimited* — **not** "subscribe to a higher tier".
-  **Why it matters:** Managed over-cap must route to BYOK/contact (we pay compute), a different message from the Free upsell.
+  **Why it matters:** Managed over-cap must route to BYOK/contact (we pay compute) — `fairUse: true`, distinct from a "subscribe to a higher tier" upsell.
 
 - [ ] **7.6** Confirm the KVS key shapes in logs.
   `forge logs -e development --since 30m` after the above.
-  **Expected:** Managed activity references `usage:YYYY-MM:u:<accountId>`; Free/BYOK reference `usage:YYYY-MM`. (Restore `MANAGED_USER_CAP`/`ENFORCEMENT_MODE` if you changed them.)
+  **Expected:** Managed activity references `usage:YYYY-MM:u:<accountId>`; BYOK references `usage:YYYY-MM`. (Restore `MANAGED_USER_CAP`/`ENFORCEMENT_MODE` if you changed them.)
   **Why it matters:** the key shape is the metering contract; a wrong shape silently breaks billing fairness.
 
 ---
@@ -301,17 +273,19 @@
 
 ---
 
-## Section 9 — Push-gating (license required to write Jira)
+## Section 9 — Push to Jira (licensed tiers)
 
-- [ ] **9.1** **Free → push blocked with the friendly screen.** On a **no-license** install, Generate → Review → click **Push to JIRA**.
-  **Expected:** `push_requires_license` → a clean screen: *"Pushing to JIRA requires a subscription or an active trial… subscribe to BYOK Pro or Managed Pro"* with the two edition rows. **No raw 401.**
-  **Why it matters:** `asUser().requestJira` is forbidden for unlicensed users (gotcha #3); the gate turns that into an upgrade prompt instead of an error.
+> **Note (2026-06-03):** the explicit in-app **push-gate** (`push_requires_license`) was REMOVED along
+> with the Free tier — there is no unlicensed user to gate, because Atlassian admits only licensed/trial
+> users to a Paid-via-Atlassian app. Push is reachable by every (licensed) user; this section now just
+> confirms the cross-product write works on the paid tiers. (The former §9.1 "Free → push blocked" test
+> is moot and removed.)
 
 - [ ] **9.2** **Licensed → push creates issues in Jira.** On a **Standard** (or Advanced) install, Generate → Review → Push.
   **Expected:** the chunked push runs (progress bar) and creates **1 Epic + N Stories + Subtasks + dependency links + category labels** in project **`SDTY`**; success screen deep-links open the Epic + Stories.
-  **Why it matters:** confirms the license gate opens for paying tiers and the cross-product write works end to end.
+  **Why it matters:** confirms the cross-product `asUser().requestJira` write works end to end for a licensed user.
 
-- [ ] **9.3** Confirm push-gate is tier-based, not key-based.
+- [ ] **9.3** Confirm push works regardless of the Anthropic key (auth is `asUser`, not key-based).
   The Advanced (Managed) push in 9.2 should work even with **no BYOK key** stored.
   **Expected:** push succeeds on Managed without a customer key (push auth is `asUser`, independent of the Anthropic key).
   **Why it matters:** separates the two auth concerns — Anthropic key (generation) vs Jira `asUser` (push); a Managed user must be able to push.
@@ -366,12 +340,12 @@
 
 **Gate A — dev verification complete (do not proceed until every box below is checked):**
 
-- [ ] **12.1** `forge lint` is clean (no `unlicensedAccess`-on-globalSettings, no compatibility/licensing errors) — §1.1.
-- [ ] **12.2** All four **⭐CRITICAL** sections recorded with a definite outcome: §4 Free reachable (or fallback noted) · §5 guest `accountType` behavior recorded · §6 `accountId` non-null (key not `:u:unknown`) · §7 two-user per-user 10 confirmed.
-- [ ] **12.3** Edition resolution verified for all three: Standard→BYOK, Advanced→Managed, none→Free (§2); prices €4.90/€9.90 shown from `pricing[]` (§3).
-- [ ] **12.4** Managed key path proven (succeeds with no BYOK key; unset → `managed_unavailable`) (§8); push-gating proven both directions (§9).
+- [ ] **12.1** `forge lint` is clean (no compatibility/licensing errors; no `unlicensedAccess` anywhere) — §1.1.
+- [ ] **12.2** Both remaining **⭐CRITICAL** sections recorded with a definite outcome: §6 `accountId` non-null (key not `:u:unknown`) · §7 two-user per-user 10 confirmed. (Former §4/§5 are removed — moot after the Free-tier drop.)
+- [ ] **12.3** Edition resolution verified: Standard→BYOK Pro, Advanced→Managed Pro, no-license→Unlicensed-blocked (§2); prices €4.90/€9.90 shown from `pricing[]` (§3).
+- [ ] **12.4** Managed key path proven (succeeds with no BYOK key; unset → `managed_unavailable`) (§8); licensed push creates issues in Jira (§9).
 - [ ] **12.5** Full E2E green on **both** paid tiers incl. Project Context (§10); v3 regression green (§11).
-- [ ] **12.6** Any temporary debug logs (§5.3) **removed** and redeployed; `MANAGED_USER_CAP`/`ENFORCEMENT_MODE` restored to intended values.
+- [ ] **12.6** Any temporary debug logs **removed** and redeployed; `MANAGED_USER_CAP`/`ENFORCEMENT_MODE` restored to intended values.
 
 **Gate B — vendor portal + compliance (external, before resubmit):**
 
@@ -380,16 +354,18 @@
 - [ ] **12.8** Compliance docs **published**: customer DPA (legal-reviewed), Atlassian privacy questionnaire reconciled to the **Managed truth** (≤29-day Batches retention, no-training default, SCCs, Anthropic as sub-processor), sub-processor list published.
   **Why it matters:** Managed Pro processes content under OUR key — the compliance surface must match reality or the review fails on privacy.
 
-**Gate C — production rollout (only after Gates A + B; uninstall NOT needed):**
+**Gate C — production rollout (only after Gates A + B; uninstall Jira FIRST):**
 
-- [ ] **12.9** Fresh build + deploy to prod.
-  `cd "C:\Software Engineer\Success\Spec2Tickets\spec2jira-forge\static\hello-world"; npm run build` → `cd ..` → `forge deploy -e production --no-verify`.
-  **Expected:** prod environment shows the new XCA/hybrid version.
-  **Why it matters:** prod is a separate environment; dev deploys never touched it. (Do **not** uninstall Jira first — that ordering is for teardown only; Confluence installs + data are preserved.)
-- [ ] **12.10** Upgrade installs on prod for **both** products.
-  `forge install --upgrade -e production -p Confluence` and `-p Jira` (accept the licensing re-consent).
-  **Expected:** both upgraded; 2 entries on the prod site(s).
-  **Why it matters:** the licensing-enabled manifest needs admin re-consent; both products must carry the new version.
+- [ ] **12.9** Fresh build + **uninstall Jira** + deploy to prod.
+  `cd "C:\Software Engineer\Success\Spec2Tickets\spec2jira-forge\static\hello-world"; npm run build` → `cd ..` →
+  `forge uninstall -e production -p Jira -s alexacenov.atlassian.net` → `forge deploy -e production --no-verify`.
+  **Expected:** the Jira uninstall succeeds, then prod shows the new XCA/hybrid version.
+  **Why it matters:** prod is a separate environment; dev deploys never touched it. ⚠ **EMPIRICALLY CONFIRMED 2026-06-03:** the first XCA-compatibility deploy is BLOCKED while the app is installed in the NON-required app (Jira) — *"Unable to deploy an app to an environment with an existing installation in an Atlassian app that is not the required Atlassian app."* So you MUST uninstall Jira first (same as dev §0.4). Confluence (required) install + data ARE preserved. (Do NOT touch `vs-overlord22.atlassian.net` — the Atlassian reviewer's site, Confluence-only, doesn't block.)
+- [ ] **12.10** Reconnect installs on prod for **both** products.
+  `forge install --upgrade -e production -p Confluence` (preserved through the deploy) and
+  `forge install -e production -p Jira -s alexacenov.atlassian.net` (fresh, since §12.9 uninstalled it) — accept the licensing re-consent.
+  **Expected:** both installed/upgraded; 2 entries on the prod site(s).
+  **Why it matters:** the licensing-enabled manifest needs admin re-consent; both products must carry the new version, and Jira is a fresh install because the XCA deploy required uninstalling it first.
 - [ ] **12.11** Set the prod Managed key (encrypted).
   `forge variables set --encrypt -e production MANAGED_ANTHROPIC_KEY <our-key>`.
   **Expected:** set (encrypted).
@@ -397,7 +373,7 @@
 - [ ] **12.12** Confirm prod enforcement is `block`.
   `forge variables set -e production ENFORCEMENT_MODE block` (or confirm unset ⇒ block).
   **Expected:** `block` active in prod.
-  **Why it matters:** the freemium ceiling + Managed fair-use cap must enforce in production.
+  **Why it matters:** the Managed per-user fair-use cap must enforce in production (it is the only thing `ENFORCEMENT_MODE` now governs — BYOK is unlimited; there is no Free cap).
 - [ ] **12.13** Prod smoke test (one BYOK + one Managed E2E on a clean prod site you control) then **Resubmit** → new ECOHELP ticket.
   **Expected:** both flows green on prod; listing resubmitted with the XCA-enabled latest version.
   **Why it matters:** never resubmit a build that wasn't smoke-tested on prod; the resubmit version must be the XCA/hybrid one.
