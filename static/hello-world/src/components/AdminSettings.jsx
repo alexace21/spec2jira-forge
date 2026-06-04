@@ -51,7 +51,7 @@ function getErrorText(result) {
   return result?.detail || "Connection test failed";
 }
 
-// Price lookups off the getUsage `pricing[]` array (single source of €-values — the
+// Price lookups off the getUsage `pricing[]` array (single source of USD prices — the
 // UI never hardcodes prices). accountPriceFor → a named tier's price; accountPrice →
 // the customer's OWN active tier price (null when absent).
 function accountPriceFor(account, key) {
@@ -318,7 +318,7 @@ export default function AdminSettings() {
         Spec2Tickets Settings
       </h1>
       <p className="text-sm mb-5" style={{ color: "var(--s2j-text-muted)" }}>
-        Configure Spec2Tickets to generate JIRA breakdowns from your Confluence specifications using Claude AI.
+        Configure Spec2Tickets to generate JIRA breakdowns from your Confluence pages using Claude AI.
       </p>
 
       {/* Account / Plan — read-only status for the customer's admin */}
@@ -433,7 +433,7 @@ export default function AdminSettings() {
         >
           <p className="mb-2">
             <strong>Powered by Claude:</strong> Spec2Tickets uses Anthropic's Claude
-            Sonnet 4.6 to analyze your specs. There are two ways to run it:
+            Sonnet 4.6 to analyze your Confluence pages. There are two ways to run it:
           </p>
           <ul className="mb-2" style={{ marginLeft: "16px", listStyle: "disc" }}>
             <li className="mb-1">
@@ -467,7 +467,7 @@ export default function AdminSettings() {
             (sign up free; billed pay-as-you-go to your own Anthropic account).
           </p>
           <p>
-            <strong>Privacy:</strong> Under BYOK, your spec content flows directly
+            <strong>Privacy:</strong> Under BYOK, your page content flows directly
             from Forge to the Anthropic API using your key. Data falls under{" "}
             <a
               href="https://www.anthropic.com/legal/aup"
@@ -784,7 +784,7 @@ function ContextProfilesEditor({ profiles, setProfiles, apiKeyConfigured, onMess
         const len = (result.profile || "").length;
         onMessage({
           type: "success",
-          text: `Distilled across ${total} passes to ${len.toLocaleString()} characters${result.overflowTrimmed ? " (the profile ran long and its end was trimmed to fit the size limit — review the earlier sections and trim any single-spec detail, then expand the end if needed)" : result.truncated ? " (kept intentionally concise — open the editor to expand if you want more detail)" : ""}. Review and delete any line true of only ONE spec (specific timings, limits, counts, or scope) — this profile is reused for ALL your specs — then click Save Settings.`,
+          text: `Distilled across ${total} passes to ${len.toLocaleString()} characters${result.overflowTrimmed ? " (the profile ran long and its end was trimmed to fit the size limit — review the earlier sections and trim any single-page detail, then expand the end if needed)" : result.truncated ? " (kept intentionally concise — open the editor to expand if you want more detail)" : ""}. Review and delete any line true of only ONE page (specific timings, limits, counts, or scope) — this profile is reused for ALL your pages — then click Save Settings.`,
         });
       } else {
         setDistillProgress({
@@ -883,14 +883,14 @@ function ContextProfilesEditor({ profiles, setProfiles, apiKeyConfigured, onMess
         Project Context profiles (optional)
       </label>
       <p className="text-xs mb-3" style={{ color: "var(--s2j-text-muted)" }}>
-        Standing background that helps Claude understand a project's specs the way your
+        Standing background that helps Claude understand a project's pages the way your
         team does — domain, glossary, personas, systems, tech, naming conventions. You
-        pick which profile applies each time you generate, so specs from different
+        pick which profile applies each time you generate, so pages from different
         projects get the right context. It enriches terminology and interpretation — it
-        never changes what gets built or rewrites your spec's acceptance criteria.
-        Because one profile is reused across ALL of a project's specs, keep only durable
-        facts — leave out anything true of a single spec (specific timings, limits,
-        counts, or scope). A concise brief distills more cleanly than a full spec.
+        never changes what gets built or rewrites your page's acceptance criteria.
+        Because one profile is reused across ALL of a project's pages, keep only durable
+        facts — leave out anything true of a single page (specific timings, limits,
+        counts, or scope). A concise brief distills more cleanly than a full document.
       </p>
 
       {profiles.length === 0 && (

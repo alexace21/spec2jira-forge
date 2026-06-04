@@ -130,24 +130,14 @@ app:
     memoryMB: 512
     architecture: arm64
   id: ari:cloud:ecosystem::app/e804f31f-1cbf-4f09-86c1-11e36f387fe7
-  # ── XCA (Cross-Context App) migration 2026-06-03 ─────────────────────
-  # Marketplace REQUIRES this: the app is compatible with BOTH Confluence +
-  # Jira, so Atlassian mandates it be a Cross-Context App ("multiple-app
-  # compatibility"), which MUST be "Paid via Atlassian" (the SOLE remaining
-  # v4.2.0 rejection reason — FIT/security already passed). Confluence =
-  # required (the Custom UI globalPage lives there; the app is non-functional
-  # without it). Jira = optional (touched only via the write:jira-work push).
-  # ⚠ The required app is IMMUTABLE once installs exist → Confluence is the
-  # correct AND locked-in choice (we have live Confluence installs). Verified
-  # against the live app-compatibility + migration docs 2026-06-03 (XCA still
-  # in Preview; Confluence/Jira/Compass only; @forge/api ≥5.1.1 — we have
-  # ^7.2.1). ⚠ EMPIRICALLY CONFIRMED 2026-06-03: the FIRST compatibility deploy is
-  # BLOCKED while the app has an install in a NON-required app (Jira) — Atlassian
-  # errors "Unable to deploy an app to an environment with an existing installation
-  # in an Atlassian app that is not the required Atlassian app." So on each env:
-  # `forge uninstall -p jira` FIRST → `forge deploy` → then reinstall Jira.
-  # Confluence (required) install + data ARE preserved. (An earlier "do NOT uninstall
-  # first / teardown-only" note was wrong — the live deploy is the authority.)
+  # ── XCA compatibility (Confluence required / Jira optional) ──────────
+  # ✅ RESOLVED 2026-06-04. The Paid-via-Atlassian "more than one parent software"
+  # publish error was a vendor-portal LISTING-config issue, NOT the manifest. Fix:
+  # portal → app → [version] details → Compatibility tab → remove Jira (leave Confluence
+  # the SOLE billing parent). This jira.required:false form is correct. NOTE: the Jira
+  # push DOES need the Jira install (asUser().requestJira; a Confluence-only install
+  # 403s — gotcha #10 HOLDS; Jira = an optional CONNECTION installed via
+  # `forge install -p jira`). v5.3.0 resubmitted 2026-06-04 (awaiting review).
   compatibility:
     confluence:
       required: true
@@ -156,8 +146,10 @@ app:
   # ── Paid-via-Atlassian + TWO editions (Standard/Advanced) ────────────
   # The platform cap is EXACTLY two editions. editionsEnabled is MANDATORY for
   # the two-price hybrid (licensing.enabled alone → a SINGLE price):
-  #   Standard = BYOK Pro    (€4.90/user, UNLIMITED — customer's own key)
-  #   Advanced = Managed Pro (€9.90/user, capped 10/USER/mo — we call Anthropic with OUR key)
+  #   Standard = BYOK Pro    (customer's own key, UNLIMITED) — portal price (set 2026-06-04):
+  #                            100% of Confluence ($6.70/user, $57 ≤10, declining, 1.5x multi)
+  #   Advanced = Managed Pro (our key; capped 10/USER/mo) — editions are a POST-PUBLISH phase,
+  #                            so Advanced is ADDED AFTER the app is live (Phase 2; price $13/user planned)
   # Runtime tells them apart via context.license.capabilitySet
   # (capabilitystandard / capabilityadvanced) — see src/usage.js resolveTier.
   # Prices/edition names are set in the vendor portal, NOT here. Evaluation is the

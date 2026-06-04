@@ -176,7 +176,7 @@ export default function FeatureCard({ feature, index, onUpdate, onDelete }) {
                   ? 'Confident — clean extraction, little or no guesswork. A quick check is still worth it.'
                   : confidenceIndicator === '⚠'
                     ? 'Unsure — the AI inferred or assumed some details. Review this feature.'
-                    : 'Low confidence — the spec was vague or contradictory here. Manual review essential.'
+                    : 'Low confidence — the page was vague or contradictory here. Manual review essential.'
               }
               style={{
                 background: confidenceVisuals.bg,
@@ -190,7 +190,7 @@ export default function FeatureCard({ feature, index, onUpdate, onDelete }) {
           {complexityVisuals && (
             <span
               className="rounded-full px-2 py-0.5 text-[10px] font-semibold leading-none"
-              title={`Complexity ${complexity}/5 — 1 = trivial, 5 = very complex (inherent difficulty/risk, relative to this spec)`}
+              title={`Complexity ${complexity}/5 — 1 = trivial, 5 = very complex (inherent difficulty/risk, relative to this page)`}
               style={{ background: complexityVisuals.bg, color: complexityVisuals.fg, border: `1px solid ${complexityVisuals.border}` }}
             >
               C{complexity}

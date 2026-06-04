@@ -1,19 +1,69 @@
-import { useState } from 'react';
+import { useState, useRef, useLayoutEffect, useCallback } from 'react';
+import { createPortal } from 'react-dom';
 import EditableField from './EditableField.jsx';
 import { TASK_TYPES, TASK_TYPE_COLORS } from './constants.js';
 
 /**
  * SelectBadge — Badge that doubles as a dropdown selector.
  * Light theme.
+ *
+ * The open menu is rendered through a React portal to document.body and
+ * positioned `fixed` from the trigger's bounding rect. This is REQUIRED, not
+ * cosmetic: the badge lives inside TaskCard, whose ancestors (FeatureCard and
+ * CapabilityCard roots) carry `rounded-lg overflow-hidden` and the editor's
+ * scroll container carries `overflow-y-auto`. An absolutely-positioned menu
+ * (the previous approach) is CLIPPED by any such ancestor regardless of
+ * z-index, so for tasks lower in a feature the options were cut off behind the
+ * next row / next card. A portal removes the menu from those clipping subtrees
+ * entirely; `fixed` + viewport coordinates keep it anchored under the trigger
+ * and immune to ancestor transforms. We also flip the menu upward when there
+ * isn't room below (e.g. a task near the viewport bottom).
  */
 function SelectBadge({ value, options, colorMap, labelMap, onChange }) {
   const [open, setOpen] = useState(false);
+  const triggerRef = useRef(null);
+  const [menuPos, setMenuPos] = useState(null);
   const display = labelMap ? (labelMap[value] || value) : value;
   const colorClass = colorMap[value] || 'bg-gray-100 text-gray-600 ring-gray-200';
+
+  // Estimated menu height (rows × ~30px + vertical padding) — used only to
+  // decide flip direction; final size is content-driven.
+  const estMenuHeight = options.length * 30 + 8;
+
+  const reposition = useCallback(() => {
+    const el = triggerRef.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    const spaceBelow = window.innerHeight - r.bottom;
+    const flipUp = spaceBelow < estMenuHeight + 8 && r.top > spaceBelow;
+    setMenuPos({
+      left: r.left,
+      // When flipping up we anchor the menu's bottom to the trigger's top.
+      top: flipUp ? undefined : r.bottom + 4,
+      bottom: flipUp ? window.innerHeight - r.top + 4 : undefined,
+      minWidth: Math.max(r.width, 120),
+    });
+  }, [estMenuHeight]);
+
+  // Measure synchronously before paint so the menu never flashes at (0,0), and
+  // keep it pinned to the trigger while open as the user scrolls/resizes. The
+  // scroll listener is on the capture phase so it also fires for the editor's
+  // inner overflow-y-auto scroll container, not just the window.
+  useLayoutEffect(() => {
+    if (!open) return undefined;
+    reposition();
+    window.addEventListener('scroll', reposition, true);
+    window.addEventListener('resize', reposition);
+    return () => {
+      window.removeEventListener('scroll', reposition, true);
+      window.removeEventListener('resize', reposition);
+    };
+  }, [open, reposition]);
 
   return (
     <div className="relative">
       <button
+        ref={triggerRef}
         onClick={() => setOpen(!open)}
         className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium
           ring-1 ring-inset cursor-pointer transition-opacity hover:opacity-80 ${colorClass}`}
@@ -24,11 +74,20 @@ function SelectBadge({ value, options, colorMap, labelMap, onChange }) {
         </svg>
       </button>
 
-      {open && (
+      {open && menuPos && createPortal(
         <>
-          <div className="fixed inset-0 z-10" onClick={() => setOpen(false)} />
-          <div className="absolute left-0 top-full z-20 mt-1 rounded-lg py-1 min-w-[120px]"
+          {/* Click-away backdrop. z-index sits just under the menu; both are
+              portaled to body so no card overflow can clip them. z-index is set
+              inline (not a Tailwind class) so it never depends on the JIT
+              picking up an arbitrary value. */}
+          <div className="fixed inset-0" style={{ zIndex: 2000 }} onClick={() => setOpen(false)} />
+          <div className="fixed rounded-lg py-1"
             style={{
+              zIndex: 2001,
+              left: menuPos.left,
+              top: menuPos.top,
+              bottom: menuPos.bottom,
+              minWidth: menuPos.minWidth,
               border: '1px solid var(--s2j-border)',
               background: 'var(--s2j-bg)',
               boxShadow: '0 4px 12px rgba(0,0,0,0.1)',
@@ -42,8 +101,8 @@ function SelectBadge({ value, options, colorMap, labelMap, onChange }) {
                   onClick={() => { onChange(opt); setOpen(false); }}
                   className={`flex w-full items-center gap-2 px-3 py-1.5 text-xs text-left transition-colors`}
                   style={{ color: isSelected ? 'var(--s2j-text)' : 'var(--s2j-text-light)' }}
-                  onMouseEnter={e => e.target.style.background = 'var(--s2j-bg-section)'}
-                  onMouseLeave={e => e.target.style.background = 'transparent'}
+                  onMouseEnter={e => e.currentTarget.style.background = 'var(--s2j-bg-section)'}
+                  onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
                 >
                   <span className={`inline-block h-2 w-2 rounded-full ring-1 ring-inset ${optColor}`} />
                   {optLabel}
@@ -52,7 +111,8 @@ function SelectBadge({ value, options, colorMap, labelMap, onChange }) {
               );
             })}
           </div>
-        </>
+        </>,
+        document.body
       )}
     </div>
   );

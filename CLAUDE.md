@@ -75,9 +75,7 @@ CLM + Spec2jira specs.
 > The app is **licensed-only** (Paid-via-Atlassian admits only licensed/trial users by default); evaluation
 > is the **30-day Atlassian trial** (reads as an active license → resolves to a paid tier), and a truly
 > unlicensed user is blocked natively by Atlassian + a defensive `license_required` backstop in the
-> resolvers. The two editions are **BYOK Pro €4.90/user (unlimited, "Standard")** and **Managed Pro
-> €9.90/user (fair-use 10/user/mo, "Advanced")** — see the 2026-06-03 handover note. The per-user pricing
-> mechanics below remain authoritative; only the Free-tier framing is retired. Source of truth: `src/usage.js`.
+> resolvers. ⭐⭐ **PRICING IS USD AS OF 2026-06-04 (live portal): BYOK Pro $6.70/user (unlimited, "Standard"; ≤10 users = $57/mo flat, declining curve >100)** and **Managed Pro $13/user (fair-use 10/user/mo, "Advanced") — COMING SOON (editions Phase 2, post-publish; `price=null` in-app until then, shown on the site as "coming soon")**. The **€4.90/€9.90/€49/€39/€20 figures throughout this section AND the older handover notes are the RETIRED EUR plan — read them as history.** The per-user *mechanics* (per-user via Paid-via-Atlassian, declining curve, ≤10 floor) remain authoritative; only the currency/figures + the Free-tier framing changed. Source of truth: `src/usage.js` (BYOK `$6.70/user/mo`; Managed `null` until Phase 2) + the live vendor portal.
 
 Settled. Do NOT reopen these in future sessions:
 
@@ -250,18 +248,22 @@ only updates `development`. To ship to production:
 cd "C:\Software Engineer\Success\Spec2Tickets\spec2jira-forge\static\hello-world"
 npm run build                          # fresh bundle (build/ is gitignored)
 cd ..
-forge deploy -e production             # deploy code to the production environment
-forge install --upgrade -e production  # run for Confluence AND Jira (cross-product, gotcha #10)
+forge deploy -e production             # deploy code to production (auto-creates the Marketplace version)
+# ⚠ do NOT `forge install` on prod — see below (licensed app → Marketplace-only)
 ```
 
-- **`install --upgrade` IS needed for prod** even though the manifest was untouched
-  *this* session: the least-privilege **scope reduction** (`4ece939`) landed after
-  the MVP production release, and a scope change requires admin re-consent on install.
-  First run `forge install --list` / check the Developer Console to confirm what is
-  deployed/installed where (so you know whether it's `install` vs `install --upgrade`).
-- **Production `ENFORCEMENT_MODE`** is `block` by default when unset (the freemium
-  funnel is live) — verify; usually no action. To set it explicitly:
-  `forge variables set --environment production ENFORCEMENT_MODE block`.
+- ⚠ **NO `forge install` on production.** This is a **licensed (Paid-via-Atlassian)** app →
+  `forge install` on prod fails `LICENSED_APP_INSTALL_NOT_PERMITTED` (and `--license` is
+  dev-only). Production distribution is **Marketplace ONLY** — customers subscribe/install via
+  the listing. Prod rollout = `forge deploy -e production` (which AUTO-creates the Marketplace
+  version — no manual portal "Create version") → then resubmit/publish via the portal. *(The
+  obsolete pre-licensing v3/v4 step `forge install --upgrade -e production` is RETIRED since the
+  v5 licensing migration — following it now throws `LICENSED_APP_INSTALL_NOT_PERMITTED`.)*
+- **Production `ENFORCEMENT_MODE`** is `block` by default when unset — it governs ONLY the
+  **Managed Pro** per-user fair-use cap (BYOK is unlimited; unlicensed is blocked natively by
+  Atlassian — there is NO in-app Free tier). Usually no action. Set explicitly:
+  `forge variables set --environment production ENFORCEMENT_MODE block`. Also set
+  `MANAGED_ANTHROPIC_KEY` on prod (for the Managed/Advanced edition — wired at editions Phase 2).
 - The **Marketplace listing** distributes the production version to NEW customers
   (they install via the listing, not `forge install`); paste from
   `docs/MARKETPLACE-LISTING-v3.md`. Set the real `PRO_UPGRADE_URL` once the listing is live.
@@ -349,6 +351,105 @@ package names de-scaffolded (→ `spec2tickets`). Build green (bundle ≈ −1.4
   Needs a proven Forge resize/scroll approach, or accept for MVP (minor UX).
 - KVS value-size limit: push session stores full features array — very large specs
   (200+ features) may approach the ~240KB KVS limit. Monitor.
+
+---
+
+## ⚡ HANDOVER NOTE (2026-06-04 EOD — spec2jira.com rebuilt to USD + in-app "spec"→"page" cleanup + DPA/SEO/a11y; agent-conducted)
+
+A long, agent-conducted session (§13 throughout) updating the **public site** + customer-facing app copy. The site lives in the **SEPARATE GitHub Pages repo** (`C:\Software Engineer\Success\AI-delivery\ai-delivery-platform\MVP-roll-out\spec2jira-site\spec2jira-site`; auto-deploys on `git push`). All §13 gates passed (incl. a 5-agent adversarial audit + per-wave reviews). **NOT committed/deployed — partner pushes the site + builds/deploys the forge app.**
+
+**Site (spec2jira.com) — REBUILT:**
+- **New IA:** removed How-it-works + Pricing from the landing → dedicated **/how-it-works** + **/pricing**; added **/about**; standardized nav (5 links) + footer (8 links: …+ DPA + Sub-processors).
+- **Value-first landing**, hero **"Your Confluence page → a sprint-ready Jira backlog."** (partner-picked; the jargon "spec" was dropped from the hero — customers may not parse it; the subhead anchors it as "a spec, PRD, or requirements doc"). Stats: **~70%** less hand-work / minutes-not-days / 100% human-reviewed.
+- **USD pricing** everywhere: **BYOK Pro $6.70/user** ($57 ≤10 flat, declining >100); **Managed Pro $13/user "Coming soon"** (editions Phase 2). Old "Free 3/mo" dropped → 30-day trial.
+- **Published /dpa + /subprocessors** (clean — NO `[PARTNER]` placeholders; Anthropic facts WEB-VERIFIED true: ≤29-day non-ZDR Batches, no-training default, SCCs incorporated). Processor named = **Aleks Asenov Asenov** (sole trader; Ovcha Kupel 2, Sofia, BG; governing law Bulgaria). Privacy scoped (BYOK-absolutes → BYOK only + Managed role-map; "removed on push" softened to honest wording).
+- **A11y**: `--gray`/link contrast → WCAG AA; `<main id>`+skip-link, `:focus-visible`, heading order, `aria-hidden` (all 8 pages). **SEO infra**: favicon.svg, sitemap.xml, robots.txt, 404.html, OG/Twitter+canonical on all 8. ⚠ **og-image.png PENDING** — partner exports `og-image.svg` → 1200×630 PNG (social cards reference it).
+
+**App (forge) — copy + price:**
+- `usage.js`: BYOK €4.90→**$6.70/user**; Managed €9.90→**`null`** (Managed isn't a buyable edition until Phase 2 — a price there surfaced a false "Subscribe to Managed" CTA in AdminSettings; `null` hides it everywhere, verified safe; $13 lives on the site as coming-soon).
+- **In-app "spec"→"page/document" cleanup** (~19 user-facing strings: App.js + AdminSettings + FeatureCard + SharedACPanel + the `v3Schema` `'Spec Breakdown'`→`'Untitled Breakdown'` fallback) — customers may not understand "spec". Backend prompts (`prompts.js`), comments, identifiers (`spec_concerns` etc.) correctly LEFT. Also fixed a stale in-app **"60–150 seconds"→"a few minutes"** (batch reality). 3 €→USD code-comments. **Build verified GREEN** (`npm run build`). ⚠ Frontend changed → needs `npm run build` + `forge deploy`.
+
+**OPEN — partner-executed:** (1) **commit+push the SITE** (5 NEW untracked infra files: 404.html / favicon.svg / og-image.svg / robots.txt / sitemap.xml) + **build+deploy the forge app** (separate the pricing commit from the copy commit, per review). (2) **Export og-image.png.** (3) **DPA legal confirm-true** before relying on /dpa: MFA (dev + Managed Anthropic accounts) · no-content-logging (Managed path) · written confidentiality · a defined incident-response process · a maintained TIA · monitored privacy@/security@ · confirm SCC Module 2 — full list in **`memory/site-launch-punchlist.md`**. (4) Post-approval: wire the real Marketplace listing URL into the CTAs + `PRO_UPGRADE_URL`.
+
+С усмивка ✨ — сайтът е USD-чист, по-ясен (без жаргонния "spec"), достъпен, с публикувани легални страници; app copy-то е изчистено; всичко §13-gate-нато. Остават твоите push/deploy + og-image export + legal confirm.
+
+---
+
+## ⚡ HANDOVER NOTE (2026-06-04 PM — Marketplace blocker RESOLVED; resubmit = BYOK-Pro single-edition; pricing set; 3 bugs fixed)
+
+**Supersedes the 2026-06-04 note below** (its "fundamental PvA blocker → open Atlassian ticket" is RESOLVED). Live portal/CLI behavior is the authority (POLICY §9).
+
+**⭐ PvA "more than one parent software" — RESOLVED (no ticket needed).** NOT the manifest (removing AND keeping `compatibility.jira` both failed — Jira Cloud showed [REQUIRED] regardless). **Fix: vendor portal → app → [version] details → Compatibility tab → remove Jira (leave Confluence only) → Save** → "Make public" passed (Confluence = sole billing parent; Jira optional/no-badge). The listing Compatibility tab declared Jira as a 2nd billing parent, independent of the manifest.
+
+**Gotcha #10 HOLDS** — the Jira push still needs the Jira install (`forge install -p jira`; a Confluence-only install 403s). Jira = an optional installed CONNECTION (manifest `jira.required:false` + `write:jira-work`); the Compatibility-tab removal only drops it as a billing PARENT, not the connection.
+
+**⭐ Editions are a POST-PUBLISH 3-phase process** (Plan→Build→Publish-editions; SEPARATE review; appear only after approval) layered onto an already-published PvA app → **the two editions can't be set in the initial publish. Resubmit = BYOK Pro SINGLE-edition (Standard); Managed Pro (Advanced) = editions Phase 2 after approval (+ DPA/29-day compliance THEN).** Simplifies the resubmit (no Managed compliance needed yet); supersedes "full hybrid in the resubmit." Code is editions-ready (`resolveTier` safely defaults undefined `capabilitySet` → BYOK Pro, verified).
+
+**Portal pricing SET (BYOK Pro / Standard):** "100% of Confluence price" → **$6.70/user**, **≤10 flat $57**, the 100% **declining curve KEPT** (do NOT flatten — PvA bills the WHOLE Confluence instance, so a flat per-user prices out 100+ instances; the decline only starts >100 users, the ≤100 target pays $6.70 either way), **1.5x multi-instance** multiplier. USD (Atlassian USD-only). Supersedes €4.90/€49. Managed Pro price TBD at the editions phase.
+
+**3 bugs fixed + committed (partner pushes), acceptance-tested green on dev:** i18n English-only user-facing strings + push-error de-dup (`dbb601f`); task-type dropdown clipped by card `overflow:hidden` → React portal (`382225a`); task/subtask descriptions generated + pushed end-to-end (`6d64ec6` — schema + prompt + push ADF, task-type prefix preserved).
+
+**STATUS (2026-06-04 EOD): RESUBMITTED v5.3.0 (Build 2000070 — includes the 3 bug fixes) → awaiting Atlassian review.** `forge deploy -e production` AUTO-creates the Marketplace version (no manual portal "Create version" needed — unlike the 4.2.0→5.x step), and Resubmit catches the latest. The **Editions tab is now unlocked** but states *"Your app must be Paid via Atlassian AND live on Marketplace before you can create app editions"* → empirically CONFIRMS **Managed Pro = post-publish (editions Phase 2).** Release behavior = "Let me control when app is published" (partner controls go-live). **NEXT (post-approval): publish → editions Phase 2 (Managed Pro + DPA/29-day compliance), wire `PRO_UPGRADE_URL`.** Site pending: `spec2jira.com/docs` pricing ($6.70/100%, drop the dead Free-3/mo tier) + `/privacy` (BYOK fine now; Managed disclosures at Phase 2) — both URLs 200-verified. New improvement logged: concurrent-generation → notification/review-queue (`memory/product-improvements.md`). Full detail: `memory/marketplace-launch-state.md` + `memory/monetization-strategy.md`.
+
+С усмивка ✨ — блокерът падна (Marketplace portal config, не наш код); resubmit-ът е по-прост (BYOK-first single-edition); цените са сложени; продуктът е по-чист (3 бъга + English-only).
+
+---
+
+## ⚡ HANDOVER NOTE (2026-06-04 — dev acceptance COMPLETE + prod deployed; BLOCKED on a Paid-via-Atlassian cross-product constraint → open Atlassian ticket)
+
+A long, agent-conducted session continuing the XCA/hybrid resubmit on `feature/product-improvements`.
+**Dev acceptance testing is COMPLETE and GREEN; the app/code is done + verified. The ONLY blocker is a
+Marketplace listing-config contradiction (NOT an app problem) — now an open Atlassian question.**
+
+**Dev acceptance — COMPLETE (`docs/DEV-VERIFICATION-PLAN.md`):** Managed Pro + BYOK Pro both verified
+end-to-end on spec2jira-dev via `forge install --license Advanced|Standard` (dev edition sim). ⭐§6
+accountId real (`usage:YYYY-MM:u:<id>`); §8 Managed key path (our `MANAGED_ANTHROPIC_KEY`); §7.5
+cap→fair-use + LimitReached; BYOK unlimited (`usage:YYYY-MM`, no `:u:`); distill; push; reconnect.
+(`--license` is DEV-ONLY — rejected on prod.)
+
+**Polish SHIPPED (committed; partner pushes — `d36a5b7` `01b43c4` `d59a632` `449204a`):** (1) tier-aware
+onboarding + **in-app Settings** (the Forge globalSettings "Configure" is UNREACHABLE in Atlassian's
+centralized "Connected apps" admin → a Settings entry-point in the globalPage opens AdminSettings);
+(2) editor edits now reflect in the Review AI-self-check (`extractV3Signals` read the frozen
+`_v3_original`; now reads the edited `capabilities` — the push was always correct, cosmetic only);
+(3) per-feature AI concerns rendered in the editor (counted-but-not-shown gap closed); (4) honest
+generation spinner (the determinate bar sat at 0% for the opaque Anthropic batch → big spinner + live
+timer + strengthened "you can leave/reconnect" copy, backed by the no-TTL KVS job record); (5) PagePicker
+feedback/review nudge. All §13-reviewed → SHIP.
+
+**⭐ THE BLOCKER (open Atlassian ticket): a cross-product app can't be a single "Paid via Atlassian"
+listing.** Publishing fails: *"Invalid value for field 'supportedPaymentModel': More than one parent
+software is not supported for paid via Atlassian apps."* EMPIRICALLY (the authority): the **`write:jira-work`
+SCOPE** forces Jira to be a REQUIRED parent (the publish screen shows Jira Cloud [REQUIRED]) — and BOTH
+manifest forms fail identically: `jira.required:false` (v5.0.0) AND removing the jira block (v5.1.0). The
+multi-app-compatibility DOCS say Confluence-required + Jira-optional = a single paid listing (Confluence
+sole billing parent, Jira free "Works with"), but the live publish CONTRADICTS the docs. **That
+docs-vs-reality gap is the ticket question** (partner drafting): *"docs say Confluence-required +
+Jira-optional = single paid listing, but our app with `write:jira-work` fails 'More than one parent
+software' — why + the correct cross-product PvA config?"* Likely outcomes: a missing config · two separate
+listings · Paid-via-vendor.
+
+**Hard-won corrections (fold into the gotchas):** ① PvA = exactly ONE parent; the Jira write scope makes
+Jira a parent → cross-product blocked on single-listing PvA. ② A LICENSED (PvA) app CANNOT be
+`forge install`-ed on PRODUCTION (`LICENSED_APP_INSTALL_NOT_PERMITTED`) — prod = Marketplace-only; the
+runbook "forge install on prod" step is WRONG for a licensed app. ③ In-place upgrade non-XCA→XCA+licensing
+FAILS (Atlassian 500) — needs a FRESH install; real customers install fresh post-approval. ④ The Jira push
+DOES need the Jira install (asUser().requestJira; Confluence-only 403s) — gotcha #10 HOLDS; Jira = an
+optional installed CONNECTION. ⑤ Editions FINALIZED **€4.90/€9.90**; Free + unlicensedAccess + push-gate
+REMOVED (trial→paid); "uninstall Jira FIRST before the XCA deploy" is correct.
+
+**Prod state:** v5.1.0 deployed (jira-removed — ineffective for PvA); alexacenov uninstalled; vs-overlord22
+(reviewer's) outdated; env vars set (`MANAGED_ANTHROPIC_KEY` + `ENFORCEMENT_MODE=block`). manifest.yml
+REVERTED to the documented `jira.required:false` form (committed this session).
+
+**RESUME:** (a) [optional] one clean re-test of `jira.required:false` (re-deploy + re-publish) to be 100%
+sure; (b) the ATLASSIAN ECOHELP ticket — the authority on the cross-product PvA contradiction; (c) once
+PvA is resolved → configure 2 editions €4.90/€9.90 → resubmit → Managed compliance docs (DPA + 29-day
+retention) for the review. POST-APPROVAL: wire `PRO_UPGRADE_URL` + `MARKETPLACE_REVIEW_URL`. Full state:
+`memory/marketplace-launch-state.md`.
+
+С усмивка ✨ — app-ът е готов и доказан; блокерът е чисто Marketplace-policy (тяхно противоречие), не наш
+код. Топката е в полето на Atlassian.
 
 ---
 

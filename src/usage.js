@@ -14,13 +14,14 @@
  * (a trial reads as an ACTIVE license at runtime → resolves to a paid tier), so a
  * separate in-app free path — and the unverified/spoofable unlicensed-access
  * surface it rode on — is obsolete:
- *   - BYOK Pro:    "Standard" edition, €4.90/user/mo → UNLIMITED. The customer's
+ *   - BYOK Pro:    "Standard" edition, $6.70/user/mo → UNLIMITED. The customer's
  *                  own Anthropic key pays compute, so unlimited is no cost
  *                  liability for us; the subscription is pure app-value.
- *   - Managed Pro: "Advanced" edition, €9.90/user/mo → CAPPED (we call Anthropic
- *                  with OUR key, so usage = our cost). Fair-use 10 breakdowns/
- *                  user/mo (MANAGED_USER_CAP), metered PER USER, NOT pooled (no
- *                  runtime seat count) — loss-proof per seat. See below.
+ *   - Managed Pro: "Advanced" edition, $13/user/mo (editions Phase 2 — not yet a
+ *                  published edition) → CAPPED (we call Anthropic with OUR key, so usage = our
+ *                  cost). Fair-use 10 breakdowns/user/mo (MANAGED_USER_CAP),
+ *                  metered PER USER, NOT pooled (no runtime seat count) —
+ *                  loss-proof per seat. See below.
  *   - Unlicensed:  a minimal DEFENSIVE tier (limit 0, blocked) for the
  *                  no-active-license case. Not a product offering — by default
  *                  Atlassian blocks non-licensed users from a Paid-via-Atlassian
@@ -59,7 +60,7 @@ import { getAppContext } from '@forge/api';
 // per instance — the Forge License object exposes NO seat count at runtime
 // (verified @forge/api runtime.d.ts 2026-06-03), so 10×seats is uncomputable, and
 // per-user is the loss-bounded shape that needs no seat count: 10 × worst-case
-// €0.46 = €4.60 < €9.90/seat revenue → ≥54% margin at the cap, any instance size;
+// ~$0.50 = ~$5 < $13/seat revenue → ≥60% margin at the cap, any instance size;
 // and abuse is self-funding (each extra seat is paid revenue). Market research
 // (2026-06-03) confirmed 10 is GENEROUS — typical use 1-3/mo, power 5-8/mo — so it
 // rarely binds; heavy users → BYOK or a future Managed-Plus. Env-tunable for
@@ -80,14 +81,14 @@ export const TIERS = {
     key: 'byokPro',
     label: 'BYOK Pro',
     limit: null, // unlimited — customer's own key pays compute
-    price: '€4.90/user/mo',
+    price: '$6.70/user/mo', // matches the live Marketplace portal (USD; ≤10 users = $57/mo flat)
     edition: 'standard',
   },
   managedPro: {
     key: 'managedPro',
     label: 'Managed Pro',
     limit: MANAGED_USER_CAP, // we pay compute → per-USER fair-use cap (see above)
-    price: '€9.90/user/mo',
+    price: null, // null until Phase 2 launches — so the app never advertises a not-yet-buyable "Subscribe to Managed" CTA. Planned at $13/user/mo; the public site shows that as "coming soon".
     edition: 'advanced',
   },
   // Defensive backstop for the no-active-license case (no trial, no subscription).
