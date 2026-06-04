@@ -352,6 +352,26 @@ package names de-scaffolded (→ `spec2tickets`). Build green (bundle ≈ −1.4
 
 ---
 
+## ⚡ HANDOVER NOTE (2026-06-04 PM — Marketplace blocker RESOLVED; resubmit = BYOK-Pro single-edition; pricing set; 3 bugs fixed)
+
+**Supersedes the 2026-06-04 note below** (its "fundamental PvA blocker → open Atlassian ticket" is RESOLVED). Live portal/CLI behavior is the authority (POLICY §9).
+
+**⭐ PvA "more than one parent software" — RESOLVED (no ticket needed).** NOT the manifest (removing AND keeping `compatibility.jira` both failed — Jira Cloud showed [REQUIRED] regardless). **Fix: vendor portal → app → [version] details → Compatibility tab → remove Jira (leave Confluence only) → Save** → "Make public" passed (Confluence = sole billing parent; Jira optional/no-badge). The listing Compatibility tab declared Jira as a 2nd billing parent, independent of the manifest.
+
+**Gotcha #10 HOLDS** — the Jira push still needs the Jira install (`forge install -p jira`; a Confluence-only install 403s). Jira = an optional installed CONNECTION (manifest `jira.required:false` + `write:jira-work`); the Compatibility-tab removal only drops it as a billing PARENT, not the connection.
+
+**⭐ Editions are a POST-PUBLISH 3-phase process** (Plan→Build→Publish-editions; SEPARATE review; appear only after approval) layered onto an already-published PvA app → **the two editions can't be set in the initial publish. Resubmit = BYOK Pro SINGLE-edition (Standard); Managed Pro (Advanced) = editions Phase 2 after approval (+ DPA/29-day compliance THEN).** Simplifies the resubmit (no Managed compliance needed yet); supersedes "full hybrid in the resubmit." Code is editions-ready (`resolveTier` safely defaults undefined `capabilitySet` → BYOK Pro, verified).
+
+**Portal pricing SET (BYOK Pro / Standard):** "100% of Confluence price" → **$6.70/user**, **≤10 flat $57**, the 100% **declining curve KEPT** (do NOT flatten — PvA bills the WHOLE Confluence instance, so a flat per-user prices out 100+ instances; the decline only starts >100 users, the ≤100 target pays $6.70 either way), **1.5x multi-instance** multiplier. USD (Atlassian USD-only). Supersedes €4.90/€49. Managed Pro price TBD at the editions phase.
+
+**3 bugs fixed + committed (partner pushes), acceptance-tested green on dev:** i18n English-only user-facing strings + push-error de-dup (`dbb601f`); task-type dropdown clipped by card `overflow:hidden` → React portal (`382225a`); task/subtask descriptions generated + pushed end-to-end (`6d64ec6` — schema + prompt + push ADF, task-type prefix preserved).
+
+**NEXT:** finish wizard → submit for review (release behavior = "Let me control when app is published" → residual post-approval work). Post-approval: editions Phase 2 (Managed Pro + its compliance), wire `PRO_UPGRADE_URL`. Site pending: `spec2jira.com/docs` pricing ($6.70/100%, drop the dead Free-3/mo tier) + `/privacy` (BYOK fine now; Managed disclosures at Phase 2) — both URLs 200-verified. New improvement logged: concurrent-generation → notification/review-queue (`memory/product-improvements.md`). Full detail: `memory/marketplace-launch-state.md` + `memory/monetization-strategy.md`.
+
+С усмивка ✨ — блокерът падна (Marketplace portal config, не наш код); resubmit-ът е по-прост (BYOK-first single-edition); цените са сложени; продуктът е по-чист (3 бъга + English-only).
+
+---
+
 ## ⚡ HANDOVER NOTE (2026-06-04 — dev acceptance COMPLETE + prod deployed; BLOCKED on a Paid-via-Atlassian cross-product constraint → open Atlassian ticket)
 
 A long, agent-conducted session continuing the XCA/hybrid resubmit on `feature/product-improvements`.
