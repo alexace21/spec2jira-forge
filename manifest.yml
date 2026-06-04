@@ -131,21 +131,13 @@ app:
     architecture: arm64
   id: ari:cloud:ecosystem::app/e804f31f-1cbf-4f09-86c1-11e36f387fe7
   # ── XCA compatibility (Confluence required / Jira optional) ──────────
-  # ⚠ UNRESOLVED 2026-06-04 — OPEN ATLASSIAN TICKET. Publishing as "Paid via Atlassian"
-  # fails: "Invalid value for field 'supportedPaymentModel': More than one parent
-  # software is not supported for paid via Atlassian apps." EMPIRICALLY, BOTH manifest
-  # forms FAIL the same way: (a) THIS jira.required:false form (deployed v5.0.0) AND
-  # (b) removing the jira block entirely (deployed v5.1.0). In both, the publish screen
-  # shows Jira Cloud [REQUIRED] — the write:jira-work SCOPE appears to force Jira as a
-  # billing parent regardless of the compatibility flag. The multi-app-compatibility
-  # docs SAY this form yields a SINGLE paid listing (Confluence sole billing parent +
-  # Jira a free "Works with" connection) — but the live publish contradicts that. That
-  # docs-vs-reality gap IS the open Atlassian-ticket question. Restored to the
-  # DOCUMENTED form (jira.required:false) as the baseline pending Atlassian's answer.
-  # NOTE: the Jira push DOES need the Jira install (asUser().requestJira; a Confluence-
-  # only install 403s — gotcha #10 HOLDS; Jira = an optional CONNECTION installed
-  # separately via `forge install -p jira`). The app/code is done + dev-verified; this
-  # is purely a Marketplace listing-config/policy blocker.
+  # ✅ RESOLVED 2026-06-04. The Paid-via-Atlassian "more than one parent software"
+  # publish error was a vendor-portal LISTING-config issue, NOT the manifest. Fix:
+  # portal → app → [version] details → Compatibility tab → remove Jira (leave Confluence
+  # the SOLE billing parent). This jira.required:false form is correct. NOTE: the Jira
+  # push DOES need the Jira install (asUser().requestJira; a Confluence-only install
+  # 403s — gotcha #10 HOLDS; Jira = an optional CONNECTION installed via
+  # `forge install -p jira`). v5.3.0 resubmitted 2026-06-04 (awaiting review).
   compatibility:
     confluence:
       required: true
@@ -154,8 +146,10 @@ app:
   # ── Paid-via-Atlassian + TWO editions (Standard/Advanced) ────────────
   # The platform cap is EXACTLY two editions. editionsEnabled is MANDATORY for
   # the two-price hybrid (licensing.enabled alone → a SINGLE price):
-  #   Standard = BYOK Pro    (€4.90/user, UNLIMITED — customer's own key)
-  #   Advanced = Managed Pro (€9.90/user, capped 10/USER/mo — we call Anthropic with OUR key)
+  #   Standard = BYOK Pro    (customer's own key, UNLIMITED) — portal price (set 2026-06-04):
+  #                            100% of Confluence ($6.70/user, $57 ≤10, declining, 1.5x multi)
+  #   Advanced = Managed Pro (our key; capped 10/USER/mo) — editions are a POST-PUBLISH phase,
+  #                            so Advanced is ADDED AFTER the app is live (Phase 2; price TBD ~$10-13)
   # Runtime tells them apart via context.license.capabilitySet
   # (capabilitystandard / capabilityadvanced) — see src/usage.js resolveTier.
   # Prices/edition names are set in the vendor portal, NOT here. Evaluation is the
