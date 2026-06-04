@@ -75,9 +75,7 @@ CLM + Spec2jira specs.
 > The app is **licensed-only** (Paid-via-Atlassian admits only licensed/trial users by default); evaluation
 > is the **30-day Atlassian trial** (reads as an active license → resolves to a paid tier), and a truly
 > unlicensed user is blocked natively by Atlassian + a defensive `license_required` backstop in the
-> resolvers. The two editions are **BYOK Pro €4.90/user (unlimited, "Standard")** and **Managed Pro
-> €9.90/user (fair-use 10/user/mo, "Advanced")** — see the 2026-06-03 handover note. The per-user pricing
-> mechanics below remain authoritative; only the Free-tier framing is retired. Source of truth: `src/usage.js`.
+> resolvers. ⭐⭐ **PRICING IS USD AS OF 2026-06-04 (live portal): BYOK Pro $6.70/user (unlimited, "Standard"; ≤10 users = $57/mo flat, declining curve >100)** and **Managed Pro $13/user (fair-use 10/user/mo, "Advanced") — COMING SOON (editions Phase 2, post-publish; `price=null` in-app until then, shown on the site as "coming soon")**. The **€4.90/€9.90/€49/€39/€20 figures throughout this section AND the older handover notes are the RETIRED EUR plan — read them as history.** The per-user *mechanics* (per-user via Paid-via-Atlassian, declining curve, ≤10 floor) remain authoritative; only the currency/figures + the Free-tier framing changed. Source of truth: `src/usage.js` (BYOK `$6.70/user/mo`; Managed `null` until Phase 2) + the live vendor portal.
 
 Settled. Do NOT reopen these in future sessions:
 
@@ -353,6 +351,27 @@ package names de-scaffolded (→ `spec2tickets`). Build green (bundle ≈ −1.4
   Needs a proven Forge resize/scroll approach, or accept for MVP (minor UX).
 - KVS value-size limit: push session stores full features array — very large specs
   (200+ features) may approach the ~240KB KVS limit. Monitor.
+
+---
+
+## ⚡ HANDOVER NOTE (2026-06-04 EOD — spec2jira.com rebuilt to USD + in-app "spec"→"page" cleanup + DPA/SEO/a11y; agent-conducted)
+
+A long, agent-conducted session (§13 throughout) updating the **public site** + customer-facing app copy. The site lives in the **SEPARATE GitHub Pages repo** (`C:\Software Engineer\Success\AI-delivery\ai-delivery-platform\MVP-roll-out\spec2jira-site\spec2jira-site`; auto-deploys on `git push`). All §13 gates passed (incl. a 5-agent adversarial audit + per-wave reviews). **NOT committed/deployed — partner pushes the site + builds/deploys the forge app.**
+
+**Site (spec2jira.com) — REBUILT:**
+- **New IA:** removed How-it-works + Pricing from the landing → dedicated **/how-it-works** + **/pricing**; added **/about**; standardized nav (5 links) + footer (8 links: …+ DPA + Sub-processors).
+- **Value-first landing**, hero **"Your Confluence page → a sprint-ready Jira backlog."** (partner-picked; the jargon "spec" was dropped from the hero — customers may not parse it; the subhead anchors it as "a spec, PRD, or requirements doc"). Stats: **~70%** less hand-work / minutes-not-days / 100% human-reviewed.
+- **USD pricing** everywhere: **BYOK Pro $6.70/user** ($57 ≤10 flat, declining >100); **Managed Pro $13/user "Coming soon"** (editions Phase 2). Old "Free 3/mo" dropped → 30-day trial.
+- **Published /dpa + /subprocessors** (clean — NO `[PARTNER]` placeholders; Anthropic facts WEB-VERIFIED true: ≤29-day non-ZDR Batches, no-training default, SCCs incorporated). Processor named = **Aleks Asenov Asenov** (sole trader; Ovcha Kupel 2, Sofia, BG; governing law Bulgaria). Privacy scoped (BYOK-absolutes → BYOK only + Managed role-map; "removed on push" softened to honest wording).
+- **A11y**: `--gray`/link contrast → WCAG AA; `<main id>`+skip-link, `:focus-visible`, heading order, `aria-hidden` (all 8 pages). **SEO infra**: favicon.svg, sitemap.xml, robots.txt, 404.html, OG/Twitter+canonical on all 8. ⚠ **og-image.png PENDING** — partner exports `og-image.svg` → 1200×630 PNG (social cards reference it).
+
+**App (forge) — copy + price:**
+- `usage.js`: BYOK €4.90→**$6.70/user**; Managed €9.90→**`null`** (Managed isn't a buyable edition until Phase 2 — a price there surfaced a false "Subscribe to Managed" CTA in AdminSettings; `null` hides it everywhere, verified safe; $13 lives on the site as coming-soon).
+- **In-app "spec"→"page/document" cleanup** (~19 user-facing strings: App.js + AdminSettings + FeatureCard + SharedACPanel + the `v3Schema` `'Spec Breakdown'`→`'Untitled Breakdown'` fallback) — customers may not understand "spec". Backend prompts (`prompts.js`), comments, identifiers (`spec_concerns` etc.) correctly LEFT. Also fixed a stale in-app **"60–150 seconds"→"a few minutes"** (batch reality). 3 €→USD code-comments. **Build verified GREEN** (`npm run build`). ⚠ Frontend changed → needs `npm run build` + `forge deploy`.
+
+**OPEN — partner-executed:** (1) **commit+push the SITE** (5 NEW untracked infra files: 404.html / favicon.svg / og-image.svg / robots.txt / sitemap.xml) + **build+deploy the forge app** (separate the pricing commit from the copy commit, per review). (2) **Export og-image.png.** (3) **DPA legal confirm-true** before relying on /dpa: MFA (dev + Managed Anthropic accounts) · no-content-logging (Managed path) · written confidentiality · a defined incident-response process · a maintained TIA · monitored privacy@/security@ · confirm SCC Module 2 — full list in **`memory/site-launch-punchlist.md`**. (4) Post-approval: wire the real Marketplace listing URL into the CTAs + `PRO_UPGRADE_URL`.
+
+С усмивка ✨ — сайтът е USD-чист, по-ясен (без жаргонния "spec"), достъпен, с публикувани легални страници; app copy-то е изчистено; всичко §13-gate-нато. Остават твоите push/deploy + og-image export + legal confirm.
 
 ---
 

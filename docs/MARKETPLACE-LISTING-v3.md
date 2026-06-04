@@ -4,6 +4,8 @@
 > (resubmitted as v5.3.0, 2026-06-04, awaiting review).** This doc is the
 > reference / source copy — keep it aligned with the portal. Source of truth for
 > the launch state: `memory/marketplace-launch-state.md` + `memory/monetization-strategy.md`.
+>
+> 💲 **PRICING IS USD (live portal, 2026-06-04): BYOK Pro $6.70/user · flat $57 ≤10 users · declining curve >100 · Managed Pro $13/user COMING SOON (editions Phase 2).** Any €4.90 / €9.90 / €39 / €20 figures in the sections below are the **RETIRED EUR plan** — update them here only when revising portal copy; the live portal + the website (spec2jira.com) are already USD.
 
 > Copy-paste source for the Atlassian Marketplace vendor portal: listing copy,
 > pricing editions, and the security/privacy questionnaire answers. Every

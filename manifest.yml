@@ -149,7 +149,7 @@ app:
   #   Standard = BYOK Pro    (customer's own key, UNLIMITED) — portal price (set 2026-06-04):
   #                            100% of Confluence ($6.70/user, $57 ≤10, declining, 1.5x multi)
   #   Advanced = Managed Pro (our key; capped 10/USER/mo) — editions are a POST-PUBLISH phase,
-  #                            so Advanced is ADDED AFTER the app is live (Phase 2; price TBD ~$10-13)
+  #                            so Advanced is ADDED AFTER the app is live (Phase 2; price $13/user planned)
   # Runtime tells them apart via context.license.capabilitySet
   # (capabilitystandard / capabilityadvanced) — see src/usage.js resolveTier.
   # Prices/edition names are set in the vendor portal, NOT here. Evaluation is the
