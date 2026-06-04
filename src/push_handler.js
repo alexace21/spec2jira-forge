@@ -145,7 +145,7 @@ function richADF({ userStory, description, acceptanceCriteria, sourceHeading, em
         {
           type: 'text',
           text:
-            'Note: this JIRA project has no Subtask issue type, so the task breakdown is listed above as a checklist. To create these as separate Subtask issues, enable the Subtask type in project settings — or contact support@spec2jira.com for help.',
+            'Note: this Jira project has no Subtask issue type, so the task breakdown is listed above as a checklist. To create these as separate Subtask issues, enable the Subtask type in project settings — or contact support@spec2jira.com for help.',
           marks: [{ type: 'em' }],
         },
       ],
@@ -236,22 +236,23 @@ async function lookupProject(projectKey) {
     return {
       ok: false,
       error: 'project_not_found',
-      detail: `JIRA project "${projectKey}" does not exist OR you don't have access. Verify the project key in Settings.`,
+      detail: `Jira project "${projectKey}" does not exist OR you don't have access. Verify the project key in Settings.`,
     };
   }
   if (response.status === 403) {
     return {
       ok: false,
       error: 'permission_denied',
-      detail: `You lack permission to view project "${projectKey}". Ask your JIRA admin for project access.`,
+      detail: `You lack permission to view project "${projectKey}". Ask your Jira admin for project access.`,
     };
   }
   if (!response.ok) {
     const text = await response.text();
+    console.error(`[push] project lookup HTTP ${response.status}: ${text.substring(0, 300)}`);
     return {
       ok: false,
       error: `jira_${response.status}`,
-      detail: text.substring(0, 300),
+      detail: 'Jira returned an error. Check your project settings, or contact support@spec2jira.com.',
     };
   }
   const project = await response.json();
@@ -325,14 +326,48 @@ async function createSingleIssue(payload) {
   }
   if (!response.ok) {
     const text = await response.text();
+    console.error(`[push] single create HTTP ${response.status}: ${text.substring(0, 500)}`);
     return {
       ok: false,
       error: `jira_${response.status}`,
-      detail: text.substring(0, 500),
+      detail: jiraErrorMessage(response.status, text),
     };
   }
   const issue = await response.json();
   return { ok: true, issue };
+}
+
+/**
+ * Build a CLEAN, customer-facing message from a Jira error response body. Jira
+ * returns { errorMessages: [...], errors: { fieldId: "reason", ... } }; we join
+ * the general messages and the per-field reasons into one sentence and append a
+ * hint about the most common cause (a project-required custom field). The raw
+ * body is logged separately (console.error) — it never reaches the user.
+ * Parses defensively: any malformed body falls back to a generic HTTP-status line.
+ */
+function jiraErrorMessage(status, rawText) {
+  try {
+    const body = JSON.parse(rawText);
+    const reasons = [];
+    if (Array.isArray(body?.errorMessages)) {
+      for (const m of body.errorMessages) {
+        const clean = String(m || '').trim();
+        if (clean) reasons.push(clean);
+      }
+    }
+    if (body?.errors && typeof body.errors === 'object') {
+      for (const [field, msg] of Object.entries(body.errors)) {
+        const clean = String(msg || '').trim();
+        if (clean) reasons.push(`${field}: ${clean}`);
+      }
+    }
+    if (reasons.length > 0) {
+      return `Jira rejected this item: ${reasons.join('; ')}. If a required field is missing, add it under Advanced → Required custom fields in Settings (or set a default in Jira), then retry.`;
+    }
+  } catch (_) {
+    /* not JSON — fall through to the generic line */
+  }
+  return `Jira rejected this item (HTTP ${status}).`;
 }
 
 /**
@@ -356,18 +391,22 @@ async function bulkCreateIssues(issuesArray) {
       body: JSON.stringify({ issueUpdates: issuesArray }),
     });
   } catch (e) {
-    // Total failure — treat all as failed
+    // Total failure — treat all as failed. Log the raw cause; show a clean line.
+    console.error(`[push] bulk create fetch threw: ${String(e?.message || e)}`);
     return {
       issues: new Array(issuesArray.length).fill(null),
-      errors: [{ message: `fetch threw: ${String(e?.message || e)}` }],
+      errors: [{ message: 'Could not reach Jira to create these items. Please try again in a moment; if it persists, contact support@spec2jira.com.' }],
     };
   }
 
   if (!response.ok) {
     const text = await response.text();
+    // Log the raw Jira body (technical detail stays in the logs); surface a clean,
+    // parsed customer message (raw HTTP bodies must never reach the success screen).
+    console.error(`[push] bulk create HTTP ${response.status}: ${text.substring(0, 300)}`);
     return {
       issues: new Array(issuesArray.length).fill(null),
-      errors: [{ message: `HTTP ${response.status}: ${text.substring(0, 300)}` }],
+      errors: [{ message: jiraErrorMessage(response.status, text) }],
     };
   }
 
@@ -380,9 +419,13 @@ async function bulkCreateIssues(issuesArray) {
   const failedIdx = new Set();
   for (const err of data.errors || []) {
     failedIdx.add(err.failedElementNumber);
+    const elErr = err.elementErrors || {};
     errors.push({
       index: err.failedElementNumber,
-      ...err.elementErrors,
+      ...elErr,
+      // Clean, customer-facing reason for the success screen (this 200-OK
+      // per-element path is the common partial-failure case; raw body never shown).
+      message: jiraErrorMessage(elErr.status || response.status, JSON.stringify(elErr)),
     });
   }
   // Order: successful results come в order skipping failed indices
@@ -420,10 +463,11 @@ async function createIssueLink(outwardKey, inwardKey) {
   }
   if (!response.ok && response.status !== 201) {
     const text = await response.text();
+    console.error(`[push] issue link HTTP ${response.status}: ${text.substring(0, 300)}`);
     return {
       ok: false,
       error: `jira_${response.status}`,
-      detail: text.substring(0, 300),
+      detail: 'Jira returned an error. Check your project settings, or contact support@spec2jira.com.',
     };
   }
   return { ok: true };
@@ -563,7 +607,7 @@ function buildSubtaskPayload(projectKey, task, parentStoryKey, subtaskTypeId, cu
  */
 export async function startPushSession(breakdown, projectKey, customFields = null) {
   if (!breakdown) return { ok: false, error: 'no_breakdown', detail: 'No breakdown provided.' };
-  if (!projectKey) return { ok: false, error: 'no_project_key', detail: 'No JIRA project key.' };
+  if (!projectKey) return { ok: false, error: 'no_project_key', detail: 'No Jira project key.' };
 
   console.log(`[push] startPushSession project=${projectKey}`);
 

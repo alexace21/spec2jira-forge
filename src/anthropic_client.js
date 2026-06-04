@@ -192,18 +192,23 @@ export async function testConnection(apiKey = null) {
   if (response.status === 402 || response.status === 429) {
     // 402 = insufficient credits, 429 = rate limit
     const text = await response.text();
+    console.error(`[anthropic] testConnection HTTP ${response.status}: ${text.substring(0, 300)}`);
     return {
       ok: false,
       error: response.status === 402 ? 'insufficient_credits' : 'rate_limited',
-      detail: text.substring(0, 300),
+      detail:
+        response.status === 402
+          ? 'Your Anthropic account has insufficient credits. Add credits at console.anthropic.com, then try again.'
+          : 'Anthropic is rate-limiting requests right now. Please try again in a moment.',
     };
   }
   if (!response.ok) {
     const text = await response.text();
+    console.error(`[anthropic] testConnection HTTP ${response.status}: ${text.substring(0, 300)}`);
     return {
       ok: false,
       error: `anthropic_${response.status}`,
-      detail: text.substring(0, 300),
+      detail: 'The AI service returned an error. Please try again in a moment; if it persists, contact support@spec2jira.com.',
     };
   }
 
@@ -394,8 +399,8 @@ export async function submitBreakdownBatch({
   }
   if (!response.ok) {
     const text = await response.text();
-    console.warn(`[anthropic-batch] submit HTTP ${response.status}: ${text.substring(0, 300)}`);
-    return { error: `anthropic_${response.status}`, detail: text.substring(0, 500) };
+    console.warn(`[anthropic-batch] submit HTTP ${response.status}: ${text.substring(0, 500)}`);
+    return { error: `anthropic_${response.status}`, detail: 'The AI service returned an error. Please try again in a moment; if it persists, contact support@spec2jira.com.' };
   }
 
   const data = await response.json();
@@ -444,7 +449,8 @@ export async function pollBatchStatus(batchId, apiKeyOverride = null) {
   if (response.status === 404) return { error: 'batch_not_found', detail: `Batch ${batchId} not found.` };
   if (!response.ok) {
     const text = await response.text();
-    return { error: `anthropic_${response.status}`, detail: text.substring(0, 300) };
+    console.error(`[anthropic-batch] poll HTTP ${response.status}: ${text.substring(0, 300)}`);
+    return { error: `anthropic_${response.status}`, detail: 'The AI service returned an error. Please try again in a moment; if it persists, contact support@spec2jira.com.' };
   }
 
   const data = await response.json();
@@ -485,7 +491,8 @@ export async function fetchBatchResults(resultsUrl, customId, apiKeyOverride = n
 
   if (!response.ok) {
     const text = await response.text();
-    return { error: `results_fetch_${response.status}`, detail: text.substring(0, 300) };
+    console.error(`[anthropic-batch] results fetch HTTP ${response.status}: ${text.substring(0, 300)}`);
+    return { error: `results_fetch_${response.status}`, detail: "Couldn't retrieve the generated result — please try Generate again." };
   }
 
   // Results are JSONL — one line per request in the batch (we have 1).
@@ -527,7 +534,7 @@ export async function fetchBatchResults(resultsUrl, customId, apiKeyOverride = n
   }
 
   if (message.stop_reason === 'refusal') {
-    return { error: 'refused', detail: 'Anthropic refused to process this spec.', usage: message.usage };
+    return { error: 'refused', detail: 'Anthropic declined to process this page. Review the page content and try again.', usage: message.usage };
   }
 
   const truncated = message.stop_reason === 'max_tokens';
@@ -552,12 +559,12 @@ export async function fetchBatchResults(resultsUrl, customId, apiKeyOverride = n
           model: message.model,
           stop_reason: message.stop_reason,
           truncated: true,
-          truncation_note: `Output exceeded ${MAX_OUTPUT_TOKENS} tokens. Recovered ${salvaged.features.length} complete features; later features may be missing. Consider splitting the spec.`,
+          truncation_note: `Output exceeded ${MAX_OUTPUT_TOKENS} tokens. Recovered ${salvaged.features.length} complete features; later features may be missing. Consider splitting the page.`,
         };
       }
       return {
         error: 'truncated',
-        detail: `Output exceeded ${MAX_OUTPUT_TOKENS} tokens and could not be recovered. The spec is too large for a single breakdown — split it into smaller specs (e.g., per major capability area) and run each separately.`,
+        detail: `Output exceeded ${MAX_OUTPUT_TOKENS} tokens and could not be recovered. The page is too large for a single breakdown — split it into smaller pages (e.g., per major capability area) and run each separately.`,
         usage: message.usage,
       };
     }
@@ -856,7 +863,8 @@ export async function distillCategory({ text, category, apiKey, model }) {
   if (response.status === 429) return { error: 'rate_limited', detail: 'Anthropic rate limit exceeded.' };
   if (!response.ok) {
     const t = await response.text();
-    return { error: `anthropic_${response.status}`, detail: t.substring(0, 300) };
+    console.error(`[distill] category=${category.key} HTTP ${response.status}: ${t.substring(0, 300)}`);
+    return { error: `anthropic_${response.status}`, detail: 'The AI service returned an error. Please try again in a moment; if it persists, contact support@spec2jira.com.' };
   }
 
   let data;

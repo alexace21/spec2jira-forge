@@ -109,7 +109,7 @@ function buildQuotaExceeded(quota) {
     resetsAtLabel: quota.resetsAtLabel,
     pricing: pricingTable(),
     fairUse: true,
-    detail: `You've reached this month's fair-use limit (${quota.limit} breakdowns on ${quota.tierLabel}) — it resets ${quota.resetsAtLabel}. Need more this month? Contact us at support@spec2jira.com about higher-volume Managed access, or switch to BYOK Pro (use your own Anthropic key) for unlimited right away.`,
+    detail: `You've used all ${quota.limit} breakdowns included this month on ${quota.tierLabel} — they reset ${quota.resetsAtLabel}. Need more this month? Contact us at support@spec2jira.com about higher-volume Managed access, or switch to BYOK Pro (use your own Anthropic key) for unlimited right away.`,
   };
 }
 
@@ -322,12 +322,12 @@ resolver.define('saveSettings', async ({ payload }) => {
   // Validate project key
   const cleanProjectKey = (defaultProjectKey || '').trim().toUpperCase();
   if (!cleanProjectKey) {
-    return { error: 'JIRA Project Key is required' };
+    return { error: 'Jira Project Key is required' };
   }
   if (!/^[A-Z][A-Z0-9]{1,9}$/.test(cleanProjectKey)) {
     return {
       error:
-        'JIRA Project Key must be 2–10 characters, start with a letter, only uppercase letters and digits (e.g., PROJ, SCRUM2)',
+        'Jira Project Key must be 2–10 characters, start with a letter, only uppercase letters and digits (e.g., PROJ, SCRUM2)',
     };
   }
 
@@ -489,9 +489,11 @@ resolver.define('startDistillSession', async ({ payload, context }) => {
   // so Managed installs (no BYOK key) distill with OUR key, BYOK with theirs.
   const { apiKey, keySource } = await resolveAnthropicKey(context);
   if (!apiKey) {
-    return keySource === 'managed'
-      ? { error: 'managed_unavailable', code: 'NOT_CONFIGURED', detail: 'The Managed service is temporarily unavailable (server key not configured). Contact support, or switch to BYOK and save your own key.' }
-      : { error: 'not_configured', code: 'NOT_CONFIGURED', detail: 'Anthropic API key not configured. Save your key first.' };
+    if (keySource === 'managed') {
+      console.error('[distill] managed key unavailable (MANAGED_ANTHROPIC_KEY not configured)');
+      return { error: 'managed_unavailable', code: 'NOT_CONFIGURED', detail: 'The Managed service is temporarily unavailable. Please contact support@spec2jira.com, or switch to your own Anthropic API key in Settings.' };
+    }
+    return { error: 'not_configured', code: 'NOT_CONFIGURED', detail: 'Anthropic API key not configured. Save your key first.' };
   }
 
   // §13 security-review fix: Managed distill spends OUR key but has no breakdown
@@ -505,7 +507,7 @@ resolver.define('startDistillSession', async ({ payload, context }) => {
     try {
       const q = await checkQuota(context);
       if (!q.allowed) {
-        return { error: 'managed_unavailable', code: 'NOT_CONFIGURED', detail: `Managed fair-use limit reached for this period — distill is paused until ${q.resetsAtLabel}. For unlimited, switch to BYOK Pro (your own key).` };
+        return { error: 'managed_unavailable', code: 'NOT_CONFIGURED', detail: `You've used this month's Managed breakdowns — summarizing is paused until ${q.resetsAtLabel}. For unlimited, switch to BYOK Pro (your own key).` };
       }
     } catch (e) {
       console.error(`[distill] managed pool check failed (allowing): ${String(e?.message || e)}`);
@@ -565,9 +567,11 @@ resolver.define('distillStep', async ({ payload, context }) => {
 
   const { apiKey, keySource } = await resolveAnthropicKey(context);
   if (!apiKey) {
-    return keySource === 'managed'
-      ? { error: 'managed_unavailable', code: 'NOT_CONFIGURED', detail: 'The Managed service is temporarily unavailable (server key not configured). Contact support or switch to BYOK.', step, label: DISTILL_CATEGORIES[step].label }
-      : { error: 'not_configured', code: 'NOT_CONFIGURED', detail: 'Anthropic API key not configured. Save your key first.', step, label: DISTILL_CATEGORIES[step].label };
+    if (keySource === 'managed') {
+      console.error('[distill] managed key unavailable (MANAGED_ANTHROPIC_KEY not configured)');
+      return { error: 'managed_unavailable', code: 'NOT_CONFIGURED', detail: 'The Managed service is temporarily unavailable. Please contact support@spec2jira.com, or switch to your own Anthropic API key in Settings.', step, label: DISTILL_CATEGORIES[step].label };
+    }
+    return { error: 'not_configured', code: 'NOT_CONFIGURED', detail: 'Anthropic API key not configured. Save your key first.', step, label: DISTILL_CATEGORIES[step].label };
   }
 
   const category = DISTILL_CATEGORIES[step];
@@ -684,7 +688,7 @@ resolver.define('searchPages', async ({ payload }) => {
       );
   } catch (e) {
     console.error(`[searchPages] threw: ${String(e?.message || e)}`);
-    return { error: 'Search failed', detail: String(e?.message || e) };
+    return { error: 'Search failed', detail: 'Couldn\'t search Confluence right now. Try again in a moment; if it persists, contact support@spec2jira.com.' };
   }
 
   if (response.headers.get('forge-proxy-error') === 'BLOCKED_EGRESS') {
@@ -696,14 +700,16 @@ resolver.define('searchPages', async ({ payload }) => {
   if (!response.ok) {
     const text = await response.text();
     if (response.status === 403) {
+      console.error(`[searchPages] Confluence 403 (scope mismatch?): ${text.substring(0, 200)}`);
       return {
         error: 'Confluence 403 — scope mismatch?',
-        detail: `Verify the search:confluence scope is granted, then reinstall the app. Body: ${text.substring(0, 200)}`,
+        detail: 'Couldn\'t search Confluence (permission error). Ask your Confluence admin to re-authorize Spec2Tickets, or contact support@spec2jira.com.',
       };
     }
+    console.error(`[searchPages] Confluence HTTP ${response.status}: ${text.substring(0, 300)}`);
     return {
       error: `Confluence ${response.status}`,
-      detail: text.substring(0, 300),
+      detail: 'Couldn\'t read this Confluence page (Confluence returned an error). Try reopening the page; if it persists, contact support@spec2jira.com.',
     };
   }
 
@@ -720,7 +726,8 @@ resolver.define('searchPages', async ({ payload }) => {
     }).filter((r) => r.id);
     return { results };
   } catch (e) {
-    return { error: 'Parse failed', detail: String(e?.message || e) };
+    console.error(`[searchPages] parse failed: ${String(e?.message || e)}`);
+    return { error: 'Parse failed', detail: 'Couldn\'t search Confluence right now. Try again in a moment; if it persists, contact support@spec2jira.com.' };
   }
 });
 
@@ -822,7 +829,8 @@ resolver.define('fetchPage', async ({ payload }) => {
   }
   if (!response.ok) {
     const text = await response.text();
-    return { error: `confluence_${response.status}`, detail: text.substring(0, 300) };
+    console.error(`[fetchPage] Confluence HTTP ${response.status}: ${text.substring(0, 300)}`);
+    return { error: `confluence_${response.status}`, detail: 'Couldn\'t read this Confluence page (Confluence returned an error). Try reopening the page; if it persists, contact support@spec2jira.com.' };
   }
 
   const data = await response.json();
@@ -983,17 +991,19 @@ resolver.define('startGeneration', async ({ payload, context }) => {
   // the poll leg reuses the SAME key the batch was created with.
   const { apiKey, keySource } = await resolveAnthropicKey(context);
   if (!apiKey) {
-    return keySource === 'managed'
-      ? {
-          error: 'managed_unavailable',
-          detail:
-            'The Managed service is temporarily unavailable (server key not configured). Please contact support, or switch to BYOK in Settings and use your own Anthropic API key.',
-        }
-      : {
-          error: 'not_configured',
-          detail:
-            'Anthropic API key not configured. Ask your Confluence admin to open Settings → Spec2Tickets and provide an Anthropic API key.',
-        };
+    if (keySource === 'managed') {
+      console.error('[startGeneration] managed key unavailable (MANAGED_ANTHROPIC_KEY not configured)');
+      return {
+        error: 'managed_unavailable',
+        detail:
+          'The Managed service is temporarily unavailable. Please contact support@spec2jira.com, or switch to your own Anthropic API key in Settings.',
+      };
+    }
+    return {
+      error: 'not_configured',
+      detail:
+        'Anthropic API key not configured. Ask your Confluence admin to open Settings → Spec2Tickets and provide an Anthropic API key.',
+    };
   }
 
   // Record install provenance (grandfathering signal — see usage.js
@@ -1038,9 +1048,10 @@ resolver.define('startGeneration', async ({ payload, context }) => {
   }
   if (!pageFetch.ok) {
     const text = await pageFetch.text();
+    console.error(`[startGeneration] Confluence HTTP ${pageFetch.status}: ${text.substring(0, 300)}`);
     return {
       error: `confluence_${pageFetch.status}`,
-      detail: text.substring(0, 300),
+      detail: 'Couldn\'t read this Confluence page (Confluence returned an error). Try reopening the page; if it persists, contact support@spec2jira.com.',
     };
   }
   const pageData = await pageFetch.json();
@@ -1210,9 +1221,10 @@ resolver.define('pollJobStatus', async ({ payload }) => {
     // message, retry next cycle → self-heals when the key is restored) instead of a
     // silent wrong-key poll. POLICY §11: never a silent wrong-key path.
     if (job.keySource === 'managed' && !jobApiKey) {
+      console.error(`[pollJobStatus] jobId=${jobId} managed key unset mid-flight (MANAGED_ANTHROPIC_KEY) — soft-failing, will retry`);
       return {
         ...job,
-        phase: 'Managed service temporarily unavailable (server key unset) — retrying. If this persists, please contact support.',
+        phase: 'Managed service temporarily unavailable — retrying. If this persists, please contact support@spec2jira.com.',
       };
     }
 
@@ -1512,7 +1524,7 @@ resolver.define('startPush', async ({ payload }) => {
     return {
       error: 'no_project_key',
       detail:
-        'No JIRA project key configured. Open Settings → Spec2Tickets and set Default JIRA Project Key.',
+        'No Jira project key configured. Open Settings → Spec2Tickets and set Default Jira Project Key.',
     };
   }
 
