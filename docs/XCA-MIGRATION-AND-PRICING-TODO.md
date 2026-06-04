@@ -1,90 +1,108 @@
-# XCA Migration + Paid-via-Atlassian Pricing — Implementation TODO
+# XCA Migration + Paid-via-Atlassian Pricing — DONE + forward TODO
 
-> **Pick this up in a DEDICATED dev session** (the admin/rollout session is kept separate).
-> Created 2026-06-02. This is the ONLY remaining Marketplace blocker — the FIT/security
-> issue is already RESOLVED (no-backend v3 architecture; see `memory/marketplace-launch-state.md`).
+> ## ✅ STATUS: XCA migration DONE — **v5.3.0 resubmitted to Marketplace 2026-06-04, awaiting review.**
+>
+> The Paid-via-Atlassian "more than one parent software" blocker is **RESOLVED via the vendor-portal
+> Compatibility tab** (app → [version] details → Compatibility → remove Jira → Confluence = sole billing
+> parent) — **NOT via the manifest** (removing `compatibility.jira` / `jira.required:false` did NOT work;
+> that hypothesis is RETIRED). The Jira push DOES still need the Jira install (gotcha #10 holds; Jira =
+> an optional installed *connection*, reached via `write:jira-work` + `asUser().requestJira`). Licensed
+> (PvA) apps install via **Marketplace only** — no `forge install` on production.
+>
+> **Pricing LIVE:** BYOK Pro (= the **Standard** edition) shipped as a **single edition** at
+> **"100% of Confluence price" = $6.70/user** ($57 ≤10 flat, declining curve kept, 1.5× multi, USD).
+> **No in-app Free tier** (removed 2026-06-03) — evaluation = the 30-day Atlassian trial.
+>
+> Full record: `memory/marketplace-launch-state.md` + `memory/monetization-strategy.md` + the CLAUDE.md
+> handover. **Everything below the "Forward TODO" section is the historical planning record** (kept for
+> the hard-won facts; obsolete decisions are marked superseded).
+
+---
+
+## ▶ Forward TODO — editions Phase 2 (Managed Pro) + the open follow-ups
+
+These are the **still-pending** items (the XCA migration + BYOK-Pro resubmit are DONE):
+
+**1. Editions Phase 2 — add Managed Pro (the "Advanced" edition) — POST-PUBLISH only.**
+Editions are a Marketplace capability that appears **only after the app is Paid-via-Atlassian AND live on
+Marketplace** (empirically confirmed 2026-06-04: the portal Editions tab is unlocked but says *"…must be
+Paid via Atlassian and live on Marketplace before you can create app editions"*). So Managed Pro can be
+added only **after** the v5.3.0 resubmit is approved + published. The work then:
+- [ ] Define the **Advanced** edition + set its price — **TBD ~$10-13/user** (~1.5-2× BYOK), via the
+  3-phase editions process (Plan → Build → Publish-editions) with its **own separate Marketplace review**.
+  (Existing BYOK customers stay on Standard; "existing pricing → Standard" is automatic.)
+- [ ] Set the encrypted Managed key in BOTH envs: `forge variables set --encrypt MANAGED_ANTHROPIC_KEY <our-key>`.
+- [ ] **Managed compliance** (required for the Advanced edition — content runs under OUR Anthropic key):
+  legal-review + publish the customer **DPA**; reconcile the Atlassian privacy questionnaire to the Managed
+  truth (**≤29-day** Anthropic/Batches retention, SCCs auto-incorporated, Anthropic = sub-processor);
+  publish the sub-processor list; add the privacy-policy "Managed" sections. (Drafts under `docs/compliance/`.)
+  ℹ️ ZDR is NOT pursued (we disclose the 29-day Batches retention) → **no Anthropic ZDR request needed**;
+  reselling needs **no special approval** (Commercial Terms §A.1).
+- [ ] Dev-test the two editions: `forge install -e development --license Standard` / `--license Advanced`
+  (`--license` is DEV-ONLY). Confirm a Managed (Advanced) user at the fair-use cap is routed to BYOK.
+
+**2. Open follow-ups (next session, while the review is pending):**
+- [ ] Update the marketing site pricing — `spec2jira.com/docs` still shows stale figures; set it to
+  **$6.70 / 100%-of-Confluence** and drop the dead "Free 3/mo". (The site is a **separate GitHub Pages
+  repo**: `…\AI-delivery\ai-delivery-platform\MVP-roll-out\spec2jira-site\spec2jira-site` — edit the
+  docs/privacy HTML there → `git push` → GitHub Pages auto-deploys.)
+- [ ] After approval → **publish** (partner controls the "Let me control when app is published" gate).
+- [ ] **POST-APPROVAL:** wire `PRO_UPGRADE_URL` + `MARKETPLACE_REVIEW_URL` (Forge prod variables) →
+  the live Marketplace subscription/review URLs (the `LimitReachedScreen` / Account-panel CTAs are
+  info-only until then).
+
+**Already DONE in code (dev → resubmit; for reference)** — the manifest carries `app.compatibility`
+(Confluence required) + `app.licensing.enabled` + `app.licensing.editionsEnabled`; `src/usage.js` has the
+tier model (`byokPro`=Standard / `managedPro`=Advanced, `capabilitySet` resolution defaulting undefined →
+BYOK Pro, `MANAGED_USER_CAP`=10 per-user metered `usage:YYYY-MM:u:<accountId>`); `src/index.js` has the
+Managed key path (`MANAGED_ANTHROPIC_KEY`, `keySource` stamped on the job) + a defensive `license_required`
+backstop; the frontend has edition-aware onboarding + in-app Settings + the at-cap → BYOK routing. The
+in-app Free tier / `unlicensedAccess` / push-gate / guest-guard were all **removed 2026-06-03** (trial → paid).
 
 ---
 
-## ⭐ VERIFIED + IMPLEMENTED 2026-06-03 (read FIRST — supersedes stale notes below)
+## Hard-won XCA / Forge facts (still useful — keep)
 
-A dev session verified the platform facts against LIVE Atlassian/Anthropic docs (3 research agents)
-and IMPLEMENTED the code. **Scope grew per partner decision: the resubmit ships the FULL hybrid**
-(BYOK Pro + Managed Pro), so it **WAITS on the Managed compliance docs**.
+These survived the migration and are NOT obviously duplicated elsewhere:
 
-**Locked design**
-- **Two editions (platform cap = exactly 2):** `Standard` = **BYOK Pro €4.90/user** (unlimited,
-  customer's key) · `Advanced` = **Managed Pro €9.90/user** (we call Anthropic with OUR key; capped).
-  Floors €49/€99 (price × the fixed 1-10 band). Runtime tells them apart via
-  `context.license.capabilitySet` (`capabilityStandard`/`capabilityAdvanced`) read via `getAppContext()`.
-- **Trial → paid; NO in-app Free tier (SIMPLIFIED 2026-06-03).** The earlier "in-app 3/mo PERPETUAL Free
-  via `unlicensedAccess`" design was DROPPED — evaluation is the standard **30-day Atlassian trial** that
-  Paid-via-Atlassian apps get for free (a trial reads as an ACTIVE license at runtime → resolves to a paid
-  tier). Unlicensed users are simply **blocked natively by Atlassian** (Paid-via-Atlassian default), with a
-  defensive `license_required` backstop in the resolvers turning that into a clean "subscribe or start a
-  trial" prompt. There is **NO `unlicensedAccess`** on any module anymore.
-- **No push-gate.** The earlier `push_requires_license` / guest-guard (`accountType`) gating was REMOVED
-  along with the Free path — every accessing user is licensed (or trialling), so `asUser()` always works;
-  Managed cost exposure is bounded purely by the per-user `MANAGED_USER_CAP` (10/USER/mo, metered per-user).
-- **Managed retention:** the Batches API is NOT ZDR-eligible → **disclose ≤29-day retention** (+ no-
-  training default + auto-incorporated SCCs + a customer DPA). Reselling is permitted (Commercial Terms
-  §A.1) — **no special approval needed** (the old "reselling approval" premise was wrong).
-
-**DONE in code (dev, `feature/product-improvements`)**
-- ✅ `manifest.yml`: `app.compatibility` (Confluence req / Jira opt) + `app.licensing.enabled` +
-  **`app.licensing.editionsEnabled`**. `unlicensedAccess` on the Confluence modules was **REMOVED 2026-06-03**
-  (no in-app Free tier → licensed-only; the app is admitted only to licensed/trial users by default).
-- ✅ `src/usage.js`: tiers (byokPro=Standard / managedPro=Advanced / unlicensed=defensive-blocked-backstop);
-  `capabilitySet` resolution; `getActiveTier`; `MANAGED_USER_CAP` = 10 breakdowns per USER/mo (metered per-user
-  `usage:YYYY-MM:u:<accountId>`, not pooled — the License object exposes no runtime seat count). The in-app
-  Free 3/mo tier was **REMOVED 2026-06-03**.
-- ✅ `src/index.js`: Managed key path (our key from `MANAGED_ANTHROPIC_KEY` env var when Advanced;
-  `keySource` stamped on the job + reused at poll/fetch/cycle-repair); tier-aware quota messaging;
-  defensive `license_required` backstop (unlicensed); distill Managed-key support. The push-gate
-  (`push_requires_license`) + guest-guard (`accountType`) were **REMOVED 2026-06-03** — every user is
-  licensed, so `asUser()` push always works.
-- ✅ Frontend (App.js + AdminSettings.jsx): edition-aware onboarding + Managed settings (BYOK key field hidden
-  for Managed) + LimitReachedScreen with prices from `pricing[]` (Managed at-cap → BYOK). The separate push-gate
-  UI was dropped with the push-gate. Compliance docs (`docs/compliance/`): drafted, pending partner legal review.
-
-**CORRECTIONS to the original plan below (verified)**
-1. **Uninstall Jira FIRST, then deploy (EMPIRICALLY CONFIRMED 2026-06-03 — the live deploy was BLOCKED).**
-   The FIRST XCA-compatibility deploy fails while the app has an install in the NON-required app (Jira):
-   Atlassian errors *"Unable to deploy an app to an environment with an existing installation in an Atlassian
-   app that is not the required Atlassian app."* So the corrected per-env sequence is `forge uninstall -p jira`
-   → `forge deploy -e <env> --no-verify` → `forge install --upgrade` (Confluence) + `forge install -p jira`
-   (reconnect). Confluence (required) install + data ARE preserved. ⚠ **This RESTORES the original Part A
-   "uninstall Jira first" step** — an interim note here that said the OPPOSITE ("do NOT uninstall first /
-   teardown-only") was WRONG; the live deploy is the authority.
-2. **`editionsEnabled: true` is REQUIRED** (Part A only had `licensing.enabled`) — else you get ONE
-   price, not two editions.
-3. **`@forge/api ≥ 5.1.1`** + latest CLI required for XCA — we have `^7.2.1` ✅.
-4. **No in-app Free tier (SIMPLIFIED 2026-06-03 — supersedes BOTH "Free ≤10 users" AND "Free = in-app 3/mo").**
-   The model is trial → paid: evaluation is the 30-day Atlassian trial; unlicensed users are blocked natively
-   (no `unlicensedAccess`). The 1-10 band is the PAID floor (€49 BYOK / €99 Managed). The Part B "Free = in-app
-   3/mo" framing below is now also retired (kept for history).
-5. **Managed seat-scaled (10×seats) cap is unenforceable at runtime** — the License object exposes NO
-   seat count. So Managed meters **PER USER**: `MANAGED_USER_CAP` = 10 breakdowns per USER/mo
-   (`usage:YYYY-MM:u:<accountId>`, env-tunable), NOT pooled per instance — per-user needs no seat count
-   and is loss-proof per seat regardless of instance size.
-
-**PARTNER EXECUTION CHECKLIST (external — Claude can't do these)**
-- [ ] Set the Managed key (encrypted) in BOTH envs: `forge variables set --encrypt MANAGED_ANTHROPIC_KEY <our-key>`.
-- [ ] DEV (uninstall Jira FIRST — the compatibility deploy is BLOCKED otherwise, see correction #1):
-  `forge uninstall -e development -p jira` → `forge deploy -e development --no-verify` →
-  `forge install --upgrade -e development -p Confluence` + `forge install -e development -p jira` (reconnect;
-  expect licensing re-consent). Test editions: `forge install -e development --license Standard` / `--license
-  Advanced`. Verify a no-license install is **blocked natively by Atlassian** (its subscribe/trial prompt; the
-  app does NOT render — no in-app Free path). Confirm a licensed/trial user can Generate → Review → Push.
-- [ ] Vendor portal pricing: Cloud → two editions — Standard €4.90/user, Advanced €9.90/user; confirm the €49/€99 floors fall out of the 1-10 band.
-- [ ] Compliance: legal-review + publish the customer DPA; reconcile the Atlassian privacy questionnaire to the Managed truth (≤29-day retention, SCCs, Anthropic sub-processor); publish the sub-processor list. (Drafts under `docs/compliance/`.)
-- [ ] PROD (uninstall Jira FIRST, same as DEV): `forge uninstall -e production -p jira` →
-  `forge deploy -e production --no-verify` → `forge install --upgrade -e production -p Confluence` +
-  `forge install -e production -p jira` → smoke-test → set prod `MANAGED_ANTHROPIC_KEY`.
-- [ ] Resubmit → new ECOHELP ticket.
-- ℹ️ ZDR is NOT pursued (we disclose 29-day Batches retention) → **no Anthropic ZDR request needed**.
+1. **The PvA single-parent fix is a PORTAL action, not a manifest one.** "More than one parent software is
+   not supported for paid via Atlassian apps" is fixed in the vendor portal → app → [version] details →
+   **Compatibility tab → remove Jira** (Confluence = sole billing parent). Editing `manifest.yml`
+   (`jira.required:false` OR removing the `compatibility.jira` block) did **NOT** fix it — both forms still
+   showed Jira Cloud [REQUIRED] on the publish screen (driven by the `write:jira-work` SCOPE, not the
+   compatibility block). The Compatibility tab is the listing's billing-parent declaration, independent of the manifest.
+2. **A licensed (PvA) app installs via Marketplace ONLY** — `forge install` on production fails
+   (`LICENSED_APP_INSTALL_NOT_PERMITTED`); `forge install --upgrade` / `--license` are **dev-only**.
+   `forge deploy -e production` **auto-creates** the Marketplace version (no manual portal "Create version").
+   The old runbook "forge install on prod" step is WRONG for a licensed app.
+3. **Editions are POST-PUBLISH** — they appear only after the app is Paid-via-Atlassian AND live on
+   Marketplace, NOT from `editionsEnabled: true` alone. So a two-edition app ships its FIRST edition at
+   publish and adds the second via the editions phases after approval.
+4. **`editionsEnabled: true`** is kept in the manifest even for the single-edition launch (the publish
+   wizard accepted it alongside one price). `resolveTier` safely defaults an undefined `capabilitySet` →
+   BYOK Pro, so the single-edition launch resolves correctly (`src/usage.js`).
+5. **In-place upgrade from a non-XCA/non-licensed version to an XCA+licensed version FAILS** (Atlassian
+   backend 500) — the transition needs a FRESH install; real customers install the new version fresh
+   post-approval.
+6. **The Jira push needs the Jira install** (gotcha #10 holds) — `asUser().requestJira` on a Confluence-only
+   install 403s ("lack permission to view <project>"); with `forge install -p jira` the push works. Jira is
+   an optional installed *connection*, NOT a billing parent.
+7. **`@forge/api ≥ 5.1.1`** + latest CLI are required for XCA (we have `^7.2.1`).
+8. **The XCA *manifest* migration's "uninstall Jira first" gotcha** (only relevant for the in-place
+   compatibility-deploy path, which is now moot since prod installs via Marketplace): the first XCA-compatibility
+   `forge deploy` is BLOCKED while the app has an install in the non-required app (Jira) —
+   *"Unable to deploy an app to an environment with an existing installation in an Atlassian app that is not
+   the required Atlassian app."* The order was `forge uninstall -p jira` → deploy → reconnect Jira.
 
 ---
+
+---
+
+> ⚠ **HISTORICAL PLANNING RECORD BELOW (2026-06-02/03)** — superseded by the STATUS + Forward-TODO
+> sections above. Kept for the reviewer's-verdict context and the hard-won learnings already extracted
+> above. **Obsolete decisions** (the full-hybrid-in-resubmit plan, €4.90/€9.90 + €3.90/€6.90 prices, the
+> step-by-step manifest/install migration, the "remove `compatibility.jira`" fix hypothesis) **are marked
+> superseded inline.** Do NOT act on the steps below — use the Forward TODO.
 
 ---
 
@@ -107,7 +125,16 @@ Two pieces of work: **(A) XCA manifest migration** (code) + **(B) Paid-via-Atlas
 
 ---
 
-## Part A — XCA manifest migration (code)
+## Part A — XCA manifest migration (code) — ✅ EXECUTED (with corrections)
+
+> ⚠ **SUPERSEDED as a plan — see the Forward TODO + "Hard-won facts" above.** The `compatibility` +
+> `licensing.enabled` + `editionsEnabled` manifest changes below DID ship. BUT two things here proved
+> WRONG against the live platform: ① the manifest `compatibility.jira` block did **NOT** resolve the
+> Paid-via-Atlassian "more than one parent" error — the **vendor-portal Compatibility tab** did
+> (remove Jira there); ② the **install steps for PRODUCTION are WRONG for a licensed app** — a licensed
+> (PvA) app installs via **Marketplace only**, NOT `forge install` (`forge deploy -e production`
+> auto-creates the version). The "uninstall Jira first" gotcha applies only to the in-place
+> compatibility-*deploy* path (now moot). Read this section as history.
 
 ### The change (small)
 Add an `app.compatibility` block to `manifest.yml`. **Modules + scopes stay unchanged.**
@@ -168,10 +195,15 @@ data as before"). No reinstall of Confluence needed.
 
 ## Part B — Paid-via-Atlassian pricing (config + metering rethink)
 
-> ⚠ **(PARTIALLY SUPERSEDED — kept for history.)** The per-user "Paid via Atlassian" conclusion and the
-> €49/€99 floors are correct and final (see the top block). But the **"Free = in-app 3/mo PERPETUAL"**
-> framing in this section is **RETIRED 2026-06-03** — there is NO in-app Free tier; evaluation is the 30-day
-> Atlassian trial and unlicensed users are blocked natively (correction #4). Read the top block as authoritative.
+> ⚠ **SUPERSEDED — kept for history only.** Only the high-level conclusion survives: **Paid via Atlassian
+> is per-user** (no flat fee). EVERYTHING ELSE in this section is RETIRED:
+> - **All the prices below are dead** (€3.90–5/user, €39/€69 floors, and the later €4.90/€9.90). The LIVE
+>   price is **BYOK Pro / Standard = $6.70/user** ("100% of Confluence", $57 ≤10, declining, 1.5× multi, USD);
+>   Managed Pro / Advanced = editions Phase 2, TBD ~$10-13. See the Forward TODO + `memory/monetization-strategy.md`.
+> - **"Free = in-app 3/mo PERPETUAL via `unlicensedAccess`" is RETIRED** (2026-06-03) — there is NO in-app
+>   Free tier; evaluation is the 30-day Atlassian trial; unlicensed users are blocked natively (no `unlicensedAccess`).
+> - The **"metering rethink (free ≤10 users?)"** question is moot — there is no free tier to meter.
+> - The **`LICENSE_OVERRIDE` dev-test trick is superseded** by `forge install --license Standard|Advanced` (dev-only).
 
 XCA **forces "Paid via Atlassian"** → which in Atlassian cloud is **per-user** (the app license
 matches the host product's user tier). **Flat €39 is NOT available** under this model.
@@ -214,10 +246,14 @@ existing app from Free → Paid-via-Atlassian in-place.** To unlock it for a For
 
 ---
 
-## Part C — Resubmit
-After A (manifest migrated + deployed) and B (Paid-via-Atlassian configured):
+## Part C — Resubmit — ✅ DONE
+
+> ✅ **EXECUTED:** resubmitted as **v5.3.0 on 2026-06-04** (Paid via Atlassian; Confluence sole billing
+> parent via the portal Compatibility tab; BYOK Pro single edition at $6.70). Awaiting Atlassian review.
+> (The "verify the latest version (4.x)" note below is stale — prod is now v5.x.) Original plan:
+
 1. Reconfigure the listing's payment model → **Paid via Atlassian**.
-2. Verify the latest version (4.x) picks up the XCA-enabled build.
+2. Verify the latest version picks up the XCA-enabled build.
 3. **Resubmit** → new ECOHELP ticket → review.
 
 ---
@@ -239,4 +275,4 @@ app name) + emails + listing URLs + the in-app "Spec2JIRA Settings" text. The AP
 
 ---
 
-С усмивка ✨ — security премина; остава „XCA + per-user pricing" (rename-free config + малка manifest промяна, не архитектура).
+С усмивка ✨ — XCA + Paid-via-Atlassian = DONE (v5.3.0 resubmitted, awaiting review). Остава само editions Phase 2 (Managed Pro) след одобрение — вж. Forward TODO най-горе.

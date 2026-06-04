@@ -1,4 +1,9 @@
-# Spec2Tickets — Marketplace Vendor-Page Prep (v3.0.0)
+# Spec2Tickets — Marketplace Vendor-Page Prep
+
+> ⚠ **The live Marketplace listing is now configured in the vendor portal
+> (resubmitted as v5.3.0, 2026-06-04, awaiting review).** This doc is the
+> reference / source copy — keep it aligned with the portal. Source of truth for
+> the launch state: `memory/marketplace-launch-state.md` + `memory/monetization-strategy.md`.
 
 > Copy-paste source for the Atlassian Marketplace vendor portal: listing copy,
 > pricing editions, and the security/privacy questionnaire answers. Every
@@ -14,7 +19,7 @@
 |---|---|
 | Marketplace app name | **Spec2Tickets** |
 | Vendor / partner name | **Spec2JIRA** |
-| Listing version (public) | **3.0.0** |
+| Listing version (public) | **v5.3.0** (resubmitted 2026-06-04, awaiting review) |
 | Hosting | **Atlassian Forge (cloud)** — no external backend |
 | Compatible products | **Confluence Cloud** (app UI) + **Jira Cloud** (push target) |
 | App ID | `ari:cloud:ecosystem::app/e804f31f-1cbf-4f09-86c1-11e36f387fe7` |
@@ -113,56 +118,71 @@ full [Privacy Policy](https://spec2jira.com/privacy).
 | Your data, your key | Runs entirely on Atlassian Forge with your own Anthropic API key and agreement. No vendor backend — run your real, confidential specs. |
 | Human review, one-click push | Edit stories, ACs, dependencies, priority, and points in an interactive editor; nothing reaches Jira until you approve. |
 
-### What's new in 3.0.0 (release notes)
+### What's new (release notes)
 
-> **Spec2Tickets 3.0.0 — Forge + BYOK.** A ground-up rebuild on Atlassian Forge with
+> **Spec2Tickets — Forge + BYOK.** A ground-up rebuild on Atlassian Forge with
 > Anthropic Claude. Bring your own Anthropic API key — no self-hosted backend, no GPU,
 > no infrastructure. New: interactive review editor with priority, story points, and
 > labels; automatic cross-feature dependency links pushed to Jira; quality signals and
 > a dependency overview before push; chunked push for large specs.
 
+> *(A managed, no-key edition — "Managed Pro / Advanced", where we run the AI — is
+> planned as a post-launch editions phase; see §3.)*
+
 ---
 
 ## 3. Pricing editions
 
-Two paid editions (Marketplace handles billing). **Pricing model: Paid via Atlassian, per-user** —
-Atlassian requires per-user tiers for cloud apps (no single flat fee); the base rate resolves the
-small-team (1-10 user) price to the floors below. **Evaluation is the standard 30-day Atlassian
-trial** (auto-provided for Paid-via-Atlassian apps) — there is **no in-app free tier**; an unlicensed
-user is admitted only as a trial or paid subscriber.
+**Pricing model: Paid via Atlassian, per-user, USD** (Atlassian cloud is USD-only — no single flat fee;
+the small-team 1-10 band is a flat floor). **Evaluation is the standard 30-day Atlassian trial**
+(auto-provided for Paid-via-Atlassian apps) — there is **no in-app free tier** (it was removed
+2026-06-03); an unlicensed user is admitted only as a trial or paid subscriber.
 
-| Edition | Price | What it includes |
-|---|---|---|
-| **BYOK Pro — "Standard"** | **€4.90 / user / month** (Paid via Atlassian) | **Unlimited** breakdowns. The customer brings their own Anthropic key (the subscription covers the app only — process your real spec under your own Anthropic agreement). Billed per Atlassian's user tiers — **1-10 users = €49/month** (floor; = per-user × 10), declining per-user above 10. |
-| **Managed Pro — "Advanced"** | **€9.90 / user / month** (Paid via Atlassian) | **We run the AI — no key to manage.** Fair-use **10 breakdowns per user / month** (metered per user, not pooled). Everything in BYOK Pro. **1-10 users = €99/month** floor (= per-user × 10), declining above 10. |
+> ⭐ **Two-edition plan, shipped in PHASES** (set in the portal 2026-06-04). The Marketplace platform
+> caps an app at two editions, but editions are a **post-publish** capability: Atlassian only lets you
+> create app editions once the app is **Paid via Atlassian AND live on Marketplace**, so the resubmit
+> ships **BYOK Pro as a SINGLE edition (= Standard)**, and **Managed Pro (= Advanced) is added AFTER
+> approval** as "editions Phase 2". The two-edition framing below is the end state; only BYOK Pro is live now.
+
+| Edition | Price | Status | What it includes |
+|---|---|---|---|
+| **BYOK Pro — "Standard"** | **$6.70 / user / month** ("100% of Confluence price" preset) · **$57 / month for 1-10 users** (flat floor) · declining curve above 100 users · **1.5× multi-instance multiplier** | **LIVE** (in the v5.3.0 resubmit) | **Unlimited** breakdowns. The customer brings their own Anthropic key (the subscription covers the app only — process your real spec under your own Anthropic agreement). |
+| **Managed Pro — "Advanced"** | **TBD ~$10-13 / user / month** (~1.5-2× BYOK) | **Editions Phase 2** — added post-approval, NOT in this resubmit | **We run the AI — no key to manage.** Fair-use **10 breakdowns per user / month** (metered per user, not pooled). Everything in BYOK Pro. |
 
 **Portal notes:**
-- Two editions require `app.licensing.editionsEnabled: true` in the manifest (a single price otherwise).
-  Edition is resolved at runtime via `context.license.capabilitySet` (`capabilityStandard` → BYOK Pro,
-  `capabilityAdvanced` → Managed Pro) — see `src/usage.js` `resolveTier`. There is **no €0 Free edition**
-  (a free edition cannot coexist with paid ones, and the in-app Free tier was removed 2026-06-03).
-- **Managed Pro** fair-use cap = 10/user/month, env-tunable (`MANAGED_USER_CAP`); enforced in `block` mode.
-  A Managed user at the cap is routed to BYOK Pro (unlimited), not "subscribe to a higher tier". The cap
-  resets on the 1st (UTC). BYOK Pro is uncapped (the customer's own key pays compute).
-- **Pricing model (Paid via Atlassian, per-user — base €4.90 BYOK / €9.90 Managed)**,
-  so the **1-10 user tiers resolve to €49 / €99** (floor = per-user × 10).
-  Set **declining** per-user rates at higher tiers (Atlassian "price guidance"); use a **steep
-  taper above ~100 users** because Paid-via-Atlassian licenses the *whole instance* (all users,
-  not just app users). Illustrative BYOK curve: 1-10 €4.90 (=€49) · 11-100 ~€4.00 · 101-250
-  ~€2.80 · 251-1000 ~€1.50 · 1001+ ~€0.80↓ (Managed tracks ~2× above). Premium peer to StoryLoop
-  (~€42 ≤10); deliberately above budget rivals (POPal/Storygenie free ≤10) — compete on value, not
-  price. The earlier "flat €39" is retired (Atlassian forces per-user). Frame **"Early Access"** +
-  grandfather early adopters (see `memory/migration-protections.md`).
-- **Managed Pro compliance gate:** Managed processes content under OUR Anthropic key → it ships WITH the
-  customer DPA + the ≤29-day Batches retention disclosure + sub-processor list (see `docs/compliance/`).
-- Enforcement mode is per-environment: **production = block** (the Managed fair-use cap),
-  development = meter. Set the production env variable before go-live.
+- **BYOK Pro (Standard) — the live single edition.** Price = the **"100% of Confluence price"** preset
+  → **$6.70/user** (1-100 band), **$57 flat for ≤10 users**, the 100% **declining curve KEPT** (e.g.
+  101-250 ~$5.10, 251-1000 ~$3.80), **multi-instance multiplier 1.5×**. ⚠ **KEEP the declining curve —
+  never flatten it:** Paid-via-Atlassian bills the *whole* Confluence instance (ALL users, not just app
+  users), so a flat per-user price prices out every 100+ user instance; the decline only kicks in above
+  100 users (the ≤100 target pays $6.70 either way). The earlier flat-€39 / €4.90 figures are retired.
+- **`editionsEnabled: true`** is kept in the manifest (the publish wizard accepted it alongside the single
+  price). Edition is resolved at runtime via `context.license.capabilitySet` (`capabilityStandard` →
+  BYOK Pro, `capabilityAdvanced` → Managed Pro); `resolveTier` safely **defaults an undefined
+  capabilitySet → BYOK Pro** (`src/usage.js`), so the single-edition launch resolves correctly. There is
+  **no $0 Free edition** (a free edition cannot coexist with paid ones, and the in-app Free tier was removed).
+- **Managed Pro (Advanced) — editions Phase 2 (post-publish).** Price TBD ~$10-13/user (~1.5-2× BYOK).
+  Fair-use cap = 10/user/month, env-tunable (`MANAGED_USER_CAP`), enforced in `block` mode; a Managed user
+  at the cap is routed to BYOK Pro (unlimited), not "subscribe to a higher tier" (resets the 1st, UTC).
+  **Compliance gate:** Managed processes content under OUR Anthropic key → it ships WITH the customer DPA +
+  the ≤29-day Anthropic (Batches) retention disclosure + privacy "Managed" sections + sub-processor list
+  (see `docs/compliance/`) + a separate editions review. BYOK Pro is uncapped (the customer's own key pays compute).
+- Frame **"Early Access"** + grandfather early adopters (see `memory/migration-protections.md`) — chose the
+  higher 100%-of-Confluence price for value-capture + premium signal ("easier to lower / grandfather than raise").
+- Enforcement mode is per-environment: **production = block** (governs the future Managed fair-use cap;
+  BYOK is unlimited), development = meter. Set the production env variable before go-live.
 
 ---
 
 ## 4. Privacy & security — listing fields
 
 These are the data-handling fields in the listing form (mandatory for cloud apps).
+
+> **Scope:** the answers below describe the **BYOK Pro (Standard)** edition shipping in the v5.3.0
+> resubmit — content goes to Anthropic under the **customer's own** key/agreement, and Spec2JIRA stores
+> nothing on its own systems. When **Managed Pro (Advanced)** is added (editions Phase 2), content is
+> processed under **our** Anthropic key → those privacy answers gain the Managed disclosures (Anthropic =
+> sub-processor, ≤29-day Batches retention, SCCs, a customer DPA); see §3 and `docs/compliance/`.
 
 | Question | Answer |
 |---|---|
@@ -248,15 +268,28 @@ These are the data-handling fields in the listing form (mandatory for cloud apps
 
 ## 6. Pre-submission checklist
 
-- [ ] `forge deploy` the latest code (App.js + AdminSettings BG sweep, purgeJob).
-- [ ] `forge install --upgrade` for **both** Confluence and Jira (manifest unchanged →
-      only if needed).
-- [ ] Site live: landing, /docs, /privacy reachable at spec2jira.com (HTTPS).
-- [ ] Set production `ENFORCEMENT_MODE` (block) env variable.
-- [ ] Upload public version **3.0.0**; fill listing copy (§2), highlights, what's-new.
-- [ ] Configure pricing editions (§3): two paid editions, **Paid via Atlassian** — **BYOK Pro "Standard" €4.90/user** (unlimited; 1-10 = €49 floor) + **Managed Pro "Advanced" €9.90/user** (fair-use 10/user/mo; 1-10 = €99 floor), declining taper above 10. **No Free edition** — evaluation is the 30-day Atlassian trial. (Requires `editionsEnabled: true`.)
-- [ ] Fill privacy/security listing fields (§4) + the questionnaire (§5).
-- [ ] Select **Atlassian standard EULA**.
-- [ ] Add screenshots (picker → editor → confirm/dashboard → Jira result) + an icon.
+> Status: the items below were DONE for the **v5.3.0 resubmit (2026-06-04)** — kept as the reusable
+> runbook. ⚠ A **licensed (Paid-via-Atlassian) app installs via Marketplace ONLY** — there is **no
+> `forge install` on production** (`forge deploy -e production` auto-creates the Marketplace version;
+> `forge install --upgrade` / `--license` are **dev-only**). The old "`forge install --upgrade` for both
+> products on prod" step is WRONG for a licensed app.
+
+- [x] `forge deploy -e production` the latest code (auto-creates the Marketplace version).
+- [x] Resolve the Paid-via-Atlassian "more than one parent software" error: **vendor portal → app →
+      [version] details → Compatibility tab → remove Jira** (Confluence = the SOLE billing parent). This
+      was the fix — NOT a manifest change. (Jira stays an optional installed *connection* for the push —
+      `write:jira-work` via `asUser().requestJira`; the push needs the Jira install, gotcha #10 holds.)
+- [ ] Site live: landing, /docs, /privacy reachable at spec2jira.com (HTTPS). ⚠ **Open follow-up:** the
+      `spec2jira.com/docs` pricing still shows stale figures — update it to **$6.70 / 100%-of-Confluence**
+      and drop the dead "Free 3/mo" (the site is a GitHub Pages repo, separate from this one).
+- [x] Set production `ENFORCEMENT_MODE` (block) env variable.
+- [x] Upload the public version (v5.3.0); fill listing copy (§2), highlights, what's-new.
+- [x] Configure pricing (§3): **Paid via Atlassian**, **single edition for the resubmit — BYOK Pro
+      "Standard" = $6.70/user** ("100% of Confluence price"; $57 ≤10 flat; declining curve; 1.5× multi).
+      **No Free edition** — evaluation is the 30-day Atlassian trial. **Managed Pro "Advanced" is editions
+      Phase 2** (post-publish; TBD ~$10-13/user). (`editionsEnabled: true` kept in the manifest.)
+- [x] Fill privacy/security listing fields (§4) + the questionnaire (§5).
+- [x] Select **Atlassian standard EULA**.
+- [x] Add screenshots (picker → editor → confirm/dashboard → Jira result) + an icon.
 - [ ] **[YOUR CALL]** Have a lawyer/you review the privacy policy before go-live.
-- [ ] Submit for review.
+- [x] Submit for review (resubmitted 2026-06-04 → awaiting Atlassian review).

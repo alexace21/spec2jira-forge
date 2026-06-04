@@ -250,18 +250,22 @@ only updates `development`. To ship to production:
 cd "C:\Software Engineer\Success\Spec2Tickets\spec2jira-forge\static\hello-world"
 npm run build                          # fresh bundle (build/ is gitignored)
 cd ..
-forge deploy -e production             # deploy code to the production environment
-forge install --upgrade -e production  # run for Confluence AND Jira (cross-product, gotcha #10)
+forge deploy -e production             # deploy code to production (auto-creates the Marketplace version)
+# ⚠ do NOT `forge install` on prod — see below (licensed app → Marketplace-only)
 ```
 
-- **`install --upgrade` IS needed for prod** even though the manifest was untouched
-  *this* session: the least-privilege **scope reduction** (`4ece939`) landed after
-  the MVP production release, and a scope change requires admin re-consent on install.
-  First run `forge install --list` / check the Developer Console to confirm what is
-  deployed/installed where (so you know whether it's `install` vs `install --upgrade`).
-- **Production `ENFORCEMENT_MODE`** is `block` by default when unset (the freemium
-  funnel is live) — verify; usually no action. To set it explicitly:
-  `forge variables set --environment production ENFORCEMENT_MODE block`.
+- ⚠ **NO `forge install` on production.** This is a **licensed (Paid-via-Atlassian)** app →
+  `forge install` on prod fails `LICENSED_APP_INSTALL_NOT_PERMITTED` (and `--license` is
+  dev-only). Production distribution is **Marketplace ONLY** — customers subscribe/install via
+  the listing. Prod rollout = `forge deploy -e production` (which AUTO-creates the Marketplace
+  version — no manual portal "Create version") → then resubmit/publish via the portal. *(The
+  obsolete pre-licensing v3/v4 step `forge install --upgrade -e production` is RETIRED since the
+  v5 licensing migration — following it now throws `LICENSED_APP_INSTALL_NOT_PERMITTED`.)*
+- **Production `ENFORCEMENT_MODE`** is `block` by default when unset — it governs ONLY the
+  **Managed Pro** per-user fair-use cap (BYOK is unlimited; unlicensed is blocked natively by
+  Atlassian — there is NO in-app Free tier). Usually no action. Set explicitly:
+  `forge variables set --environment production ENFORCEMENT_MODE block`. Also set
+  `MANAGED_ANTHROPIC_KEY` on prod (for the Managed/Advanced edition — wired at editions Phase 2).
 - The **Marketplace listing** distributes the production version to NEW customers
   (they install via the listing, not `forge install`); paste from
   `docs/MARKETPLACE-LISTING-v3.md`. Set the real `PRO_UPGRADE_URL` once the listing is live.
