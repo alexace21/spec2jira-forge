@@ -259,7 +259,7 @@ export default function FeatureCard({ feature, index, onUpdate, onDelete }) {
             <div className="space-y-1.5 pb-1">
               <span className="text-[11px] font-medium uppercase tracking-wider"
                 style={{ color: 'var(--s2j-text-muted)' }}>
-                AI flagged ({feature.concerns.length})
+                AI-flagged concerns ({feature.concerns.length})
               </span>
               {feature.concerns.map((raw, i) => {
                 const { type, severity, text } = parseConcernPrefix(raw);

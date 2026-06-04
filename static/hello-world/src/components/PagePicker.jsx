@@ -179,7 +179,7 @@ function PagePickerScreen({ onSelect, onOpenSettings }) {
         )}
       </div>
       <p className="text-sm mb-6" style={{ color: "var(--s2j-text-light)" }}>
-        Pick a Confluence page to generate a JIRA breakdown.
+        Pick a Confluence page to generate a Jira breakdown.
       </p>
 
       {/* ── Search input ──────────────────────────────────────── */}
@@ -428,7 +428,7 @@ function PageRow({ page, onPick }) {
             outline: "none",
             minWidth: 0,
           }}
-          title="Open page (run generation OR resume)"
+          title="Open this page to create or resume a breakdown"
         >
           <div className="font-medium leading-tight">{page.title}</div>
           {page.spaceName && (

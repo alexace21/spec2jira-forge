@@ -131,13 +131,13 @@ export default function AdminSettings() {
 
     const cleanProjectKey = (defaultProjectKey || "").trim().toUpperCase();
     if (!cleanProjectKey) {
-      setMessage({ type: "error", text: "JIRA Project Key is required" });
+      setMessage({ type: "error", text: "Jira Project Key is required" });
       return;
     }
     if (!/^[A-Z][A-Z0-9]{1,9}$/.test(cleanProjectKey)) {
       setMessage({
         type: "error",
-        text: "JIRA Project Key must be 2–10 characters, start with a letter, only uppercase letters + digits (e.g., PROJ, SCRUM2).",
+        text: "Jira Project Key must be 2–10 characters, start with a letter, only uppercase letters + digits (e.g., PROJ, SCRUM2).",
       });
       return;
     }
@@ -318,7 +318,7 @@ export default function AdminSettings() {
         Spec2Tickets Settings
       </h1>
       <p className="text-sm mb-5" style={{ color: "var(--s2j-text-muted)" }}>
-        Configure Spec2Tickets to generate JIRA breakdowns from your Confluence pages using Claude AI.
+        Configure Spec2Tickets to generate Jira breakdowns from your Confluence pages using Claude AI.
       </p>
 
       {/* Account / Plan — read-only status for the customer's admin */}
@@ -360,7 +360,7 @@ export default function AdminSettings() {
               <span className="font-medium" style={{ color: "var(--s2j-text)" }}>
                 {account.unlimited
                   ? "Unlimited"
-                  : `${account.used ?? 0} (fair-use)`}
+                  : `${account.used ?? 0}`}
               </span>
             </div>
             {!account.unlimited && account.resetsAtLabel && (
@@ -384,8 +384,8 @@ export default function AdminSettings() {
               the unlimited option. BYOK Pro (unlimited): nothing to add. */}
           {account.tier === "managedPro" && (
             <p className="text-xs mt-3" style={{ color: "var(--s2j-text-muted)" }}>
-              Managed Pro runs Claude for you (no API key needed). The monthly limit is
-              a fair-use allowance{account.resetsAtLabel ? ` and resets on ${account.resetsAtLabel}` : ""}.{" "}
+              Managed Pro runs Claude for you (no API key needed). Your plan includes a monthly
+              breakdown allowance{account.resetsAtLabel ? ` that resets on ${account.resetsAtLabel}` : ""}.{" "}
               {accountPriceFor(account, "byokPro")
                 ? `For unlimited breakdowns, switch to BYOK Pro (${accountPriceFor(account, "byokPro")}) and use your own Anthropic key.`
                 : "For unlimited breakdowns, switch to BYOK Pro and use your own Anthropic key."}
@@ -410,11 +410,11 @@ export default function AdminSettings() {
             <strong>Managed Pro — we run Claude for you.</strong> Your{" "}
             {accountPriceFor(account, "managedPro") || "Managed Pro"} subscription
             runs every breakdown on our Anthropic key, so there is{" "}
-            <strong>no API key to configure</strong>. Just set your default JIRA
+            <strong>no API key to configure</strong>. Just set your default Jira
             project below and you're ready to generate.
           </p>
           <p>
-            Your monthly allowance is a fair-use limit. Want unlimited breakdowns and
+            Your plan includes a generous monthly breakdown allowance. Want unlimited breakdowns and
             to use your own Anthropic agreement? Switch to BYOK Pro
             {accountPriceFor(account, "byokPro")
               ? ` (${accountPriceFor(account, "byokPro")})`
@@ -511,7 +511,7 @@ export default function AdminSettings() {
             description={
               apiKeyConfigured
                 ? `API key configured${apiKeyLastSetAt ? ` (last set ${new Date(apiKeyLastSetAt).toLocaleDateString()})` : ""}. Paste a new value to replace, or leave blank to keep current.`
-                : "Paste your Anthropic API key (sk-ant-...). Stored encrypted in Forge KVS, never visible to the UI after save."
+                : "Paste your Anthropic API key (sk-ant-...). Stored encrypted in Atlassian Forge storage, never visible to the UI after save."
             }
             required={!apiKeyConfigured}
           >
@@ -560,8 +560,8 @@ export default function AdminSettings() {
         )}
 
         <Field
-          label="Default JIRA Project Key"
-          description="2–10 uppercase letters/digits, starting with a letter. Used as the default destination when pushing breakdowns to JIRA."
+          label="Default Jira Project Key"
+          description="2–10 uppercase letters/digits, starting with a letter. Used as the default destination when pushing breakdowns to Jira."
           required
         >
           <input
@@ -610,7 +610,7 @@ export default function AdminSettings() {
             <div className="mt-3">
               <Field
                 label="Required custom fields"
-                description="OPTIONAL — only needed if your JIRA project requires custom fields on issue creation (e.g., a mandatory 'Team', 'Story Points', or 'Sprint' field). Without them, push fails with 'field is required'. Enter a JSON object mapping each field's ID to its value. Leave blank if your project doesn't require any."
+                description="OPTIONAL — only needed if your Jira project requires custom fields on issue creation (e.g., a mandatory 'Team', 'Story Points', or 'Sprint' field). Without them, push fails with 'field is required'. Enter a JSON object mapping each field's ID to its value. Leave blank if your project doesn't require any."
               >
                 <textarea
                   value={requiredCustomFieldsJson}
@@ -638,7 +638,7 @@ export default function AdminSettings() {
                 }}
               >
                 <p className="mb-1">
-                  <strong>How to find a field ID:</strong> in JIRA go to Settings → Issues → Custom fields, click the field → the URL contains <code>customfield_XXXXX</code>. The <em>value shape</em> depends on the field type:
+                  <strong>How to find a field ID:</strong> in Jira go to Settings → Issues → Custom fields, click the field → the URL contains <code>customfield_XXXXX</code>. The <em>value shape</em> depends on the field type:
                 </p>
                 <ul style={{ marginLeft: "16px", listStyle: "disc" }}>
                   <li>Select/dropdown → <code>{'{ "value": "Option name" }'}</code></li>
@@ -756,7 +756,7 @@ function ContextProfilesEditor({ profiles, setProfiles, apiKeyConfigured, onMess
         result = await invoke("distillStep", { sessionId, step });
       } catch (e) {
         setDistillFailure({ id, sessionId, step, total });
-        onMessage({ type: "error", text: e?.message || "Distill step failed" });
+        onMessage({ type: "error", text: e?.message || "Summarize step failed" });
         return;
       }
       if (result?.error) {
@@ -769,7 +769,7 @@ function ContextProfilesEditor({ profiles, setProfiles, apiKeyConfigured, onMess
             ? result.detail || ERROR_MESSAGES.MANAGED_UNAVAILABLE
             : ERROR_MESSAGES[result.code] ||
               result.detail ||
-              `Couldn't distill ${label}.`;
+              `Couldn't summarize ${label}.`;
         setDistillFailure({ id, sessionId, step, total });
         onMessage({
           type: "error",
@@ -784,7 +784,7 @@ function ContextProfilesEditor({ profiles, setProfiles, apiKeyConfigured, onMess
         const len = (result.profile || "").length;
         onMessage({
           type: "success",
-          text: `Distilled across ${total} passes to ${len.toLocaleString()} characters${result.overflowTrimmed ? " (the profile ran long and its end was trimmed to fit the size limit — review the earlier sections and trim any single-page detail, then expand the end if needed)" : result.truncated ? " (kept intentionally concise — open the editor to expand if you want more detail)" : ""}. Review and delete any line true of only ONE page (specific timings, limits, counts, or scope) — this profile is reused for ALL your pages — then click Save Settings.`,
+          text: `Condensed to ${len.toLocaleString()} characters${result.overflowTrimmed ? " (the draft ran long and its end was trimmed to fit the size limit — review the earlier sections and trim any single-page detail, then expand the end if needed)" : result.truncated ? " (kept intentionally concise — open the editor to expand if you want more detail)" : ""}. Review the draft and remove anything specific to a single page (exact timings, limits, counts), then click Save Settings — this context is reused for all your pages.`,
         });
       } else {
         setDistillProgress({
@@ -802,7 +802,7 @@ function ContextProfilesEditor({ profiles, setProfiles, apiKeyConfigured, onMess
     if (!apiKeyConfigured) {
       onMessage({
         type: "error",
-        text: "Save your Anthropic API key first — then Claude can help shape your project context.",
+        text: "Add your project context text first, then Claude can condense it.",
       });
       return;
     }
@@ -814,7 +814,7 @@ function ContextProfilesEditor({ profiles, setProfiles, apiKeyConfigured, onMess
       try {
         start = await invoke("startDistillSession", { text: t });
       } catch (e) {
-        onMessage({ type: "error", text: e?.message || "Distill failed" });
+        onMessage({ type: "error", text: e?.message || "Summarize failed" });
         return;
       }
       if (start?.error || !start?.sessionId) {
@@ -825,7 +825,7 @@ function ContextProfilesEditor({ profiles, setProfiles, apiKeyConfigured, onMess
               ? start.detail || ERROR_MESSAGES.MANAGED_UNAVAILABLE
               : ERROR_MESSAGES[start?.code] ||
                 start?.detail ||
-                "Couldn't start the distill. Try again.",
+                "Couldn't start summarizing. Try again.",
         });
         return;
       }
@@ -859,14 +859,14 @@ function ContextProfilesEditor({ profiles, setProfiles, apiKeyConfigured, onMess
   // Distill button label — shows live "{Category} (k/6)" progress while the 6-step
   // pipeline runs (shared by the inline card + the focus-mode modal so they stay in sync).
   const renderDistillLabel = (busy) => {
-    if (!busy) return "✨ Distill with Claude";
+    if (!busy) return "✨ Summarize with Claude";
     const p = distillProgress;
     const text =
       p && p.label
-        ? `Distilling… ${p.label} (${p.current}/${p.total})`
+        ? `Summarizing… ${p.label} (${p.current}/${p.total})`
         : p
-          ? `Distilling… (${p.current}/${p.total})`
-          : "Distilling…";
+          ? `Summarizing… (${p.current}/${p.total})`
+          : "Summarizing…";
     return (
       <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
         <Spinner /> {text}
@@ -880,17 +880,17 @@ function ContextProfilesEditor({ profiles, setProfiles, apiKeyConfigured, onMess
         className="text-sm font-medium block mb-1"
         style={{ color: "var(--s2j-text)" }}
       >
-        Project Context profiles (optional)
+        Project context (optional)
       </label>
       <p className="text-xs mb-3" style={{ color: "var(--s2j-text-muted)" }}>
         Standing background that helps Claude understand a project's pages the way your
         team does — domain, glossary, personas, systems, tech, naming conventions. You
-        pick which profile applies each time you generate, so pages from different
-        projects get the right context. It enriches terminology and interpretation — it
+        pick which context applies each time you generate, so pages from different
+        projects get the right background. It enriches terminology and interpretation — it
         never changes what gets built or rewrites your page's acceptance criteria.
-        Because one profile is reused across ALL of a project's pages, keep only durable
+        Because one context is reused across ALL of a project's pages, keep only durable
         facts — leave out anything true of a single page (specific timings, limits,
-        counts, or scope). A concise brief distills more cleanly than a full document.
+        counts, or scope). A concise brief condenses more cleanly than a full document.
       </p>
 
       {profiles.length === 0 && (
@@ -902,7 +902,7 @@ function ContextProfilesEditor({ profiles, setProfiles, apiKeyConfigured, onMess
             color: "var(--s2j-text-muted)",
           }}
         >
-          No profiles yet. Add one per project to tailor breakdowns to its domain,
+          No project context yet. Add one per project to tailor breakdowns to its domain,
           glossary, and conventions.
         </p>
       )}
@@ -923,7 +923,7 @@ function ContextProfilesEditor({ profiles, setProfiles, apiKeyConfigured, onMess
                   type="text"
                   value={p.name}
                   onChange={(e) => update(p.id, { name: e.target.value })}
-                  placeholder="Profile name (e.g. Logistics Platform)"
+                  placeholder="Context name (e.g. Logistics Platform)"
                   maxLength={CONTEXT_PROFILE_NAME_MAX}
                   disabled={busy}
                   style={{ ...inputStyle, fontWeight: 600 }}
@@ -939,7 +939,7 @@ function ContextProfilesEditor({ profiles, setProfiles, apiKeyConfigured, onMess
                     cursor: "pointer",
                     padding: "4px 6px",
                   }}
-                  title="Remove this profile"
+                  title="Remove this context"
                 >
                   Remove
                 </button>
@@ -972,7 +972,7 @@ function ContextProfilesEditor({ profiles, setProfiles, apiKeyConfigured, onMess
                     }}
                     title={
                       !apiKeyConfigured
-                        ? "Save your Anthropic API key first, then Claude can shape this for you"
+                        ? "Add your project context text first, then Claude can condense it"
                         : "Let Claude condense and structure this into a concise project context"
                     }
                   >
@@ -991,7 +991,7 @@ function ContextProfilesEditor({ profiles, setProfiles, apiKeyConfigured, onMess
                         padding: 0,
                         fontWeight: 500,
                       }}
-                      title="Resume the distill from the step that failed"
+                      title="Resume summarizing from the step that failed"
                     >
                       Retry from step {distillFailure.step + 1}
                     </button>
@@ -1024,7 +1024,7 @@ function ContextProfilesEditor({ profiles, setProfiles, apiKeyConfigured, onMess
               {over && (
                 <p className="text-xs mt-2" style={{ color: "var(--s2j-text-muted)" }}>
                   Over the {PROJECT_CONTEXT_MAX_CHARS.toLocaleString()}-character limit —
-                  pasted a whole page? Click <strong>Distill with Claude</strong> to
+                  pasted a whole page? Click <strong>Summarize with Claude</strong> to
                   condense it (you can edit the result before saving).
                 </p>
               )}
@@ -1166,7 +1166,7 @@ function ContextProfilesEditor({ profiles, setProfiles, apiKeyConfigured, onMess
                           padding: 0,
                           fontWeight: 500,
                         }}
-                        title="Resume the distill from the step that failed"
+                        title="Resume summarizing from the step that failed"
                       >
                         Retry from step {distillFailure.step + 1}
                       </button>

@@ -30,7 +30,7 @@ export default function BreakdownEditor({ initialBreakdown, onPush, isPushing = 
   function deleteCapability(i) { if (breakdown.capabilities.length <= 1) return; setBreakdown((p) => ({ ...p, capabilities: p.capabilities.filter((_, idx) => idx !== i) })); }
   function addCapability() {
     setBreakdown((p) => ({ ...p, capabilities: [...p.capabilities, {
-      name: 'New Capability', features: [{ name: 'New Feature', user_story: 'As a user, I want [goal], so that [benefit].',
+      name: 'New Category', features: [{ name: 'New Feature', user_story: 'As a user, I want [goal], so that [benefit].',
         acceptance_criteria: ['Acceptance criterion'], priority: 'Medium', story_points: 3, complexity_score: 3,
         tasks: [{ type: 'API', summary: 'New task' }] }]
     }] }));
@@ -111,12 +111,12 @@ export default function BreakdownEditor({ initialBreakdown, onPush, isPushing = 
       }}>
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-4 text-xs">
-            <StatChip label="Epics"  value={stats.capCount}     color="var(--s2j-blue)" />
+            <StatChip label="Categories"  value={stats.capCount}     color="var(--s2j-blue)" />
             <StatChip label="Stories" value={stats.featureCount} color="var(--s2j-green)" />
             <StatChip label="Tasks"  value={stats.taskCount}    color="var(--s2j-orange)" />
             <StatChip label="Total SP" value={stats.totalSP}    color="var(--s2j-text)" highlight />
             <span className="text-[11px]" style={{ color: 'var(--s2j-text-muted)' }}>
-              {stats.totalItems} JIRA items
+              {stats.totalItems} Jira items
             </span>
           </div>
           <button onClick={resetBreakdown}
@@ -218,10 +218,10 @@ export default function BreakdownEditor({ initialBreakdown, onPush, isPushing = 
             {isPushing ? (
               <>
                 <SpinnerInline />
-                Validating...
+                Creating in Jira...
               </>
             ) : (
-              'Push to JIRA →'
+              'Push to Jira →'
             )}
           </button>
         </div>

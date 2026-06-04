@@ -10,7 +10,7 @@ import { useState } from 'react';
  *
  * @param {{ labels?: string[], onChange: (labels: string[]) => void, placeholder?: string }} props
  */
-export default function LabelsEditor({ labels = [], onChange, placeholder = 'add label…' }) {
+export default function LabelsEditor({ labels = [], onChange, placeholder = 'Add a label…' }) {
   const [draft, setDraft] = useState('');
 
   function normalize(raw) {

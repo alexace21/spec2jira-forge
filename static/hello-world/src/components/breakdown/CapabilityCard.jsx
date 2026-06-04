@@ -100,7 +100,7 @@ export default function CapabilityCard({ capability, index, onUpdate, onDelete }
           style={{ color: 'var(--s2j-text-muted)' }}
           onMouseEnter={e => { e.target.style.background = 'var(--s2j-red-bg)'; e.target.style.color = 'var(--s2j-red)'; }}
           onMouseLeave={e => { e.target.style.background = 'transparent'; e.target.style.color = 'var(--s2j-text-muted)'; }}
-          title="Delete capability"
+          title="Delete category"
           role="button"
         >
           <svg className="h-3.5 w-3.5" viewBox="0 0 20 20" fill="currentColor">

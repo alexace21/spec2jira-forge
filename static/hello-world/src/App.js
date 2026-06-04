@@ -166,6 +166,86 @@ function _classifyBackendError(errorShape, contextLabel = "") {
     };
   }
 
+  // The classes below humanize specific backend error CODES so the user never sees
+  // a raw HTTP body or an opaque token. They must come BEFORE Class 7 (the generic
+  // pass-through, which would otherwise append the raw `detail` verbatim).
+
+  // Confluence permission / scope error — the app couldn't read the page or search
+  // because of authorization (403 / missing scope / search/parse failure). Actionable:
+  // re-authorize the app. Checked before the numeric confluence_<status> class below.
+  if (
+    /confluence_403/i.test(errorStr) ||
+    /scope/i.test(errorStr + detail) ||
+    /forbidden/i.test(errorStr + detail) ||
+    /search[ _]failed/i.test(errorStr) ||
+    /parse[ _]failed/i.test(errorStr)
+  ) {
+    return {
+      message:
+        "Couldn't search Confluence (permission error) — ask your Confluence admin to re-authorize Spec2Tickets, or contact support@spec2jira.com.",
+      routeToSetup: false,
+    };
+  }
+
+  // Confluence returned some other error reading the page (e.g. confluence_404,
+  // confluence_500). Friendly summary — never the raw Confluence body.
+  if (/confluence_\d+/i.test(errorStr)) {
+    return {
+      message:
+        "Couldn't read this Confluence page (Confluence returned an error). Try reopening the page; if it persists, contact support@spec2jira.com.",
+      routeToSetup: false,
+    };
+  }
+
+  // Jira returned an error while creating issues (jira_<status>). Point at project
+  // settings — never the raw Jira body.
+  if (/jira_\d+/i.test(errorStr)) {
+    return {
+      message:
+        "Jira returned an error while creating issues. Check your project settings, or contact support@spec2jira.com.",
+      routeToSetup: false,
+    };
+  }
+
+  // Anthropic 4xx (e.g. 400 / 413) — NOT the 5xx already handled in Class 2. Usually
+  // the page is too large or malformed for the request. Suggest a smaller/cleaner page.
+  if (/anthropic_4\d\d/i.test(errorStr)) {
+    return {
+      message:
+        "The page couldn't be processed (it may be too large or malformed). Try a smaller/cleaner page.",
+      routeToSetup: false,
+    };
+  }
+
+  // Couldn't retrieve the generated result (results_fetch_<status>, non-5xx — the 5xx
+  // case is folded into Class 2 above). Transient — just retry.
+  if (/results_fetch_\d+/i.test(errorStr)) {
+    return {
+      message:
+        "Couldn't retrieve the result of your breakdown. Please try again in a moment.",
+      routeToSetup: false,
+    };
+  }
+
+  // The page is too short to generate a meaningful breakdown.
+  if (/page_too_small/i.test(errorStr)) {
+    return {
+      message:
+        "This page is too short to generate a breakdown — add more detail to the page, then try again.",
+      routeToSetup: false,
+    };
+  }
+
+  // Anthropic declined to process the page (a refusal). Ask the user to review the
+  // page content rather than showing the raw refusal text.
+  if (/refused/i.test(errorStr)) {
+    return {
+      message:
+        "Anthropic declined to process this page. Review the page content and try again.",
+      routeToSetup: false,
+    };
+  }
+
   // Class 7: generic — pass through with optional context label
   const errorPart = errorStr || "Unknown error";
   const detailPart = detail ? `: ${detail}` : "";
@@ -773,7 +853,7 @@ function App() {
       // BYOK) — show it directly rather than the generic classifier wrapping.
       setError(
         result.detail ||
-          "The Managed service is temporarily unavailable. Please contact support, or switch to BYOK in Settings and use your own Anthropic API key.",
+          "The Managed service is temporarily unavailable. Please contact support, or switch to your own Anthropic API key in Settings.",
       );
       setScreen("error");
       return;
@@ -858,7 +938,7 @@ function App() {
     setScreen("pushing");
 
     const fail = (res, fallback) => {
-      const friendly = _classifyBackendError(res, "Push to JIRA failed");
+      const friendly = _classifyBackendError(res, "Push to Jira failed");
       // Only append the raw detail as a parenthetical when it adds NEW information.
       // For generic (Class 7) errors _classifyBackendError already folds res.detail
       // into friendly.message (": <detail>"), so re-appending it here doubled the
@@ -914,7 +994,7 @@ function App() {
       }
 
       setError(
-        "Push took an unexpectedly large number of steps. Check JIRA for created items; contact support@spec2jira.com if items are missing.",
+        "Push took an unexpectedly large number of steps. Check Jira for created items; contact support@spec2jira.com if items are missing.",
       );
       setScreen("error");
       setIsPushing(false);
@@ -1409,13 +1489,13 @@ function ReadyScreen({
               <strong style={{ color: "var(--s2j-text)" }}>
                 {usage.tierLabel} plan
               </strong>{" "}
-              · {usage.used} breakdowns this month (fair-use allowance) · resets{" "}
+              · {usage.used} breakdowns this month · resets{" "}
               {usage.resetsAtLabel}
               {usage.remaining === 0 && byokProPrice && (
                 <span style={{ color: "var(--s2j-text)" }}>
                   {" "}
-                  · for unlimited, switch to BYOK Pro ({byokProPrice}) with your own
-                  key
+                  · for unlimited, switch to BYOK Pro — bring your own Anthropic key
+                  ({byokProPrice})
                 </span>
               )}
             </span>
@@ -1441,7 +1521,7 @@ function ReadyScreen({
         }}
       >
         <strong>Ready to generate.</strong> Claude Sonnet 4.6 will analyze
-        this Confluence page and produce a structured JIRA breakdown —
+        this Confluence page and produce a structured Jira breakdown —
         Stories, Subtasks, cross-feature dependencies, and quality signals.
         Typical runtime: a few minutes, depending on the size of your page.
       </div>
@@ -1470,7 +1550,7 @@ function ReadyScreen({
               outline: "none",
             }}
           >
-            <option value="none">None — use the page on its own</option>
+            <option value="none">None — no project context</option>
             {contextProfiles.map((p) => (
               <option key={p.id} value={p.id}>
                 {p.name}
@@ -1557,7 +1637,7 @@ function GeneratingScreen({ pageTitle, elapsed, onBack, onStartOver }) {
           className="text-xs mt-2.5"
           style={{ color: "var(--s2j-text-muted)", maxWidth: "26rem" }}
         >
-          Building a structured JIRA breakdown — Stories, Subtasks, cross-feature
+          Building a structured Jira breakdown — Stories, Subtasks, cross-feature
           dependencies, and quality signals. This usually takes a few minutes; large
           pages and busy periods take longer.
         </p>
@@ -1628,7 +1708,7 @@ function GeneratingScreen({ pageTitle, elapsed, onBack, onStartOver }) {
           }}
           title="Abandon this run and start over from the current page (e.g. you edited the page after starting this generation)"
         >
-          Started this before your latest edits? Start over
+          Edited the page after starting? Start over
         </button>
       )}
     </div>
@@ -1691,7 +1771,7 @@ function ConfirmScreen({
         className="text-lg font-semibold mb-2"
         style={{ color: "var(--s2j-text)" }}
       >
-        Review and Push to JIRA
+        Review and Push to Jira
       </h2>
       {signals.specSummary && (
         <p
@@ -2041,7 +2121,7 @@ function ConfirmScreen({
         }}
       >
         <p className="text-xs" style={{ color: "var(--s2j-text)" }}>
-          This will create real JIRA issues. The action cannot be undone from within Spec2Tickets.
+          This will create real Jira issues. The action cannot be undone from within Spec2Tickets.
         </p>
       </div>
 
@@ -2060,7 +2140,7 @@ function ConfirmScreen({
               <span>Creating {total} items...</span>
             </>
           ) : (
-            `Create ${total} Items in JIRA`
+            `Create ${total} Items in Jira`
           )}
         </button>
       </div>
@@ -2130,7 +2210,7 @@ function DependencyStructure({ edges, onRemove, onRestore }) {
             <span>Cross-feature dependencies ({edges.length})</span>
           </h3>
           <p className="text-xs mb-3" style={{ color: "var(--s2j-text-muted)" }}>
-            Each becomes a Story-blocks-Story link in JIRA — the feature it depends on
+            Each becomes a Story-blocks-Story link in Jira — the feature it depends on
             must be completed first. Remove any that don't belong before pushing.
           </p>
         </>
@@ -2187,7 +2267,7 @@ function DependencyStructure({ edges, onRemove, onRestore }) {
                         <button
                           type="button"
                           onClick={() => handleRemove(source, t)}
-                          title={`Remove this dependency — "${source}" will no longer be blocked by "${t}" in JIRA`}
+                          title={`Remove this dependency — "${source}" will no longer be blocked by "${t}" in Jira`}
                           aria-label={`Remove dependency: ${source} depends on ${t}`}
                           style={{
                             background: "transparent",
@@ -2224,7 +2304,7 @@ function DependencyStructure({ edges, onRemove, onRestore }) {
             className="text-[11px] font-medium uppercase tracking-wider mb-2"
             style={{ color: "var(--s2j-text-muted)" }}
           >
-            Removed — won't be pushed to JIRA ({removed.length})
+            Removed — won't be pushed to Jira ({removed.length})
           </p>
           <ul
             className="space-y-1"
@@ -2347,9 +2427,9 @@ function PushingScreen({ progress, phase }) {
   const pct = Math.round((progress || 0) * 100);
   const phaseLabel =
     phase === "stories"
-      ? "Creating stories..."
+      ? "Creating Stories..."
       : phase === "subtasks"
-        ? "Creating subtasks..."
+        ? "Creating Subtasks..."
         : phase === "links"
           ? "Linking dependencies..."
           : phase === "starting"
@@ -2360,7 +2440,7 @@ function PushingScreen({ progress, phase }) {
       <div className="flex items-center gap-2 mb-3">
         <Spinner size={18} />
         <h2 className="text-lg font-semibold" style={{ color: "var(--s2j-text)" }}>
-          Creating issues in JIRA
+          Creating issues in Jira
         </h2>
       </div>
       <p className="text-sm mb-4" style={{ color: "var(--s2j-text-muted)" }}>
@@ -2427,7 +2507,7 @@ function PushedScreen({ result, onBack, onNew }) {
             className="text-lg font-semibold"
             style={{ color: "var(--s2j-text)" }}
           >
-            Pushed to JIRA
+            Pushed to Jira
           </h2>
         </div>
         <p className="text-sm mb-1" style={{ color: "var(--s2j-text)" }}>
@@ -2457,7 +2537,7 @@ function PushedScreen({ result, onBack, onNew }) {
             className="text-xs font-medium mb-2"
             style={{ color: "var(--s2j-text-light)" }}
           >
-            Open in JIRA
+            Open in Jira
           </p>
           {result?.epic_key && (
             <button
@@ -2520,7 +2600,7 @@ function PushedScreen({ result, onBack, onNew }) {
             Tasks added as checklists ({result.tasks_embedded})
           </p>
           <p style={{ color: "var(--s2j-text-muted)" }}>
-            This JIRA project has no Subtask issue type, so the task breakdown
+            This Jira project has no Subtask issue type, so the task breakdown
             was embedded into each Story description as a checklist. To create
             them as separate Subtask issues, enable the Subtask type in project
             settings — or contact{" "}
@@ -2682,12 +2762,14 @@ function LimitReachedScreen({ quota, onBack }) {
   // mode-specific sentence if it is ever absent.
   const heading = isLicenseRequired
     ? "Subscription required"
-    : "You've reached this month's fair-use limit";
+    : "You've used this month's breakdowns";
   const fallbackBody = isLicenseRequired
     ? "An active subscription is required to use Spec2Tickets. Manage your subscription from your Atlassian site admin."
     : limit
-      ? `You've used all ${limit} breakdowns in this month's fair-use allowance.`
-      : "You've used this month's fair-use allowance.";
+      ? `You've used all ${limit} breakdowns included this month${
+          resetsAt ? ` — they reset on ${resetsAt}.` : "."
+        }`
+      : "You've used this month's breakdowns.";
 
   const openUpgrade = () => {
     if (!UPGRADE_URL) return;
@@ -2722,7 +2804,7 @@ function LimitReachedScreen({ quota, onBack }) {
             monthly reset (it's an account/subscription state, not a quota). */}
         {isFairUse && !quota?.detail && resetsAt && (
           <p className="text-sm mt-1" style={{ color: "var(--s2j-text-light)" }}>
-            Your fair-use allowance resets on <strong>{resetsAt}</strong>.
+            Your monthly breakdowns reset on <strong>{resetsAt}</strong>.
           </p>
         )}
       </div>
@@ -2798,7 +2880,7 @@ function ErrorScreen({ error, onRetry, onBackToPicker }) {
   const rawError = typeof error === "string" ? error : JSON.stringify(error);
   const hasHtml = /<html|<!doctype/i.test(rawError);
   const displayError = hasHtml
-    ? "Backend returned an unexpected response. The service may be unreachable or misconfigured. Verify Settings → Manage Apps → Spec2Tickets → Configure."
+    ? "Spec2Tickets received an unexpected response. The service may be temporarily unreachable — please try again, or open Settings (top-right) to check your configuration."
     : rawError;
   return (
     <div className="p-6" style={SCREEN_MAX_WIDTH_STYLE}>
@@ -2911,7 +2993,7 @@ function SetupScreen({ message, isManaged = false, onOpenSettings }) {
         {isManaged ? (
           <p className="text-sm mb-3" style={{ color: "var(--s2j-text)" }}>
             <strong>You will need:</strong>
-            <br />• A JIRA project key where the breakdown will be created
+            <br />• A Jira project key where the breakdown will be created
             <br />
             <span style={{ color: "var(--s2j-text-light)" }}>
               No Anthropic API key needed — Managed Pro runs Claude with our key.
@@ -2931,7 +3013,7 @@ function SetupScreen({ message, isManaged = false, onOpenSettings }) {
               console.anthropic.com → API Keys
             </a>
             ; billed pay-as-you-go to your own Anthropic account)
-            <br />• A JIRA project key where the breakdown will be created
+            <br />• A Jira project key where the breakdown will be created
           </p>
         )}
 
@@ -2970,8 +3052,8 @@ function SetupScreen({ message, isManaged = false, onOpenSettings }) {
           <p>
             4.{" "}
             {isManaged
-              ? "Set your JIRA Project Key, then Save"
-              : "Paste your Anthropic API key + JIRA Project Key, then Test & Save"}
+              ? "Set your Jira Project Key, then Save"
+              : "Paste your Anthropic API key + Jira Project Key, then Test & Save"}
           </p>
           <p style={{ marginTop: "6px", fontStyle: "italic" }}>
             {isManaged
