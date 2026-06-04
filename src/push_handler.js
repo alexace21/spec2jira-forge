@@ -145,7 +145,7 @@ function richADF({ userStory, description, acceptanceCriteria, sourceHeading, em
         {
           type: 'text',
           text:
-            'Note: this JIRA project has no Subtask issue type, so the task breakdown е listed above as a checklist. To create these as separate Subtask issues, enable the Subtask type in project settings — or contact support@spec2jira.com for help.',
+            'Note: this JIRA project has no Subtask issue type, so the task breakdown is listed above as a checklist. To create these as separate Subtask issues, enable the Subtask type in project settings — or contact support@spec2jira.com for help.',
           marks: [{ type: 'em' }],
         },
       ],
@@ -236,14 +236,14 @@ async function lookupProject(projectKey) {
     return {
       ok: false,
       error: 'project_not_found',
-      detail: `JIRA project "${projectKey}" does not exist OR you don't have access. Verify the project key в Settings.`,
+      detail: `JIRA project "${projectKey}" does not exist OR you don't have access. Verify the project key in Settings.`,
     };
   }
   if (response.status === 403) {
     return {
       ok: false,
       error: 'permission_denied',
-      detail: `You lack permission к view project "${projectKey}". Ask your JIRA admin за project access.`,
+      detail: `You lack permission to view project "${projectKey}". Ask your JIRA admin for project access.`,
     };
   }
   if (!response.ok) {

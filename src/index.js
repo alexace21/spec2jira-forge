@@ -302,7 +302,7 @@ function parseRequiredCustomFields(raw) {
     return { ok: false, error: 'Custom fields must be valid JSON (e.g. {"customfield_10042": {"value": "Team A"}}).' };
   }
   if (typeof parsed !== 'object' || Array.isArray(parsed) || parsed === null) {
-    return { ok: false, error: 'Custom fields must be а JSON object mapping field IDs к values.' };
+    return { ok: false, error: 'Custom fields must be a JSON object mapping field IDs to values.' };
   }
   return { ok: true, value: parsed };
 }
@@ -322,12 +322,12 @@ resolver.define('saveSettings', async ({ payload }) => {
   // Validate project key
   const cleanProjectKey = (defaultProjectKey || '').trim().toUpperCase();
   if (!cleanProjectKey) {
-    return { error: 'JIRA Project Key е required' };
+    return { error: 'JIRA Project Key is required' };
   }
   if (!/^[A-Z][A-Z0-9]{1,9}$/.test(cleanProjectKey)) {
     return {
       error:
-        'JIRA Project Key must be 2–10 characters, start with а letter, only uppercase letters and digits (e.g., PROJ, SCRUM2)',
+        'JIRA Project Key must be 2–10 characters, start with a letter, only uppercase letters and digits (e.g., PROJ, SCRUM2)',
     };
   }
 
@@ -433,7 +433,7 @@ resolver.define('testConnection', async ({ payload }) => {
   if (result.ok) {
     return {
       status: 'ok',
-      message: `Connected к Anthropic API (${result.model})`,
+      message: `Connected to Anthropic API (${result.model})`,
     };
   }
 
@@ -818,7 +818,7 @@ resolver.define('fetchPage', async ({ payload }) => {
     return { error: 'page_not_found', detail: `Page ${pageId} does not exist or you don't have access` };
   }
   if (response.status === 403) {
-    return { error: 'permission_denied', detail: 'You do not have permission к view this page' };
+    return { error: 'permission_denied', detail: 'You do not have permission to view this page' };
   }
   if (!response.ok) {
     const text = await response.text();
@@ -1056,7 +1056,7 @@ resolver.define('startGeneration', async ({ payload, context }) => {
   if (pageContent.length < 50) {
     return {
       error: 'page_too_small',
-      detail: `Page content е too short к extract a meaningful breakdown (${pageContent.length} chars)`,
+      detail: `Page content is too short to extract a meaningful breakdown (${pageContent.length} chars)`,
     };
   }
 
@@ -1256,7 +1256,7 @@ resolver.define('pollJobStatus', async ({ payload }) => {
           status: 'failed',
           completedAt: new Date().toISOString(),
           error: 'no_results_url',
-          detail: 'Batch ended но Anthropic returned no results_url.',
+          detail: 'Batch ended but Anthropic returned no results_url.',
         };
         await kvs.set(`${JOB_KEY_PREFIX}${jobId}`, failed);
         return failed;

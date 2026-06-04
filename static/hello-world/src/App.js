@@ -859,9 +859,16 @@ function App() {
 
     const fail = (res, fallback) => {
       const friendly = _classifyBackendError(res, "Push to JIRA failed");
-      const message = res?.detail
-        ? `${friendly.message} (${res.detail})`
-        : friendly.message || fallback;
+      // Only append the raw detail as a parenthetical when it adds NEW information.
+      // For generic (Class 7) errors _classifyBackendError already folds res.detail
+      // into friendly.message (": <detail>"), so re-appending it here doubled the
+      // identical sentence. Append only when the detail is non-empty AND not already
+      // contained in the friendly message (e.g. a connection-class message that omits it).
+      const detail = res?.detail ? String(res.detail) : "";
+      const message =
+        detail && friendly.message && !friendly.message.includes(detail)
+          ? `${friendly.message} (${detail})`
+          : friendly.message || fallback;
       setError(message);
       setScreen(friendly.routeToSetup ? "setup" : "error");
       setIsPushing(false);

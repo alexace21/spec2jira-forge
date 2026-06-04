@@ -81,7 +81,7 @@ export async function getStoredApiKey() {
  */
 export async function setStoredApiKey(apiKey) {
   if (!apiKey || typeof apiKey !== 'string') {
-    return { success: false, error: 'API key е required and must be a string' };
+    return { success: false, error: 'API key is required and must be a string' };
   }
   const trimmed = apiKey.trim();
   if (trimmed.length < 20) {
@@ -90,7 +90,7 @@ export async function setStoredApiKey(apiKey) {
   if (!trimmed.startsWith('sk-ant-')) {
     return {
       success: false,
-      error: 'API key должен start with "sk-ant-" (Anthropic format)',
+      error: 'API key must start with "sk-ant-" (Anthropic format)',
     };
   }
   try {
@@ -154,7 +154,7 @@ export async function testConnection(apiKey = null) {
     return {
       ok: false,
       error: 'not_configured',
-      detail: 'No API key configured. Enter your Anthropic API key в the Settings UI first.',
+      detail: 'No API key configured. Enter your Anthropic API key in the Settings UI first.',
     };
   }
 
@@ -324,17 +324,17 @@ export async function submitBreakdownBatch({
     return {
       error: 'not_configured',
       detail:
-        'Anthropic API key not configured. Ask your Confluence admin к open Settings → Spec2Tickets and provide an Anthropic API key.',
+        'Anthropic API key not configured. Ask your Confluence admin to open Settings → Spec2Tickets and provide an Anthropic API key.',
     };
   }
   if (!pageContent || pageContent.trim().length < 50) {
     return {
       error: 'input_too_small',
-      detail: `Page content е too short к extract meaningful breakdown (${pageContent?.length || 0} chars).`,
+      detail: `Page content is too short to extract meaningful breakdown (${pageContent?.length || 0} chars).`,
     };
   }
   if (!customId) {
-    return { error: 'no_custom_id', detail: 'customId е required to identify the batch request.' };
+    return { error: 'no_custom_id', detail: 'customId is required to identify the batch request.' };
   }
 
   const systemContent = buildSystemContent(projectContext, useCaching);
@@ -425,7 +425,7 @@ export async function submitBreakdownBatch({
 export async function pollBatchStatus(batchId, apiKeyOverride = null) {
   const apiKey = apiKeyOverride || (await getStoredApiKey());
   if (!apiKey) return { error: 'not_configured', detail: 'API key not configured.' };
-  if (!batchId) return { error: 'no_batch_id', detail: 'batchId е required.' };
+  if (!batchId) return { error: 'no_batch_id', detail: 'batchId is required.' };
 
   let response;
   try {
@@ -468,7 +468,7 @@ export async function pollBatchStatus(batchId, apiKeyOverride = null) {
 export async function fetchBatchResults(resultsUrl, customId, apiKeyOverride = null) {
   const apiKey = apiKeyOverride || (await getStoredApiKey());
   if (!apiKey) return { error: 'not_configured', detail: 'API key not configured.' };
-  if (!resultsUrl) return { error: 'no_results_url', detail: 'resultsUrl е required.' };
+  if (!resultsUrl) return { error: 'no_results_url', detail: 'resultsUrl is required.' };
 
   let response;
   try {
@@ -506,7 +506,7 @@ export async function fetchBatchResults(resultsUrl, customId, apiKeyOverride = n
   if (!targetRow) {
     return {
       error: 'result_row_missing',
-      detail: `Batch returned ${lines.length} rows but none с custom_id=${customId}.`,
+      detail: `Batch returned ${lines.length} rows but none with custom_id=${customId}.`,
     };
   }
 
@@ -527,7 +527,7 @@ export async function fetchBatchResults(resultsUrl, customId, apiKeyOverride = n
   }
 
   if (message.stop_reason === 'refusal') {
-    return { error: 'refused', detail: 'Anthropic refused к process this spec.', usage: message.usage };
+    return { error: 'refused', detail: 'Anthropic refused to process this spec.', usage: message.usage };
   }
 
   const truncated = message.stop_reason === 'max_tokens';
@@ -557,7 +557,7 @@ export async function fetchBatchResults(resultsUrl, customId, apiKeyOverride = n
       }
       return {
         error: 'truncated',
-        detail: `Output exceeded ${MAX_OUTPUT_TOKENS} tokens and could not be recovered. The spec е too large for а single breakdown — split it into smaller specs (e.g., per major capability area) and run each separately.`,
+        detail: `Output exceeded ${MAX_OUTPUT_TOKENS} tokens and could not be recovered. The spec is too large for a single breakdown — split it into smaller specs (e.g., per major capability area) and run each separately.`,
         usage: message.usage,
       };
     }
