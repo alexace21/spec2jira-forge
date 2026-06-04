@@ -522,10 +522,6 @@ function buildStoryPayload(projectKey, feature, parentEpicKey, opts = {}) {
 }
 
 function buildSubtaskPayload(projectKey, task, parentStoryKey, subtaskTypeId, customFields) {
-  const typeLabel = task.type ? `${task.type}: ` : '';
-  const description = task.description
-    ? `${typeLabel}${task.description}`
-    : `${typeLabel}${task.summary}`;
   // Prefer the dynamically-resolved subtask type ID (naming-independent).
   // Fall back to name 'Sub-task' only ako lookup didn't surface а subtask type.
   const issuetype = subtaskTypeId ? { id: subtaskTypeId } : { name: 'Sub-task' };
@@ -533,9 +529,22 @@ function buildSubtaskPayload(projectKey, task, parentStoryKey, subtaskTypeId, cu
     project: { key: projectKey },
     issuetype,
     summary: (task.summary || 'Subtask').substring(0, 255),
-    description: plainADF(description),
     parent: { key: parentStoryKey },
   };
+  // Push the task's generated description as an ADF document via the SAME
+  // plainADF builder the Epic + the Story's description paragraph use (a single
+  // text paragraph). The description ADDS implementation detail beyond the
+  // summary (it is NOT a restatement — see SYSTEM_PROMPT rule 8). We prefix the
+  // task type (API/UI/DB/etc.) so the Subtask still shows its category at a glance
+  // in JIRA (subtasks have no native type field; this keeps the prior
+  // categorisation while the body is now real detail, not a summary echo).
+  // Surface-failures discipline: when the description is empty/whitespace/missing,
+  // OMIT the field entirely rather than send an empty ADF or echo the summary.
+  const description = (task.description || '').trim();
+  if (description) {
+    const typeLabel = task.type ? `${task.type}: ` : '';
+    fields.description = plainADF(`${typeLabel}${description}`);
+  }
   return { fields: applyCustomFields(fields, customFields) };
 }
 

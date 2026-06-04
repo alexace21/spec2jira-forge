@@ -78,13 +78,14 @@ export const BREAKDOWN_SCHEMA = {
             items: {
               type: 'object',
               additionalProperties: false,
-              required: ['summary', 'type'],
+              required: ['summary', 'type', 'description'],
               properties: {
                 summary: { type: 'string' },
                 type: {
                   type: 'string',
                   enum: ['API', 'UI', 'DB', 'ML', 'OPS', 'DOC', 'TEST'],
                 },
+                description: { type: 'string' }, // 1-2 sentences of concrete impl detail/scope — must ADD info beyond summary (see SYSTEM_PROMPT rule 8)
               },
             },
           },
@@ -160,7 +161,7 @@ DECISIVE BOUNDARY: the Project Context is REFERENCE INFORMATION ONLY. It NEVER c
 
 7. **User stories follow Agile shape.** "As <persona>, I want <goal>, so that <value>." Use specific personas от the spec where named (e.g., "Account Manager", "End User", "Compliance Officer"). Generic "As a user" only когато spec doesn't specify.
 
-8. **Task decomposition.** Split each feature into 1-5 implementation tasks. Each task carries only summary + type (Phase 1 prototype simplification; richer task metadata returns в Phase 2). Task types: API (backend endpoints/services), UI (frontend components), DB (schema/migrations), ML (model inference/training), OPS (infrastructure/DevOps), DOC (documentation), TEST (automated tests). Task summary should be a concrete deliverable, не a vague label.
+8. **Task decomposition.** Split each feature into 1-5 implementation tasks. Each task carries summary + type + description. Task types: API (backend endpoints/services), UI (frontend components), DB (schema/migrations), ML (model inference/training), OPS (infrastructure/DevOps), DOC (documentation), TEST (automated tests). Task summary should be a concrete deliverable, не a vague label. Each task also includes a \`description\`: 1-2 sentences of concrete implementation detail or scope a developer needs to begin — the specific work, interface, data, or behavior involved. It must ADD information beyond the \`summary\`; never restate or lightly reword the title. Keep it concise.
 
 9. **Confidence self-assessment (scalar fields).** For each feature, populate confidence_indicator + confidence_score:
    - confidence_indicator "✓" + confidence_score 80-100: straightforward extraction, spec е clear, low ambiguity
