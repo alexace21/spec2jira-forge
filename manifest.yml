@@ -130,24 +130,22 @@ app:
     memoryMB: 512
     architecture: arm64
   id: ari:cloud:ecosystem::app/e804f31f-1cbf-4f09-86c1-11e36f387fe7
-  # ── XCA (Cross-Context App) migration 2026-06-03 ─────────────────────
-  # Marketplace REQUIRES this: the app is compatible with BOTH Confluence +
-  # Jira, so Atlassian mandates it be a Cross-Context App ("multiple-app
-  # compatibility"), which MUST be "Paid via Atlassian" (the SOLE remaining
-  # v4.2.0 rejection reason — FIT/security already passed). Confluence =
-  # required (the Custom UI globalPage lives there; the app is non-functional
-  # without it). Jira = optional (touched only via the write:jira-work push).
-  # ⚠ The required app is IMMUTABLE once installs exist → Confluence is the
-  # correct AND locked-in choice (we have live Confluence installs). Verified
-  # against the live app-compatibility + migration docs 2026-06-03 (XCA still
-  # in Preview; Confluence/Jira/Compass only; @forge/api ≥5.1.1 — we have
-  # ^7.2.1). ⚠ EMPIRICALLY CONFIRMED 2026-06-03: the FIRST compatibility deploy is
-  # BLOCKED while the app has an install in a NON-required app (Jira) — Atlassian
-  # errors "Unable to deploy an app to an environment with an existing installation
-  # in an Atlassian app that is not the required Atlassian app." So on each env:
-  # `forge uninstall -p jira` FIRST → `forge deploy` → then reinstall Jira.
-  # Confluence (required) install + data ARE preserved. (An earlier "do NOT uninstall
-  # first / teardown-only" note was wrong — the live deploy is the authority.)
+  # ── XCA compatibility (Confluence required / Jira optional) ──────────
+  # ⚠ UNRESOLVED 2026-06-04 — OPEN ATLASSIAN TICKET. Publishing as "Paid via Atlassian"
+  # fails: "Invalid value for field 'supportedPaymentModel': More than one parent
+  # software is not supported for paid via Atlassian apps." EMPIRICALLY, BOTH manifest
+  # forms FAIL the same way: (a) THIS jira.required:false form (deployed v5.0.0) AND
+  # (b) removing the jira block entirely (deployed v5.1.0). In both, the publish screen
+  # shows Jira Cloud [REQUIRED] — the write:jira-work SCOPE appears to force Jira as a
+  # billing parent regardless of the compatibility flag. The multi-app-compatibility
+  # docs SAY this form yields a SINGLE paid listing (Confluence sole billing parent +
+  # Jira a free "Works with" connection) — but the live publish contradicts that. That
+  # docs-vs-reality gap IS the open Atlassian-ticket question. Restored to the
+  # DOCUMENTED form (jira.required:false) as the baseline pending Atlassian's answer.
+  # NOTE: the Jira push DOES need the Jira install (asUser().requestJira; a Confluence-
+  # only install 403s — gotcha #10 HOLDS; Jira = an optional CONNECTION installed
+  # separately via `forge install -p jira`). The app/code is done + dev-verified; this
+  # is purely a Marketplace listing-config/policy blocker.
   compatibility:
     confluence:
       required: true

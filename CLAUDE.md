@@ -352,6 +352,64 @@ package names de-scaffolded (→ `spec2tickets`). Build green (bundle ≈ −1.4
 
 ---
 
+## ⚡ HANDOVER NOTE (2026-06-04 — dev acceptance COMPLETE + prod deployed; BLOCKED on a Paid-via-Atlassian cross-product constraint → open Atlassian ticket)
+
+A long, agent-conducted session continuing the XCA/hybrid resubmit on `feature/product-improvements`.
+**Dev acceptance testing is COMPLETE and GREEN; the app/code is done + verified. The ONLY blocker is a
+Marketplace listing-config contradiction (NOT an app problem) — now an open Atlassian question.**
+
+**Dev acceptance — COMPLETE (`docs/DEV-VERIFICATION-PLAN.md`):** Managed Pro + BYOK Pro both verified
+end-to-end on spec2jira-dev via `forge install --license Advanced|Standard` (dev edition sim). ⭐§6
+accountId real (`usage:YYYY-MM:u:<id>`); §8 Managed key path (our `MANAGED_ANTHROPIC_KEY`); §7.5
+cap→fair-use + LimitReached; BYOK unlimited (`usage:YYYY-MM`, no `:u:`); distill; push; reconnect.
+(`--license` is DEV-ONLY — rejected on prod.)
+
+**Polish SHIPPED (committed; partner pushes — `d36a5b7` `01b43c4` `d59a632` `449204a`):** (1) tier-aware
+onboarding + **in-app Settings** (the Forge globalSettings "Configure" is UNREACHABLE in Atlassian's
+centralized "Connected apps" admin → a Settings entry-point in the globalPage opens AdminSettings);
+(2) editor edits now reflect in the Review AI-self-check (`extractV3Signals` read the frozen
+`_v3_original`; now reads the edited `capabilities` — the push was always correct, cosmetic only);
+(3) per-feature AI concerns rendered in the editor (counted-but-not-shown gap closed); (4) honest
+generation spinner (the determinate bar sat at 0% for the opaque Anthropic batch → big spinner + live
+timer + strengthened "you can leave/reconnect" copy, backed by the no-TTL KVS job record); (5) PagePicker
+feedback/review nudge. All §13-reviewed → SHIP.
+
+**⭐ THE BLOCKER (open Atlassian ticket): a cross-product app can't be a single "Paid via Atlassian"
+listing.** Publishing fails: *"Invalid value for field 'supportedPaymentModel': More than one parent
+software is not supported for paid via Atlassian apps."* EMPIRICALLY (the authority): the **`write:jira-work`
+SCOPE** forces Jira to be a REQUIRED parent (the publish screen shows Jira Cloud [REQUIRED]) — and BOTH
+manifest forms fail identically: `jira.required:false` (v5.0.0) AND removing the jira block (v5.1.0). The
+multi-app-compatibility DOCS say Confluence-required + Jira-optional = a single paid listing (Confluence
+sole billing parent, Jira free "Works with"), but the live publish CONTRADICTS the docs. **That
+docs-vs-reality gap is the ticket question** (partner drafting): *"docs say Confluence-required +
+Jira-optional = single paid listing, but our app with `write:jira-work` fails 'More than one parent
+software' — why + the correct cross-product PvA config?"* Likely outcomes: a missing config · two separate
+listings · Paid-via-vendor.
+
+**Hard-won corrections (fold into the gotchas):** ① PvA = exactly ONE parent; the Jira write scope makes
+Jira a parent → cross-product blocked on single-listing PvA. ② A LICENSED (PvA) app CANNOT be
+`forge install`-ed on PRODUCTION (`LICENSED_APP_INSTALL_NOT_PERMITTED`) — prod = Marketplace-only; the
+runbook "forge install on prod" step is WRONG for a licensed app. ③ In-place upgrade non-XCA→XCA+licensing
+FAILS (Atlassian 500) — needs a FRESH install; real customers install fresh post-approval. ④ The Jira push
+DOES need the Jira install (asUser().requestJira; Confluence-only 403s) — gotcha #10 HOLDS; Jira = an
+optional installed CONNECTION. ⑤ Editions FINALIZED **€4.90/€9.90**; Free + unlicensedAccess + push-gate
+REMOVED (trial→paid); "uninstall Jira FIRST before the XCA deploy" is correct.
+
+**Prod state:** v5.1.0 deployed (jira-removed — ineffective for PvA); alexacenov uninstalled; vs-overlord22
+(reviewer's) outdated; env vars set (`MANAGED_ANTHROPIC_KEY` + `ENFORCEMENT_MODE=block`). manifest.yml
+REVERTED to the documented `jira.required:false` form (committed this session).
+
+**RESUME:** (a) [optional] one clean re-test of `jira.required:false` (re-deploy + re-publish) to be 100%
+sure; (b) the ATLASSIAN ECOHELP ticket — the authority on the cross-product PvA contradiction; (c) once
+PvA is resolved → configure 2 editions €4.90/€9.90 → resubmit → Managed compliance docs (DPA + 29-day
+retention) for the review. POST-APPROVAL: wire `PRO_UPGRADE_URL` + `MARKETPLACE_REVIEW_URL`. Full state:
+`memory/marketplace-launch-state.md`.
+
+С усмивка ✨ — app-ът е готов и доказан; блокерът е чисто Marketplace-policy (тяхно противоречие), не наш
+код. Топката е в полето на Atlassian.
+
+---
+
 ## ⚡ HANDOVER NOTE (2026-06-03 — XCA resubmit release: hybrid two-edition pricing, agent-conducted)
 
 > ⭐ **TWO LATER CORRECTIONS to this note (same day, after these paragraphs were written):**
