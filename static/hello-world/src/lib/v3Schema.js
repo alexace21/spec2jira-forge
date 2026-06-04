@@ -106,7 +106,7 @@ export function adaptToLegacyShape(v3) {
 
   return {
     epic: v3.epic || {
-      summary: v3.metadata?.spec_summary?.substring(0, 100) || 'Spec Breakdown',
+      summary: v3.metadata?.spec_summary?.substring(0, 100) || 'Untitled Breakdown',
       description: v3.metadata?.spec_summary || '',
     },
     capabilities,

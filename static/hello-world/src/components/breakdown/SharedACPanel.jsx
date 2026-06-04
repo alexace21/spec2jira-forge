@@ -67,7 +67,7 @@ export default function SharedACPanel({
         </span>
 
         <span className="flex-1 text-sm font-semibold" style={{ color: 'var(--s2j-text)' }}>
-          Acceptance Criteria from Specification
+          Acceptance Criteria from the document
         </span>
 
         <span className="text-[11px]" style={{ color: 'var(--s2j-text-muted)' }}>

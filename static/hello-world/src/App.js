@@ -120,7 +120,7 @@ function _classifyBackendError(errorShape, contextLabel = "") {
   ) {
     return {
       message:
-        "Anthropic's API is temporarily unavailable or overloaded. This is on Anthropic's side, not your spec — please wait a few minutes and try Generate again.",
+        "Anthropic's API is temporarily unavailable or overloaded. This is on Anthropic's side, not your page — please wait a few minutes and try Generate again.",
       routeToSetup: false,
     };
   }
@@ -1339,7 +1339,7 @@ function ReadyScreen({
   onOpenSettings,
 }) {
   // Prices come from getUsage's pricing[] (single source of truth — no hardcoded
-  // €-values in the UI). The hybrid has two paid editions: byokPro (unlimited, own
+  // USD prices in the UI). The hybrid has two paid editions: byokPro (unlimited, own
   // key) + managedPro (we run it). Only byokProPrice is surfaced on this badge (the
   // Managed → unlimited upsell); there is no Free tier to upsell from.
   const byokProPrice = findPrice(usage, "byokPro");
@@ -1443,7 +1443,7 @@ function ReadyScreen({
         <strong>Ready to generate.</strong> Claude Sonnet 4.6 will analyze
         this Confluence page and produce a structured JIRA breakdown —
         Stories, Subtasks, cross-feature dependencies, and quality signals.
-        Typical runtime: 60–150 seconds depending on spec size.
+        Typical runtime: a few minutes, depending on the size of your page.
       </div>
 
       {/* Project Context selector — pick which named context applies to THIS spec, so
@@ -1470,7 +1470,7 @@ function ReadyScreen({
               outline: "none",
             }}
           >
-            <option value="none">None — use the spec on its own</option>
+            <option value="none">None — use the page on its own</option>
             {contextProfiles.map((p) => (
               <option key={p.id} value={p.id}>
                 {p.name}
@@ -1479,7 +1479,7 @@ function ReadyScreen({
           </select>
           <p className="text-xs mt-1" style={{ color: "var(--s2j-text-muted)" }}>
             Applies your project's domain &amp; glossary to this breakdown. Pick the
-            profile matching this spec's project; manage profiles in Settings.
+            profile matching this page's project; manage profiles in Settings.
           </p>
         </div>
       ) : (
@@ -1546,7 +1546,7 @@ function GeneratingScreen({ pageTitle, elapsed, onBack, onStartOver }) {
           className="text-base font-semibold"
           style={{ color: "var(--s2j-text)" }}
         >
-          Your Confluence specification is being analyzed
+          Your Confluence page is being analyzed
         </h2>
         {pageTitle && (
           <p className="text-sm mt-0.5" style={{ color: "var(--s2j-text-light)" }}>
@@ -1559,7 +1559,7 @@ function GeneratingScreen({ pageTitle, elapsed, onBack, onStartOver }) {
         >
           Building a structured JIRA breakdown — Stories, Subtasks, cross-feature
           dependencies, and quality signals. This usually takes a few minutes; large
-          specs and busy periods take longer.
+          pages and busy periods take longer.
         </p>
       </div>
 
@@ -1626,7 +1626,7 @@ function GeneratingScreen({ pageTitle, elapsed, onBack, onStartOver }) {
             cursor: "pointer",
             textDecoration: "underline",
           }}
-          title="Abandon this run and start over from the current page (e.g. you edited the spec after starting this generation)"
+          title="Abandon this run and start over from the current page (e.g. you edited the page after starting this generation)"
         >
           Started this before your latest edits? Start over
         </button>
@@ -1964,7 +1964,7 @@ function ConfirmScreen({
             className="text-xs mb-3"
             style={{ color: "var(--s2j-text-muted)" }}
           >
-            Spec-level concerns surfaced by AI analysis. Address before push when severity is high.
+            Document-level concerns surfaced by AI analysis. Address before push when severity is high.
           </p>
           <div className="space-y-2">
             {sortedSpecConcerns.map((concern, idx) => (
@@ -2975,8 +2975,8 @@ function SetupScreen({ message, isManaged = false, onOpenSettings }) {
           </p>
           <p style={{ marginTop: "6px", fontStyle: "italic" }}>
             {isManaged
-              ? "Powered by Claude Sonnet 4.6 — Managed Pro runs it for you (no API key needed). Your spec content flows from Forge to the Anthropic API; nothing is stored on Spec2Tickets servers."
-              : "Powered by Claude Sonnet 4.6 — your spec content flows directly from Forge to the Anthropic API using your own key. No data on Spec2Tickets servers."}
+              ? "Powered by Claude Sonnet 4.6 — Managed Pro runs it for you (no API key needed). Your page content flows from Forge to the Anthropic API; nothing is stored on Spec2Tickets servers."
+              : "Powered by Claude Sonnet 4.6 — your page content flows directly from Forge to the Anthropic API using your own key. No data on Spec2Tickets servers."}
           </p>
         </div>
       </div>
@@ -2987,7 +2987,7 @@ function SetupScreen({ message, isManaged = false, onOpenSettings }) {
 // ── Util ────────────────────────────────────────────────────────
 
 // Look up a tier's display price from a getUsage/quota pricing[] array. The
-// pricing table is the SINGLE source of €-values (composed server-side) — the UI
+// pricing table is the SINGLE source of USD prices (composed server-side) — the UI
 // never hardcodes prices, so a price change in usage.js flows through everywhere.
 // Accepts the full usage/quota object OR a raw pricing array. Returns null if absent.
 function findPrice(usageOrPricing, key) {
