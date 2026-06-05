@@ -354,6 +354,120 @@ package names de-scaffolded (→ `spec2tickets`). Build green (bundle ≈ −1.4
 
 ---
 
+## ⚡ HANDOVER NOTE (2026-06-05 cont. — Test-case FORMAT research (14 tools) → dual-format strategy; P1 core reshaped + §13-gated + re-validated; P2 next)
+
+A long conductor-orchestrated (§13) session on `feature/product-improvements` continuing the test-case feature. **P1 DONE; P2–P6 pending. Committed this session (partner pushes).** Folds in / supersedes the 4 directives in the note below.
+
+**Format research (partner-directed "sharpen the axe" before hands-on):** a 14-tool sweep (Xray/Zephyr/TestRail/qTest/PractiTest/**OpenText ALM Octane**/Polarion/codeBeamer/Jama/IBM-ETM/**Azure DevOps Test Plans**/Cucumber-Studio/Gauge/SpiraTest/TestLink) → **DUAL-FORMAT strategy LOCKED**: two output shapes cover the whole professional world, both **deterministic pure-function renders from ONE rich schema** (§4, zero extra model tokens): **Gherkin `.feature`** (BDD world: Octane BDD-Spec / Xray / Zephyr / Cucumber-Studio / SpiraTest / Polarion) + **structured table/CSV** (manual/enterprise: **ADO = huge + NO native Gherkin**, Jama, IBM-ETM, codeBeamer, TestLink). `type`→@tag; `ac_trace`→References/`# Covers:`; `confidence`→internal-only; `given[]`=preconditions (rendered, not a schema field). ⚠ **NEVER emit Octane `@TID/@REV`** (Octane generates them). UI label "Test Cases", framed as **acceptance scenarios** (BDD/Octane culture). test_data flat v1; Examples/Scenario-Outline = v2. Push v1 = Gherkin `codeBlock` embed (verify ADF-safety in P4, else bulletList fallback).
+
+**P1 (validated-core reshape):** schema −`coverage_self_assessment`, +`priority` (Critical/High/Medium/Low, capitalized) +`test_data` (flat string[]); prompt BREADTH-FIRST + Bug-Y-clean priority/test_data guidance + few-shots now demo priority; `category` provenance line. **§13 4-lens gate** (audit / code-review / Bug-Y / integration + conductor adversarial synthesis): the **Bug-Y agent caught a §5 crack in the TEST DATA guidance that the code-review PASSED** → rewrote to the abstract decisive-test; conductor OVERRODE one finding (kept "or compliance" in PRIORITY — abstract archetype + load-bearing for the regulated BA audience). **Re-validated** (Haiku/2400, multi-run): **≤5-AC = 100% coverage every run**, <17s, 0 flags, **priority now on EVERY case** (few-shot demo closed the prior 1/18 gap), **test_data BA-grade** (concrete boundary values + leap-year). **6-AC (rich) stories truncate stochastically** (the verbose new fields ate the budget; breadth-first did NOT fix it — Haiku ordering limit) → handled BY DESIGN by **P3's REACTIVE sub-chunk** (coverage strip DETECTS, never silent; **max_tokens 2400 KEEP** — bumping gambles the HARD 25s OUTPUT-token limit). Harness defaults FIXED (4000→2400, Sonnet→Haiku, +`--sonnet`, `category` wired). Spend ≈ $0.69 / 4 runs (1 was a max_tokens=4000 mis-config — the harness default, now fixed → won't recur).
+
+**Hard-won (fold into the Forge gotchas):** Anthropic structured outputs REJECT numeric JSON-schema constraints (maxItems/minItems/min/max) — bounds live in the defensive parse. The 25s Forge resolver limit binds on **OUTPUT** tokens (Haiku ~140 tok/s measured). Forge sandbox iframe blocks `blob:` downloads → copy-to-clipboard primary, data-URI best-effort. **ADF `codeBlock` safety is UNPROVEN** in this app's push — validate in isolation before relying (else bulletList, gotcha #11).
+
+**Committed this session (partner pushes):** `src/prompts.js` (P1 core) + `prototype/testcase_harness.js` + `prototype/fixtures/testcase_stories.json` + this `CLAUDE.md`. *(The `.claude` memory `testcase-generation-feature.md` is auto-persisted, not in-repo.)*
+
+**RESUME (on the partner's GREEN signal — do NOT start P2 unprompted):** **P2 — the two deterministic renderers (`renderGherkin` + `renderManualTable`/CSV) + port `computeCoverage` into a prod lib** (v3Schema.js or new testcases.js), with OFFLINE unit tests (escaping / no-acs / stale-AC / inferred / duplicate-name). **Zero API cost.** Then P3 (backend `generateTestCasesForStory` + chunked session + reactive sub-chunk + defensive parse; clone distillCategory@anthropic_client.js:826 + startDistillSession/distillStep@index.js:484-629) → P4 (push embed + reconnect rehydration HIGH + staleness fingerprint) → P5 (dedicated screen) → P6 (§13 gate + `docs/TEST-CASE-GENERATION-DESIGN.md` + build + deploy). **Carry-forwards:** P2 must render a `NOTE` concern-type gracefully (a prefix-less concern defaults to NOTE, outside the breakdown vocab) + use `(story_name,title)` composite for binding; P3 parse keeps+defaults a prefix-less concern (`[ASSUMPTION|medium]`) + salvage overwrites `story_name`. Full detail: `.claude` memory `testcase-generation-feature.md`.
+
+С усмивка ✨ — брадвата е наточена (14-tool format research), P1 ядрото е reshape-нато + §13-gate-нато + re-validate-нато; остават renderers + backend + screen, фаза по фаза.
+
+---
+
+## ⚡ HANDOVER NOTE (2026-06-05 — Test-case generation: design + make-or-break PROMPT empirically VALIDATED + LOCKED; backend/UI deferred to a fresh session; 4 partner directives folded in)
+
+A long, conductor-orchestrated (§13) session on `feature/product-improvements` building the NEXT
+product-improvements feature — **per-Story TEST-CASE generation** (the P1/P2 roadmap item). **Design
+locked + the make-or-break quality core (schema + prompt) built and EMPIRICALLY VALIDATED; backend +
+UI implementation deliberately deferred to a FRESH focused session** (partner's call at a natural
+milestone — large context). **NOT committed/deployed — partner commits the validated core + builds
+the rest fresh.** Full state: `memory/testcase-generation-feature.md`.
+
+**Feature (partner-LOCKED):** a dedicated **"Test Cases" screen**, flow **Review → Test Cases → Push,
+OPTIONAL/skippable** (NOT mixed into the already-dense breakdown editor), with **bulk "generate for all
+stories"** (progress bar) + per-Story regenerate. Audience = picky senior **BA/PO**; test cases are
+their core professional deliverable → **MAX quality** bar.
+
+**⭐ AUDIENCE & VALUE NORTH STAR (partner's framing — the WHY behind every decision):** the BA/PO are
+**maximally critical** — writing tests is their own discipline + job description, so they will **hunt for
+the smallest wrong thing to latch onto**; the output must survive expert scrutiny. **But the bar is
+EXCELLENT, not PERFECT** — AI AUGMENTS the human (it doesn't replace them; they have a job), so a strong
+expert-grade DRAFT that gives a tough expert a real head-start makes them **happy, satisfied, and READY TO
+PAY**; they refine + sign off (human-in-the-loop). **Quality > speed** (Haiku was chosen only because it
+empirically MATCHED the quality bar, not for speed). **Highest value, spend tokens SMARTLY** — drop what
+the expert doesn't need (→ no self-assessment for tests) and reinvest the budget on what adds value for
+them. **Signal direction = "would a critical BA/PO expert be impressed enough to pay?"** — every choice
+(trustworthy coverage, falsifiable cases, honestly-flagged assumptions, scope fence, 1:1 with their real
+tools/format) points there.
+
+**⭐ VALIDATED + LOCKED** (in `src/prompts.js`: `TEST_CASE_SCHEMA` + `TEST_CASE_SYSTEM_PROMPT` +
+`buildTestCaseUserPrompt`; harness in `prototype/`):
+- **Model = claude-haiku-4-5.** An empirical bake-off OVERRODE the partner's initial "Sonnet quality-
+  first" pick (re-confirmed Haiku WITH data): Haiku is at the BA/PO quality bar across clinical/fintech/
+  logistics + no-acs/trivial/rich probes, fits the 25s budget, ~1/3 cost. **Sonnet was superb but ~54s
+  single-call / ~38s per-type → blows the 25s resolver limit** and inflated volume.
+- **Transport = ONE sync structured-output call PER STORY**; **`max_tokens ~2400` HARD-bounds the call
+  <~18s.** ⭐ The 25s Forge resolver limit binds on **OUTPUT tokens, not input** (Haiku ≈ 110 tok/s), so
+  engineering owns the cap (§4) — a high max_tokens risks a >25s timeout that kills the resolver before
+  any salvage runs. Per-type chunking was rejected (timing-safe but bloated to 17-27 cases/story).
+- The **"COVER EVERY AC FIRST" prompt rule makes truncation COVERAGE-SAFE** — 100% AC coverage on every
+  validated run even when the tail truncates (the PURE coverage strip is authoritative). Multi-run × 3
+  domains + 3 probes: 9-12 calibrated cases/story, 100% coverage, ~15-22s, 0 heuristic flags, BA/PO-grade
+  (boundary inclusive/exclusive, leap-year month-end, self-co-sign, honest `[ASSUMPTION]` concerns,
+  scope fence, shared ACs used). ~$0.65 of validation calls on the partner's key.
+- **Hard-won (fold into the Forge gotchas):** Anthropic **structured outputs REJECT numeric JSON-schema
+  constraints** — `output_config.format.schema: For 'array' type, property 'maxItems' is not supported`
+  (also `minItems`/`minimum`/`maximum`; `BREAKDOWN_SCHEMA` uses none) → enforce ceilings/bounds in the
+  **defensive parse**, not the schema. **AC-trace by VERBATIM text, never by index** (an index goes
+  stale-but-in-range and silently mis-attributes coverage — the worst §8 failure). The PURE coverage
+  strip (`normAC` + match → covered / uncovered / stale / inferred; `coverage_pct` null, never vacuous
+  100%, on no-ACs) is the implementation contract for `v3Schema.js` — drafted in `prototype/testcase_harness.js`.
+- **prototype/ dual-file rule is DEAD** (`prototype/prompts.js` frozen 2026-05-30; schema/prompt live
+  ONLY in `src/prompts.js`). prototype/ is reused as the standalone LLM validation harness:
+  `prototype/testcase_harness.js` + `prototype/fixtures/testcase_stories.json` (`--selftest` offline,
+  `--runs`, `--per-type`, `--haiku`, `--max-tokens`; needs an Anthropic key — partner's at
+  `C:\Users\AlexAsenov\Downloads\anthropic-key.txt`).
+
+**⭐⭐ PARTNER DIRECTIVES for the fresh session — do these as part of the schema/format rework BEFORE finalizing:**
+1. **REMOVE `coverage_self_assessment`** from the schema + prompt. BA/PO are experts at test cases — they
+   do NOT need the model's self-assessment of test coverage (self-assessment is useful only for the
+   TECHNICAL breakdown stories/details, not the tests). Bonus: it cuts output tokens (likely lets typical
+   stories finish CLEANLY at max_tokens 2400 → kills the "truncated" cosmetic) and it was the truncated
+   tail anyway. Re-validate after removal.
+2. **RESEARCH professional BA test-case tooling + format; align 1:1.** Investigate the tools BAs actually
+   use to author test cases (Xray, Zephyr, TestRail, qTest, PractiTest, …) and the FORMAT they expect
+   (Gherkin/BDD step tables, CSV/import schemas, fields: preconditions / test steps / test data / expected
+   results / priority / labels). Compare to our schema + the JIRA push format and **make our output 1:1
+   with what they work with** so they can drop it straight into their tools. ⇒ This may RESHAPE the schema
+   + the push format — the current schema is QUALITY-validated but the FORMAT is pending this research. Do
+   this FIRST (it informs #1's rework).
+3. **Per-Story stepping + a progress bar + ADAPTIVE sub-chunking for rich Stories.** Generation runs one
+   Story at a time (the chunked-session pattern, progress bar). For a VERY RICH Story (would exceed 25s /
+   the case ceiling), split that ONE Story's Haiku call into several (per-type, or loop-until-done) so each
+   sub-call stays bounded — i.e. the session supports 1+ steps per Story, adaptive.
+4. **INVESTIGATE Epic / Category context.** Check whether feeding the Epic summary + the feature's Category
+   (the cluster the Story sits in) into the call adds **highest-value** (richer §8 provenance). **Verify the
+   value BEFORE adding** (don't bloat the call blindly) — verdict-pending.
+
+**RESUME (fresh session, branch `feature/product-improvements`):** re-Analyze through the LENS; do
+directives #2 → #1 first (BA-tool format research may reshape the schema) → then T3 backend
+(`generateTestCasesForStory` Haiku-call + chunked session, adaptive per-Story) → T4 push-embed (richADF
+☐-bulletList, gotcha #11) + separate-KVS persistence + **reconnect rehydration** (HIGH pitfall: `getResults`
+reloads `job.breakdown` which has NO test cases → must rehydrate `testcases:<jobId>` into the editor or
+expensive output vanishes silently on reload) → T5 quota/key-source (mid-run managed-key-vanish FAIL LOUD;
+distill RE-RESOLVES the key per step, does NOT stamp) → T6 dedicated screen → **T7 §13 audit + code-review
+gate** → T8 design doc + build + deploy. Clone templates: `distillCategory` (anthropic_client.js:826) +
+`startDistillSession`/`distillStep` (index.js:484-629) + `resolveAnthropicKey`/`checkQuota`/`buildQuotaExceeded`
+(index.js:73-130). The 10-agent design + 14 pitfalls are recorded in `memory/testcase-generation-feature.md`.
+
+**To COMMIT now (partner):** `src/prompts.js` (the validated schema + prompt + user-builder) +
+`prototype/testcase_harness.js` + `prototype/fixtures/testcase_stories.json` (the validation harness) +
+the new memory. Suggested: `feat(product-improvements): test-case generation — validated quality core (schema+prompt+harness)`;
+the backend/UI lands next session.
+
+С усмивка ✨ — make-or-break-ът (качеството на prompt-а + изборът на модел) е емпирично доказан и
+заключен; остават имплементацията + format-research-ът, в свежа фокусирана сесия.
+
+---
+
 ## ⚡ HANDOVER NOTE (2026-06-04 EOD — spec2jira.com rebuilt to USD + in-app "spec"→"page" cleanup + DPA/SEO/a11y; agent-conducted)
 
 A long, agent-conducted session (§13 throughout) updating the **public site** + customer-facing app copy. The site lives in the **SEPARATE GitHub Pages repo** (`C:\Software Engineer\Success\AI-delivery\ai-delivery-platform\MVP-roll-out\spec2jira-site\spec2jira-site`; auto-deploys on `git push`). All §13 gates passed (incl. a 5-agent adversarial audit + per-wave reviews). **NOT committed/deployed — partner pushes the site + builds/deploys the forge app.**
