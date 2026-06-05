@@ -31,6 +31,11 @@ import { fileURLToPath } from 'node:url';
 
 import { TEST_CASE_SCHEMA, TEST_CASE_SYSTEM_PROMPT, buildTestCaseUserPrompt } from '../src/prompts.js';
 import { estimateCost, MODEL_PRIMARY, MODEL_FALLBACK } from './anthropic_client.js';
+// NOTE: this harness keeps a LOCAL computeCoverage/normAC copy (below) that is byte-identical
+// in coverage LOGIC to ../src/testcases.js (the P2 prod lib). De-dup-via-import is deferred:
+// a literal NBSP inside normAC's regex makes automated block-removal fragile. Drift risk is
+// benign (the only src divergence is the additive `complete` field, which this harness never
+// asserts). TODO: de-dup at a manual editing pass.
 
 const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages';
 const ANTHROPIC_VERSION = '2023-06-01';
