@@ -72,7 +72,7 @@ honest flagged case (§4), not a silent gap.
 
 | New | Clone from | File |
 |---|---|---|
-| `TC_MAX_OUTPUT_TOKENS = 8000` | — | anthropic_client.js |
+| `TC_MAX_OUTPUT_TOKENS = 16000` (8000→16000 for the §10 §7-feed; per-story output is 15-case-ceiling-bound, not spec-size-bound) | — | anthropic_client.js |
 | `submitTestCaseBatch({stories, sharedAcceptanceCriteria, specSummary, apiKey})` → `{batchId}` | `submitBreakdownBatch` (~318-421) | anthropic_client.js |
 | `pollTestCaseBatch` = alias of `pollBatchStatus` (same endpoint/shape) | `pollBatchStatus` (~430-463) | anthropic_client.js |
 | `fetchTestCaseResults(resultsUrl, stampedStories, apiKey)` → `{perStory:[{storyIdx,result,coverage,error?}]}` (scan ALL N JSONL rows, sort by idx) | `fetchBatchResults` (~474-588) | anthropic_client.js |
@@ -136,7 +136,7 @@ validation across the model/architecture/config decisions.
 | 1 | HIGH | Test cases invisible on reconnect (`getResults` reloads breakdown only) | **DONE** — `getResults` + `getGenerationStatus` now return `tcStatus` (stamped from tcjob); P4/P5 call `getTestCases` on mount + rehydrate before render. `getTestCases` is standalone (no live poll needed). |
 | 2 | HIGH | Double-submit burns 2× cost | `tcjob:<jobId>` idempotency guard: if exists+batched/completed, return existing batchId — never re-submit. |
 | 3 | HIGH | Mixed-batch partial failure drops stories silently | `fetchTestCaseResults` scans ALL N rows; non-`succeeded` rows store an explicit `{error}` sentinel at `testcases:<jobId>:<idx>` + a `failedStories[]`; screen renders "failed — regenerate", never blank. |
-| 4 | HIGH | N sequential KVS writes blow the 25s poll resolver | `Promise.all` the per-story writes (never a sequential loop). Safe for ≤~50 stories (real range; 39-feature stress max). NOTE: chunk the fetch+store into a stepping loop only if a future spec exceeds ~50 stories. |
+| 4 | HIGH | N sequential KVS writes / large-JSONL fetch+parse blow the 25s poll resolver | `Promise.all` the per-story writes (never a sequential loop). ⚠ The §10 raise to `max_tokens 16000` DOUBLED the worst-case JSONL size → the safe story-count dropped from ~50 toward ~25-30 at the all-cap pathological case. Realistic risk stays LOW (the 15-case ceiling caps REAL per-story output ~8-10K, not 16K → a 39-story dense spec ≈ ~1MB JSONL << 25s). FOLLOW-UP for 50+ dense-story specs: chunk the fetch/parse/store across poll cycles (cursor on tcjob), do NOT raise N×ceiling unbounded. |
 | 5 | HIGH | Managed key vanish between submit & fetch → wrong key | Stamp `keySource` on `tcjob`; re-resolve via `anthropicKeyForSource(keySource)` at poll/fetch (batch is bound to its creating key); generalized null-key soft-fail guard covers BOTH managed AND BYOK (a transiently-removed BYOK key now recovers). Never store key bytes. |
 | 6 | MED | Uncovered ACs invisible in UI | Store `coverage` alongside `result`; P5 renders a per-story `N/M covered` badge + the `uncovered_acs` list + regenerate. |
 | 7 | MED | Editor edit between submit & fetch mis-routes index→story | Stamp the LEAN story list `{idx,name,acceptance_criteria}` on `tcjob` at submit; bind results to the STAMPED list; P5 reconciles (deleted → discard, added → "not generated"). `getTestCases` exposes `story:{name,acceptance_criteria}` on each entry so P4 renderers have the story without re-joining the breakdown. |
@@ -306,3 +306,47 @@ message · a post-save "N cases dropped" toast (the pre-save inline warning + th
 cover the silent-drop). A stable `story_uid` at generation would retire the AC-hash collision residual.
 
 Commit `90cba80`.
+
+## 10. §7-aware test generation — the §8 informational-completeness fix (2026-06-06)
+
+A 4-lens EVALUATION of a real output (FlexiCash loan spec) found two weaknesses with ONE root cause:
+per-Story test-gen was STARVED of the spec's §7 business rules — it saw only the Story's ACs, which
+reference rules by ID ("BR-101..BR-109") WITHOUT the concrete numbers + the decision matrix in the spec
+body. So tests asserted NO concrete eligibility thresholds and only ~4 of a 15-cell decision matrix. A §8
+(informational-completeness) gap — a starved call.
+
+**Fix (test-gen-only; the LOCKED breakdown generation is untouched):**
+- **Snapshot** the source page at breakdown generation → sibling KVS key `pagesnap:<jobId>`
+  (`resolveSpecSourceText` reads it at test-gen, version-checked, fail-soft). Coherent-by-construction
+  with the stamped ACs (same execution/pageVersion). **Byte-capped ~180KB** (a char cap overflows the
+  ~240KB KVS limit on Cyrillic/CJK — binary-search byte-trim). **Deleted by `purgeJob`** (it IS page
+  content — the privacy-critical item).
+- **Feed** it as a SHARED ephemeral-cached "SOURCE SPECIFICATION" system block in `submitTestCaseBatch`
+  (paid ~once across the N batch requests — 1 cache-write + N-1 reads). Both call-sites (bulk +
+  regenerate). Backward-compat: no snapshot → identical to prior behaviour.
+- **Prompt** (`buildSpecSourceSystemText` + RULE 6 + LESSON D — Bug-Y-clean/domain-free; the domain
+  content rides the DATA block): assert each threshold at/just-inside/just-outside its literal value;
+  one case per reachable decision-table cell with its exact outcome; scope-fence binds; rule-derived
+  cases trace kind='inferred' + a concern naming the rule. Breadth-first ladder ranks rule-cells
+  alongside ACs (before depth); cap-overflow surfaces a loud `[RISK]` concern.
+- **`max_tokens` 8000 → 16000** (per-story output is 15-case-ceiling-bound, not spec-size-bound; 16K
+  covers the densest single story; CEILING not target → free for normal stories; timing-safe on async
+  Batches — see §5 #4 for the >50-dense-story poll-scale follow-up).
+
+**Empirically validated** (Sonnet, 3 runs, A/B WITH vs WITHOUT, real FlexiCash, `prototype/validate_spec_source.js`):
+decision matrix **~4/15 → 12-15/15** cells (every present cell asserts the CORRECT BR-402 outcome);
+eligibility literals **0/8 → 7-8/8** at boundaries (18/17, 70/71, 75/76, €1,200/€1,199…); **ZERO
+regression** of the validated affordability/pricing boundary cases; scope-fence held; no truncation at
+16K; cache-read confirmed. Quality ~6.5 → ~8.5. Commit `7614772` (+ deep-audit fixes).
+
+**§13-gated + 4-lens deep audit:** Bug-Y PASS (prompt domain-free, independently re-verified). Fixed the
+snapshot char-cap KVS-overflow (→ byte-cap) and `purgeJob` not deleting `pagesnap` (privacy).
+
+**Deferred follow-ups (ranked):** (1) **breakdown-side BR-ID→value resolution** — the eval found the
+BREAKDOWN's ACs are ID-only too; a Bug-Y-clean Rule-5 sharpening ("inline an ID-referenced rule's deciding
+value when the spec body defines it") would lift breakdown fidelity, but touches the LOCKED generation →
+own §13 gate. (2) **Pricing/Affordability A/B** — only Decisioning + Eligibility got the A/B; confirm the
+§7 feed lifts multi-lever BR-505/BR-507 + compound BR-204 during pre-ship Task #7. (3) **chunked poll**
+for 50+ dense-story specs (§5 #4). (4) **regenerate §7 cache cost** (~$0.06/regen; BYOK-acceptable; flag
+for Managed metering at editions Phase 2). (5) a **rule_coverage signal** (not a BR-regex — Bug-Y; e.g.
+surface inferred-cell count beside coverage_pct) so "100% AC coverage" stops slightly over-signalling.

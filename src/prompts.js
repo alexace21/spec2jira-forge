@@ -283,25 +283,23 @@ export function buildSpecSourceSystemText(specSourceText) {
 // degradation), grafted with Draft-1's falsifiability-against-oracle decisive-test
 // clause, the hard maxItems ceiling, and the explicit merge rule.
 //
-// ⭐ VALIDATED CONFIG (local harness, multi-run × 3 domains + 3 probes, 2026-06-05):
-//   MODEL = claude-haiku-4-5 (NOT Sonnet). Empirical bake-off: Haiku is at the BA/PO
-//   quality bar across clinical/fintech/logistics + no-acs/trivial/rich probes, fits
-//   the 25s resolver budget, ~1/3 the cost. Sonnet was superb but ~54s single-call /
-//   ~38s per-type (blows 25s) and inflated volume. (Partner-confirmed Haiku.)
-//   TRANSPORT = single call PER STORY (best-calibrated volume 9-12 cases; per-type
-//   chunking guaranteed timing but bloated to 17-27). max_tokens ~2400 HARD-bounds the
-//   call <~18s (the 25s limit binds on OUTPUT tokens, so engineering owns the cap —
-//   POLICY §4). The "COVER EVERY AC FIRST" rule makes truncation COVERAGE-SAFE:
-//   every validated run kept 100% AC coverage even when the tail truncated (the lost
-//   tail is the lowest-priority extra case; the PURE coverage strip is authoritative
-//   and always survives). [2026-06-05: coverage_self_assessment REMOVED per partner
-//   directive #1 — BA experts don't need a model self-grade of test coverage. ALSO
-//   ADDED optional priority (Critical/High/Medium/Low) + test_data (flat string[]) per
-//   case (rendered to Gherkin tags / CSV columns by pure functions, §4). NET token
-//   effect (re-validated 2026-06-05): priority+test_data are MORE verbose than the
-//   removed self-assessment, so rich (6+ AC) Stories truncate slightly MORE often —
-//   ≤5-AC Stories stay 100%; the coverage strip DETECTS any shortfall (never silent)
-//   and P3's reactive sub-chunk completes the rich ones. Quality stayed BA-grade.]
+// ⭐ SHIPPED CONFIG (production): MODEL = claude-sonnet-4-6 via the Anthropic Message
+//   BATCHES API; max_tokens = 16000 (TC_MAX_OUTPUT_TOKENS in anthropic_client.js). The
+//   async Batches transport means the 25s Forge limit binds ONLY on the POLL resolver
+//   (fetch+parse of the completed JSONL), NOT on generation — so a generous output cap is
+//   free insurance against truncating a dense Story (engineering owns the cap, POLICY §4).
+//   [SUPERSEDES the earlier 2026-06-05 Haiku-4-5 / single-SYNC-call / max_tokens-2400
+//   design — that was validated when test-gen ran as a SYNC resolver call where 25s bound
+//   OUTPUT tokens; the P3 Sonnet+Batches pivot retired the 2400 cap + the per-type/reactive
+//   sub-chunk. Read that older Haiku/2400/sync framing as history.]
+//   The "COVER EVERY AC FIRST" rule makes any truncation COVERAGE-SAFE: every validated run
+//   kept 100% AC coverage even when the tail truncated (the PURE coverage strip is
+//   authoritative and always survives). [2026-06-05: coverage_self_assessment REMOVED — BA
+//   experts don't need a model self-grade; ADDED optional priority + test_data per case,
+//   rendered to Gherkin tags / CSV columns by pure functions (§4).] [2026-06-06: the §8
+//   SOURCE SPECIFICATION feed + RULE 6 + LESSON D let the model assert concrete threshold
+//   VALUES + one case per decision-table CELL; empirically lifted decision-matrix coverage
+//   ~4→12-15/15 + eligibility literals 0→7-8/8, zero regression (prototype/validate_spec_source.js).]
 //
 // AC-TRACE BY CONTENT, NEVER BY INDEX: ACs are independently editable in the editor,
 // so a stored array index goes stale-but-in-range and silently mis-attributes coverage

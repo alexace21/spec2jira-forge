@@ -1569,6 +1569,11 @@ resolver.define('purgeJob', async ({ payload }) => {
       await kvs.delete(`${PAGE_JOB_PREFIX}${String(job.pageId)}`);
     }
     await kvs.delete(`${JOB_KEY_PREFIX}${jobId}`);
+    // Delete the source-page snapshot (the §8 test-gen feed stores a full page-content copy in
+    // pagesnap:<jobId>). It IS the privacy-critical item this purge exists to remove — without
+    // this it would linger ~180KB/job indefinitely, falsifying the "page content removed after
+    // processing" privacy claim (deep-audit 2026-06-06). Fail-open like the rest.
+    await kvs.delete(`${PAGE_SNAP_PREFIX}${jobId}`);
 
     // P4 audit B/Finding-6: also purge test-case KVS entries so generated cases
     // don't linger after the user's content has been pushed. Fail-open: a purge
