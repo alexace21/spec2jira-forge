@@ -31,7 +31,7 @@ for (let run = 1; run <= RUNS; run++) {
   const dT = lc(d.section);
   const cT = lc(c.section);
 
-  const domainClean = !/must be preserved|never collapse|intentionally[^.]{0,20}unresolved|unresolved[^.]{0,20}tension/.test(dT);
+  const domainClean = !/must be preserved|never[^.]{0,15}collapse|collapse into|silently collapsed|must all be honoured|intentionally[^.]{0,20}unresolved|unresolved[^.]{0,20}tension/.test(dT);
   const noFabImmutable = !/document[^.]{0,40}immutable|requirements[^.]{0,25}immutable|immutable once set/.test(cT);
   const jiraPresent = /epic/.test(cT) && /story|stories/.test(cT) && /subtask/.test(cT);
   const antiTemplating = /fixed template|actual work|not.{0,12}template|reflect.{0,20}work/.test(cT);
