@@ -123,6 +123,7 @@ function StoryTestCaseCard({
   onRegenerate,
   draftResult,
   isDirty = false,
+  structurallyShifted = false,
   saveState = "idle",
   saveError = null,
   onCaseChange,
@@ -145,6 +146,20 @@ function StoryTestCaseCard({
   const cases = result && Array.isArray(result.test_cases) ? result.test_cases : [];
   const isPolling = regenState === "polling" || regenState === "pending";
   const isSaving = saveState === "saving";
+
+  // ── Per-case Save/Revert footers (Work B) ──────────────────────────────────────────
+  // In the COMMON flow (field edits + appends) each edited/new case shows its own footer below it,
+  // so Save/Revert is always where you're editing. A DELETE shifts array indices, making per-case-
+  // by-index comparison unsafe → the parent flags `structurallyShifted` and we fall back to ONE
+  // story-level bar at the bottom. savedCases = the last-SAVED cases (entry.result).
+  const savedCases =
+    !hasError && entry?.result && Array.isArray(entry.result.test_cases) ? entry.result.test_cases : [];
+  const perCaseMode = isDirty && !structurallyShifted && !!draftResult && cases.length >= savedCases.length;
+  const caseIsNew = (i) => i >= savedCases.length;
+  const caseIsDirty = (i) =>
+    perCaseMode && (caseIsNew(i) || JSON.stringify(cases[i]) !== JSON.stringify(savedCases[i]));
+  // True when at least one per-case footer is showing → suppress the story-level fallback bar.
+  const anyCaseFooter = perCaseMode && cases.some((_, i) => caseIsDirty(i));
 
   // Fix 3: two-step inline confirm — avoids window.confirm (may be blocked in Forge iframe).
   // 'idle' | 'armed'; auto-resets after 4 s if the user doesn't confirm.
@@ -418,6 +433,17 @@ function StoryTestCaseCard({
             acceptanceCriteria={acceptanceCriteria}
             onChange={(next) => onCaseChange && onCaseChange(i, next)}
             onDelete={() => onDeleteCase && onDeleteCase(i)}
+            showSaveBar={caseIsDirty(i)}
+            isNewCase={caseIsNew(i)}
+            saving={isSaving || isPolling}
+            saveState={saveState}
+            saveError={saveError}
+            onSaveStory={onSave}
+            onRevertCase={() =>
+              caseIsNew(i)
+                ? onDeleteCase && onDeleteCase(i)
+                : onCaseChange && onCaseChange(i, JSON.parse(JSON.stringify(savedCases[i])))
+            }
           />
         ))}
 
@@ -427,9 +453,9 @@ function StoryTestCaseCard({
           </p>
         )}
 
-        {/* + Add test case — disabled at the 15-case ceiling (the parse caps at 15; adding a
-            16th would be silently dropped). Hidden while regenerating. */}
-        {!hasError && !isPolling && (cases.length < 15 ? (
+        {/* + Add test case — disabled at the 20-case ceiling (the parse caps at 20 — testcases.js
+            parseTestCaseResult; adding a 21st would be silently dropped). Hidden while regenerating. */}
+        {!hasError && !isPolling && (cases.length < 20 ? (
           <button
             type="button"
             onClick={() => onAddCase && onAddCase()}
@@ -440,14 +466,16 @@ function StoryTestCaseCard({
           </button>
         ) : (
           <p className="text-[11px] mb-1" style={{ color: "var(--s2j-text-muted)" }}>
-            Maximum 15 cases per story — delete one to add another.
+            Maximum 20 cases per story — delete one to add another.
           </p>
         ))}
 
-        {/* Per-story Save bar — appears only when there are unsaved edits.
-            WHY explicit save (unlike the breakdown editor's in-memory edits): test cases are
-            re-read from KVS by BOTH export and the Jira push, so edits must be persisted there. */}
-        {!hasError && isDirty && (
+        {/* Story-level Save/Revert FALLBACK bar — shown only when NO per-case footer is (a case was
+            removed → indices shifted, so per-case-by-index revert is unsafe; or a no-op draft). In the
+            common edit/append flow the per-case footers above handle Save/Revert (Work B).
+            WHY explicit save (unlike the breakdown editor's in-memory edits): test cases are re-read
+            from KVS by BOTH export and the Jira push, so edits must be persisted there. */}
+        {!hasError && isDirty && !anyCaseFooter && (
           <div
             className="mt-2 flex items-center gap-2 rounded-md px-3 py-2 flex-wrap"
             style={{
@@ -471,9 +499,9 @@ function StoryTestCaseCard({
                 color: "var(--s2j-text-muted)",
                 cursor: (isSaving || isPolling) ? "not-allowed" : "pointer",
               }}
-              title="Discard your edits to this story"
+              title="Discard ALL your edits to this story"
             >
-              Revert
+              Revert all edits
             </button>
             <button
               type="button"

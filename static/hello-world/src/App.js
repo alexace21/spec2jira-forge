@@ -1247,7 +1247,7 @@ function App() {
 
   // handleSaveTestCase — persist ONE story's hand-edits to KVS via saveTestCases, then delta-patch
   // testCaseResults from the SAVED + sanitized result/coverage (the resolver returns the authoritative
-  // shape: cap-15, dropped empties, recomputed coverage — never the raw edit buffer). Returns the
+  // shape: cap-20, dropped empties, recomputed coverage — never the raw edit buffer). Returns the
   // resolver response so TestCasesScreen drives its per-story Save UI (saved / fail-loud-keep-buffer).
   // Mirrors the regenerate delta-patch above. Editing CASES doesn't change ACs → the push-embed
   // AC-hash is unchanged → the embed reads the edited entry for free (no push change needed).

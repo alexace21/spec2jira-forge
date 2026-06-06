@@ -365,6 +365,15 @@ function TestCasesScreen({
   const [drafts, setDrafts] = useState({});
   const [saveStates, setSaveStates] = useState({}); // storyIdx → 'idle'|'saving'|'saved'|'error'
   const [saveErrors, setSaveErrors] = useState({});
+  // Work B: true for a story whose draft had a SAVED case deleted since last save. A delete shifts
+  // array indices, making the card's per-case-by-index Save/Revert footers unsafe → it falls back to a
+  // single story-level bar. Field edits + appends (and deleting a never-saved appended case) keep
+  // indices aligned and do NOT set this. Cleared on save-success / revert / regenerate.
+  const [shiftedStories, setShiftedStories] = useState({});
+  const clearShifted = useCallback(
+    (storyIdx) => setShiftedStories((prev) => { const n = { ...prev }; delete n[storyIdx]; return n; }),
+    [],
+  );
   const savedTimers = useRef({});
   const pushArmTimer = useRef(null);
   const backArmTimer = useRef(null);
@@ -397,6 +406,12 @@ function TestCasesScreen({
   }, [perStory]);
 
   const handleDeleteCase = useCallback((storyIdx, caseIdx) => {
+    // Deleting a SAVED case (index < saved length) shifts indices → per-case-by-index footers become
+    // unsafe; flag it so the card falls back to the story-level bar. Deleting a never-saved appended
+    // case (index ≥ saved length) keeps the saved region aligned → no flag. (Once flagged it stays
+    // until save/revert; a later imprecise eval is harmless.)
+    const savedLen = (perStory.find((e) => e && e.storyIdx === storyIdx)?.result?.test_cases || []).length;
+    if (caseIdx < savedLen) setShiftedStories((prev) => ({ ...prev, [storyIdx]: true }));
     setDrafts((prev) => {
       const base = prev[storyIdx] || (perStory.find((e) => e && e.storyIdx === storyIdx)?.result) || { test_cases: [], no_acs: false, story_name: "" };
       return { ...prev, [storyIdx]: { ...base, test_cases: (base.test_cases || []).filter((_, i) => i !== caseIdx) } };
@@ -406,9 +421,10 @@ function TestCasesScreen({
 
   const handleRevert = useCallback((storyIdx) => {
     setDrafts((prev) => { const n = { ...prev }; delete n[storyIdx]; return n; });
+    clearShifted(storyIdx);
     setSaveStates((prev) => ({ ...prev, [storyIdx]: "idle" }));
     setSaveErrors((prev) => ({ ...prev, [storyIdx]: null }));
-  }, []);
+  }, [clearShifted]);
 
   const handleSave = useCallback(async (storyIdx) => {
     const draft = drafts[storyIdx];
@@ -425,6 +441,7 @@ function TestCasesScreen({
       // App.js delta-patched testCaseResults from the SAVED result; drop the local draft so the
       // card shows the persisted entry (with the authoritative recomputed coverage).
       setDrafts((prev) => { const n = { ...prev }; delete n[storyIdx]; return n; });
+      clearShifted(storyIdx); // saved baseline now matches the draft → per-case footers safe again
       setSaveStates((prev) => ({ ...prev, [storyIdx]: "saved" }));
       clearTimeout(savedTimers.current[storyIdx]);
       savedTimers.current[storyIdx] = setTimeout(
@@ -436,17 +453,18 @@ function TestCasesScreen({
       setSaveStates((prev) => ({ ...prev, [storyIdx]: "error" }));
       setSaveErrors((prev) => ({ ...prev, [storyIdx]: (resp && resp.detail) || "Save failed — your edits are still here." }));
     }
-  }, [drafts, onSaveTestCase]);
+  }, [drafts, onSaveTestCase, clearShifted]);
 
   // Regenerate must DISCARD this story's unsaved draft first — else the stale draft shadows the
   // regenerated cases (the card renders draftResult || entry.result) and a later Save would clobber
   // the regenerate. Makes the "Discard edits & regenerate?" confirm truthful.
   const handleRegenerate = useCallback((storyIdx) => {
     setDrafts((prev) => { const n = { ...prev }; delete n[storyIdx]; return n; });
+    clearShifted(storyIdx);
     setSaveStates((prev) => ({ ...prev, [storyIdx]: "idle" }));
     setSaveErrors((prev) => ({ ...prev, [storyIdx]: null }));
     onRegenerate?.(storyIdx);
-  }, [onRegenerate]);
+  }, [onRegenerate, clearShifted]);
 
   const dirtyCount = Object.keys(drafts).length;
 
@@ -550,6 +568,7 @@ function TestCasesScreen({
                   onRegenerate={handleRegenerate}
                   draftResult={drafts[entry.storyIdx] || null}
                   isDirty={drafts[entry.storyIdx] !== undefined}
+                  structurallyShifted={!!shiftedStories[entry.storyIdx]}
                   saveState={saveStates[entry.storyIdx] || "idle"}
                   saveError={saveErrors[entry.storyIdx] || null}
                   onCaseChange={(caseIdx, next) => handleCaseChange(entry.storyIdx, caseIdx, next)}

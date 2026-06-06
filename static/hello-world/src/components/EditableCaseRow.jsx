@@ -73,7 +73,23 @@ function StringListEditor({ label, items, onChange, addLabel = "+ Add", placehol
  *   onChange            — fn(nextCase)
  *   onDelete            — fn()
  */
-export default function EditableCaseRow({ tc, caseNumber, acceptanceCriteria, onChange, onDelete }) {
+export default function EditableCaseRow({
+  tc,
+  caseNumber,
+  acceptanceCriteria,
+  onChange,
+  onDelete,
+  // Per-case Save/Revert footer (Work B) — rendered below THIS case when it has unsaved edits, so
+  // Save/Revert is always right where you're editing. Save is per-STORY (KVS is per-story; the
+  // tooltip says so honestly); Revert is genuinely per-case.
+  showSaveBar = false,
+  isNewCase = false,
+  saving = false,
+  saveState = "idle",
+  saveError = null,
+  onSaveStory,
+  onRevertCase,
+}) {
   const c = tc || {};
   const type = c.type || "happy-path";
   const badge = TYPE_BADGE[type] || { fg: "var(--s2j-text-muted)", bg: "var(--s2j-bg-section)", border: "var(--s2j-border)" };
@@ -201,6 +217,58 @@ export default function EditableCaseRow({ tc, caseNumber, acceptanceCriteria, on
       <div className="mt-2 pt-2" style={{ borderTop: "1px dashed var(--s2j-border)" }}>
         <AcTraceEditor acTrace={c.ac_trace} acceptanceCriteria={acceptanceCriteria} onChange={(next) => set("ac_trace", next)} />
       </div>
+
+      {/* Per-case Save/Revert footer (Work B) — under THIS case when it has unsaved edits, so the
+          controls are always where you're editing. Save persists the WHOLE story (KVS is per-story —
+          the tooltip is explicit); Revert is genuinely per-case (or "Remove" for a never-saved case). */}
+      {showSaveBar && (
+        <div
+          className="mt-3 pt-2 flex items-center gap-2 flex-wrap"
+          style={{ borderTop: "1px dashed var(--s2j-blue-border)" }}
+        >
+          <span
+            className="text-[10px] flex-1 min-w-[110px] font-medium"
+            style={{ color: saveState === "error" ? "var(--s2j-red)" : "var(--s2j-blue)" }}
+          >
+            {saveState === "error"
+              ? saveError || "Save failed — your edits are still here. Try again."
+              : isNewCase
+              ? "● New case — unsaved"
+              : "● Edited — unsaved"}
+          </span>
+          <button
+            type="button"
+            onClick={() => onRevertCase && onRevertCase()}
+            disabled={saving}
+            className="text-[10px] px-2 py-0.5 rounded shrink-0"
+            style={{
+              background: "none",
+              border: "1px solid var(--s2j-border)",
+              color: "var(--s2j-text-muted)",
+              cursor: saving ? "not-allowed" : "pointer",
+            }}
+            title={isNewCase ? "Remove this unsaved case" : "Discard your edits to this case"}
+          >
+            {isNewCase ? "↩ Remove" : "↩ Revert this case"}
+          </button>
+          <button
+            type="button"
+            onClick={() => onSaveStory && onSaveStory()}
+            disabled={saving}
+            className="text-[10px] px-3 py-0.5 rounded font-medium shrink-0"
+            style={{
+              background: "var(--s2j-blue)",
+              border: "1px solid var(--s2j-blue)",
+              color: "#fff",
+              cursor: saving ? "not-allowed" : "pointer",
+              opacity: saving ? 0.7 : 1,
+            }}
+            title="Save all edits in this story (updates coverage, export & push)"
+          >
+            {saving ? "Saving…" : "Save changes"}
+          </button>
+        </div>
+      )}
     </div>
   );
 }
