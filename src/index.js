@@ -147,11 +147,15 @@ const SETTINGS_KEY = 'spec2jira_settings';
 // 12000: the 6-call decomposed distill produces a COMPLETE multi-category profile, and a
 // genuinely rich regulated domain (the bilingual 3-site sepsis CDS) merges to ~7.5K chars
 // of pure signal — 8000 left almost no headroom and risked silently trimming the LAST
-// category (Conventions: the counterintuitive rules + lineage carve-out). 12000 fits the
-// complete profile with room and still leaves a hand-editable draft; the aggregate store
-// size is guarded gracefully in saveSettings (a too-large write is rejected with a clear
-// message, never silently dropped).
-const PROJECT_CONTEXT_MAX_CHARS = 12000;
+// category (Conventions: the counterintuitive rules + lineage carve-out). 20000 (raised from
+// 12000 2026-06-06) lets a DENSE, high-signal real context pass through RAW rather than be
+// condensed: a real FlexiCash lending context (19,775 chars) was distilled and the distill
+// INTERPRETED — it fabricated/drifted 2 normative "standing rules" that contradicted the spec
+// and dropped high-signal conventions (anti-templating, JIRA structure, team composition).
+// For a context that fits 20000, faithful raw text beats a lossy+interpretive condense.
+// "Distill with Claude" remains for contexts that genuinely exceed 20000 (and is being
+// hardened to extract-not-interpret). Aggregate store size is still guarded in saveSettings.
+const PROJECT_CONTEXT_MAX_CHARS = 20000;
 
 // "Distill with Claude" is a 6-call CHUNKED pipeline (startDistillSession → distillStep ×6,
 // looped by the UI — mirrors the chunked JIRA push). Each call extracts ONE category from
