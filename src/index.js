@@ -171,7 +171,7 @@ const DISTILL_SESSION_PREFIX = 'distill_session:';
 // so a SINGLE global context would misapply across them (project A's glossary on a
 // project B spec = wrong output). Profiles let the user pick the right context per
 // generation. Per-profile + count caps bound each entry; the AGGREGATE serialized
-// size is guarded in saveSettings — 20 × 12000 chars (plus non-ASCII at 2-4 UTF-8
+// size is guarded in saveSettings — 20 × 20000 chars (plus non-ASCII at 2-4 UTF-8
 // bytes/char) can approach the ~240KB KVS value cap, so the write is size-checked.
 const MAX_CONTEXT_PROFILES = 20;
 const CONTEXT_PROFILE_NAME_MAX = 60;

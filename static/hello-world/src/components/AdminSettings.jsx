@@ -22,7 +22,10 @@ import { invoke } from "@forge/bridge";
 
 // Mirrors of the server-authoritative caps in src/index.js — kept here only for the
 // live character counter + fail-fast UX on the Project Context profiles editor.
-const PROJECT_CONTEXT_MAX_CHARS = 12000;
+// ⚠ Keep in sync with PROJECT_CONTEXT_MAX_CHARS in src/index.js (raised 12000→20000 2026-06-06;
+// the frontend mirror was missed → the counter + "over the limit" warning + the Save-blocking
+// over-check still showed 12000, more restrictive than the backend).
+const PROJECT_CONTEXT_MAX_CHARS = 20000;
 const MAX_CONTEXT_PROFILES = 20;
 const CONTEXT_PROFILE_NAME_MAX = 60;
 
