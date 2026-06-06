@@ -2,9 +2,10 @@
 
 > The synthesized, verdict-orchestrated design for the per-Story test-case feature,
 > after the **Sonnet + Batches** pivot (data-confirmed). Branch `feature/product-improvements`.
-> Source-of-truth for the P3 backend build. Supersedes the earlier Haiku-sync-chunked +
-> reactive-sub-chunk plan (that design's parse/key-source/reconnect/KVS *concepts* carry
-> over; the *call structure* becomes a batch).
+> Source-of-truth for the FULL feature: P1 prompt → P3 backend → P4 push embed → P5 screen →
+> §9 human-in-the-loop editing. Supersedes the earlier Haiku-sync-chunked + reactive-sub-chunk
+> plan (that design's parse/key-source/reconnect/KVS *concepts* carry over; the *call structure*
+> becomes a batch).
 
 ---
 
@@ -162,13 +163,19 @@ Every phase: built → §13 gate (code-review + audit) → 4-lens deep audit →
   fingerprint; reconnect rehydration; purgeJob cleanup. Commit `01a32d4`.
 - ✅ **P5 — Test Cases screen** (see §8): generate/view/regenerate/export; the uncovered/stale-AC
   rendering (trust); `getTestCaseExports`. Commit `e22bee0`.
+- ✅ **Push-embed Story-attachment FIX + human-in-the-loop EDITING** (see §7 revised + §9): content-match
+  each Story to its cases by AC-hash (the live-smoke "only the first story embedded" fix + a collision
+  guard) AND the editable Test Cases screen (`saveTestCases` + `AcTraceEditor` + `EditableCaseRow` +
+  dirty-guards). §13 conductor design army + a 4-lens deep adversarial audit (which caught the
+  hash-collision mis-embed + the edit-during-regen shadow/clobber). Commit `90cba80`.
 - ⭐ **Regression verdict (P5 deep-audit integration lens):** the core breakdown → review → push E2E
   is INTACT — a push with NO test cases is BYTE-IDENTICAL to pre-P4; reconnect / state-machine /
   purgeJob all fail-soft. P4/P5's shared-path changes did not break the shipped flow.
-- ⏭ **P6 — deploy + live E2E smoke** (first real run: generate via Sonnet batch → view/coverage →
-  export → push → verify the JIRA Story summary) · **Task #7 — validate quality on the partner's
-  ~9 real Confluence pages** (the pre-ship "sharpen the axe" gate). No manifest change (resolvers are
-  `resolver.define` within the single function; egress + scopes unchanged → deploy-safe).
+- ⏭ **P6 — §13 gate ✅ + design doc ✅ (this file) → deploy + live E2E smoke remain** (first real run:
+  generate via Sonnet batch → view/coverage → EDIT a few cases + Save → export → push → verify the JIRA
+  Story summary across ALL stories) · **Task #7 — validate quality on the partner's ~9 real Confluence
+  pages** (the pre-ship "sharpen the axe" gate). No manifest change (resolvers are `resolver.define`
+  within the single function; egress + scopes unchanged → deploy-safe).
 - 🚩 **Partner flag:** §5 #8 — Managed quota accounting (defer to editions Phase 2).
 
 ### Directive verdicts (2026-06-06)
@@ -196,15 +203,23 @@ Every phase: built → §13 gate (code-review + audit) → 4-lens deep audit →
   rendering as an UNPROVEN ADF structure (whole-chunk-fail risk, gotcha #11) AND as noise that buries
   the story; the summary de-risks AND de-noises. The full cases live in the export + the P5 screen
   (the BA's primary artifact).
-- **Push integration:** `jobId` → `startPush` → session (carries `tcAcHashes`); `stepStories` fetches
-  `testcases:<jobId>:<idx>` per chunk + appends the summary; the embed is wrapped in try/catch
-  (fail-open — a render throw must never kill the Story create). Backwards-compatible: no test cases →
-  the description is BYTE-IDENTICAL to pre-P4.
-- **⭐ Staleness fingerprint:** a per-story djb2 hash of the normAC'd+sorted ACs (`acSetHash`), frozen
-  in the session as a compact `tcAcHashes` map (~40 B/story — not the full ACs). Embed only when the
-  live feature's AC-hash still matches: a name edit still embeds (ACs unchanged); a reorder /
-  duplicate-name / AC-edit correctly SKIPS (no mis-attribution). `tc_embedded`/`tc_skipped` counts
-  surface on the confirm + success screens (a stale-skip is visible, never silent).
+- **⭐ Push integration — content-match, NOT position (live-smoke fix 2026-06-06):** `jobId` →
+  `startPush` → session carries `tcHashToIdx` (AC-content-hash → generation storyIdx) + `tcTotal`. For
+  each pushed feature, `stepStories` looks up `tcHashToIdx[acSetHash(feature.acceptance_criteria)]` →
+  fetches `testcases:<jobId>:<idx>` → appends the summary. The push order (`flattenBreakdown` —
+  capability-grouped from the EDITED breakdown) diverges from the generation order (flat `features[]`),
+  so the original POSITION-keying (`testcases:<jobId>:<start+j>`) embedded only the coincidentally-first
+  Story — the bug the partner hit. Binding by AC-CONTENT makes each feature find ITS cases regardless of
+  reorder, and the hash lookup IS the staleness check (a feature whose ACs were edited post-generation
+  matches no entry → no embed, never a mis-attribution). Embed wrapped in try/catch (fail-open); no test
+  cases → BYTE-IDENTICAL to pre-P4.
+- **⭐ Collision guard + counts (deep-audit 2026-06-06):** `tcHashToIdx` is built with a collision guard
+  — two stories with an identical AC set (incl. multiple no-AC stories, which all hash the empty set)
+  would collapse to one idx (last-writer-wins) and embed the WRONG cases; an ambiguous hash is DROPPED →
+  those features read as honest `tc_skipped`, never a wrong embed. A SINGLE no-AC story keeps its unique
+  (empty-set) hash → still embeds (no regression). `tc_embedded` (gated on `test_cases.length>0`) /
+  `tc_skipped` (`= max(0, tcTotal − tc_embedded)`) surface on the PushedScreen (a skip is visible, never
+  silent). The real long-term fix is a stable `story_uid` minted at generation.
 - **Reconnect:** `getResults`/`getGenerationStatus` return `tcStatus`; App.js rehydrates + resumes the
   poll. `purgeJob` deletes `tcjob` + `testcases:*` after push (fail-soft; no-tcjob → no-op).
 
@@ -225,3 +240,69 @@ Every phase: built → §13 gate (code-review + audit) → 4-lens deep audit →
   single-source `testcases.js` (CRA cannot import `../../../src`); per-story + all-stories; Gherkin +
   CSV; clipboard primary + data-URI download (Forge blocks `blob:`); discriminated feedback
   (✓ Copied / ✓ Downloaded / "Copy failed") — never a silent no-op on the BA's key action.
+
+## 9. Human-in-the-loop test-case EDITING (2026-06-06)
+
+The Test Cases screen is read-no-more — each story's cases are **editable like the BreakdownEditor**
+(the partner's named reference), so a BA refines the expert DRAFT before export/push. Designed via the
+§13 conductor model (3-lens design army → verdict synthesis) and gated by a 4-lens deep adversarial audit.
+
+- **⭐ The persistence model (load-bearing decision).** Unlike the breakdown (which travels in the push
+  payload → in-memory edits suffice), test cases are RE-READ from KVS by BOTH the export
+  (`getTestCaseExports`) and the push embed (`stepStories`). So an edit reaches export/push ONLY if
+  persisted back to `testcases:<jobId>:<idx>`. ⇒ an explicit per-story **Save** — the ONE deliberate
+  divergence from the no-save BreakdownEditor — which keeps ONE source of truth for bounds (the canonical
+  `parseTestCaseResult` + `computeCoverage`) and one persistence path shared by bulk/regen/edit/export/push.
+  (The spec-fidelity audit lens challenged this hard and BLESSED it: threading edits through the payload
+  would still need the server-side re-parse + coverage recompute, so the Save button is the higher-value choice.)
+- **`saveTestCases({jobId, storyIdx, result})` resolver.** Guard chain (no_job_id / bad_story_idx /
+  invalid_result / license / not_found / not_ready / story_out_of_range / regen_in_progress) → re-sanitize
+  the user-edited result through `parseTestCaseResult` (user input is LESS trusted than model JSON — the
+  parser owns every bound: drop empty when/then, repair ac_trace→inferred, priority whitelist, test_data
+  cap, cap-15 AC-covering partition) → recompute coverage against the **STAMPED ACs** (the same oracle the
+  embed-hash + generation use, NOT the live breakdown) → REJECT an empty result (would silently erase the
+  story's export + embed) → write EXACTLY ONE key (tcjob's stamped ACs stay IMMUTABLE = embed key +
+  coverage oracle) → return `{ok, result, coverage}`. Pure KVS op (no Anthropic call → no keySource).
+  Editing CASES never touches ACs → the embed AC-hash is unchanged → push reads the edited entry for free
+  (no push_handler change needed for editing).
+- **⭐ Coverage-safe `ac_trace` editing (the trust pillar).** Coverage is the BA's #1 signal, derived
+  from `ac_trace.ac_text` matched VERBATIM vs the story ACs — so ac_trace is NEVER free-text. The
+  `AcTraceEditor` is an **AC-checklist**: ticking a story AC writes `{kind:'story-ac', ac_text:<verbatim
+  AC>}`, so the stored text is always verbatim-equal to a live AC → coverage stays trustworthy BY
+  CONSTRUCTION (no free-text drift — the exact failure this feature must prevent). Plus an inferred toggle
+  (mutually exclusive) + shared-ac chips (display+remove) + stale-ref cleanup. The badge shows the
+  last-SAVED (authoritative) coverage; the recompute is server-side on Save — no duplicated coverage logic
+  in the frontend (the frontend `normForMatch` is a display-only port of `normAC` and can never mis-check
+  toward green, since the stored text is verbatim).
+- **State architecture + dirty discipline.** Edit drafts live in `TestCasesScreen` (`drafts[storyIdx]`),
+  ABOVE the memoized `StoryTestCaseCard`, so a card re-render / accordion collapse never drops in-progress
+  edits. `App.handleSaveTestCase` delta-patches `testCaseResults.perStory[idx]` from the SAVED + sanitized
+  result/coverage (mirrors the regenerate delta-patch). **Pessimistic, fail-loud:** a failed save KEEPS the
+  buffer + dirty state (never a silent "saved"); only `{ok}` clears the draft. Dirty guards (all two-step,
+  no `window.confirm` — Forge iframe): Regenerate-when-dirty ("Discard edits & regenerate?" + clears the
+  draft so it can't shadow the regen), Back-to-Review + Continue-to-Push ("⚠ N unsaved"), Copy/Export
+  disabled-or-warned when dirty (export reads SAVED KVS). Save↔Regenerate mutual exclusion (last-writer KVS
+  race) + a `regen_in_progress` backend backstop; **editing is PAUSED while a regen poll is in flight**.
+- **New components.** `AcTraceEditor.jsx` (coverage-safe checklist), `EditableCaseRow.jsx` (editable case —
+  reuses the breakdown's `EditableField` + a FeatureCard-style `+Add`/hover-✕ StringListEditor + native
+  `<select>` for type/priority + two-step delete). `StoryTestCaseCard` swaps read-only CaseRow →
+  EditableCaseRow + the Save bar; `TestCasesScreen` owns the drafts + the guards.
+
+**4-lens deep audit — caught what the per-change §13 gate missed:**
+
+| Lens | Finding | Sev | Fix |
+|---|---|---|---|
+| Correctness | hash-collision mis-embed (multiple no-AC / identical-AC stories → WRONG cases on a Story) | HIGH | collision guard drops ambiguous hashes → honest `tc_skipped` (§7) |
+| Silent-failure | edit-during-regen-poll: a new draft shadows the regenerated cases + a later Save clobbers them | MED | editing paused while `isPolling` |
+| Backend-security | guard chain complete · coverage vs stamped ACs · tcjob immutable · empty-result reject | — | SHIP (clean) |
+| Spec-fidelity | both asks delivered; AC-hash join-key + Save-button are the RIGHT engineering, not gold-plating | — | blessed |
+
+Folded the same pass: `AcTraceEditor` shared-ac symmetry guard, `acSetHash` djb2-readability parens.
+
+**Deferred (post-MVP, honest):** restore-original-cases-after-save undo (Revert covers UNSAVED edits;
+post-save undo needs regenerate) · "Copy All" omits the failed-story count · `tc_embedded` over-counts on a
+story-create failure (cosmetic, success-screen only) · array-index list keys · a friendlier KVS-oversize
+message · a post-save "N cases dropped" toast (the pre-save inline warning + the empty-result reject already
+cover the silent-drop). A stable `story_uid` at generation would retire the AC-hash collision residual.
+
+Commit `90cba80`.
