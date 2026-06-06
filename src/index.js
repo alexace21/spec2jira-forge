@@ -56,6 +56,7 @@ import {
 } from './anthropic_client.js';
 import { startPushSession, pushSessionStep } from './push_handler.js';
 import { detectCycles } from './graph.js';
+import { renderGherkin, renderManualTable } from './testcases.js';
 import {
   TIERS,
   checkQuota,
@@ -2147,6 +2148,88 @@ resolver.define('pollRegenerateTestCase', async ({ payload }) => {
   }
 
   return { ...regenJob, batchStatus: pollResult.status, phase: `Unknown batch status: ${pollResult.status}` };
+});
+
+/**
+ * getTestCaseExports — deterministic pure-render resolver (NO LLM, NO KVS writes).
+ * Returns Gherkin and/or CSV for one story (storyIdx = number) or all stories
+ * (storyIdx = null / omitted). Reads the same testcases:<jobId>:<idx> entries
+ * that getTestCases reads; fails gracefully on missing/error entries.
+ *
+ * Payload: { jobId, storyIdx?, format? }
+ *   jobId     — required; the completed breakdown job id
+ *   storyIdx  — number → single story; null/omitted → all stories (concat)
+ *   format    — 'gherkin' | 'csv' | 'both' (default 'both')
+ *
+ * Returns: { gherkin?, csv? } or { error, detail }
+ *   confidence is NEVER exported (opts { includeConfidence: false }).
+ */
+resolver.define('getTestCaseExports', async ({ payload }) => {
+  const { jobId, storyIdx, format = 'both' } = payload || {};
+  if (!jobId) return { error: 'no_job_id', detail: 'jobId is required.' };
+
+  const tcJob = await kvs.get(`${TC_JOB_KEY_PREFIX}${jobId}`).catch(() => null);
+  if (!tcJob) return { error: 'not_found', detail: `tcjob ${jobId} not found.` };
+  if (tcJob.status !== 'completed') {
+    return { error: 'not_ready', status: tcJob.status, detail: `Test case generation is in status '${tcJob.status}'.` };
+  }
+
+  const total = tcJob.total || 0;
+  const stampedStories = tcJob.stampedStories || [];
+
+  // Determine which indices to render
+  const indices = (typeof storyIdx === 'number' && Number.isInteger(storyIdx) && storyIdx >= 0)
+    ? [storyIdx]
+    : Array.from({ length: total }, (_, i) => i);
+
+  // Read all required per-story entries in parallel (pure read, no writes)
+  const entries = await Promise.all(
+    indices.map((idx) => kvs.get(`${TC_STORY_KEY_PREFIX}${jobId}:${idx}`).catch(() => null)),
+  );
+
+  const renderOpts = { includeConfidence: false };
+  const gherkinParts = [];
+  // CSV: first valid story gets headerRow:true (includes column header); subsequent
+  // stories get headerRow:false so there is exactly ONE header row in the combined CSV.
+  const csvParts = [];
+  let csvHeaderEmitted = false;
+
+  for (let i = 0; i < indices.length; i++) {
+    const idx = indices[i];
+    const entry = entries[i];
+    if (!entry || entry.error) continue; // skip error/missing entries gracefully
+
+    const stamped = stampedStories.find((s) => s && s.idx === idx);
+    const story = stamped
+      ? { name: stamped.name || '', acceptance_criteria: stamped.acceptance_criteria || [] }
+      : { name: entry.storyName || '', acceptance_criteria: [] };
+
+    const result = entry.result;
+    if (!result) continue;
+
+    if (format === 'gherkin' || format === 'both') {
+      const g = renderGherkin(result, story, renderOpts);
+      if (g) gherkinParts.push(g);
+    }
+    if (format === 'csv' || format === 'both') {
+      const { csv } = renderManualTable(result, story, { ...renderOpts, headerRow: !csvHeaderEmitted });
+      if (csv) {
+        csvParts.push(csv);
+        csvHeaderEmitted = true;
+      }
+    }
+  }
+
+  const out = {};
+
+  if (format === 'gherkin' || format === 'both') {
+    out.gherkin = gherkinParts.join('\n\n');
+  }
+  if (format === 'csv' || format === 'both') {
+    out.csv = csvParts.join('\n');
+  }
+
+  return out;
 });
 
 // ── Export handler bound к manifest function key "resolver" ──

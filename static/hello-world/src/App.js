@@ -12,6 +12,7 @@ import BreakdownEditor from "./components/breakdown";
 import AdminSettings from "./components/AdminSettings";
 import PagePickerScreen from "./components/PagePicker";
 import BackButton from "./components/BackButton";
+import TestCasesScreen from "./components/TestCasesScreen";
 import {
   adaptToLegacyShape,
   extractV3Signals,
@@ -258,6 +259,9 @@ function _classifyBackendError(errorShape, contextLabel = "") {
 
 function App() {
   const [screen, setScreen] = useState("loading");
+  // screenRef mirrors screen state so poll callbacks always read the CURRENT value
+  // without a stale closure (fix 6: navigate to testcases only when generatingTests).
+  const screenRef = useRef("loading");
   const [pageData, setPageData] = useState(null);
   const [pageId, setPageId] = useState(null);
   const [error, setError] = useState(null);
@@ -388,6 +392,22 @@ function App() {
   const pollRef = useRef(null);
   const timerRef = useRef(null);
   const pushPollRef = useRef(null);
+
+  // Test-case generation state (P5)
+  const [tcJobStatus, setTcJobStatus] = useState(null);
+  const [tcStartTime, setTcStartTime] = useState(null);
+  const [tcElapsed, setTcElapsed] = useState(0);
+  // Fix 6: tracks whether a TC generation is in-flight (persists across screen transitions
+  // so the reviewing-screen button can show "⏳ Generating…" even after the BA navigates back)
+  const [tcGenerating, setTcGenerating] = useState(false);
+  const tcPollRef = useRef(null);
+  // Per-story regenerate: { [storyIdx]: 'idle'|'pending'|'polling'|'done'|'error' }
+  const [regenStates, setRegenStates] = useState({});
+  const regenPollRefs = useRef({});
+
+  // Keep screenRef in sync with screen state (fix 6: poll callbacks read the current screen
+  // without a stale closure — useEffect fires after every render where screen changed).
+  useEffect(() => { screenRef.current = screen; }, [screen]);
 
   // ── Init ──────────────────────────────────────────────────────
   // globalPage migration (2026-05-09): no longer auto-binds via
@@ -620,6 +640,8 @@ function App() {
       clearInterval(pollRef.current);
       clearInterval(timerRef.current);
       clearInterval(pushPollRef.current);
+      clearInterval(tcPollRef.current);
+      Object.values(regenPollRefs.current).forEach(clearInterval);
     };
     // reinitNonce: bumped by handleCloseSettings → re-runs the init/config gate after
     // closing in-app Settings (re-checks config → routes to picker if now configured).
@@ -637,6 +659,17 @@ function App() {
     }
     return () => clearInterval(timerRef.current);
   }, [screen, startTime]);
+
+  // TC timer — elapsed counter for the generatingTests screen
+  useEffect(() => {
+    if (screen === "generatingTests" && tcStartTime) {
+      const id = setInterval(
+        () => setTcElapsed(Math.floor((Date.now() - tcStartTime) / 1000)),
+        1000,
+      );
+      return () => clearInterval(id);
+    }
+  }, [screen, tcStartTime]);
 
   // ── Bug F1 fix (2026-05-10 part 44) — reviewing screen layout reflow ─
   // Symptom: in-flight generation→reviewing transition rendered breakdown
@@ -772,6 +805,13 @@ function App() {
               console.error("getTestCases rehydrate failed (non-fatal):", e);
             }
           }
+          // Fix 6 (Audit-6/7 reconnect): if TC generation was in-flight when the user
+          // reconnected (tcStatus batched/pending), resume polling so completion still lands.
+          // setTcGenerating(true) drives the "⏳ Generating…" button on the reviewing screen.
+          if (full.tcStatus === 'batched' || full.tcStatus === 'pending') {
+            setTcGenerating(true);
+            startTcPolling(statusResult.job_id);
+          }
           return;
         }
       }
@@ -779,7 +819,7 @@ function App() {
       // Idle / no job → fresh start.
       setScreen("ready");
     },
-    [startPolling],
+    [startPolling, startTcPolling],
   );
 
   // handlePageSelected — picker hands off the chosen page (or manual
@@ -1032,6 +1072,183 @@ function App() {
     }
   }, [pendingBreakdown, jobId]);
 
+  // ── Test-case generation (P5) ─────────────────────────────────
+
+  const startTcPolling = useCallback(
+    (jid) => {
+      clearInterval(tcPollRef.current);
+      tcPollRef.current = setInterval(async () => {
+        try {
+          const st = await invoke("pollTestCaseStatus", { jobId: jid });
+          if (st.error) {
+            clearInterval(tcPollRef.current);
+            setTcGenerating(false); // Fix 6
+            const friendly = _classifyBackendError(st, "Test case generation failed");
+            setError(friendly.message);
+            setScreen("error");
+            return;
+          }
+          setTcJobStatus(st);
+          if (st.status === "completed") {
+            clearInterval(tcPollRef.current);
+            const tc = await invoke("getTestCases", { jobId: jid });
+            if (tc.error) {
+              setTcGenerating(false); // Fix 6
+              const friendly = _classifyBackendError(tc, "Failed to load test cases");
+              setError(friendly.message);
+              setScreen("error");
+            } else {
+              setTestCaseResults(tc);
+              setTcGenerating(false); // Fix 6
+              // Fix 6: navigate to testcases ONLY when the user is on the generating screen;
+              // if they backed to reviewing, update results silently — don't yank them away.
+              if (screenRef.current === "generatingTests") {
+                setScreen("testcases");
+              }
+            }
+          } else if (st.status === "failed") {
+            clearInterval(tcPollRef.current);
+            setTcGenerating(false); // Fix 6
+            const friendly = _classifyBackendError(st, "Test case generation failed");
+            setError(friendly.message);
+            setScreen("error");
+          }
+        } catch (e) {
+          console.error("TC poll error:", e);
+        }
+      }, POLL_MS);
+    },
+    [],
+  );
+
+  const handleGenerateTestCases = useCallback(async () => {
+    if (!jobId) return;
+    setScreen("generatingTests");
+    setTcGenerating(true); // Fix 6: mark in-flight before the invoke
+    setTcStartTime(Date.now());
+    setTcElapsed(0);
+    setTcJobStatus({ progress: 0, phase: "Starting…" });
+
+    const result = await invoke("startTestCaseGeneration", { jobId });
+
+    if (result.error === "quota_exceeded") {
+      setTcGenerating(false); // Fix 6
+      setQuotaInfo(result);
+      setScreen("limit_reached");
+      return;
+    }
+    if (result.error === "license_required") {
+      setTcGenerating(false); // Fix 6
+      setQuotaInfo(result);
+      setScreen("limit_reached");
+      return;
+    }
+    if (result.error === "managed_unavailable") {
+      setTcGenerating(false); // Fix 6
+      setError(
+        result.detail ||
+          "The Managed service is temporarily unavailable. Please contact support, or switch to your own Anthropic API key in Settings.",
+      );
+      setScreen("error");
+      return;
+    }
+    if (result.error) {
+      setTcGenerating(false); // Fix 6
+      const friendly = _classifyBackendError(result, "Test case generation failed");
+      if (friendly.routeToSetup) {
+        setError(friendly.message);
+        setScreen("setup");
+        return;
+      }
+      setError(friendly.message);
+      setScreen("error");
+      return;
+    }
+
+    // Idempotency: if the resolver returned already-completed, load results directly.
+    // Fix 5: if getTestCases returns an error on the fast-path, do NOT silently return
+    // (leaves user stuck on generatingTests) — fall through to startTcPolling to re-poll.
+    if (result.status === "completed") {
+      const tc = await invoke("getTestCases", { jobId });
+      if (!tc.error) {
+        setTcGenerating(false); // Fix 6
+        setTestCaseResults(tc);
+        setScreen("testcases");
+        return;
+      }
+      // tc.error → fall through: re-poll picks up the completed status and retries the fetch
+    }
+
+    startTcPolling(jobId);
+  }, [jobId, startTcPolling]);
+
+  const handleRegenerateTestCase = useCallback(
+    (storyIdx) => {
+      setRegenStates((prev) => ({ ...prev, [storyIdx]: "pending" }));
+      (async () => {
+        let submitResult;
+        try {
+          submitResult = await invoke("regenerateTestCase", { jobId, storyIdx });
+        } catch (_invokeErr) {
+          setRegenStates((prev) => ({ ...prev, [storyIdx]: "error" }));
+          return;
+        }
+        if (submitResult.error) {
+          setRegenStates((prev) => ({ ...prev, [storyIdx]: "error" }));
+          return;
+        }
+        setRegenStates((prev) => ({ ...prev, [storyIdx]: "polling" }));
+
+        // Poll this story's regen until done
+        clearInterval(regenPollRefs.current[storyIdx]);
+        regenPollRefs.current[storyIdx] = setInterval(async () => {
+          try {
+            const st = await invoke("pollRegenerateTestCase", { jobId, storyIdx });
+            if (!st || st.error) {
+              clearInterval(regenPollRefs.current[storyIdx]);
+              setRegenStates((prev) => ({ ...prev, [storyIdx]: "error" }));
+              return;
+            }
+            if (st.status === "completed") {
+              clearInterval(regenPollRefs.current[storyIdx]);
+              // Delta-patch: only update the one entry in testCaseResults.perStory
+              setTestCaseResults((prev) => {
+                if (!prev) return prev;
+                const updated = prev.perStory.map((entry) => {
+                  if (entry.storyIdx !== storyIdx) return entry;
+                  return {
+                    ...entry,
+                    result: st.result !== undefined ? st.result : entry.result,
+                    coverage: st.coverage !== undefined ? st.coverage : entry.coverage,
+                    error: st.error,
+                  };
+                });
+                const failedCount = updated.filter((e) => e && e.error).length;
+                return { ...prev, perStory: updated, failedCount };
+              });
+              setRegenStates((prev) => ({ ...prev, [storyIdx]: "done" }));
+            } else if (st.status === "failed") {
+              clearInterval(regenPollRefs.current[storyIdx]);
+              setRegenStates((prev) => ({ ...prev, [storyIdx]: "error" }));
+            }
+          } catch (e) {
+            console.error("Regen poll error:", e);
+          }
+        }, POLL_MS);
+      })();
+    },
+    [jobId],
+  );
+
+  const handleOpenTestCases = useCallback(() => {
+    setScreen("testcases");
+  }, []);
+
+  const handleBackFromTestCases = useCallback(() => {
+    setScreen("reviewing");
+    // Intentionally does NOT clear testCaseResults — they persist until page change / regenerate
+  }, []);
+
   // ── Navigation ────────────────────────────────────────────────
   // handleRetry — same page, fresh attempt. Used by ErrorScreen
   // "Try again". Preserves pageId + pageData so user retries same spec
@@ -1045,6 +1262,13 @@ function App() {
   const handleRetry = useCallback(() => {
     clearInterval(pollRef.current);
     clearInterval(pushPollRef.current);
+    // Fix 4: stop in-flight TC + regen polls (interval-leak on SPA navigation)
+    clearInterval(tcPollRef.current);
+    Object.values(regenPollRefs.current).forEach(clearInterval);
+    // Fix 6: reset TC UI state so the reviewing screen doesn't show a stuck "⏳ Generating…"
+    setTcGenerating(false);
+    setRegenStates({});
+    setTcJobStatus(null);
     setError(null);
     setJobId(null);
     setJobStatus(null);
@@ -1069,6 +1293,13 @@ function App() {
   const handleRegenerate = useCallback(() => {
     clearInterval(pollRef.current);
     clearInterval(pushPollRef.current);
+    // Fix 4: stop in-flight TC + regen polls (interval-leak on SPA navigation)
+    clearInterval(tcPollRef.current);
+    Object.values(regenPollRefs.current).forEach(clearInterval);
+    // Fix 6: reset TC UI state so the reviewing screen doesn't show a stuck "⏳ Generating…"
+    setTcGenerating(false);
+    setRegenStates({});
+    setTcJobStatus(null);
     setResults(null);
     setTestCaseResults(null);
     setPendingBreakdown(null);
@@ -1087,6 +1318,13 @@ function App() {
   const handleNewPage = useCallback(() => {
     clearInterval(pollRef.current);
     clearInterval(pushPollRef.current);
+    // Fix 4: stop in-flight TC + regen polls (interval-leak on SPA navigation)
+    clearInterval(tcPollRef.current);
+    Object.values(regenPollRefs.current).forEach(clearInterval);
+    // Fix 6: reset TC UI state so the reviewing screen doesn't show a stuck "⏳ Generating…"
+    setTcGenerating(false);
+    setRegenStates({});
+    setTcJobStatus(null);
     setError(null);
     setPageId(null);
     setPageData(null);
@@ -1225,6 +1463,45 @@ function App() {
           >
             {pageData?.title || "(reviewing)"}
           </span>
+          {/* Test Cases button (P5) — routes to the dedicated test cases screen.
+              Shows "✓ Test Cases" when results are already generated (green, signals
+              they're ready). ml-auto is on the Regenerate button (far right), so this
+              one sits between the page title and Regenerate. */}
+          {/* Fix 6: button label reflects tcGenerating state so the BA sees progress
+              even after backing from generatingTests to reviewing. */}
+          <button
+            onClick={tcGenerating ? undefined : handleOpenTestCases}
+            disabled={tcGenerating}
+            className="text-xs flex items-center gap-1.5 ml-auto"
+            style={{
+              background: "none",
+              border: "none",
+              color: tcGenerating
+                ? "var(--s2j-text-muted)"
+                : testCaseResults
+                ? "var(--s2j-green-dark)"
+                : "var(--s2j-blue)",
+              cursor: tcGenerating ? "not-allowed" : "pointer",
+              padding: "4px 8px",
+              borderRadius: "4px",
+              transition: "all 0.15s",
+            }}
+            onMouseEnter={(e) => {
+              if (!tcGenerating) e.currentTarget.style.background = "var(--s2j-border)";
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.background = "none";
+            }}
+            title={
+              tcGenerating
+                ? "Test cases are being generated in the background…"
+                : testCaseResults
+                ? "View generated test cases"
+                : "Generate and view test cases for this breakdown"
+            }
+          >
+            {tcGenerating ? "⏳ Generating…" : testCaseResults ? "✓ Test Cases" : "Test Cases"}
+          </button>
           {/* Regenerate (2026-06-02) — the must-have path back to generation. A
               reopened completed page lands here on the OLD breakdown (routeByPageStatus
               bypasses Ready), so without this a user who edited the spec page had no
@@ -1232,10 +1509,10 @@ function App() {
               auto-generate — so the user can re-pick the Project Context profile + see
               their usage first. Always present; the stale banner below just makes it
               salient when the page changed. Mirrors BackButton's muted-with-hover style;
-              ml-auto pins it to the far end of this flex-row top-bar. */}
+              marginRight: -8px pins it to the far end of this flex-row top-bar. */}
           <button
             onClick={handleRegenerate}
-            className="text-xs flex items-center gap-1.5 ml-auto"
+            className="text-xs flex items-center gap-1.5"
             style={{
               background: "none",
               border: "none",
@@ -1358,6 +1635,30 @@ function App() {
           elapsed={elapsed}
           onBack={handleNewPage}
           onStartOver={handleRegenerate}
+        />
+      );
+    case "generatingTests":
+      return (
+        <GeneratingTestsScreen
+          pageTitle={pageData?.title}
+          tcJobStatus={tcJobStatus}
+          tcElapsed={tcElapsed}
+          onBack={handleBackFromTestCases}
+        />
+      );
+    case "testcases":
+      return (
+        <TestCasesScreen
+          testCaseResults={testCaseResults}
+          breakdown={pendingBreakdown || results?.breakdown}
+          pageTitle={pageData?.title}
+          jobId={jobId}
+          currentVersion={pageData?.version}
+          onBack={handleBackFromTestCases}
+          onPush={handlePush}
+          onGenerate={handleGenerateTestCases}
+          onRegenerate={handleRegenerateTestCase}
+          regenStates={regenStates}
         />
       );
     case "confirming":
@@ -1742,6 +2043,114 @@ function GeneratingScreen({ pageTitle, elapsed, onBack, onStartOver }) {
           Edited the page after starting? Start over
         </button>
       )}
+    </div>
+  );
+}
+
+// ── GeneratingTestsScreen (P5) ──────────────────────────────────
+// Clones GeneratingScreen for test-case bulk generation.
+// Generation runs on Anthropic's async Batch API (same as the breakdown
+// batch); the same "you can leave" and "taking longer" UX applies.
+function GeneratingTestsScreen({ pageTitle, tcJobStatus, tcElapsed, onBack }) {
+  const progress = tcJobStatus?.progress;
+  const pct = typeof progress === "number" ? Math.round(progress * 100) : null;
+
+  return (
+    <div className="p-6" style={SCREEN_MAX_WIDTH_STYLE}>
+      {onBack && (
+        <BackButton
+          onClick={onBack}
+          label="Back to Review"
+          title="Return to the breakdown editor. Test-case generation continues in the background — return to this breakdown to see progress."
+        />
+      )}
+      <div className="flex flex-col items-center text-center py-6">
+        <div className="relative mb-5" style={{ width: 96, height: 96 }}>
+          <div
+            className="absolute inset-0 rounded-full animate-spin"
+            style={{
+              border: "3px solid var(--s2j-border)",
+              borderTopColor: "var(--s2j-blue)",
+              animationDuration: "1.1s",
+            }}
+          />
+          <div className="absolute inset-0 flex items-center justify-center">
+            <span
+              className="text-xl font-mono font-semibold"
+              style={{ color: "var(--s2j-text)" }}
+            >
+              {fmtTime(tcElapsed)}
+            </span>
+          </div>
+        </div>
+        <h2
+          className="text-base font-semibold"
+          style={{ color: "var(--s2j-text)" }}
+        >
+          Generating test cases…
+        </h2>
+        {pageTitle && (
+          <p className="text-sm mt-0.5" style={{ color: "var(--s2j-text-light)" }}>
+            {pageTitle}
+          </p>
+        )}
+        {pct !== null && (
+          <p className="text-xs mt-1" style={{ color: "var(--s2j-text-muted)" }}>
+            {pct}% complete
+          </p>
+        )}
+        <p
+          className="text-xs mt-2.5"
+          style={{ color: "var(--s2j-text-muted)", maxWidth: "26rem" }}
+        >
+          Building BA-grade acceptance scenarios for every story — Gherkin and CSV
+          export included. Typically a few minutes; large breakdowns take longer.
+        </p>
+      </div>
+
+      {tcElapsed >= 600 && (
+        <div
+          className="rounded-lg p-3 mb-4 flex items-start gap-2"
+          style={{
+            background: "var(--s2j-orange-bg)",
+            border: "1px solid var(--s2j-orange-border)",
+          }}
+        >
+          <span aria-hidden="true">⏳</span>
+          <div>
+            <p
+              className="text-xs font-medium mb-1"
+              style={{ color: "var(--s2j-text)" }}
+            >
+              Taking longer than usual — this is normal, nothing is broken
+            </p>
+            <p className="text-xs" style={{ color: "var(--s2j-text-light)" }}>
+              Test-case generation runs on Anthropic's Batch API; it can slow down under
+              heavy load. Your request is still processing.
+            </p>
+          </div>
+        </div>
+      )}
+
+      <div
+        className="rounded-lg p-3"
+        style={{
+          background: "var(--s2j-blue-bg)",
+          border: "1px solid var(--s2j-blue-border)",
+        }}
+      >
+        <p
+          className="text-xs font-medium mb-1"
+          style={{ color: "var(--s2j-text)" }}
+        >
+          ☕ You can safely leave — we'll keep working
+        </p>
+        <p className="text-xs" style={{ color: "var(--s2j-text-light)" }}>
+          Close this tab or switch tasks — test-case generation continues in the
+          background. Reopen the breakdown (Apps → Spec2Tickets) and the results
+          will be waiting for you.
+        </p>
+      </div>
     </div>
   );
 }
