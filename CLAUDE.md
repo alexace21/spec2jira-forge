@@ -354,6 +354,88 @@ package names de-scaffolded (→ `spec2tickets`). Build green (bundle ≈ −1.4
 
 ---
 
+## ⚡ HANDOVER NOTE (2026-06-07 — Test-case feature: deep-audit cycle-fix (PROD-VALIDATED) + Work B per-case Save/Revert + export validation; Live-E2E GREEN)
+
+A focused session on `feature/product-improvements` hardening the test-case feature after the partner's
+Live E2E. **3 commits (pending partner push → 8 ahead of origin): `396b204` cycle-fix · `7374289` Work B ·
+`6919b16` export polish+validation.** All §13-gated; Live-E2E confirmed working by the partner.
+
+**Deep audit (rigorous, 4-lens) of the ceiling-20 §7-fed FlexiCash output → ~8.1/10, SHIP.** Confirmed:
+decision-matrix **14/15** cells (the missing E-band cell is a CORRECT MERGE, not a gap — band E
+AUTO_DECLINEs regardless of affordability per BR-303, so E/PASS is the strongest falsifiable test and the
+redundant E cell is rightly not padded), **100% AC coverage on all 11 stories**, eligibility 8/8 +
+affordability + pricing boundary literals, 175 cases / 50 inferred (inferred = genuine §7 boundary
+enrichment: BR-901 30d purge, BR-108/109 bounds at/inside/outside — NOT padding), 0 title/body mismatches,
+0 stale refs.
+
+**The ONE code bug found + fixed — cycle-resolution incoherent narrative (PROD-VALIDATED fix):**
+`verifyAndRepairCycles` (index.js) iterated a STALE `detectCycles` list → on overlapping/mutual cycles it
+over-cut + emitted CONTRADICTORY `[RISK|low]` concerns (FlexiCash: a mutual RBP↔ACD pair had BOTH directions
+cut + 3 contradictory notes, one factually wrong about BR-402). The dependency GRAPH was always
+acyclic+buildable — only the NARRATIVE (the BA's audit trail) was incoherent, which for this trust-critical
+audience is decisive. **Fix (pure control-flow, NO LLM/prompt change):** re-detect after each cut (only cut
+STILL-LIVE cycles) + a `cutEdges` reverse-guard (never cut both directions of a mutual pair) + an
+`unresolvable` loop-guard + **dropped the LLM's free-text `reason` from the user-facing note** (the edge
+CHOICE is legitimately the LLM's, but its prose can make a checkably-wrong factual claim → kept the
+deterministic WHAT, handed the WHY to the BA: "Review whether this is the right edge to remove"). §13 gate
+(code-review + adversarial audit) → SHIP; offline control-flow test `prototype/test_cycle_repair.js` 5/5.
+**VALIDATED IN PRODUCTION**: the partner's fresh Live breakdown shows ONE coherent concern + a
+semantically-correct cut (RBP made independent = the spec's own "pricing-first" sequencing assumption).
+
+**⭐ Pure-function dispatch debate (partner-raised, POLICY §4/§7) — RESOLVED: the pure fix is CORRECT, NOT a
+patch, and NO LLM critic/verdict-taker is needed.** The cycle pipeline is a correctly-partitioned HYBRID:
+DETECTION = structure → pure (`detectCycles`); EDGE-CHOICE = meaning → LLM (`resolveDependencyCycle`,
+UNTOUCHED — the reasoning lives here); ORCHESTRATION = structure → pure (the fix); VERDICT-on-correctness =
+the HUMAN BA (surfaced `[RISK|low]` advisory). 4-test on orchestration: structure / universal / an-LLM-
+would-be-worse / deterministic-wrong-is-testable. NOT a patch — `graph.js` documents non-FlexiCash cycle
+instances (Subscription↔Payment, ConfluenceConnection↔ConfluenceExtraction); the fix is domain-blind +
+abstract-graph-tested. §7 critic bar (silent + expensive) NOT met — cuts are SURFACED + recoverable in the
+editor; a verdict-taker LLM would RE-INTRODUCE exactly the unreliable prose the fix removed. If ever more
+rigor is wanted, the §7-correct place is a critic on EDGE-CHOICE (#2), never orchestration (#3) —
+over-engineering today. (Folded into `memory/deep-audit-vs-per-change-gate` thinking + the dispatch rule.)
+
+**Work B — per-case Save/Revert footers (partner UX ask "move Save+Revert under each case #1, #2"):** each
+edited/new case shows its own footer `[↩ Revert this case]` (or `[↩ Remove]` for a never-saved case) +
+`[Save changes]`. HONEST about per-STORY save (KVS is one value/story → per-case "Save changes" persists the
+WHOLE story; tooltip says so); per-case revert is genuine (reuses onCaseChange/onDeleteCase — no new backend
+path). SAFE index handling: per-case-by-index is valid only while no SAVED case was deleted (a delete shifts
+indices) → parent flags `structurallyShifted` (sticky; set on saved-case delete; cleared on
+save/revert/regen) AND `cases.length >= savedCases.length`; when unsafe → a story-level FALLBACK bar (also
+the catch-all for a no-op draft, so the BA is NEVER trapped with unsaved edits + no control). §13 gate
+(code-review + UX/data-loss audit) → SHIP (the decisive delete-saved+append-to-equal-length case holds via
+the sticky flag; no false-negative dirty; no data-loss path; Back/Push/Regenerate dirty-guards intact).
+**Bonus fix:** stale frontend "+ Add" cap 15→20 (backend caps at 20 — `testcases.js` `slice(0,20)`; the UI
+silently blocked cases 16-20).
+
+**Save-to-export polish (Live-E2E feedback):** when a story is dirty the Copy Gherkin/CSV buttons used to
+become two DISABLED "Save to export" buttons (correct — export renders SAVED KVS, mid-edit would copy stale
+— but it READS as broken). Now ONE clear dashed-border hint "⤓ Save to enable export"; the Copy buttons
+return after Save. Pure presentation; the no-stale-export guard unchanged.
+
+**Export format VALIDATED (partner's "test Copy works"):** `prototype/validate_exports.js` renders the live
+FlexiCash test-cases through the PROD renderers (`renderGherkin`/`renderManualTable` — what
+`getTestCaseExports` calls). Gherkin = valid `.feature` (Feature / @tags / Scenario / # Covers /
+Given-When-Then, `expected_result` as the final assertion STEP, no empty steps, all 11 stories render); CSV
+= valid RFC-4180 (11 columns, consistent column count, formula-injection neutralized, multi-row per case).
+Both tool-importable (Xray/Zephyr/Octane · ADO/Jama/TestRail). [Worth a real Copy→paste into ONE target tool
+on next deploy to 100% close it.]
+
+**RESUME / remaining:**
+1. **Partner: push the 8 commits + `npm run build` && `forge deploy`** — Work B + the export polish are
+   FRONTEND (the cycle-fix backend was ALREADY deployed — the Live breakdown proved it). Then a quick Live
+   E2E of the "Save to enable export" hint + a real Copy→paste into Xray/ADO to 100% confirm import.
+2. **Test-case feature finish-line:** optional design-doc note (Work B + cycle coherence) in
+   `docs/TESTCASE-GENERATION-DESIGN.md`; broader quality validation on the partner's ~9 real Confluence
+   pages (beyond FlexiCash) as the pre-ship confidence sweep; then fold the feature toward a release.
+3. **Launch track (separate, unchanged):** Marketplace v5.3.0 awaiting Atlassian review → post-approval
+   publish → editions Phase 2 (Managed Pro + DPA/29-day) → wire `PRO_UPGRADE_URL`; site og-image.png + DPA
+   legal confirm-true (`memory/site-launch-punchlist.md`).
+
+С усмивка ✨ — deep audit-ът хвана + затвори единствения реален бъг (prod-validated), pure-function
+dispatch-ът е защитен през самата политика, а Work B + export polish-ът са §13-gate-нати и Live-E2E зелени.
+
+---
+
 ## ⚡ HANDOVER NOTE (2026-06-05 cont. — Test-case FORMAT research (14 tools) → dual-format strategy; P1 core reshaped + §13-gated + re-validated; P2 next)
 
 A long conductor-orchestrated (§13) session on `feature/product-improvements` continuing the test-case feature. **P1 DONE; P2–P6 pending. Committed this session (partner pushes).** Folds in / supersedes the 4 directives in the note below.
