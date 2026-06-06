@@ -192,6 +192,11 @@ check('csv: opts.headerRow:false omits the header', !has(renderManualTable(resul
 check('csv: opts.delimiter → TSV header has tab-separated columns', renderManualTable(result1, story1, { delimiter: '\t' }).csv.split('\n')[0].split('\t').length === TABLE_COLUMNS.length);
 check('table: opts.suite overrides story.name', renderManualTable(result1, story1, { suite: 'CustomSuite' }).rows[0].Suite === 'CustomSuite');
 
+// Real-spec bake-off fix (2026-06-06): a model-added "AC1:" label prefix in ac_text no longer
+// false-uncovers (was 73% of the false-uncovered on real long ACs; invisible on synthetic fixtures).
+check('coverage: model "AC1:" label prefix still matches the live AC', computeCoverage({ acceptance_criteria: ['The order total must be visible.'] }, { test_cases: [{ ac_trace: [{ kind: 'story-ac', ac_text: 'AC1: The order total must be visible.' }] }] }).covered_acs === 1);
+check('coverage: normAC strips backslash-escape artifacts (We\\\\\'re → were)', normAC("We\\'re ready") === normAC("We're ready"));
+
 let ok = true;
 console.log('─'.repeat(64));
 console.log('  P2 RENDER SELFTEST — src/testcases.js (offline, no API)');

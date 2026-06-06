@@ -43,6 +43,12 @@
  */
 export function normAC(s) {
   return String(s == null ? '' : s)
+    // Real-spec bake-off fix (2026-06-06): strip a model-added "AC1:"/"AC 2." label prefix
+    // (real AC content never starts so; symmetric on both sides) + strip backslashes
+    // (Markdown-escape artifacts in source ACs, e.g. We\'re). These two were 73% of the
+    // false-uncovered on real LONG/labeled/escaped ACs — invisible on the short synthetic fixtures.
+    .replace(/^\s*AC\s*\d+\s*[:.]\s*/i, '')
+    .replace(/\\/g, '')
     .replace(/[‘’‛′]/g, "'")   // curly / prime single quotes → '
     .replace(/[“”‟″]/g, '"')   // curly double quotes → "
     .replace(/ /g, ' ')                        // NBSP → space
