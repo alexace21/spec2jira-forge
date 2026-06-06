@@ -21,7 +21,7 @@
 
 import { kvs } from '@forge/kvs';
 
-import { BREAKDOWN_SCHEMA, SYSTEM_PROMPT, buildProjectContextSystemText, TEST_CASE_SCHEMA, TEST_CASE_SYSTEM_PROMPT, buildTestCaseUserPrompt } from './prompts.js';
+import { BREAKDOWN_SCHEMA, SYSTEM_PROMPT, buildProjectContextSystemText, TEST_CASE_SCHEMA, TEST_CASE_SYSTEM_PROMPT, buildTestCaseUserPrompt, buildSpecSourceSystemText } from './prompts.js';
 import { parseTestCaseResult } from './testcases.js';
 
 // ── Constants ──────────────────────────────────────────────
@@ -39,7 +39,12 @@ export const MODEL_FALLBACK = 'claude-haiku-4-5';
 // time — so a generous cap is free insurance against truncating a dense Story. The
 // reactive sub-chunk was dropped (Sonnet single-call covers ~100% on validated dense
 // stories), so this cap IS the worst-case safety margin. Engineering owns this cap (§4).
-export const TC_MAX_OUTPUT_TOKENS = 8000;
+// 16000 (raised from 8000, 2026-06-06): per-story output is bounded by the 15-case CEILING, so
+// this cap tracks the densest SINGLE story (≤15 verbose cases with long verbatim ac_text + the
+// §7 rule-derived cases ≈ ~10K worst case), NOT the spec size (a bigger spec = more stories =
+// more batch requests, each independently capped). It is a CEILING, not a target — normal stories
+// cost the same. If the 15-case ceiling ever rises, raise this with it.
+export const TC_MAX_OUTPUT_TOKENS = 16000;
 
 // Output cap. Sonnet 4.6's max output is 64K tokens — we use ALL of it for
 // maximum headroom (it is a CEILING, not a target: a small spec still emits a
@@ -615,7 +620,7 @@ export async function fetchBatchResults(resultsUrl, customId, apiKeyOverride = n
  * @param {string} args.apiKey                       caller MUST pass the resolved key (Managed or BYOK)
  * @returns {Promise<{batchId?, status?, createdAt?, expiresAt?, error?, detail?}>}
  */
-export async function submitTestCaseBatch({ stories, siblingNames, sharedAcceptanceCriteria, specSummary, apiKey }) {
+export async function submitTestCaseBatch({ stories, siblingNames, sharedAcceptanceCriteria, specSummary, specSourceText, apiKey }) {
   if (!apiKey) {
     return { error: 'not_configured', detail: 'Anthropic API key not configured.' };
   }
@@ -625,6 +630,19 @@ export async function submitTestCaseBatch({ stories, siblingNames, sharedAccepta
 
   // Shared ephemeral system block — identical for all N requests → maximal cache reuse.
   const systemBlock = [{ type: 'text', text: TEST_CASE_SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } }];
+
+  // §8 fix (2026-06-06): when the breakdown's source page was snapshotted at generation, feed it
+  // as a SECOND shared ephemeral-cached block (the SOURCE SPECIFICATION) so the model can assert
+  // concrete threshold VALUES + one case per decision-table CELL (Rule 6). Shared across all N
+  // requests → the page is a single cache-write + N-1 cache-reads (~10%), not N× full price.
+  // Feed-side char cap (a pathological page can't blow the input budget; the snapshot was already
+  // byte-capped at capture). Absent snapshot → omit the block → today's behaviour (backward-compat).
+  const TC_SPEC_SOURCE_MAX_CHARS = 80000;
+  const specSource = typeof specSourceText === 'string' ? specSourceText.trim().slice(0, TC_SPEC_SOURCE_MAX_CHARS) : '';
+  const hasSpecSource = specSource.length > 0;
+  if (hasSpecSource) {
+    systemBlock.push({ type: 'text', text: buildSpecSourceSystemText(specSource), cache_control: { type: 'ephemeral' } });
+  }
 
   // §8 scope fence. Callers MAY pass the full breakdown's story names — the single-story
   // regen path submits stories=[oneStory], which would otherwise starve the model of its
@@ -649,6 +667,7 @@ export async function submitTestCaseBatch({ stories, siblingNames, sharedAccepta
             sharedAcceptanceCriteria: sharedAcceptanceCriteria || [],
             specSummary: specSummary || '',
             category: story && story.category,
+            hasSpecSource,
           }),
         },
       ],

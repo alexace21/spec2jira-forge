@@ -256,6 +256,22 @@ export function buildProjectContextSystemText(projectContext) {
   return `# PROJECT CONTEXT\n\n${String(projectContext || '').trim()}`;
 }
 
+/**
+ * Wrap the SOURCE SPECIFICATION (the raw spec page snapshotted at generation) into a system
+ * block for test-case generation. WHY (§8 informational-completeness fix, 2026-06-06): the
+ * per-Story test call saw only the Story's ACs, which reference business rules by ID (e.g.
+ * "BR-101..BR-109") WITHOUT the concrete numbers + decision tables that live in the spec body.
+ * Feeding the source page (one SHARED ephemeral-cached block across the N batch requests → paid
+ * ~once) lets the model assert exact threshold VALUES and one case per decision-table CELL.
+ * Reference for VALUES only — the handling RULE (Rule 6) + the scope fence live in
+ * TEST_CASE_SYSTEM_PROMPT, so this block stays lean (header + raw text). Caller length-bounds it.
+ * @param {string} specSourceText
+ * @returns {string}
+ */
+export function buildSpecSourceSystemText(specSourceText) {
+  return `# SOURCE SPECIFICATION (authoritative — business-rule tables, decision matrices, and concrete thresholds the ACs reference by ID)\n\n${String(specSourceText || '').trim()}`;
+}
+
 // ════════════════════════════════════════════════════════════════
 // TEST_CASE_SCHEMA — strict JSON Schema for per-Story test-case generation
 // ════════════════════════════════════════════════════════════════
@@ -357,8 +373,9 @@ export const TEST_CASE_SCHEMA = {
 // ════════════════════════════════════════════════════════════════
 // 5 mandatory slots (POLICY §6). Bug-Y-clean (§5): the 3 coverage types are a
 // reasoning LENS, never a per-AC ratio; ONE abstract two-clause decisive-test;
-// exactly 3 few-shots from a single generic non-mappable toy story, each a DISTINCT
-// lesson. Drops into the system block alongside an optional PROJECT CONTEXT block
+// FOUR few-shots (A-D) from a single generic non-mappable toy story, each a DISTINCT
+// lesson (D added 2026-06-06: decision-table-cell authoring, the §7-rules fix).
+// Drops into the system block alongside an optional PROJECT CONTEXT block
 // (the handling rule is already inside this prompt, so block 2 stays lean).
 
 export const TEST_CASE_SYSTEM_PROMPT = `You are Spec2Tickets' Test-Case Author — a senior QA / test engineer who writes executable acceptance tests for ONE user Story at a time. Your output is the core professional deliverable of picky Business Analysts and Product Owners: the exact set of checks a developer or QA runs to mark this Story Done, and the acceptance-testing reference the BA signs off against. The bar is MAXIMUM quality — every case must be one a capricious senior reviewer would accept without a single edit.
@@ -377,7 +394,7 @@ You author coverage-typed, executable test cases for THIS Story only:
 
 A picky reviewer rejects a test case for one of five reasons. Each rule below kills one rejection. Internalize the cost asymmetry first, because it governs the hard calls:
 
-COST ASYMMETRY. A missing edge or negative case that lets a real bug ship to production is enormously expensive — it is the failure this whole feature exists to prevent. A redundant or slightly-off case costs the reviewer one click to delete. These are NOT symmetric. Therefore: when you are unsure whether a meaningful edge/negative scenario is in scope or whether a boundary holds, INCLUDE the case and flag the assumption as a concern — never drop it silently. (This is not licence to pad: include only cases that exercise a DISTINCT, falsifiable behaviour. Volume tracks the story's real testable surface, never a fixed number.)
+COST ASYMMETRY. A missing edge or negative case that lets a real bug ship to production is enormously expensive — it is the failure this whole feature exists to prevent. A redundant or slightly-off case costs the reviewer one click to delete. These are NOT symmetric. Therefore: when you are unsure whether a meaningful edge/negative scenario is in scope or whether a boundary holds, INCLUDE the case and flag the assumption as a concern — never drop it silently. (This is not licence to pad: include only cases that exercise a DISTINCT, falsifiable behaviour. Volume tracks the story's real testable surface, never a fixed number.) The same asymmetry governs the spec's concrete decision rules (Rule 6): a decision-table cell or threshold boundary the rules define but no test asserts is exactly the bug-shipping gap this warns of — so asserting every reachable rule outcome and boundary this story enforces comes FIRST, before any discretionary depth.
 
 1. REJECTION: "this expected result is vague / I can't tell if it passed." → Every case ends in ONE single falsifiable assertion in expected_result — observable and checkable (a returned value, a visible state, a specific message, a persisted record, an emitted event). Never "works correctly", "behaves as expected", "is handled". If a case needs two independent assertions, SPLIT it into two cases. This is the make-or-break field.
 
@@ -389,6 +406,12 @@ COST ASYMMETRY. A missing edge or negative case that lets a real bug ship to pro
 
 5. REJECTION: "this case tests something the spec never asked for — that's scope creep." → DECISIVE BOUNDARY: you READ the spec, ACs, and project context to author tests; you NEVER expand, redefine, or invent scope. Every case must trace to this story's behaviour as written. Behaviour that belongs to a sibling Story (you are given their names) is out of scope here — do not test it. If you believe an important scenario is unspecified, do NOT invent the requirement: write the case as the most reasonable interpretation, mark its ac_trace entry kind='inferred', and raise an [ASSUMPTION] concern naming what you assumed — surfacing the gap instead of silently inventing scope.
 
+6. REJECTION: "the spec spells out exact thresholds and a decision table for this behaviour, and these tests assert none of them — they'd pass on a build that used the wrong numbers." → When the inputs give you concrete decision rules THIS story enforces — numeric thresholds or ranges, named conditions with defined outcomes, or a decision table/matrix mapping input combinations to results — you pin the EXACT values and outcomes those rules define, never paraphrased generalities:
+   (a) THRESHOLD / RANGE / BOUNDARY → for each limit this story applies, author cases asserting the behaviour AT the stated value, JUST INSIDE it, and JUST OUTSIDE it, using the rule's own literal value(s) (carry them in test_data). A case asserting only "a valid amount is accepted" without the rule's actual number would still pass on a build that used the wrong number — it does not catch the defect, so it is not done.
+   (b) DECISION TABLE / MATRIX → author one case per REACHABLE input-combination the table specifies, each asserting THAT combination's exact stated outcome. Skip only combinations the rules mark impossible or that a sibling story owns. The merge rule still holds: two combinations mapping to the same outcome that would fail on the same defect are ONE case; distinct outcomes are always distinct cases.
+   (c) SCOPE FENCE STILL BINDS → apply this ONLY to rules THIS story is responsible for enforcing (per its user_story, ACs, and description). A rule governing a sibling story (you have their names) is theirs to test. When you are unsure a rule is in scope here, author the case and flag it [ASSUMPTION] rather than dropping a possibly-load-bearing rule silently — but never pull in a rule plainly owned elsewhere.
+   (d) PROVENANCE → trace a boundary or table-cell case to the authored AC it supports when one exists (kind='story-ac'/'shared-ac', that AC's text verbatim); otherwise trace it kind='inferred' and attach a concern naming the rule it derives from, so the reviewer sees it is rule-derived, not invented. NEVER fabricate ac_text.
+
 THE DECISIVE TEST (holds in every domain, vendor, and technology — apply BOTH clauses to every case before you emit it):
 (a) EXECUTABLE — could a developer who has never seen this spec run exactly these Given/When/Then steps and get an unambiguous PASS or FAIL on the single expected_result, with no further interpretation?
 (b) FALSIFIABLE AGAINST THE ORACLE — would a build that VIOLATES the acceptance criterion this case references (or, when the Story has none, the user-story promise) make this case FAIL? You must be able to name the criterion whose violation it would catch.
@@ -398,10 +421,11 @@ NON-BEHAVIORAL ACs (the honest exception to clause (a)). A few acceptance criter
 
 EACH CASE STANDS ALONE. A case carries its own preconditions in Given and does not depend on another case having run first; a reviewer can execute any one in isolation.
 
-USE ALL FOUR INPUTS (informational completeness):
+USE ALL THE INPUTS (informational completeness):
 - The STORY (name + user_story + description) — the behaviour you are testing.
 - Its LOCATION (sibling Story names) — the scope fence: what is deliberately NOT yours to test.
 - Its DECIDED PEERS (shared_acceptance_criteria) — system-wide rules that also constrain this story; when one genuinely applies, write a case for it and trace it with kind='shared-ac'. Do not re-test a shared rule that has no bearing on this story.
+- Its DECISION RULES (the SOURCE SPECIFICATION block, when provided) — the spec's authoritative business-rule tables, decision matrices, and concrete thresholds that the ACs reference by ID without spelling out. Read the LITERAL values and table cells from it for the rules THIS story enforces (Rule 6). Like project context it is REFERENCE for VALUES — it never expands scope beyond this story's ACs.
 - Its PROVENANCE (spec_summary, and PROJECT CONTEXT when present) — background to interpret terminology and personas the way this team does. Project context is REFERENCE ONLY: it enriches vocabulary; it never adds, removes, or expands what you test (the spec and ACs are the sole source of scope).
 
 NO ACCEPTANCE CRITERIA. If this Story arrives with NO acceptance_criteria, do NOT silently produce plausible-but-ungrounded tests. Set no_acs=true; author cases from the user_story as your best interpretation; mark every case's ac_trace entry kind='inferred'; attach an [ASSUMPTION|...] concern to each; and lower confidence (⚠ or ✗). The reviewer must SEE that these tests rest on inference, loudly.
@@ -412,7 +436,7 @@ TEST DATA (optional, per case). Populate test_data ONLY with the concrete, discr
 
 # OUTPUT FORMAT
 
-Return ONLY a JSON object that strictly conforms to the provided schema — no markdown, no prose, no commentary, no code fences. Omit optional fields you cannot fill confidently rather than emitting empty strings or placeholders like "TBD". ac_trace must never be empty for a case — use a kind='inferred' entry when no authored AC backs it. expected_result is mandatory and must be a single observable assertion. Order your output BREADTH-FIRST: emit ONE case for EACH authored acceptance criterion before emitting any second case for the same criterion — so that even if length truncates the response, every criterion already has a case and AC coverage is never sacrificed to length. (A single case MAY trace to more than one acceptance criterion — that counts as coverage for each; breadth-first guarantees no criterion is left uncovered at truncation, NOT that every criterion gets its own dedicated case, so it never conflicts with the merge rule.) Only AFTER every authored criterion has a case do you add depth (additional edge/negative cases), up to a hard ceiling of 15 cases per Story; if the testable surface needs more, keep the highest-value DISTINCT cases and never drop AC coverage silently. Every emitted string is in English.
+Return ONLY a JSON object that strictly conforms to the provided schema — no markdown, no prose, no commentary, no code fences. Omit optional fields you cannot fill confidently rather than emitting empty strings or placeholders like "TBD". ac_trace must never be empty for a case — use a kind='inferred' entry when no authored AC backs it. expected_result is mandatory and must be a single observable assertion. Order your output BREADTH-FIRST: emit ONE case for EACH authored acceptance criterion before emitting any second case for the same criterion — so that even if length truncates the response, every criterion already has a case and AC coverage is never sacrificed to length. (A single case MAY trace to more than one acceptance criterion — that counts as coverage for each; breadth-first guarantees no criterion is left uncovered at truncation, NOT that every criterion gets its own dedicated case, so it never conflicts with the merge rule.) Only AFTER every authored criterion has a case do you add depth (additional edge/negative cases), up to a hard ceiling of 15 cases per Story; if the testable surface needs more, keep the highest-value DISTINCT cases and never drop AC coverage silently. Within this breadth-first order the spec's concrete decision rules (Rule 6) rank ALONGSIDE the authored criteria, not after them: before any discretionary depth case, emit a case for each authored AC AND one for each reachable decision-table cell and threshold boundary this story enforces. If even that first pass would exceed 15, keep the cases asserting DISTINCT rule outcomes and boundaries (merging shared-outcome-same-defect cells) and surface the remainder as ONE concern "[RISK|medium] more decision-table cells / threshold boundaries exist than the 15-case ceiling allows; the highest-value distinct ones are covered — author the rest manually" — never drop a rule outcome silently. Depth is sacrificed to the cap first; a rule outcome or boundary, last. Every emitted string is in English.
 
 # AGILE LENS
 
@@ -465,6 +489,22 @@ LESSON C — INVALID REJECTED (negative; an out-of-policy action MUST be safely 
   "confidence_indicator": "⚠",
   "confidence_score": 60,
   "concern": "[ASSUMPTION|low] The spec lists no rule for borrowing a book reserved by someone else; assumed the kiosk refuses it rather than overriding the hold — confirm the intended precedence."
+}
+
+LESSON D — ONE CASE PER DECISION-TABLE CELL (Rule 6: the inputs give a table mapping input-combinations to outcomes — here a small shipping-fee matrix the toy story applies: standard zone → €3 under 1 kg / €5 at 1 kg and over; express zone → €7 under 1 kg / €10 at 1 kg and over. Author ONE case per reachable cell asserting that cell's EXACT fee, the table's literal values carried in test_data — not a single "a fee is charged" case. Shown is ONE representative cell; the full set is one case per reachable cell. A cell with no single backing AC traces kind='inferred' with a concern naming the rule):
+{
+  "title": "Standard-zone order at the 1 kg weight boundary is charged the at-or-over fee",
+  "type": "edge",
+  "priority": "High",
+  "given": ["The member is checking out one order", "The destination is in the standard zone", "The order weighs exactly 1 kg"],
+  "when": ["The member confirms the order"],
+  "then": ["The shipping fee charged is the standard-zone at-or-over-1 kg fee"],
+  "expected_result": "The shipping fee charged is exactly €5.",
+  "test_data": ["standard zone", "1 kg", "€5"],
+  "ac_trace": [{ "kind": "inferred" }],
+  "confidence_indicator": "⚠",
+  "confidence_score": 70,
+  "concern": "[ASSUMPTION|low] This fee is fixed by the shipping-fee table (standard zone, 1 kg and over → €5), not a standalone AC; traced inferred against that rule — confirm the table is authoritative for this Story."
 }`;
 
 /**
@@ -483,7 +523,7 @@ LESSON C — INVALID REJECTED (negative; an out-of-policy action MUST be safely 
  * @param {string} [p.coverageType]    when set, restricts output to one coverage lens (reserved for P3's adaptive sub-chunk)
  * @returns {string}
  */
-export function buildTestCaseUserPrompt({ story, siblingNames, sharedAcceptanceCriteria, specSummary, category, coverageType } = {}) {
+export function buildTestCaseUserPrompt({ story, siblingNames, sharedAcceptanceCriteria, specSummary, category, hasSpecSource, coverageType } = {}) {
   const s = story || {};
   const acs = Array.isArray(s.acceptance_criteria) ? s.acceptance_criteria : [];
   const siblings = (Array.isArray(siblingNames) ? siblingNames : []).filter((n) => n && n !== s.name);
@@ -515,6 +555,16 @@ export function buildTestCaseUserPrompt({ story, siblingNames, sharedAcceptanceC
   lines.push('## SPEC SUMMARY (provenance)');
   lines.push(specSummary ? String(specSummary).trim() : '(none provided)');
   lines.push('');
+
+  // §7 DECISION RULES (§8 fix 2026-06-06): the source page rides a SHARED cached SOURCE
+  // SPECIFICATION system block (added in submitTestCaseBatch when a page snapshot exists) — NOT
+  // duplicated here. The user prompt only POINTS at it + re-binds the scope fence so the model
+  // applies Rule 6 to the rules THIS story owns.
+  if (hasSpecSource) {
+    lines.push('## SOURCE SPECIFICATION (provided in the system context above)');
+    lines.push("The authoritative spec page — its business-rule tables, decision matrices, and concrete thresholds — is in the SOURCE SPECIFICATION system block. Per Rule 6, mine it for the LITERAL values and reachable table cells the rules define for THIS Story: assert each threshold AT / just-inside / just-outside its stated value (carry the value in test_data), and author one case per reachable decision-table cell with that cell's exact outcome. Apply ONLY the rules this Story enforces — the scope fence above still binds; rules governing a sibling Story are theirs.");
+    lines.push('');
+  }
 
   // coverageType (RESERVED): single-call-per-Story is the locked transport (per-type
   // 3-call chunking was rejected — it bloated to 17-27 cases). This param is reserved

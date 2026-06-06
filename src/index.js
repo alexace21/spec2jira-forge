@@ -208,6 +208,26 @@ const PAGE_CONTEXT_PREFIX = 'pageCtx:';
 const TC_JOB_KEY_PREFIX = 'tcjob:';
 const TC_STORY_KEY_PREFIX = 'testcases:';
 const TC_REGEN_KEY_PREFIX = 'tcregenjob:';
+const PAGE_SNAP_PREFIX = 'pagesnap:'; // §8 fix (2026-06-06): source-page snapshot for test-gen, in a sibling key (keeps the job record lean)
+
+// Load the source-page snapshot for test-case generation (§8 fix). Returns the raw page text when a
+// COHERENT snapshot exists (its page version matches the breakdown's, so the rules the tests mine are
+// the SAME ones the stamped ACs were authored against), else '' (→ submitTestCaseBatch falls back to
+// today's no-source behaviour). Fail-soft — a miss/throw never blocks test-gen.
+async function resolveSpecSourceText(jobId, job) {
+  try {
+    const snap = await kvs.get(`${PAGE_SNAP_PREFIX}${jobId}`);
+    if (!snap || !snap.content) return '';
+    if (job && typeof job.pageVersion === 'number' && typeof snap.pageVersion === 'number' && snap.pageVersion !== job.pageVersion) {
+      console.warn(`[tcgen] page snapshot version ${snap.pageVersion} != job ${job.pageVersion} — skipping source (fallback to no-source)`);
+      return '';
+    }
+    return String(snap.content || '');
+  } catch (e) {
+    console.warn(`[tcgen] spec-source load failed (non-fatal): ${String(e?.message || e)}`);
+    return '';
+  }
+}
 
 
 // ── Settings helpers ────────────────────────────────────────
@@ -1108,6 +1128,45 @@ resolver.define('startGeneration', async ({ payload, context }) => {
   // Index page → this job so reopening mid-generation reconnects (not a new batch).
   await kvs.set(`${PAGE_JOB_PREFIX}${String(pageId)}`, { jobId });
 
+  // §8 fix (2026-06-06): snapshot the source page into a SIBLING key so per-Story test-case
+  // generation can feed the spec's business-rule tables + decision matrices + concrete thresholds
+  // (the values the ACs reference by ID). A sibling key (not the job record) keeps the job lean —
+  // the job is read on every poll/reconnect; this snapshot is read once, only at test-gen. Captured
+  // in THIS execution from the SAME page object → coherent with the breakdown's stamped ACs (no
+  // staleness). Byte-capped under the ~240KB KVS limit. Fail-soft: a snapshot failure must never
+  // block generation (test-gen then falls back to today's no-source behaviour).
+  try {
+    // Cap by BYTES, not chars (§13 gate fix 2026-06-06): KVS limits the serialized value to ~240KB,
+    // and a char cap overflows on multi-byte scripts — Cyrillic ~2B, CJK ~3B/char, so 120K chars ≈
+    // 240-360KB → kvs.set throws → silent fallback to no-source on exactly the dense/non-ASCII specs
+    // this fix targets. 80K chars aligns with the feed cap (TC_SPEC_SOURCE_MAX_CHARS — storing more is
+    // unused); the ~180KB byte budget (headroom under 240KB for the wrapper) is the hard guard.
+    const TC_SNAP_MAX_CHARS = 80000;
+    const TC_SNAP_MAX_BYTES = 180000;
+    const enc = new TextEncoder();
+    const full = String(pageContent || '');
+    let snapContent = full.slice(0, TC_SNAP_MAX_CHARS);
+    if (enc.encode(snapContent).length > TC_SNAP_MAX_BYTES) {
+      // Binary-search the largest char-prefix whose UTF-8 byte length fits the budget.
+      let lo = 0, hi = snapContent.length;
+      while (lo < hi) {
+        const mid = (lo + hi + 1) >> 1;
+        if (enc.encode(snapContent.slice(0, mid)).length <= TC_SNAP_MAX_BYTES) lo = mid; else hi = mid - 1;
+      }
+      snapContent = snapContent.slice(0, lo);
+    }
+    await kvs.set(`${PAGE_SNAP_PREFIX}${jobId}`, {
+      jobId,
+      pageId: String(pageId),
+      pageVersion,
+      capturedAt: new Date().toISOString(),
+      content: snapContent,
+      truncatedSnapshot: full.length > snapContent.length,
+    });
+  } catch (e) {
+    console.warn(`[startGeneration] page snapshot failed (non-fatal; test-gen falls back to no-source): ${String(e?.message || e)}`);
+  }
+
   // Resolve the SELECTED Project Context profile to enrich the generation. A
   // workspace may span multiple projects, so the user picks which context applies —
   // we never apply one silently (a wrong-project context is worse than none).
@@ -1739,8 +1798,11 @@ resolver.define('startTestCaseGeneration', async ({ payload, context }) => {
     : [];
   const specSummary = (job.breakdown && job.breakdown.metadata && job.breakdown.metadata.spec_summary) || '';
 
+  // §8 fix: feed the source-page snapshot (the business rules the ACs reference by ID) to test-gen.
+  const specSourceText = await resolveSpecSourceText(jobId, job);
+
   // Submit the N-request batch to Anthropic
-  const submitResult = await submitTestCaseBatch({ stories, sharedAcceptanceCriteria: sharedACs, specSummary, apiKey });
+  const submitResult = await submitTestCaseBatch({ stories, sharedAcceptanceCriteria: sharedACs, specSummary, specSourceText, apiKey });
   if (submitResult.error) {
     console.error(`[startTCGen] batch submit failed: ${submitResult.error} | ${submitResult.detail}`);
     await kvs.set(`${TC_JOB_KEY_PREFIX}${jobId}`, {
@@ -2133,11 +2195,14 @@ resolver.define('regenerateTestCase', async ({ payload, context }) => {
 
   // Submit a 1-request batch (all siblings passed as context — scope fence is important
   // for a correct regenerate; quality-consistent with the bulk Sonnet call #9)
+  // §8 fix: feed the source-page snapshot so a single-story regen mines the same business rules.
+  const specSourceText = await resolveSpecSourceText(jobId, job);
   const submitResult = await submitTestCaseBatch({
     stories: [story],
     siblingNames: stories.map((s) => s && (s.name || '')),
     sharedAcceptanceCriteria: sharedACs,
     specSummary,
+    specSourceText,
     apiKey,
   });
 
