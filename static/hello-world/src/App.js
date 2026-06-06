@@ -732,6 +732,58 @@ function App() {
     }, POLL_MS);
   }, []);
 
+  // ── Test-case poll (P5) ─────────────────────────────────────
+  // ⚠ Declared BEFORE routeByPageStatus, which references startTcPolling in its
+  // reconnect path AND its dependency array. A `const` referenced before its own
+  // declaration line is a Temporal-Dead-Zone crash at render ("Cannot access … before
+  // initialization") — it blanks the whole app. Order matters; keep this above routeByPageStatus.
+  const startTcPolling = useCallback(
+    (jid) => {
+      clearInterval(tcPollRef.current);
+      tcPollRef.current = setInterval(async () => {
+        try {
+          const st = await invoke("pollTestCaseStatus", { jobId: jid });
+          if (st.error) {
+            clearInterval(tcPollRef.current);
+            setTcGenerating(false); // Fix 6
+            const friendly = _classifyBackendError(st, "Test case generation failed");
+            setError(friendly.message);
+            setScreen("error");
+            return;
+          }
+          setTcJobStatus(st);
+          if (st.status === "completed") {
+            clearInterval(tcPollRef.current);
+            const tc = await invoke("getTestCases", { jobId: jid });
+            if (tc.error) {
+              setTcGenerating(false); // Fix 6
+              const friendly = _classifyBackendError(tc, "Failed to load test cases");
+              setError(friendly.message);
+              setScreen("error");
+            } else {
+              setTestCaseResults(tc);
+              setTcGenerating(false); // Fix 6
+              // Fix 6: navigate to testcases ONLY when the user is on the generating screen;
+              // if they backed to reviewing, update results silently — don't yank them away.
+              if (screenRef.current === "generatingTests") {
+                setScreen("testcases");
+              }
+            }
+          } else if (st.status === "failed") {
+            clearInterval(tcPollRef.current);
+            setTcGenerating(false); // Fix 6
+            const friendly = _classifyBackendError(st, "Test case generation failed");
+            setError(friendly.message);
+            setScreen("error");
+          }
+        } catch (e) {
+          console.error("TC poll error:", e);
+        }
+      }, POLL_MS);
+    },
+    [],
+  );
+
   // ── Page selection routing (post globalPage migration) ───────
   // routeByPageStatus is shared между init's reconnect path AND
   // handlePageSelected (picker → editor handoff). v3 routing: active job
@@ -1073,53 +1125,6 @@ function App() {
   }, [pendingBreakdown, jobId]);
 
   // ── Test-case generation (P5) ─────────────────────────────────
-
-  const startTcPolling = useCallback(
-    (jid) => {
-      clearInterval(tcPollRef.current);
-      tcPollRef.current = setInterval(async () => {
-        try {
-          const st = await invoke("pollTestCaseStatus", { jobId: jid });
-          if (st.error) {
-            clearInterval(tcPollRef.current);
-            setTcGenerating(false); // Fix 6
-            const friendly = _classifyBackendError(st, "Test case generation failed");
-            setError(friendly.message);
-            setScreen("error");
-            return;
-          }
-          setTcJobStatus(st);
-          if (st.status === "completed") {
-            clearInterval(tcPollRef.current);
-            const tc = await invoke("getTestCases", { jobId: jid });
-            if (tc.error) {
-              setTcGenerating(false); // Fix 6
-              const friendly = _classifyBackendError(tc, "Failed to load test cases");
-              setError(friendly.message);
-              setScreen("error");
-            } else {
-              setTestCaseResults(tc);
-              setTcGenerating(false); // Fix 6
-              // Fix 6: navigate to testcases ONLY when the user is on the generating screen;
-              // if they backed to reviewing, update results silently — don't yank them away.
-              if (screenRef.current === "generatingTests") {
-                setScreen("testcases");
-              }
-            }
-          } else if (st.status === "failed") {
-            clearInterval(tcPollRef.current);
-            setTcGenerating(false); // Fix 6
-            const friendly = _classifyBackendError(st, "Test case generation failed");
-            setError(friendly.message);
-            setScreen("error");
-          }
-        } catch (e) {
-          console.error("TC poll error:", e);
-        }
-      }, POLL_MS);
-    },
-    [],
-  );
 
   const handleGenerateTestCases = useCallback(async () => {
     if (!jobId) return;
