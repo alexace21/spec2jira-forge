@@ -1580,6 +1580,9 @@ function App() {
             initialBreakdown={pendingBreakdown || results.breakdown}
             onPush={handlePush}
             isPushing={isPushing}
+            onOpenTestCases={handleOpenTestCases}
+            testCaseResults={testCaseResults}
+            tcGenerating={tcGenerating}
           />
         </div>
       </div>

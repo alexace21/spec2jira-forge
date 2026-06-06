@@ -4,7 +4,7 @@ import CapabilityCard from './CapabilityCard.jsx';
 import SharedACPanel from './SharedACPanel.jsx';
 import LabelsEditor from './LabelsEditor.jsx';
 
-export default function BreakdownEditor({ initialBreakdown, onPush, isPushing = false }) {
+export default function BreakdownEditor({ initialBreakdown, onPush, isPushing = false, onOpenTestCases, testCaseResults, tcGenerating = false }) {
   const [breakdown, setBreakdown] = useState(() => JSON.parse(JSON.stringify(initialBreakdown)));
 
   useEffect(() => {
@@ -210,20 +210,48 @@ export default function BreakdownEditor({ initialBreakdown, onPush, isPushing = 
         borderTop: '1px solid var(--s2j-border)',
         background: 'var(--s2j-bg-section)',
       }}>
-        <div className="flex items-center justify-between">
+        <div className="flex items-center justify-between gap-3">
           <p className="text-xs" style={{ color: 'var(--s2j-text-light)' }}>
             {stats.totalItems} items will be created
           </p>
-          <button onClick={() => onPush(breakdown)} disabled={isPushing} className="btn-primary">
-            {isPushing ? (
-              <>
-                <SpinnerInline />
-                Creating in Jira...
-              </>
-            ) : (
-              'Push to Jira →'
+          <div className="flex items-center gap-2">
+            {/* P5 entry point — placed RIGHT NEXT TO Push so the OPTIONAL test-case step is
+                discoverable in the action flow (the top-bar link was too easy to miss). */}
+            {onOpenTestCases && (
+              <button
+                onClick={onOpenTestCases}
+                disabled={isPushing || tcGenerating}
+                title="Generate acceptance test cases for these stories (optional) — Gherkin / CSV export + a summary embedded in each Jira Story"
+                style={{
+                  background: testCaseResults ? 'var(--s2j-green-bg)' : 'var(--s2j-blue-bg)',
+                  border: `1px solid ${testCaseResults ? 'var(--s2j-green-border)' : 'var(--s2j-blue-border)'}`,
+                  color: testCaseResults ? 'var(--s2j-green-dark)' : 'var(--s2j-blue)',
+                  padding: '6px 12px',
+                  borderRadius: '6px',
+                  fontSize: '13px',
+                  fontWeight: 500,
+                  cursor: isPushing || tcGenerating ? 'not-allowed' : 'pointer',
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                {tcGenerating
+                  ? '⏳ Generating tests…'
+                  : testCaseResults
+                  ? '✓ Test Cases ready'
+                  : '🧪 Generate Test Cases'}
+              </button>
             )}
-          </button>
+            <button onClick={() => onPush(breakdown)} disabled={isPushing} className="btn-primary">
+              {isPushing ? (
+                <>
+                  <SpinnerInline />
+                  Creating in Jira...
+                </>
+              ) : (
+                'Push to Jira →'
+              )}
+            </button>
+          </div>
         </div>
       </div>
     </div>
