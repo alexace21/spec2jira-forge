@@ -935,19 +935,31 @@ async function verifyAndRepairCycles(breakdown, apiKey, model) {
   const features = breakdown?.features;
   if (!Array.isArray(features) || features.length === 0) return;
 
-  const cycles = detectCycles(features); // pure, deterministic, exhaustive
+  let cycles = detectCycles(features); // pure, deterministic, exhaustive
   if (cycles.length === 0) return;
   console.log(`[cycle] detected ${cycles.length} dependency cycle(s)`);
 
   const byName = new Map(features.map((f) => [f.name, f]));
   const concerns = [];
+  const cutEdges = new Set();     // "from→to" already cut — never cut a reverse (would over-cut a mutual pair)
+  const unresolvable = new Set(); // node-set signatures already surfaced as NOT auto-resolved (loop guard)
+  const sigOf = (p) => [...p].sort().join('|');
   let resolves = 0;
 
-  for (const path of cycles) {
+  // Process ONE live cycle at a time, RE-DETECTING after each cut. detectCycles returns every cycle of
+  // the CURRENT graph (deduped by node-set), but a single cut can break SEVERAL overlapping cycles (a
+  // mutual A↔B pair, or a 3-node knot seen from different entry nodes). Re-detecting after each cut means
+  // we only ever cut a STILL-LIVE cycle, and the cutEdges guard refuses to cut a reverse edge — together
+  // preventing the over-cutting + contradictory concerns the old stale-list `for` loop produced
+  // (deep-audit 2026-06-07: a mutual RBP↔ACD pair had BOTH directions cut and emitted 3 mutually-
+  // contradictory [RISK|low] concerns for what was ~1 real resolution — an incoherent audit trail).
+  while (resolves < MAX_CYCLE_RESOLVES) {
+    const path = cycles.find((c) => !unresolvable.has(sigOf(c)));
+    if (!path) break; // no live cycle left that we haven't already judged unresolvable
     const label = `${path.join(' → ')} → ${path[0]}`;
-    let cut = null;
 
-    if (apiKey && resolves < MAX_CYCLE_RESOLVES) {
+    let cut = null;
+    if (apiKey) {
       const involved = path.map((n) => byName.get(n)).filter(Boolean);
       try {
         const r = await resolveDependencyCycle({ cyclePath: path, features: involved, apiKey, model });
@@ -957,23 +969,42 @@ async function verifyAndRepairCycles(breakdown, apiKey, model) {
       }
     }
 
-    if (cut) {
-      const f = byName.get(cut.cut_from);
-      if (f && Array.isArray(f.dependencies) && f.dependencies.includes(cut.cut_to)) {
-        f.dependencies = f.dependencies.filter((d) => d !== cut.cut_to);
-        resolves++;
-        console.log('[cycle] auto-resolved a dependency cycle (cut the softer edge)');
-        concerns.push(
-          `[RISK|low] Circular dependency auto-resolved: dropped the "${cut.cut_from}" → "${cut.cut_to}" blocker (${cut.reason || 'softer edge'}). Confirm the ordering.`,
-        );
-        continue;
-      }
+    const f = cut && byName.get(cut.cut_from);
+    const edgeLive = f && Array.isArray(f.dependencies) && f.dependencies.includes(cut.cut_to);
+    const reverseAlreadyCut = cut && cutEdges.has(`${cut.cut_to}→${cut.cut_from}`);
+
+    if (edgeLive && !reverseAlreadyCut) {
+      f.dependencies = f.dependencies.filter((d) => d !== cut.cut_to);
+      cutEdges.add(`${cut.cut_from}→${cut.cut_to}`);
+      resolves++;
+      console.log('[cycle] auto-resolved a dependency cycle (cut the softer edge)');
+      // Surface WHAT was cut (deterministic) + hand the JUDGEMENT to the BA. We intentionally do NOT
+      // print the LLM's `cut.reason` prose: the edge CHOICE is meaning-reading (legitimately the LLM's),
+      // but its free-text rationale can make a checkably-wrong factual claim about a business rule, which
+      // an expert BA/PO catches and which then taints trust in the whole breakdown (deep-audit 2026-06-07).
+      concerns.push(
+        `[RISK|low] Circular dependency auto-resolved: dropped the "${cut.cut_from}" → "${cut.cut_to}" blocker to break a dependency cycle. Review whether this is the right edge to remove.`,
+      );
+      cycles = detectCycles(features); // the cut may have broken other listed cycles — re-detect
+      continue;
     }
 
-    // Not resolved (no key / over budget / uncertain / invalid edge) → surface honestly.
+    // Couldn't safely auto-resolve THIS cycle (no key / uncertain / invalid edge / cutting it would
+    // remove both directions of a mutual pair). Surface it once + mark it so the loop never repeats it.
     concerns.push(
       `[RISK|medium] Circular dependency detected but NOT auto-resolved: ${label}. Break it manually before relying on blocks-links for sprint sequencing.`,
     );
+    unresolvable.add(sigOf(path));
+  }
+
+  // Budget exhausted (or no apiKey) with cycles still live → surface the remainder honestly (deduped).
+  for (const c of cycles) {
+    if (!unresolvable.has(sigOf(c))) {
+      concerns.push(
+        `[RISK|medium] Circular dependency detected but NOT auto-resolved: ${c.join(' → ')} → ${c[0]}. Break it manually before relying on blocks-links for sprint sequencing.`,
+      );
+      unresolvable.add(sigOf(c));
+    }
   }
 
   if (concerns.length) {
