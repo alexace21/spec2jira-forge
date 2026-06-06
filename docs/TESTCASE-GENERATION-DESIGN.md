@@ -117,10 +117,14 @@ artifacts). max_tokens is now 8000 (raised from 6000) — batch async removes th
 the extra headroom covers rich/monster stories without any timeout cost. **Schema needs NO
 change** (concern + ac_trace kind='story-ac' + expected_result already carry the non-behavioral path).
 
-**Re-validation (running):** `bakeoff_harness --strategies S4 --max-stories 5 --runs 3` on the
-dense real stories with the tweaked prompt. Gates: coverage holds ≥98% (toward 100% via the
-flagged non-behavioral cases); `test_data` presence rises from 21%; **no over-use** of the
-non-behavioral escape (spot-check); no false-uncovered regression from `normAC`.
+**Re-validation (DONE 2026-06-06):** `bakeoff_harness --strategies S4` on the 5 dense real
+stories with the tweaked prompt + the 8000/ceiling-15 config. RESULT: **100% AC coverage +
+100% complete on every run** (the non-behavioral flagged cases closed the residual gap);
+`test_data` presence 21%→47% on dense stories (honest — compliance cases correctly omit it);
+0 truncation at 8000t; the tail (cases 12-16) spot-checked DISTINCT (not padding). Ceiling-15
+is DATA-JUSTIFIED: a 16-case story lost 1 AC at cap-12 (88%) but holds 100% at cap-15;
+`parseTestCaseResult` partitions AC-covering cases before the cap (cost-asymmetry). ~$5 of
+validation across the model/architecture/config decisions.
 
 ---
 
@@ -143,13 +147,28 @@ non-behavioral escape (spot-check); no false-uncovered regression from `normAC`.
 
 ---
 
-## 6. Status
+## 6. Status — CODE-COMPLETE (P1–P5); live-validation pending (P6 + Task #7)
 
-- ✅ **Model + architecture LOCKED** (Sonnet + batch), data-confirmed.
-- ✅ **P1 prompt tweaks APPLIED** (test_data nudge + non-behavioral ACs) — re-validation running.
-- ✅ **P2** (renderers + coverage strip + `normAC` real-spec fix) — unchanged, carries over.
-- ✅ **P3 build** — §3 surface shipped (batch lifecycle + resolvers + `parseTestCaseResult`), all §5 mitigations wired. 4-lens audit polish applied 2026-06-06: lean stamp (#10), tcStatus on reconnect (#1), pageVersion on tcjob (#3-derived), `story` + `failedCount` in `getTestCases` (#7/#11), max_tokens 8000 + ceiling 15 (#4), generalized null-key soft-fail (#5), quota comment clarified (#8).
-- ⏭ **P4** — push embed + reconnect rehydration (HIGH pitfall: `getResults` now returns `tcStatus`; P4 uses it to skip an extra round-trip). P5 (screen), P6 (§13 gate + deploy), Task #7 (full real-spec validation).
+Every phase: built → §13 gate (code-review + audit) → 4-lens deep audit → fix → commit. ~$5 validation.
+
+- ✅ **P1 — prompt/schema** (Sonnet config): test_data nudge + non-behavioral-AC honest exception;
+  max_tokens 8000 + ceiling 15 + AC-covering partition before the cap. §4 re-validation DONE (100%).
+  Commits `e90d318`/`4459d2a`.
+- ✅ **P2 — renderers + coverage strip** (`renderGherkin`/`renderManualTable`/`computeCoverage` +
+  the `normAC` real-spec fix). Commit `33aaede`.
+- ✅ **P3 — backend** (Sonnet + Batches API): the §3 surface + all §5 mitigations + the 4-lens polish.
+  Commit `108ac84`.
+- ✅ **P4 — push embed + reconnect** (see §7): compact-summary embed; the AC-hash staleness
+  fingerprint; reconnect rehydration; purgeJob cleanup. Commit `01a32d4`.
+- ✅ **P5 — Test Cases screen** (see §8): generate/view/regenerate/export; the uncovered/stale-AC
+  rendering (trust); `getTestCaseExports`. Commit `e22bee0`.
+- ⭐ **Regression verdict (P5 deep-audit integration lens):** the core breakdown → review → push E2E
+  is INTACT — a push with NO test cases is BYTE-IDENTICAL to pre-P4; reconnect / state-machine /
+  purgeJob all fail-soft. P4/P5's shared-path changes did not break the shipped flow.
+- ⏭ **P6 — deploy + live E2E smoke** (first real run: generate via Sonnet batch → view/coverage →
+  export → push → verify the JIRA Story summary) · **Task #7 — validate quality on the partner's
+  ~9 real Confluence pages** (the pre-ship "sharpen the axe" gate). No manifest change (resolvers are
+  `resolver.define` within the single function; egress + scopes unchanged → deploy-safe).
 - 🚩 **Partner flag:** §5 #8 — Managed quota accounting (defer to editions Phase 2).
 
 ### Directive verdicts (2026-06-06)
@@ -163,3 +182,46 @@ non-behavioral escape (spot-check); no false-uncovered regression from `normAC`.
 - Multi-request batch caching across regen calls is cost-only optimization (not a correctness gap).
 - A `tcJob.expiresAt` check in poll for a friendlier expiry message (currently falls through to Anthropic's raw error).
 - Regen progress is binary (batched → completed); P5 renders it as indeterminate (acceptable for ~2 min wait).
+- (P5) Export is a lazy resolver round-trip per click (~300ms); pre-render on mount is a later optimization (CRA can't import `../../../src` → no clean frontend render path).
+- (P5) "Copy All" silently skips failed stories (the SummaryBar shows the failed count above it); a per-button count is a nicety.
+
+---
+
+## 7. P4 — JIRA push embed (compact summary) + reconnect
+
+- **Embed = a COMPACT summary (partner decision), NOT the full cases.** Each Story description gets a
+  `renderTestCasesAdf(result, coverage)` block: a heading + 3 paragraphs — "{N} cases · {M}/{T} ACs
+  covered", the type breakdown + flagged count, and a pointer to the screen/export. ONLY
+  heading/paragraph/text ADF nodes. The deep audit flagged the original full 7-paragraph-per-bullet
+  rendering as an UNPROVEN ADF structure (whole-chunk-fail risk, gotcha #11) AND as noise that buries
+  the story; the summary de-risks AND de-noises. The full cases live in the export + the P5 screen
+  (the BA's primary artifact).
+- **Push integration:** `jobId` → `startPush` → session (carries `tcAcHashes`); `stepStories` fetches
+  `testcases:<jobId>:<idx>` per chunk + appends the summary; the embed is wrapped in try/catch
+  (fail-open — a render throw must never kill the Story create). Backwards-compatible: no test cases →
+  the description is BYTE-IDENTICAL to pre-P4.
+- **⭐ Staleness fingerprint:** a per-story djb2 hash of the normAC'd+sorted ACs (`acSetHash`), frozen
+  in the session as a compact `tcAcHashes` map (~40 B/story — not the full ACs). Embed only when the
+  live feature's AC-hash still matches: a name edit still embeds (ACs unchanged); a reorder /
+  duplicate-name / AC-edit correctly SKIPS (no mis-attribution). `tc_embedded`/`tc_skipped` counts
+  surface on the confirm + success screens (a stale-skip is visible, never silent).
+- **Reconnect:** `getResults`/`getGenerationStatus` return `tcStatus`; App.js rehydrates + resumes the
+  poll. `purgeJob` deletes `tcjob` + `testcases:*` after push (fail-soft; no-tcjob → no-op).
+
+## 8. P5 — the Test Cases screen
+
+- **Flow:** Review → "Test Cases" → (generate → poll → display) → "Continue to Push". OPTIONAL /
+  skippable (never-open → push unchanged). New screen states `testcases`/`generatingTests` clone the
+  breakdown's submit→poll→display (reconnect-able, "you can leave" copy).
+- **Display:** a `<details>` accordion — failed + partial-coverage stories open by default; internal
+  open-state (the controlled `open` prop snapped back on re-render, fighting the user — fixed). Per
+  story: a coverage badge + ⭐ the **`uncovered_acs` + `stale_refs` lists** (the trust signal — a
+  number without the named gaps is not honest for the BA), the cases (type/priority/Given-When-Then/
+  expected/test_data/concern/ac_trace), a SummaryBar coverage rollup ("{N} fully covered · {M} partial
+  · {K} no-ACs · {W} failed").
+- **Regenerate:** per-story (1-request Sonnet batch, delta-patch) with a TWO-STEP inline confirm
+  (window.confirm may be blocked in the Forge sandbox iframe) + a retry-all-failed button.
+- **Export (the primary artifact):** `getTestCaseExports({jobId, storyIdx?, format})` renders via the
+  single-source `testcases.js` (CRA cannot import `../../../src`); per-story + all-stories; Gherkin +
+  CSV; clipboard primary + data-URI download (Forge blocks `blob:`); discriminated feedback
+  (✓ Copied / ✓ Downloaded / "Copy failed") — never a silent no-op on the BA's key action.
