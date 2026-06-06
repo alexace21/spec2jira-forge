@@ -301,10 +301,10 @@ export function buildProjectContextSystemText(projectContext) {
 // ⚠ CONFIRMED 2026-06-05 (harness): Anthropic structured outputs REJECT numeric
 // constraints — "output_config.format.schema: For 'array' type, property 'maxItems'
 // is not supported" (minItems / minimum / maximum likewise; BREAKDOWN_SCHEMA uses none).
-// So the ceiling (≤12 cases), the ≥1 when/then, the non-empty ac_trace, and the 0-100
+// So the ceiling (≤15 cases), the ≥1 when/then, the non-empty ac_trace, and the 0-100
 // confidence band are NOT schema-enforced — they live in the SYSTEM_PROMPT and are
 // enforced in the defensive parse (engineering owns the limit — POLICY §4): the backend
-// caps test_cases to 12 (surfacing tail-loss via coverage, never silent), drops cases
+// caps test_cases to 15 (surfacing tail-loss via coverage, never silent), drops cases
 // with an empty when/then/ac_trace, and clamps confidence_score to 0-100.
 
 export const TEST_CASE_SCHEMA = {
@@ -412,7 +412,7 @@ TEST DATA (optional, per case). Populate test_data ONLY with the concrete, discr
 
 # OUTPUT FORMAT
 
-Return ONLY a JSON object that strictly conforms to the provided schema — no markdown, no prose, no commentary, no code fences. Omit optional fields you cannot fill confidently rather than emitting empty strings or placeholders like "TBD". ac_trace must never be empty for a case — use a kind='inferred' entry when no authored AC backs it. expected_result is mandatory and must be a single observable assertion. Order your output BREADTH-FIRST: emit ONE case for EACH authored acceptance criterion before emitting any second case for the same criterion — so that even if length truncates the response, every criterion already has a case and AC coverage is never sacrificed to length. (A single case MAY trace to more than one acceptance criterion — that counts as coverage for each; breadth-first guarantees no criterion is left uncovered at truncation, NOT that every criterion gets its own dedicated case, so it never conflicts with the merge rule.) Only AFTER every authored criterion has a case do you add depth (additional edge/negative cases), up to a hard ceiling of 12 cases per Story; if the testable surface needs more, keep the highest-value DISTINCT cases and never drop AC coverage silently. Every emitted string is in English.
+Return ONLY a JSON object that strictly conforms to the provided schema — no markdown, no prose, no commentary, no code fences. Omit optional fields you cannot fill confidently rather than emitting empty strings or placeholders like "TBD". ac_trace must never be empty for a case — use a kind='inferred' entry when no authored AC backs it. expected_result is mandatory and must be a single observable assertion. Order your output BREADTH-FIRST: emit ONE case for EACH authored acceptance criterion before emitting any second case for the same criterion — so that even if length truncates the response, every criterion already has a case and AC coverage is never sacrificed to length. (A single case MAY trace to more than one acceptance criterion — that counts as coverage for each; breadth-first guarantees no criterion is left uncovered at truncation, NOT that every criterion gets its own dedicated case, so it never conflicts with the merge rule.) Only AFTER every authored criterion has a case do you add depth (additional edge/negative cases), up to a hard ceiling of 15 cases per Story; if the testable surface needs more, keep the highest-value DISTINCT cases and never drop AC coverage silently. Every emitted string is in English.
 
 # AGILE LENS
 

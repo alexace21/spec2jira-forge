@@ -21,7 +21,7 @@
  *             only for stories with ≥6 ACs (skipped for <6 ACs).
  *     S3  — Haiku REACTIVE: main 2400t call, then one targeted completion call (1500t)
  *             only for uncovered ACs, merged + deduped. MAX single-call time is the Forge gate.
- *     S4  — Sonnet SINGLE: 6000t, BATCH-ONLY in production (no 25s limit). Run sync here
+ *     S4  — Sonnet SINGLE: 8000t, BATCH-ONLY in production (no 25s limit). Run sync here
  *             for quality/coverage measurement; timing is informational (exceeds 25s = expected).
  *   Use --strategies S1,S3,S4 to run a focused subset (default = all).
  *   Print per-story comparison + summary table segmented by AC band (3-5 / 6-7 / 8+).
@@ -83,8 +83,8 @@ const STRATEGIES = [
   },
   {
     id: 'S4',
-    label: 'Sonnet Single (6000t batch-only)',
-    maxTokens: 6000,
+    label: 'Sonnet Single (8000t batch-only)',
+    maxTokens: 8000,
     kind: 'sonnet-single',
     // In PRODUCTION this runs via the async Batches API (no 25s resolver limit).
     // Here we run it SYNC to measure quality/coverage; elapsedMs is informational only.

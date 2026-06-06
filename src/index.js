@@ -50,6 +50,9 @@ import {
   DISTILL_MAX_INPUT_CHARS,
   MODEL_PRIMARY,
   MODEL_FALLBACK,
+  submitTestCaseBatch,
+  pollTestCaseBatch,
+  fetchTestCaseResults,
 } from './anthropic_client.js';
 import { startPushSession, pushSessionStep } from './push_handler.js';
 import { detectCycles } from './graph.js';
@@ -188,6 +191,18 @@ const PAGE_CONTEXT_PREFIX = 'pageCtx:';
 // pollJobStatus); push is a CHUNKED resolver (startPush + UI-looped pushStep,
 // one bounded JIRA batch per call). Neither uses @forge/events queues anymore —
 // asUser() is unavailable in async consumers (AUTH_TYPE_UNAVAILABLE 2026-05-30).
+
+// ── Test-case generation KVS key prefixes ─────────────────────
+// tcjob:<jobId>               — control record (batch lifecycle + stampedStories)
+// testcases:<jobId>:<idx>     — per-story result (result + coverage, or error sentinel)
+// tcregenjob:<jobId>:<idx>    — per-story single-regen control (mirrors tcjob)
+// KVS sizes: tcjob holds control + lean stampedStories {idx,name,acceptance_criteria};
+//   ~1-2KB/story → ~40-80KB at 39 stories, well under 240KB (#10).
+//             per-story ~2-4KB, well within 240KB. No TTL (matches breakdown job —
+//             test cases must survive reconnect as long as the breakdown does).
+const TC_JOB_KEY_PREFIX = 'tcjob:';
+const TC_STORY_KEY_PREFIX = 'testcases:';
+const TC_REGEN_KEY_PREFIX = 'tcregenjob:';
 
 
 // ── Settings helpers ────────────────────────────────────────
@@ -1379,6 +1394,8 @@ resolver.define('getResults', async ({ payload }) => {
   if (job.status !== 'completed') {
     return { error: 'not_ready', detail: `Job status: ${job.status}` };
   }
+  // tcStatus: lets the reconnecting frontend know test cases exist without a 2nd round-trip.
+  const tcJob = await kvs.get(`${TC_JOB_KEY_PREFIX}${jobId}`).catch(() => null);
   return {
     breakdown: job.breakdown,
     usage: job.usage,
@@ -1393,6 +1410,8 @@ resolver.define('getResults', async ({ payload }) => {
     // undefined on a normal complete run.
     truncated: job.truncated,
     truncation_note: job.truncation_note,
+    // tcStatus: 'none' | 'pending' | 'batched' | 'completed' | 'failed'
+    tcStatus: tcJob ? tcJob.status : 'none',
   };
 });
 
@@ -1422,7 +1441,9 @@ resolver.define('getGenerationStatus', async ({ payload }) => {
   if (!job) return { status: 'idle' };
 
   if (job.status === 'completed') {
-    return { status: 'completed', job_id: job.jobId };
+    // tcStatus: lets the reconnecting frontend know test cases exist without a 2nd round-trip.
+    const tcJob = await kvs.get(`${TC_JOB_KEY_PREFIX}${ref.jobId}`).catch(() => null);
+    return { status: 'completed', job_id: job.jobId, tcStatus: tcJob ? tcJob.status : 'none' };
   }
   if (job.status === 'pending' || job.status === 'batched') {
     const startedAt = job.submittedAt || job.createdAt;
@@ -1591,6 +1612,521 @@ resolver.define('pushStep', async ({ payload }) => {
     progress: outcome.progress,
     counts: outcome.counts,
   };
+});
+
+// ════════════════════════════════════════════════════════════════
+// TEST-CASE GENERATION — Sonnet 4.6 + Anthropic Batches API (P3)
+//
+// Architecture mirrors the breakdown batch lifecycle exactly (startGeneration →
+// pollJobStatus → getResults). Cloned per TESTCASE-GENERATION-DESIGN.md §3.
+// All 12 §5 mitigations are wired — see inline comments marked #1-#12.
+// ════════════════════════════════════════════════════════════════
+
+/**
+ * startTestCaseGeneration — submit a test-case batch for all Stories in a job.
+ *
+ * Payload: { jobId }
+ *   jobId: the completed breakdown job whose features[] we generate test cases for.
+ *
+ * Mitigations wired:
+ *   #2 (idempotency): if tcjob already exists in batched/completed state, return it.
+ *   #5 (keySource stamp): records keySource on tcjob; poll leg reuses the same key.
+ *   #7 (story stamp): records stampedStories {idx,name,acceptance_criteria} (lean coverage inputs) at submit time.
+ *   #8 (BYOK quota): consume-on-success; BYOK always allowed; Managed = Phase 2.
+ */
+resolver.define('startTestCaseGeneration', async ({ payload, context }) => {
+  const { jobId } = payload || {};
+  if (!jobId) return { error: 'no_job_id', detail: 'jobId is required.' };
+
+  // Defensive license gate (mirrors startGeneration)
+  try {
+    if (getActiveTier(context).key === 'unlicensed') return buildLicenseRequired();
+  } catch (e) {
+    console.error(`[startTCGen] license check failed (failing open): ${String(e?.message || e)}`);
+  }
+
+  // Resolve the Anthropic key by tier (#5: keySource-stamp enables same-key reuse at poll)
+  const { apiKey, keySource } = await resolveAnthropicKey(context);
+  if (!apiKey) {
+    if (keySource === 'managed') {
+      console.error('[startTCGen] managed key unavailable (MANAGED_ANTHROPIC_KEY not configured)');
+      return { error: 'managed_unavailable', detail: 'The Managed service is temporarily unavailable. Please contact support@spec2jira.com, or switch to your own Anthropic API key in Settings.' };
+    }
+    return { error: 'not_configured', detail: 'Anthropic API key not configured. Ask your Confluence admin to open Settings → Spec2Tickets and provide an Anthropic API key.' };
+  }
+
+  // Quota gate (mirrors startGeneration; BYOK = unlimited; Managed = per-user cap)
+  let quota = null;
+  try {
+    quota = await checkQuota(context);
+    if (!quota.allowed) return buildQuotaExceeded(quota);
+  } catch (e) {
+    console.error(`[startTCGen] quota check failed (failing open): ${String(e?.message || e)}`);
+  }
+
+  // Load the completed breakdown job
+  const job = await kvs.get(`${JOB_KEY_PREFIX}${jobId}`);
+  if (!job) return { error: 'not_found', detail: `Breakdown job ${jobId} not found.` };
+  if (job.status !== 'completed') {
+    return { error: 'breakdown_not_ready', detail: `Breakdown job is in status '${job.status}'; it must be 'completed' before generating test cases.` };
+  }
+  const stories = (job.breakdown && Array.isArray(job.breakdown.features)) ? job.breakdown.features : [];
+  if (stories.length === 0) {
+    return { error: 'no_stories', detail: 'The breakdown has no features/stories to generate test cases for.' };
+  }
+
+  // #2 — IDEMPOTENCY: if a tcjob already exists and is batched or completed, return it
+  // immediately without re-submitting (avoids 2× cost on double-click or UI re-mount).
+  const existingTcJob = await kvs.get(`${TC_JOB_KEY_PREFIX}${jobId}`);
+  if (existingTcJob && (existingTcJob.status === 'batched' || existingTcJob.status === 'completed')) {
+    console.log(`[startTCGen] idempotent return — tcjob ${jobId} already ${existingTcJob.status}`);
+    return { jobId, status: existingTcJob.status, total: existingTcJob.total };
+  }
+
+  const total = stories.length;
+  const createdAt = new Date().toISOString();
+
+  // #7 — stamp the story list (idx + name + acceptance_criteria) at submit time. When the
+  // editor edits a Story between submit and fetch, the stamped list preserves the
+  // ORIGINAL ACs that coverage was computed against. P5 reconciles added/deleted stories.
+  // LEAN: only {idx, name, acceptance_criteria} — the only fields computeCoverage uses.
+  const stampedStories = stories.map((s, i) => ({
+    idx: i,
+    name: s && (s.name || `Story ${i}`),
+    acceptance_criteria: Array.isArray(s && s.acceptance_criteria) ? s.acceptance_criteria : [],
+  }));
+
+  // Write initial tcjob record (status 'pending' → updated to 'batched' on success).
+  // pageVersion is stamped here so getTestCases can read it without a separate job lookup.
+  const pageVersion = job.pageVersion;
+  await kvs.set(`${TC_JOB_KEY_PREFIX}${jobId}`, {
+    jobId,
+    status: 'pending',
+    total,
+    keySource,
+    stampedStories,
+    pageVersion,
+    createdAt,
+  });
+
+  const sharedACs = (job.breakdown && Array.isArray(job.breakdown.shared_acceptance_criteria))
+    ? job.breakdown.shared_acceptance_criteria
+    : [];
+  const specSummary = (job.breakdown && job.breakdown.metadata && job.breakdown.metadata.spec_summary) || '';
+
+  // Submit the N-request batch to Anthropic
+  const submitResult = await submitTestCaseBatch({ stories, sharedAcceptanceCriteria: sharedACs, specSummary, apiKey });
+  if (submitResult.error) {
+    console.error(`[startTCGen] batch submit failed: ${submitResult.error} | ${submitResult.detail}`);
+    await kvs.set(`${TC_JOB_KEY_PREFIX}${jobId}`, {
+      jobId, status: 'failed', total, keySource, stampedStories, createdAt,
+      error: submitResult.error, detail: submitResult.detail,
+    });
+    return { error: submitResult.error, detail: submitResult.detail };
+  }
+
+  // #8 — consume quota on success. BYOK (launch) = no-op (unlimited).
+  // Managed Phase 2 MUST decide test-case metering (separate cap vs counts-as-a-unit)
+  // — NOT settled; consuming on success here is the loss-safe default.
+  if (quota) {
+    try {
+      await consumeQuota(quota.usageKey);
+    } catch (e) {
+      console.error(`[startTCGen] quota consume failed (generation still OK): ${String(e?.message || e)}`);
+    }
+  }
+
+  // #5 — persist keySource + #7 persist stampedStories + batchId + pageVersion
+  await kvs.set(`${TC_JOB_KEY_PREFIX}${jobId}`, {
+    jobId,
+    status: 'batched',
+    total,
+    keySource,
+    stampedStories,
+    pageVersion,
+    batchId: submitResult.batchId,
+    batchStatus: submitResult.status,
+    createdAt,
+    submittedAt: new Date().toISOString(),
+    expiresAt: submitResult.expiresAt,
+  });
+
+  console.log(`[startTCGen] jobId=${jobId} batchId=${submitResult.batchId} stories=${total}`);
+  return { jobId, status: 'batched', total };
+});
+
+/**
+ * pollTestCaseStatus — poll the Anthropic batch for a test-case generation job.
+ * When the batch ends, fetches the JSONL, writes per-story KVS keys via Promise.all,
+ * and marks the tcjob completed. Terminal states return immediately.
+ *
+ * Mitigations wired:
+ *   #3 (partial-failure sentinel): non-succeeded rows store an explicit {error} key.
+ *   #4 (Promise.all writes): never a sequential loop — all N KVS writes in parallel.
+ *   #5 (managed key guard): soft-fail if the managed key vanished mid-flight.
+ *   #10 (240KB guard): per-story payloads go to testcases:<jobId>:<idx>, never merged into tcjob.
+ */
+resolver.define('pollTestCaseStatus', async ({ payload }) => {
+  const { jobId } = payload || {};
+  if (!jobId) return { error: 'no_job_id', detail: 'jobId is required.' };
+
+  const tcJob = await kvs.get(`${TC_JOB_KEY_PREFIX}${jobId}`);
+  if (!tcJob) return { error: 'not_found', detail: `tcjob ${jobId} not found.` };
+
+  // Terminal states — return immediately (avoid redundant Anthropic polls)
+  if (tcJob.status === 'completed' || tcJob.status === 'failed') return tcJob;
+
+  // Re-resolve the key via the STAMPED keySource (same key the batch was created with —
+  // #5: Anthropic batches are scoped to their creating key; never re-derive from the
+  // current license which may have changed since submit, e.g. trial expiring).
+  const jobApiKey = await anthropicKeyForSource(tcJob.keySource || 'byok');
+
+  // #5 — Key-vanish guard (generalized for any source): soft-fail so the UI retries on
+  // the next poll cycle; self-heals when the key is restored. Managed = admin restores
+  // MANAGED_ANTHROPIC_KEY; BYOK = user re-adds their key in Settings. Never hard-fail on
+  // a transient absence — the batch is still in-flight at Anthropic.
+  if (!jobApiKey) {
+    const msg = (tcJob.keySource === 'managed')
+      ? 'Managed service temporarily unavailable — retrying. If this persists, please contact support@spec2jira.com.'
+      : 'Your Anthropic API key is unavailable — re-add it in Settings; generation will resume.';
+    console.error(`[pollTCStatus] jobId=${jobId} keySource=${tcJob.keySource} key unavailable — soft-failing`);
+    return { ...tcJob, phase: msg };
+  }
+
+  if (tcJob.status !== 'batched' || !tcJob.batchId) return tcJob; // pending or unknown
+
+  const pollResult = await pollTestCaseBatch(tcJob.batchId, jobApiKey);
+  if (pollResult.error) {
+    console.error(`[pollTCStatus] jobId=${jobId} batchId=${tcJob.batchId} poll failed: ${pollResult.error}`);
+    // Soft-fail — return current state; next poll cycle will retry
+    return { ...tcJob, phase: `Batch poll error: ${pollResult.error}` };
+  }
+
+  const counts = pollResult.requestCounts || {};
+  const totalRequests =
+    (counts.processing || 0) + (counts.succeeded || 0) + (counts.errored || 0) +
+    (counts.canceled || 0) + (counts.expired || 0);
+
+  // Still processing — return progress
+  if (pollResult.status === 'in_progress' || pollResult.status === 'canceling') {
+    return {
+      ...tcJob,
+      batchStatus: pollResult.status,
+      phase: 'Anthropic processing test cases...',
+      progress: totalRequests > 0 ? ((counts.succeeded || 0) + (counts.errored || 0)) / totalRequests : 0,
+      request_counts: counts,
+    };
+  }
+
+  // Batch ended — fetch JSONL + parse all N results
+  if (pollResult.status === 'ended') {
+    if (!pollResult.resultsUrl) {
+      const failed = { ...tcJob, status: 'failed', completedAt: new Date().toISOString(), error: 'no_results_url', detail: 'Batch ended but Anthropic returned no results_url.' };
+      await kvs.set(`${TC_JOB_KEY_PREFIX}${jobId}`, failed);
+      return failed;
+    }
+
+    const fetchResult = await fetchTestCaseResults(pollResult.resultsUrl, tcJob.stampedStories, jobApiKey);
+    if (fetchResult.error) {
+      const failed = { ...tcJob, status: 'failed', completedAt: new Date().toISOString(), error: fetchResult.error, detail: fetchResult.detail };
+      await kvs.set(`${TC_JOB_KEY_PREFIX}${jobId}`, failed);
+      return failed;
+    }
+
+    const { perStory } = fetchResult;
+
+    // #4 — Promise.all: write all N per-story KVS keys in parallel (never sequential —
+    // 25s resolver limit; N ≤ ~50 stories is safe; chunk if spec ever exceeds ~100).
+    // #3 — explicit sentinel for error rows: the KVS entry ALWAYS exists (success or error),
+    // so the P5 screen can detect "failed — regenerate" rather than rendering blank.
+    // #10 — payloads go to testcases:<jobId>:<idx>, never merged into tcjob.
+    await Promise.all(
+      perStory.map((entry) => {
+        const stamped = (tcJob.stampedStories || []).find((s) => s && s.idx === entry.storyIdx);
+        const storyName = (stamped && stamped.name) || '';
+        const kvsValue = entry.error
+          ? { storyIdx: entry.storyIdx, storyName, error: entry.error, detail: entry.detail }
+          : { storyIdx: entry.storyIdx, storyName, result: entry.result, coverage: entry.coverage };
+        return kvs.set(`${TC_STORY_KEY_PREFIX}${jobId}:${entry.storyIdx}`, kvsValue);
+      }),
+    );
+
+    const completedAt = new Date().toISOString();
+    const failedCount = perStory.filter((e) => e.error).length;
+    const completed = {
+      ...tcJob,
+      status: 'completed',
+      completedAt,
+      batchStatus: 'ended',
+      failedCount,
+    };
+    // #10 — do NOT merge perStory payloads into tcjob (240KB KVS value-size guard)
+    await kvs.set(`${TC_JOB_KEY_PREFIX}${jobId}`, completed);
+
+    console.log(`[pollTCStatus] jobId=${jobId} COMPLETED stories=${perStory.length} failed=${failedCount}`);
+    return completed;
+  }
+
+  // Unknown batch status
+  return { ...tcJob, batchStatus: pollResult.status, phase: `Unknown batch status: ${pollResult.status}` };
+});
+
+/**
+ * getTestCases — fetch the completed test-case results for a job. Standalone read —
+ * reconnect-safe (#1: the caller can invoke this at any time after completion without
+ * a live poll, so test cases survive page reloads and navigation).
+ *
+ * Returns { perStory, total, completedAt, breakdownPageVersion, failedStories, failedCount }
+ *   perStory[]: each entry is { storyIdx, storyName, story:{name,acceptance_criteria}, result?, coverage?, error?, detail? }
+ *   breakdownPageVersion: from tcJob.pageVersion (stamped at submit; no extra job KVS read)
+ *   failedStories: names of stories that errored in the batch (#3 transparency signal)
+ *   failedCount: number of errored stories (P5 all-failed check, mitigation #11)
+ *
+ * Mitigations wired:
+ *   #1 (reconnect safety): standalone read from KVS; no live poll dependency.
+ *   #4 (Promise.all): all N per-story reads in parallel.
+ */
+resolver.define('getTestCases', async ({ payload }) => {
+  const { jobId } = payload || {};
+  if (!jobId) return { error: 'no_job_id', detail: 'jobId is required.' };
+
+  const tcJob = await kvs.get(`${TC_JOB_KEY_PREFIX}${jobId}`);
+  if (!tcJob) return { error: 'not_found', detail: `tcjob ${jobId} not found.` };
+  if (tcJob.status !== 'completed') {
+    return { error: 'not_ready', status: tcJob.status, detail: `Test case generation is in status '${tcJob.status}'.` };
+  }
+
+  const total = tcJob.total || 0;
+
+  // #4 — Promise.all: read all N per-story keys in parallel
+  const entries = await Promise.all(
+    Array.from({ length: total }, (_, i) => kvs.get(`${TC_STORY_KEY_PREFIX}${jobId}:${i}`)),
+  );
+
+  const perStory = entries.map((entry, i) => {
+    // Build the story reference from the lean stampedStories (no extra job lookup needed).
+    // P4's renderGherkin/renderManualTable call needs story.name + acceptance_criteria.
+    const stamped = (tcJob.stampedStories || []).find((s) => s && s.idx === i);
+    const story = stamped
+      ? { name: stamped.name || '', acceptance_criteria: stamped.acceptance_criteria || [] }
+      : { name: '', acceptance_criteria: [] };
+
+    if (!entry) {
+      // KVS key missing — should not happen (pollTestCaseStatus writes all N keys),
+      // but treat as an error sentinel for robustness (#3 defence-in-depth)
+      return { storyIdx: i, storyName: story.name, story, error: 'key_missing', detail: 'Per-story KVS entry missing — regenerate this story.' };
+    }
+    return { ...entry, story };
+  });
+
+  // breakdownPageVersion is stamped on tcjob at submit — no extra KVS job read required.
+  const breakdownPageVersion = tcJob.pageVersion;
+
+  const failedStories = perStory
+    .filter((e) => e && e.error)
+    .map((e) => e.storyName || `Story ${e.storyIdx}`);
+
+  const failedCount = perStory.filter((e) => e && e.error).length;
+
+  return {
+    perStory,
+    total,
+    completedAt: tcJob.completedAt,
+    breakdownPageVersion,
+    failedStories,
+    failedCount,
+  };
+});
+
+/**
+ * regenerateTestCase — submit a 1-request Sonnet batch for a single Story and
+ * poll until done.
+ *
+ * DESIGN DECISION (flagged for the conductor per spec): a single-story regenerate
+ * cannot reuse the bulk tcjob because writing to tcjob:<jobId> would clobber the
+ * bulk batch's batchId/status. Instead, a SEPARATE control record
+ * tcregenjob:<jobId>:<storyIdx> mirrors the tcjob shape. The per-story result key
+ * testcases:<jobId>:<storyIdx> IS shared with the bulk path — on completion the
+ * regenerate OVERWRITES the existing entry (the most recent generation wins, which
+ * is always the intended behaviour: the user clicked Regenerate explicitly).
+ *
+ * This resolver SUBMITS only; the frontend polls via pollRegenerateTestCase
+ * (defined next) using { jobId, storyIdx }. Both are required because the single-
+ * story batch is async (Sonnet) — the same 2-10 min window as the bulk batch.
+ *
+ * Mitigations wired:
+ *   #5 (keySource stamp): re-resolves key by source at submit.
+ *   #7 (story stamp): stamps the single story on the regen control key.
+ *   #9 (1-request Sonnet batch): quality-consistent with the bulk; ~2 min UX.
+ */
+resolver.define('regenerateTestCase', async ({ payload, context }) => {
+  const { jobId, storyIdx } = payload || {};
+  if (!jobId) return { error: 'no_job_id', detail: 'jobId is required.' };
+  if (typeof storyIdx !== 'number' || !Number.isInteger(storyIdx) || storyIdx < 0) {
+    return { error: 'bad_story_idx', detail: 'storyIdx must be a non-negative integer.' };
+  }
+
+  // Defensive license gate
+  try {
+    if (getActiveTier(context).key === 'unlicensed') return buildLicenseRequired();
+  } catch (e) {
+    console.error(`[regenTC] license check failed (failing open): ${String(e?.message || e)}`);
+  }
+
+  // Resolve the key (#5: regen key must match the bulk batch's keySource for cost/auth consistency)
+  const tcJob = await kvs.get(`${TC_JOB_KEY_PREFIX}${jobId}`);
+  // Use the bulk tcjob's keySource when available (same billing source as the original batch);
+  // fall back to resolveAnthropicKey for the first-ever regen on a job with no bulk tcjob.
+  let apiKey, keySource;
+  if (tcJob && tcJob.keySource) {
+    keySource = tcJob.keySource;
+    apiKey = await anthropicKeyForSource(keySource);
+  } else {
+    const resolved = await resolveAnthropicKey(context);
+    apiKey = resolved.apiKey;
+    keySource = resolved.keySource;
+  }
+  if (!apiKey) {
+    if (keySource === 'managed') return { error: 'managed_unavailable', detail: 'The Managed service is temporarily unavailable. Please contact support@spec2jira.com.' };
+    return { error: 'not_configured', detail: 'Anthropic API key not configured.' };
+  }
+
+  // Load the full story from the breakdown job
+  const job = await kvs.get(`${JOB_KEY_PREFIX}${jobId}`);
+  if (!job || job.status !== 'completed') {
+    return { error: 'breakdown_not_ready', detail: 'Breakdown job must be completed before regenerating test cases.' };
+  }
+  const stories = (job.breakdown && Array.isArray(job.breakdown.features)) ? job.breakdown.features : [];
+  const story = stories[storyIdx];
+  if (!story) {
+    return { error: 'story_not_found', detail: `No story at index ${storyIdx}.` };
+  }
+
+  const sharedACs = (job.breakdown && Array.isArray(job.breakdown.shared_acceptance_criteria))
+    ? job.breakdown.shared_acceptance_criteria : [];
+  const specSummary = (job.breakdown && job.breakdown.metadata && job.breakdown.metadata.spec_summary) || '';
+
+  const createdAt = new Date().toISOString();
+
+  // Write the regen control key (separate from the bulk tcjob). NOTE: stampedStories uses
+  // idx:0 — the batch-LOCAL index matching the 1-request custom_id "0"; the real breakdown
+  // position is the payload storyIdx (the KVS key suffix + the testcases:<jobId>:<storyIdx> write).
+  await kvs.set(`${TC_REGEN_KEY_PREFIX}${jobId}:${storyIdx}`, {
+    jobId, storyIdx, status: 'pending', keySource,
+    stampedStories: [{ idx: 0, name: story.name || '', acceptance_criteria: Array.isArray(story.acceptance_criteria) ? story.acceptance_criteria : [] }],
+    createdAt,
+  });
+
+  // Submit a 1-request batch (all siblings passed as context — scope fence is important
+  // for a correct regenerate; quality-consistent with the bulk Sonnet call #9)
+  const submitResult = await submitTestCaseBatch({
+    stories: [story],
+    siblingNames: stories.map((s) => s && (s.name || '')),
+    sharedAcceptanceCriteria: sharedACs,
+    specSummary,
+    apiKey,
+  });
+
+  if (submitResult.error) {
+    console.error(`[regenTC] submit failed: ${submitResult.error} | ${submitResult.detail}`);
+    await kvs.set(`${TC_REGEN_KEY_PREFIX}${jobId}:${storyIdx}`, {
+      jobId, storyIdx, status: 'failed', keySource,
+      stampedStories: [{ idx: 0, name: story.name || '', acceptance_criteria: Array.isArray(story.acceptance_criteria) ? story.acceptance_criteria : [] }],
+      createdAt, error: submitResult.error, detail: submitResult.detail,
+    });
+    return { error: submitResult.error, detail: submitResult.detail };
+  }
+
+  await kvs.set(`${TC_REGEN_KEY_PREFIX}${jobId}:${storyIdx}`, {
+    jobId, storyIdx, status: 'batched', keySource,
+    stampedStories: [{ idx: 0, name: story.name || '', acceptance_criteria: Array.isArray(story.acceptance_criteria) ? story.acceptance_criteria : [] }],
+    batchId: submitResult.batchId,
+    batchStatus: submitResult.status,
+    createdAt, submittedAt: new Date().toISOString(), expiresAt: submitResult.expiresAt,
+  });
+
+  console.log(`[regenTC] jobId=${jobId} storyIdx=${storyIdx} batchId=${submitResult.batchId}`);
+  return { jobId, storyIdx, status: 'batched', batchId: submitResult.batchId };
+});
+
+/**
+ * pollRegenerateTestCase — poll a single-story regen batch until done.
+ * On completion, overwrites testcases:<jobId>:<storyIdx> with the new result.
+ * The frontend polls this (same pattern as pollTestCaseStatus for the bulk job).
+ *
+ * Mitigations wired:
+ *   #3 (explicit sentinel): error rows write an explicit error entry, never blank.
+ *   #5 (managed key guard): soft-fail if managed key vanished.
+ */
+resolver.define('pollRegenerateTestCase', async ({ payload }) => {
+  const { jobId, storyIdx } = payload || {};
+  if (!jobId || typeof storyIdx !== 'number') {
+    return { error: 'bad_args', detail: 'jobId and numeric storyIdx are required.' };
+  }
+
+  const regenKey = `${TC_REGEN_KEY_PREFIX}${jobId}:${storyIdx}`;
+  const regenJob = await kvs.get(regenKey);
+  if (!regenJob) return { error: 'not_found', detail: `Regen job ${jobId}:${storyIdx} not found.` };
+
+  // Terminal states
+  if (regenJob.status === 'completed' || regenJob.status === 'failed') return regenJob;
+  if (regenJob.status !== 'batched' || !regenJob.batchId) return regenJob;
+
+  // #5 — Key-vanish guard (generalized, same as pollTestCaseStatus)
+  const jobApiKey = await anthropicKeyForSource(regenJob.keySource || 'byok');
+  if (!jobApiKey) {
+    const msg = (regenJob.keySource === 'managed')
+      ? 'Managed service temporarily unavailable — retrying. If this persists, please contact support@spec2jira.com.'
+      : 'Your Anthropic API key is unavailable — re-add it in Settings; generation will resume.';
+    console.error(`[pollRegenTC] jobId=${jobId}:${storyIdx} keySource=${regenJob.keySource} key unavailable — soft-failing`);
+    return { ...regenJob, phase: msg };
+  }
+
+  const pollResult = await pollTestCaseBatch(regenJob.batchId, jobApiKey);
+  if (pollResult.error) {
+    console.error(`[pollRegenTC] poll failed: ${pollResult.error}`);
+    return { ...regenJob, phase: `Batch poll error: ${pollResult.error}` };
+  }
+
+  const counts = pollResult.requestCounts || {};
+  const totalRequests = (counts.processing || 0) + (counts.succeeded || 0) + (counts.errored || 0) + (counts.canceled || 0) + (counts.expired || 0);
+
+  if (pollResult.status === 'in_progress' || pollResult.status === 'canceling') {
+    return { ...regenJob, batchStatus: pollResult.status, phase: 'Regenerating test cases...', progress: totalRequests > 0 ? ((counts.succeeded || 0) + (counts.errored || 0)) / totalRequests : 0 };
+  }
+
+  if (pollResult.status === 'ended') {
+    if (!pollResult.resultsUrl) {
+      const failed = { ...regenJob, status: 'failed', completedAt: new Date().toISOString(), error: 'no_results_url', detail: 'Batch ended but Anthropic returned no results_url.' };
+      await kvs.set(regenKey, failed);
+      return failed;
+    }
+
+    const fetchResult = await fetchTestCaseResults(pollResult.resultsUrl, regenJob.stampedStories, jobApiKey);
+    if (fetchResult.error) {
+      const failed = { ...regenJob, status: 'failed', completedAt: new Date().toISOString(), error: fetchResult.error, detail: fetchResult.detail };
+      await kvs.set(regenKey, failed);
+      return failed;
+    }
+
+    const entry = fetchResult.perStory[0];
+    const storyName = regenJob.stampedStories[0] && regenJob.stampedStories[0].name || '';
+
+    // Overwrite the shared per-story KVS key (intentional: user clicked Regenerate)
+    // #3 — explicit sentinel even for regen errors
+    const storyKvsValue = entry && !entry.error
+      ? { storyIdx, storyName, result: entry.result, coverage: entry.coverage }
+      : { storyIdx, storyName, error: (entry && entry.error) || 'regen_failed', detail: (entry && entry.detail) || 'Regen parse failed.' };
+    await kvs.set(`${TC_STORY_KEY_PREFIX}${jobId}:${storyIdx}`, storyKvsValue);
+
+    const completed = { ...regenJob, status: 'completed', completedAt: new Date().toISOString(), batchStatus: 'ended' };
+    await kvs.set(regenKey, completed);
+
+    console.log(`[pollRegenTC] jobId=${jobId} storyIdx=${storyIdx} COMPLETED error=${entry && !!entry.error}`);
+    return { ...completed, result: storyKvsValue.result, coverage: storyKvsValue.coverage, error: storyKvsValue.error };
+  }
+
+  return { ...regenJob, batchStatus: pollResult.status, phase: `Unknown batch status: ${pollResult.status}` };
 });
 
 // ── Export handler bound к manifest function key "resolver" ──

@@ -21,7 +21,8 @@
 
 import { kvs } from '@forge/kvs';
 
-import { BREAKDOWN_SCHEMA, SYSTEM_PROMPT, buildProjectContextSystemText } from './prompts.js';
+import { BREAKDOWN_SCHEMA, SYSTEM_PROMPT, buildProjectContextSystemText, TEST_CASE_SCHEMA, TEST_CASE_SYSTEM_PROMPT, buildTestCaseUserPrompt } from './prompts.js';
+import { parseTestCaseResult } from './testcases.js';
 
 // ── Constants ──────────────────────────────────────────────
 
@@ -31,6 +32,14 @@ const ANTHROPIC_VERSION = '2023-06-01';
 
 export const MODEL_PRIMARY = 'claude-sonnet-4-6';
 export const MODEL_FALLBACK = 'claude-haiku-4-5';
+
+// Output cap for the per-Story test-case Sonnet batch. 8000 tokens: headroom for the
+// richest/monster stories. Batch is async so the 25s resolver limit binds ONLY on the
+// POLL resolver (fetch+parse of the already-complete JSONL), NOT on Sonnet's generation
+// time — so a generous cap is free insurance against truncating a dense Story. The
+// reactive sub-chunk was dropped (Sonnet single-call covers ~100% on validated dense
+// stories), so this cap IS the worst-case safety margin. Engineering owns this cap (§4).
+export const TC_MAX_OUTPUT_TOKENS = 8000;
 
 // Output cap. Sonnet 4.6's max output is 64K tokens — we use ALL of it for
 // maximum headroom (it is a CEILING, not a target: a small spec still emits a
@@ -586,6 +595,237 @@ export async function fetchBatchResults(resultsUrl, customId, apiKeyOverride = n
     stop_reason: message.stop_reason,
     ...(truncated ? { truncated: true, truncation_note: `Output reached ${MAX_OUTPUT_TOKENS} tokens but parsed completely.` } : {}),
   };
+}
+
+// ── Test-case batch lifecycle (cloned from submitBreakdownBatch / pollBatchStatus /
+//    fetchBatchResults). One Anthropic Batches API batch per startTestCaseGeneration
+//    call, carrying N requests — one per Story (custom_id = story array index). The
+//    batch transport is identical; what changes is the prompt, schema, and parse.
+// ────────────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Submit an N-request test-case batch. One request per Story; custom_id = String(index).
+ * The system block is SHARED across all N requests (ephemeral cache → one cache-write
+ * cost, N-1 cache-reads). Each request's user block is per-Story (not cached).
+ *
+ * @param {object} args
+ * @param {Array<object>} args.stories               the feature/Story objects from job.breakdown.features
+ * @param {string[]} [args.sharedAcceptanceCriteria] from breakdown.shared_acceptance_criteria
+ * @param {string} [args.specSummary]                from breakdown.metadata.spec_summary
+ * @param {string} args.apiKey                       caller MUST pass the resolved key (Managed or BYOK)
+ * @returns {Promise<{batchId?, status?, createdAt?, expiresAt?, error?, detail?}>}
+ */
+export async function submitTestCaseBatch({ stories, siblingNames, sharedAcceptanceCriteria, specSummary, apiKey }) {
+  if (!apiKey) {
+    return { error: 'not_configured', detail: 'Anthropic API key not configured.' };
+  }
+  if (!Array.isArray(stories) || stories.length === 0) {
+    return { error: 'no_stories', detail: 'No stories to generate test cases for.' };
+  }
+
+  // Shared ephemeral system block — identical for all N requests → maximal cache reuse.
+  const systemBlock = [{ type: 'text', text: TEST_CASE_SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } }];
+
+  // §8 scope fence. Callers MAY pass the full breakdown's story names — the single-story
+  // regen path submits stories=[oneStory], which would otherwise starve the model of its
+  // siblings (the worst §8 failure: it could test a sibling Story's behaviour). Default to
+  // the batch's own story names for the bulk path.
+  const resolvedSiblingNames = (Array.isArray(siblingNames) && siblingNames.length)
+    ? siblingNames
+    : stories.map((s) => s && (s.name || ''));
+
+  const requests = stories.map((story, index) => ({
+    custom_id: String(index),
+    params: {
+      model: MODEL_PRIMARY,
+      max_tokens: TC_MAX_OUTPUT_TOKENS,
+      system: systemBlock,
+      messages: [
+        {
+          role: 'user',
+          content: buildTestCaseUserPrompt({
+            story,
+            siblingNames: resolvedSiblingNames,
+            sharedAcceptanceCriteria: sharedAcceptanceCriteria || [],
+            specSummary: specSummary || '',
+            category: story && story.category,
+          }),
+        },
+      ],
+      output_config: {
+        format: {
+          type: 'json_schema',
+          schema: TEST_CASE_SCHEMA,
+        },
+      },
+    },
+  }));
+
+  const requestBody = { requests };
+
+  let response;
+  try {
+    response = await fetch(ANTHROPIC_BATCHES_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'anthropic-version': ANTHROPIC_VERSION,
+        'X-Api-Key': apiKey,
+      },
+      body: JSON.stringify(requestBody),
+    });
+  } catch (e) {
+    console.error(`[tc-batch] submit fetch threw: ${String(e?.message || e)}`);
+    return { error: 'network_failure', detail: `Fetch threw before response: ${String(e?.message || e)}` };
+  }
+
+  if (response.status === 401) return { error: 'auth_rejected', detail: 'Anthropic rejected the API key.' };
+  if (response.status === 402) return { error: 'insufficient_credits', detail: 'Anthropic account has insufficient credits.' };
+  if (response.status === 429) return { error: 'rate_limited', detail: 'Anthropic rate limit exceeded.' };
+  if (!response.ok) {
+    const text = await response.text();
+    console.warn(`[tc-batch] submit HTTP ${response.status}: ${text.substring(0, 500)}`);
+    return { error: `anthropic_${response.status}`, detail: 'The AI service returned an error. Please try again in a moment; if it persists, contact support@spec2jira.com.' };
+  }
+
+  const data = await response.json();
+  if (!data.id) {
+    return { error: 'no_batch_id', detail: `Batch submit returned no id. Raw: ${JSON.stringify(data).substring(0, 300)}` };
+  }
+
+  console.log(`[tc-batch] submitted batchId=${data.id} stories=${stories.length} status=${data.processing_status}`);
+  return {
+    batchId: data.id,
+    status: data.processing_status,
+    createdAt: data.created_at,
+    expiresAt: data.expires_at,
+  };
+}
+
+/**
+ * Poll the status of a test-case batch. This is an ALIAS of pollBatchStatus — the
+ * endpoint and response shape are identical; we expose a named export so callers
+ * in index.js never import the breakdown-named function for test-case work.
+ *
+ * @param {string} batchId
+ * @param {string} [apiKeyOverride]
+ * @returns {Promise<{status?, resultsUrl?, requestCounts?, endedAt?, error?, detail?}>}
+ */
+export const pollTestCaseBatch = pollBatchStatus;
+
+/**
+ * Fetch + parse test-case batch results. Scans ALL N JSONL rows (unlike fetchBatchResults
+ * which looks for one custom_id). Non-succeeded rows store an explicit error sentinel.
+ * The perStory array is SORTED by storyIdx so callers can index into it safely.
+ *
+ * @param {string} resultsUrl
+ * @param {Array<{idx:number,name:string}>} stampedStories   the tcjob.stampedStories list
+ * @param {string} apiKey                                    caller MUST pass the resolved key
+ * @returns {Promise<{perStory:[{storyIdx,result?,coverage?,error?,detail?}], error?, detail?}>}
+ */
+export async function fetchTestCaseResults(resultsUrl, stampedStories, apiKey) {
+  if (!apiKey) return { error: 'not_configured', detail: 'API key not configured.' };
+  if (!resultsUrl) return { error: 'no_results_url', detail: 'resultsUrl is required.' };
+
+  let response;
+  try {
+    response = await fetch(resultsUrl, {
+      method: 'GET',
+      headers: {
+        'anthropic-version': ANTHROPIC_VERSION,
+        'X-Api-Key': apiKey,
+      },
+    });
+  } catch (e) {
+    return { error: 'network_failure', detail: String(e?.message || e) };
+  }
+
+  if (!response.ok) {
+    const text = await response.text();
+    console.error(`[tc-batch] results fetch HTTP ${response.status}: ${text.substring(0, 300)}`);
+    return { error: `results_fetch_${response.status}`, detail: "Couldn't retrieve the generated test cases — please try generating again." };
+  }
+
+  const rawText = await response.text();
+  const lines = rawText.split('\n').filter((l) => l.trim().length > 0);
+
+  // Parse ALL N JSONL rows — unlike the breakdown (1 row), we scan the whole file.
+  // Key: custom_id → Integer(idx); per-row lookup is O(1) via a Map.
+  const rowsByIdx = new Map();
+  for (const line of lines) {
+    try {
+      const row = JSON.parse(line);
+      const idx = parseInt(row.custom_id, 10);
+      if (!Number.isNaN(idx)) rowsByIdx.set(idx, row);
+    } catch (_) {
+      // skip malformed JSONL line
+    }
+  }
+
+  const perStory = [];
+  const stamped = Array.isArray(stampedStories) ? stampedStories : [];
+
+  for (const stamped_entry of stamped) {
+    const storyIdx = stamped_entry.idx;
+    const row = rowsByIdx.get(storyIdx);
+
+    if (!row) {
+      // Row entirely missing from JSONL — explicit error sentinel (#3: never drop)
+      perStory.push({ storyIdx, error: 'row_missing', detail: `No JSONL row for story index ${storyIdx}.` });
+      continue;
+    }
+
+    const result = row.result || {};
+    if (result.type !== 'succeeded') {
+      // Errored/expired/canceled — explicit error sentinel (#3)
+      perStory.push({
+        storyIdx,
+        error: `batch_request_${result.type || 'unknown'}`,
+        detail: result.error?.error?.message || result.error?.message || JSON.stringify(result).substring(0, 300),
+      });
+      continue;
+    }
+
+    const message = result.message;
+    if (!message) {
+      perStory.push({ storyIdx, error: 'no_message', detail: 'Result row missing message field.' });
+      continue;
+    }
+
+    if (message.stop_reason === 'refusal') {
+      perStory.push({ storyIdx, error: 'refused', detail: 'Anthropic declined to process this story.' });
+      continue;
+    }
+
+    const outputText = message.content?.[0]?.text || '';
+    let parsed;
+    try {
+      parsed = typeof outputText === 'string' ? JSON.parse(outputText) : outputText;
+    } catch (_) {
+      // Privacy ("Log End-User Data: No"): the raw model output is content-derived — never
+      // persist it (this detail is written to KVS). Keep the failure signal generic.
+      perStory.push({ storyIdx, error: 'parse_failed', detail: `Invalid JSON returned for story index ${storyIdx} (raw output omitted for privacy).` });
+      continue;
+    }
+
+    // INVARIANT: stampedStories carries {idx, name, acceptance_criteria} (the lean coverage
+    // inputs, stamped by start/regen at submit time — mitigation #7) so coverage is computed
+    // against the FROZEN ACs the model actually saw, surviving any editor edit mid-batch.
+    const storyRef = { name: stamped_entry.name, acceptance_criteria: stamped_entry.acceptance_criteria || [] };
+
+    const parseOutcome = parseTestCaseResult(parsed, storyRef);
+    if (parseOutcome.error) {
+      perStory.push({ storyIdx, error: parseOutcome.error, detail: parseOutcome.detail });
+    } else {
+      perStory.push({ storyIdx, result: parseOutcome.result, coverage: parseOutcome.coverage });
+    }
+  }
+
+  // Sort by storyIdx (JSONL order is not guaranteed — §design §2).
+  perStory.sort((a, b) => a.storyIdx - b.storyIdx);
+
+  console.log(`[tc-batch] results parsed: ${perStory.length} stories, ${perStory.filter((s) => !s.error).length} OK, ${perStory.filter((s) => s.error).length} errors`);
+  return { perStory };
 }
 
 // ── Dependency-cycle resolution (tiny sync call) ───────────────────────

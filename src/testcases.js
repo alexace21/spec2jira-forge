@@ -31,6 +31,131 @@
  */
 
 // ════════════════════════════════════════════════════════════════
+// parseTestCaseResult — defensive parse of the raw Anthropic structured-output
+// response for one Story's test cases. Engineering owns ALL caps and coercions
+// here (§4): the schema has NO numeric constraints (Anthropic rejects them), so
+// every ceiling/clamp/filter lives in this function, never in the schema.
+// ════════════════════════════════════════════════════════════════
+
+/**
+ * Parse and defensively sanitize the raw model output for one Story's test cases.
+ * Overwrites story_name from the real story object (the model echoes its own
+ * prompt text — the KVS key is the authoritative binding, not the echoed name).
+ * Applies the following engineering-owned invariants:
+ *   - String JSON input is parsed (catch → error shape)
+ *   - story_name always overwritten with story.name
+ *   - no_acs coerced to Boolean
+ *   - test_cases: DROP cases with empty when/then or missing/empty ac_trace
+ *   - ac_trace: an empty trace is repaired to [{kind:'inferred'}]
+ *   - confidence_score: clamped 0-100
+ *   - priority: if not in ['Critical','High','Medium','Low'] it is deleted
+ *   - test_data: empty-string entries filtered; capped at 5 entries
+ *   - concern: left as-is (any concern type is valid — no breakdown-vocab assumption)
+ *   - test_cases: AC-covering cases (tracing a real AC by ac_text) stably partitioned
+ *     BEFORE inferred-only depth, THEN sliced to ≤15 — so the cap never drops AC coverage
+ *     (cost-asymmetry: an uncovered AC is expensive; an extra depth case is a cheap delete)
+ * Then computes coverage via computeCoverage.
+ *
+ * @param {string|object} raw   the raw output text or already-parsed object
+ * @param {object} story        the Story (name, acceptance_criteria[])
+ * @returns {{ result: object, coverage: object } | { error: string, detail: string }}
+ */
+export function parseTestCaseResult(raw, story) {
+  let obj;
+  if (typeof raw === 'string') {
+    try {
+      obj = JSON.parse(raw);
+    } catch (e) {
+      return { error: 'parse_failed', detail: `JSON parse failed: ${String(e?.message || e).slice(0, 200)}` };
+    }
+  } else if (raw && typeof raw === 'object') {
+    obj = raw;
+  } else {
+    return { error: 'parse_failed', detail: 'Expected a string or object; got neither.' };
+  }
+
+  // OVERWRITE story_name with the authoritative story name (the model echoes its
+  // prompt text which may differ from the live story name in the editor — the
+  // storyIdx is the binding; the name is a convenience label).
+  obj.story_name = (story && story.name) || obj.story_name || '';
+
+  // Coerce no_acs to Boolean (schema says boolean but coerce defensively)
+  obj.no_acs = !!obj.no_acs;
+
+  // Normalize test_cases array
+  const rawCases = Array.isArray(obj.test_cases) ? obj.test_cases : [];
+  const VALID_PRIORITIES = new Set(['Critical', 'High', 'Medium', 'Low']);
+
+  const cleaned = rawCases
+    .filter((c) => c && typeof c === 'object')
+    .map((c) => {
+      // Drop case if when[] or then[] is empty/absent (the decisive-test clause (a)
+      // requires at least one observable action and one observable outcome)
+      const when = Array.isArray(c.when) ? c.when.filter((s) => String(s || '').trim()) : [];
+      const then = Array.isArray(c.then) ? c.then.filter((s) => String(s || '').trim()) : [];
+      if (when.length === 0 || then.length === 0) return null; // DROP
+
+      // Repair empty ac_trace → [{kind:'inferred'}] (the honest-degradation channel)
+      let acTrace = Array.isArray(c.ac_trace) ? c.ac_trace.filter((t) => t && typeof t === 'object') : [];
+      if (acTrace.length === 0) acTrace = [{ kind: 'inferred' }];
+
+      // Clamp confidence_score to 0-100
+      let cs = c.confidence_score;
+      if (typeof cs === 'number') {
+        cs = Math.max(0, Math.min(100, Math.round(cs)));
+      }
+
+      // Drop invalid priority (absent → clean omission; never a wrong value)
+      let priority = c.priority;
+      if (priority !== undefined && !VALID_PRIORITIES.has(priority)) {
+        priority = undefined;
+      }
+
+      // Filter empty test_data strings; cap at 5
+      let testData = Array.isArray(c.test_data)
+        ? c.test_data.filter((s) => String(s || '').trim()).slice(0, 5)
+        : undefined;
+      if (testData && testData.length === 0) testData = undefined;
+
+      const out = {
+        title: c.title || '',
+        type: c.type || 'happy-path',
+        given: Array.isArray(c.given) ? c.given : [],
+        when,
+        then,
+        expected_result: c.expected_result || '',
+        ac_trace: acTrace,
+      };
+      // Attach optional fields only when present
+      if (priority !== undefined) out.priority = priority;
+      if (testData !== undefined) out.test_data = testData;
+      if (typeof cs === 'number') out.confidence_score = cs;
+      if (c.confidence_indicator) out.confidence_indicator = c.confidence_indicator;
+      if (c.concern) out.concern = c.concern; // leave as-is — any concern type renders gracefully
+
+      return out;
+    })
+    .filter(Boolean); // remove DROPped nulls
+
+  // Cap at 15 AFTER cleaning — but PARTITION AC-covering cases (those tracing a real AC
+  // by ac_text) BEFORE inferred-only depth, so the cap never drops AC coverage. The system
+  // prompt's breadth-first rule is SOFT (empirically the model occasionally places an
+  // AC-covering case late: a 16-case story lost 1 AC at a pure slice(0,12)); this stable
+  // partition makes the cap provably coverage-safe regardless. Cost-asymmetry (POLICY): an
+  // uncovered AC is expensive; an extra depth case is a cheap one-click delete — so when the
+  // cap must drop a case, it drops inferred depth, never an oracle-backed case.
+  const tracesAC = (c) => Array.isArray(c.ac_trace) && c.ac_trace.some((t) => t && t.ac_text && String(t.ac_text).trim());
+  const covering = cleaned.filter(tracesAC);
+  const depth = cleaned.filter((c) => !tracesAC(c));
+  obj.test_cases = [...covering, ...depth].slice(0, 15);
+
+  // Compute coverage against the live Story ACs
+  const coverage = computeCoverage(story, obj);
+
+  return { result: obj, coverage };
+}
+
+// ════════════════════════════════════════════════════════════════
 // computeCoverage — the PURE AC-coverage strip (ported verbatim from the
 // validated prototype harness; AC-trace by normalized VERBATIM text, never index)
 // ════════════════════════════════════════════════════════════════
