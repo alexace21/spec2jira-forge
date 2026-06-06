@@ -1505,7 +1505,27 @@ resolver.define('purgeJob', async ({ payload }) => {
       await kvs.delete(`${PAGE_JOB_PREFIX}${String(job.pageId)}`);
     }
     await kvs.delete(`${JOB_KEY_PREFIX}${jobId}`);
-    console.log(`[purgeJob] removed job ${jobId} (page content + breakdown) post-push`);
+
+    // P4 audit B/Finding-6: also purge test-case KVS entries so generated cases
+    // don't linger after the user's content has been pushed. Fail-open: a purge
+    // failure must never error the push completion (the page content is the
+    // privacy-critical item; test cases are derived data, bounded by the same
+    // instance's KVS). tcregenjob has no wildcard key pattern — leave a TODO.
+    try {
+      const tcJob = await kvs.get(`tcjob:${jobId}`);
+      if (tcJob && typeof tcJob.total === 'number' && tcJob.total > 0) {
+        const perStoryKeys = Array.from({ length: tcJob.total }, (_, i) => `testcases:${jobId}:${i}`);
+        await Promise.all(perStoryKeys.map((k) => kvs.delete(k).catch(() => {})));
+      }
+      await kvs.delete(`tcjob:${jobId}`);
+      // TODO: tcregenjob:<jobId>:<storyIdx> entries have no wildcard — each
+      // regen job is keyed per-story and short-lived; leave cleanup for a
+      // future housekeeping trigger if KVS usage becomes a concern.
+    } catch (tcErr) {
+      console.warn(`[purgeJob] tc KVS purge failed (non-fatal): ${String(tcErr?.message || tcErr)}`);
+    }
+
+    console.log(`[purgeJob] removed job ${jobId} (page content + breakdown + test cases) post-push`);
     return { ok: true };
   } catch (e) {
     console.error(`[purgeJob] failed (non-fatal): ${String(e?.message || e)}`);
@@ -1529,7 +1549,7 @@ resolver.define('purgeJob', async ({ payload }) => {
  * Returns { ok, sessionId, phase, totals } OR { error, detail }.
  */
 resolver.define('startPush', async ({ payload }) => {
-  const { breakdown, projectKey: payloadProjectKey } = payload || {};
+  const { breakdown, projectKey: payloadProjectKey, jobId } = payload || {};
   if (!breakdown) {
     return { error: 'no_breakdown', detail: 'No breakdown payload provided' };
   }
@@ -1556,7 +1576,7 @@ resolver.define('startPush', async ({ payload }) => {
 
   let outcome;
   try {
-    outcome = await startPushSession(breakdown, projectKey, customFields);
+    outcome = await startPushSession(breakdown, projectKey, customFields, jobId || null);
   } catch (e) {
     console.error(`[startPush] threw: ${String(e?.message || e)}`);
     return { error: 'push_exception', detail: String(e?.message || e) };

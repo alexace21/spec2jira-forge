@@ -364,6 +364,12 @@ function App() {
   // NEVER show a false "edited" banner).
   const [staleBreakdown, setStaleBreakdown] = useState(null);
 
+  // Test-case results (P4). null = none generated / not loaded.
+  // Shape: the getTestCases resolver return ({ perStory, total, completedAt, ... }).
+  // Set on reconnect rehydration (routeByPageStatus completed branch) when
+  // tcStatus === 'completed'. Cleared on page change / regenerate / retry.
+  const [testCaseResults, setTestCaseResults] = useState(null);
+
   // In-app Settings access (2026-06-03). WHY this exists: the Forge
   // confluence:globalSettings "Configure" page (which renders AdminSettings) is
   // NOT reachable from Atlassian's centralized "Connected apps" admin — the classic
@@ -703,6 +709,9 @@ function App() {
     async (pageRef, pageResult, statusResult) => {
       setPageId(String(pageRef.id));
       setPageData(pageResult);
+      // Defensive: clear any test cases from a previously-routed page before this page's
+      // state loads — the completed branch below re-sets them when tcStatus==='completed'.
+      setTestCaseResults(null);
 
       if (
         statusResult.status === "running" ||
@@ -744,7 +753,25 @@ function App() {
             setStaleBreakdown(null);
           }
           setResults(v3AdaptResultPayload(full));
+          // P4 (§13 BUG-6): stamp jobId so a reconnect→push carries it to startPush —
+          // else the push reads tcjob:<null> and the embed is silently skipped.
+          setJobId(statusResult.job_id);
+          // P4 audit B3: transition to reviewing BEFORE the getTestCases await so the
+          // user sees the review screen immediately. Test cases feed the P5 screen, not
+          // the review screen — they must not block the transition. The rehydrate is
+          // still non-fatal: a failure here must never block the reviewing screen.
           setScreen("reviewing");
+          // P4 reconnect rehydration: if test cases were completed for this job,
+          // load them back into state so the Test Cases screen can restore without
+          // re-generating. Non-fatal. full.tcStatus forwarded by getResults.
+          if (full.tcStatus === 'completed') {
+            try {
+              const tc = await invoke("getTestCases", { jobId: statusResult.job_id });
+              if (!tc.error) setTestCaseResults(tc);
+            } catch (e) {
+              console.error("getTestCases rehydrate failed (non-fatal):", e);
+            }
+          }
           return;
         }
       }
@@ -955,7 +982,7 @@ function App() {
     };
 
     try {
-      const start = await invoke("startPush", { breakdown: pendingBreakdown });
+      const start = await invoke("startPush", { breakdown: pendingBreakdown, jobId });
       // No push gate: every app user is licensed (30-day Atlassian trial → paid;
       // unsubscribed users are blocked natively by Atlassian, never reaching here),
       // so push proceeds. Any startPush error is a genuine failure → normal path.
@@ -1022,6 +1049,7 @@ function App() {
     setJobId(null);
     setJobStatus(null);
     setResults(null);
+    setTestCaseResults(null);
     setPushResult(null);
     setDryRunResult(null);
     setPendingBreakdown(null);
@@ -1042,6 +1070,7 @@ function App() {
     clearInterval(pollRef.current);
     clearInterval(pushPollRef.current);
     setResults(null);
+    setTestCaseResults(null);
     setPendingBreakdown(null);
     setJobId(null);
     setJobStatus(null);
@@ -1064,6 +1093,7 @@ function App() {
     setJobId(null);
     setJobStatus(null);
     setResults(null);
+    setTestCaseResults(null);
     setPushResult(null);
     setDryRunResult(null);
     setPendingBreakdown(null);
@@ -1342,6 +1372,7 @@ function App() {
           onBackToPicker={handleNewPage}
           onRemoveDependency={handleRemoveDependency}
           onRestoreDependency={handleRestoreDependency}
+          testCaseResults={testCaseResults}
         />
       );
     case "pushing":
@@ -1742,6 +1773,7 @@ function ConfirmScreen({
   onBackToPicker,
   onRemoveDependency,
   onRestoreDependency,
+  testCaseResults,
 }) {
   const total = dryRunResult?.total_items || 0;
   const epics = dryRunResult?.total_epics || 0;
@@ -2018,6 +2050,23 @@ function ConfirmScreen({
           )}
         </div>
       </div>
+
+      {/* Test-case summary line — shown when test cases have been generated */}
+      {testCaseResults && typeof testCaseResults.total === "number" && (
+        <div
+          className="rounded-lg p-3 mb-4 text-xs"
+          style={{
+            background: "var(--s2j-bg-section)",
+            border: "1px solid var(--s2j-border)",
+            color: "var(--s2j-text-muted)",
+          }}
+        >
+          <strong style={{ color: "var(--s2j-text)" }}>
+            Test cases: {testCaseResults.total} generated
+          </strong>{" "}
+          — a summary will be added to each Story.
+        </div>
+      )}
 
       {/* Cross-feature dependency structure — shows WHICH feature depends on
           WHICH and lets the reviewer remove an over-inferred edge before push
@@ -2523,6 +2572,14 @@ function PushedScreen({ result, onBack, onNew }) {
             ? ` · ${result.dependency_links_created} links`
             : ""}
         </p>
+        {result?.tc_embedded > 0 && (
+          <p className="text-xs mt-1" style={{ color: "var(--s2j-text-light)" }}>
+            Test cases summarized in {result.tc_embedded} Stories
+            {result.tc_skipped > 0
+              ? ` (${result.tc_skipped} skipped — ACs changed since generation; regenerate on the Test Cases screen)`
+              : ""}
+          </p>
+        )}
       </div>
 
       {(result?.epic_key || stories.length > 0) && (

@@ -31,6 +31,7 @@
 
 import api, { route } from '@forge/api';
 import { kvs } from '@forge/kvs';
+import { renderTestCasesAdf, normAC } from './testcases.js';
 
 const BULK_MAX = 50;
 // Concurrency cap для parallel issueLink creation. 6 concurrent stays well
@@ -67,7 +68,7 @@ function plainADF(text) {
   };
 }
 
-function richADF({ userStory, description, acceptanceCriteria, sourceHeading, embeddedTasks }) {
+function richADF({ userStory, description, acceptanceCriteria, sourceHeading, embeddedTasks, tcEntry = null }) {
   const content = [];
 
   if (userStory) {
@@ -160,6 +161,25 @@ function richADF({ userStory, description, acceptanceCriteria, sourceHeading, em
         { type: 'text', text: String(sourceHeading) },
       ],
     });
+  }
+
+  // Embed compact test-case summary when available (P4). Passes coverage so the
+  // summary paragraph shows "{covered}/{total} ACs covered". Wrapped in try/catch:
+  // a render failure must never block the Story create (a test-case embed is bonus
+  // content, not a required field — gotcha #11). renderTestCasesAdf returns [] when
+  // absent, so the spread is always safe. ONLY safe ADF node types used (gotcha #11).
+  if (
+    tcEntry &&
+    !tcEntry.error &&
+    tcEntry.result &&
+    Array.isArray(tcEntry.result.test_cases) &&
+    tcEntry.result.test_cases.length > 0
+  ) {
+    try {
+      content.push(...renderTestCasesAdf(tcEntry.result, tcEntry.coverage));
+    } catch (e) {
+      console.warn('[push] tc embed render failed (non-fatal, skipping):', String(e?.message || e));
+    }
   }
 
   return { type: 'doc', version: 1, content };
@@ -515,6 +535,7 @@ function buildStoryPayload(projectKey, feature, parentEpicKey, opts = {}) {
     customFields = null,
     storyPointsFieldId = null,
     validPriorities = null,
+    tcEntry = null,
   } = opts;
   const fields = {
     project: { key: projectKey },
@@ -527,6 +548,7 @@ function buildStoryPayload(projectKey, feature, parentEpicKey, opts = {}) {
       sourceHeading: feature.source_heading,
       // Embed task checklist directly into the Story когато no subtask type.
       embeddedTasks: embedTasks ? feature.tasks || [] : null,
+      tcEntry,
     }),
   };
   if (parentEpicKey) {
@@ -605,7 +627,7 @@ function buildSubtaskPayload(projectKey, task, parentStoryKey, subtaskTypeId, cu
  * @param {object|null} customFields
  * @returns {Promise<{ok, sessionId?, phase?, epicKey?, totals?, error?, detail?}>}
  */
-export async function startPushSession(breakdown, projectKey, customFields = null) {
+export async function startPushSession(breakdown, projectKey, customFields = null, jobId = null) {
   if (!breakdown) return { ok: false, error: 'no_breakdown', detail: 'No breakdown provided.' };
   if (!projectKey) return { ok: false, error: 'no_project_key', detail: 'No Jira project key.' };
 
@@ -629,6 +651,27 @@ export async function startPushSession(breakdown, projectKey, customFields = nul
   );
 
   const { epic, features, links } = flattenBreakdown(breakdown);
+
+  // Read the test-case job record (fail-open: a missing/failed tcjob → no embed,
+  // which is the pre-P4 behaviour; never block push on a test-case absence).
+  // Build a compact hash map (C2 audit): {[storyIdx]: acSetHash} instead of the
+  // full stampedStories array (~40 KB). The map's presence gates the embed.
+  let tcAcHashes = null;
+  if (jobId) {
+    try {
+      const tcJob = await kvs.get(`tcjob:${jobId}`);
+      if (tcJob && tcJob.status === 'completed' && Array.isArray(tcJob.stampedStories)) {
+        tcAcHashes = {};
+        for (const st of tcJob.stampedStories) {
+          if (st && typeof st.idx === 'number') {
+            tcAcHashes[st.idx] = acSetHash(st.acceptance_criteria);
+          }
+        }
+      }
+    } catch (e) {
+      console.warn(`[push] tcjob read failed (non-fatal, no embed): ${String(e?.message || e)}`);
+    }
+  }
 
   // Create the Epic (one fast call) up front.
   let epicKey = null;
@@ -680,9 +723,14 @@ export async function startPushSession(breakdown, projectKey, customFields = nul
       subtasks_created: 0, subtask_failures: 0,
       links_created: 0, link_failures: 0,
       tasks_embedded: 0,
+      tc_embedded: 0, tc_skipped: 0,
     },
     totals: { stories: features.length, tasks: totalTasks, links: links.length },
     failureDetails: { stories: [], subtasks: [], links: [] },
+    // Test-case embed metadata (P4 audit C2). jobId null → no embed; tcAcHashes null → no embed.
+    // tcAcHashes is a compact {[storyIdx]: acSetHash} map — presence is the gate.
+    jobId: jobId || null,
+    tcAcHashes,
   };
   await kvs.set(PUSH_SESSION_PREFIX + sessionId, session);
 
@@ -740,18 +788,80 @@ export async function pushSessionStep(sessionId) {
   };
 }
 
+// ── AC-set hash (P4 audit C2) ─────────────────────────────────────────────────
+// Replaces the full tcStampedStories array (up to ~40 KB of raw AC text) with a
+// compact hash map. Zero external dependencies — the Forge sandbox has no crypto.
+// djb2 over the sorted, normalised AC set is collision-resistant enough for a
+// staleness fingerprint (same as normAC, order-insensitive).
+
+/**
+ * Compute a compact djb2 hash of an AC set. Normalises via normAC, sorts
+ * (order-insensitive), joins with '|', then hashes. Returns a base-36 string.
+ * @param {string[]} acs acceptance_criteria array (may be null/undefined)
+ * @returns {string}
+ */
+function acSetHash(acs) {
+  const s = (Array.isArray(acs) ? acs : []).map(normAC).sort().join('|');
+  let h = 5381;
+  for (const ch of s) h = ((h << 5) + h ^ ch.charCodeAt(0)) >>> 0;
+  return h.toString(36);
+}
+
+// Staleness fingerprint helper (P4 audit C2): true when the live feature's AC set
+// still matches the hash frozen at generation time. Uses the compact tcAcHashes map
+// (not the full tcStampedStories array) so the session KVS value stays small.
+// normAC folding makes a cosmetic AC reorder / label tweak still match, while a real
+// content change (or a different Story sliding into the same index) correctly skips.
+function tcAcsUnchanged(tcAcHashes, idx, feature) {
+  return !!tcAcHashes && tcAcHashes[idx] === acSetHash(feature && feature.acceptance_criteria);
+}
+
 async function stepStories(s) {
   const start = s.cursor;
   const end = Math.min(start + STORY_CHUNK, s.features.length);
   const slice = s.features.slice(start, end);
-  const payloads = slice.map((f) =>
-    buildStoryPayload(s.projectKey, f, s.epicKey, {
+
+  // Fetch per-story test-case entries in parallel when the tc hash map is present.
+  // Each entry lives at testcases:<jobId>:<globalIdx> (global index = start + j).
+  // Fail-open: a KVS read error → null → no embed for that story (never blocks push).
+  let tcEntries = null;
+  if (s.jobId && s.tcAcHashes) {
+    try {
+      tcEntries = await Promise.all(
+        slice.map((_, j) => kvs.get(`testcases:${s.jobId}:${start + j}`).catch(() => null)),
+      );
+    } catch (e) {
+      console.warn(`[push] tc entries fetch failed (non-fatal, no embed): ${String(e?.message || e)}`);
+      tcEntries = null;
+    }
+  }
+
+  const payloads = slice.map((f, j) => {
+    // ⭐ STALENESS FINGERPRINT (P4 audit C2): bind by AC-set HASH frozen at generation
+    // time, NOT the story name — a name edit still embeds (ACs unchanged), while a real
+    // AC edit / reorder / duplicate-name scenario correctly skips. Counts are updated
+    // only when a candidate exists (story with no generated cases is neither embedded nor skipped).
+    let tcEntry = null;
+    if (tcEntries) {
+      const candidate = tcEntries[j];
+      if (candidate && !candidate.error) {
+        if (tcAcsUnchanged(s.tcAcHashes, start + j, f)) {
+          tcEntry = candidate;
+          s.counts.tc_embedded++;
+        } else {
+          // Candidate exists but ACs changed since generation → skip embed.
+          s.counts.tc_skipped++;
+        }
+      }
+    }
+    return buildStoryPayload(s.projectKey, f, s.epicKey, {
       embedTasks: !s.hasSubtasks,
       customFields: s.customFields,
       storyPointsFieldId: s.storyPointsFieldId,
       validPriorities: s.validPriorities,
-    }),
-  );
+      tcEntry,
+    });
+  });
   const bulk = await bulkCreateIssues(payloads);
   for (let j = 0; j < bulk.issues.length; j++) {
     if (bulk.issues[j]) {
@@ -904,7 +1014,7 @@ function computeProgress(s) {
 function buildFinalResult(s) {
   const c = s.counts;
   const allSuccess = c.story_failures === 0 && c.subtask_failures === 0 && c.link_failures === 0;
-  console.log(`[push] DONE session=${s.sessionId} - stories=${c.stories_created} subtasks=${c.subtasks_created} links=${c.links_created} embedded=${c.tasks_embedded} (partial=${!allSuccess})`);
+  console.log(`[push] DONE session=${s.sessionId} - stories=${c.stories_created} subtasks=${c.subtasks_created} links=${c.links_created} embedded=${c.tasks_embedded} tc_embedded=${c.tc_embedded} tc_skipped=${c.tc_skipped} (partial=${!allSuccess})`);
   return {
     partial: !allSuccess,
     result: {
@@ -917,6 +1027,8 @@ function buildFinalResult(s) {
       dependency_links_created: c.links_created,
       subtasks_embedded: !s.hasSubtasks,
       tasks_embedded: c.tasks_embedded,
+      tc_embedded: c.tc_embedded,
+      tc_skipped: c.tc_skipped,
       epic_key: s.epicKey,
       browse_base: s.browseBase || null,
       created_issues: s.createdStories || [],
