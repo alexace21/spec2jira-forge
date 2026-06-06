@@ -217,11 +217,19 @@ const PAGE_SNAP_PREFIX = 'pagesnap:'; // §8 fix (2026-06-06): source-page snaps
 async function resolveSpecSourceText(jobId, job) {
   try {
     const snap = await kvs.get(`${PAGE_SNAP_PREFIX}${jobId}`);
-    if (!snap || !snap.content) return '';
+    if (!snap || !snap.content) {
+      // Diagnostic (NOT silent): a breakdown generated BEFORE the §7 fix was deployed has no
+      // snapshot, so test-gen falls back to no-source. Re-running test-gen alone on an old
+      // breakdown won't enable §7 — the snapshot is written at GENERATION, so REGENERATE the
+      // breakdown after deploying the fix. This log makes a Live-E2E run diagnosable.
+      console.log(`[tcgen] NO source-page snapshot for job ${jobId} → test-gen runs WITHOUT §7 rules (regenerate the breakdown after deploying the §7 fix to enable concrete-value + decision-table coverage)`);
+      return '';
+    }
     if (job && typeof job.pageVersion === 'number' && typeof snap.pageVersion === 'number' && snap.pageVersion !== job.pageVersion) {
       console.warn(`[tcgen] page snapshot version ${snap.pageVersion} != job ${job.pageVersion} — skipping source (fallback to no-source)`);
       return '';
     }
+    console.log(`[tcgen] source-page snapshot loaded for job ${jobId} (${String(snap.content).length} chars) → §7 rules fed to test-gen`);
     return String(snap.content || '');
   } catch (e) {
     console.warn(`[tcgen] spec-source load failed (non-fatal): ${String(e?.message || e)}`);
@@ -1163,6 +1171,7 @@ resolver.define('startGeneration', async ({ payload, context }) => {
       content: snapContent,
       truncatedSnapshot: full.length > snapContent.length,
     });
+    console.log(`[startGeneration] page snapshot written for job ${jobId} (${snapContent.length} chars${full.length > snapContent.length ? ', byte-trimmed' : ''}) → enables §7-aware test generation`);
   } catch (e) {
     console.warn(`[startGeneration] page snapshot failed (non-fatal; test-gen falls back to no-source): ${String(e?.message || e)}`);
   }
