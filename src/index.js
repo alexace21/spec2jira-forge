@@ -56,7 +56,7 @@ import {
 } from './anthropic_client.js';
 import { startPushSession, pushSessionStep } from './push_handler.js';
 import { detectCycles } from './graph.js';
-import { renderGherkin, renderManualTable } from './testcases.js';
+import { renderGherkin, renderManualTable, parseTestCaseResult } from './testcases.js';
 import {
   TIERS,
   checkQuota,
@@ -1961,6 +1961,95 @@ resolver.define('getTestCases', async ({ payload }) => {
     failedStories,
     failedCount,
   };
+});
+
+/**
+ * saveTestCases — persist a BA's hand-edits to ONE story's test cases.
+ *
+ * WHY a backend write (not in-memory like the breakdown editor): unlike the breakdown
+ * (which travels in the push payload), test cases are RE-READ from KVS by BOTH the
+ * dual-format export (getTestCaseExports) AND the Jira push embed (push_handler reads
+ * testcases:<jobId>:<idx>). So an edit only reaches export/push if it is written back to
+ * that per-story key, with coverage recomputed. This resolver is that single safe write.
+ *
+ * SAFETY (design-army verdict, 2026-06-06):
+ *   - Re-sanitize the user-edited result through parseTestCaseResult — user input is LESS
+ *     trusted than model JSON; the parser owns every bound (drop empty when/then, repair
+ *     ac_trace→inferred, priority whitelist, test_data cap, cap-15 AC-covering partition,
+ *     computeCoverage). One source of truth for bounds (POLICY §4).
+ *   - Recompute coverage against the STAMPED ACs (tcjob.stampedStories) — the SAME ACs the
+ *     push-embed AC-hash binds on and the original generation used. Never the live breakdown.
+ *   - Write EXACTLY one key; tcjob (stamped ACs = embed key + coverage oracle) stays IMMUTABLE.
+ *   - Editing CASES never changes the story's ACs → the AC-hash is unchanged → the push embed
+ *     reads the edited entry for free (no push_handler change needed).
+ *   - Reject an empty result (would silently erase this story's export + embed) + a regen
+ *     in flight (last-writer race). Every failure FAILS LOUD; the frontend keeps the buffer.
+ */
+resolver.define('saveTestCases', async ({ payload, context }) => {
+  const { jobId, storyIdx, result } = payload || {};
+  if (!jobId) return { error: 'no_job_id', detail: 'jobId is required.' };
+  if (typeof storyIdx !== 'number' || !Number.isInteger(storyIdx) || storyIdx < 0) {
+    return { error: 'bad_story_idx', detail: 'storyIdx must be a non-negative integer.' };
+  }
+  if (!result || typeof result !== 'object') {
+    return { error: 'invalid_result', detail: 'A test-case result object is required.' };
+  }
+
+  // Defensive license gate — editing is a licensed action (mirror regenerateTestCase).
+  try {
+    if (getActiveTier(context).key === 'unlicensed') return buildLicenseRequired();
+  } catch (e) {
+    console.error(`[saveTC] license check failed (failing open): ${String(e?.message || e)}`);
+  }
+
+  const tcJob = await kvs.get(`${TC_JOB_KEY_PREFIX}${jobId}`);
+  if (!tcJob) return { error: 'not_found', detail: `Test-case set ${jobId} not found — it may have expired. Regenerate test cases.` };
+  if (tcJob.status !== 'completed') {
+    return { error: 'not_ready', status: tcJob.status, detail: 'Test cases are still generating — wait for completion before editing.' };
+  }
+
+  const total = tcJob.total || 0;
+  const stamped = (tcJob.stampedStories || []).find((s) => s && s.idx === storyIdx);
+  if (storyIdx >= total || !stamped) {
+    return { error: 'story_out_of_range', detail: `No story at index ${storyIdx} in this test-case set (total ${total}).` };
+  }
+
+  // Regen-in-flight backstop: never overwrite a story mid-regenerate (last-writer race).
+  try {
+    const regen = await kvs.get(`${TC_REGEN_KEY_PREFIX}${jobId}:${storyIdx}`);
+    if (regen && (regen.status === 'batched' || regen.status === 'pending')) {
+      return { error: 'regen_in_progress', detail: 'This story is regenerating — wait for it to finish, then edit.' };
+    }
+  } catch (_) { /* non-fatal: the backstop is best-effort; the frontend also mutually-excludes */ }
+
+  // Authoritative story = the STAMPED ACs (coverage oracle + the embed-hash basis). Immutable.
+  const story = {
+    name: stamped.name || '',
+    acceptance_criteria: Array.isArray(stamped.acceptance_criteria) ? stamped.acceptance_criteria : [],
+  };
+
+  // Re-sanitize the edited result through the canonical parser (bounds + coverage recompute).
+  const parsed = parseTestCaseResult(result, story);
+  if (parsed.error) {
+    return { error: 'invalid_result', detail: parsed.detail || 'The edited test cases could not be saved (invalid format).' };
+  }
+  // Never silently persist an empty set — it would erase this story's export + push embed.
+  if (!Array.isArray(parsed.result.test_cases) || parsed.result.test_cases.length === 0) {
+    return { error: 'empty_result', detail: 'A saved story must keep at least one test case (each with a When and a Then). Add a case, or use Regenerate.' };
+  }
+
+  // Overwrite the ONE per-story key — byte-identical shape to the bulk/regen success entry,
+  // so getTestCases / export / push consume it unchanged.
+  const entry = { storyIdx, storyName: story.name, result: parsed.result, coverage: parsed.coverage };
+  try {
+    await kvs.set(`${TC_STORY_KEY_PREFIX}${jobId}:${storyIdx}`, entry);
+  } catch (e) {
+    console.error(`[saveTC] KVS write failed jobId=${jobId} storyIdx=${storyIdx}: ${String(e?.message || e)}`);
+    return { error: 'save_failed', detail: 'Could not save your edits (storage error). Your changes are still on screen — try Save again.' };
+  }
+
+  console.log(`[saveTC] jobId=${jobId} storyIdx=${storyIdx} cases=${parsed.result.test_cases.length} coverage_pct=${parsed.coverage && parsed.coverage.coverage_pct}`);
+  return { ok: true, storyIdx, result: parsed.result, coverage: parsed.coverage };
 });
 
 /**

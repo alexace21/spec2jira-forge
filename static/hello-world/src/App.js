@@ -1245,6 +1245,41 @@ function App() {
     [jobId],
   );
 
+  // handleSaveTestCase — persist ONE story's hand-edits to KVS via saveTestCases, then delta-patch
+  // testCaseResults from the SAVED + sanitized result/coverage (the resolver returns the authoritative
+  // shape: cap-15, dropped empties, recomputed coverage — never the raw edit buffer). Returns the
+  // resolver response so TestCasesScreen drives its per-story Save UI (saved / fail-loud-keep-buffer).
+  // Mirrors the regenerate delta-patch above. Editing CASES doesn't change ACs → the push-embed
+  // AC-hash is unchanged → the embed reads the edited entry for free (no push change needed).
+  const handleSaveTestCase = useCallback(
+    async (storyIdx, result) => {
+      let resp;
+      try {
+        resp = await invoke("saveTestCases", { jobId, storyIdx, result });
+      } catch (e) {
+        return { error: "save_failed", detail: String(e?.message || e) || "Save failed (network)." };
+      }
+      if (resp && resp.ok) {
+        setTestCaseResults((prev) => {
+          if (!prev) return prev;
+          const updated = prev.perStory.map((entry) => {
+            if (entry.storyIdx !== storyIdx) return entry;
+            return {
+              ...entry,
+              result: resp.result !== undefined ? resp.result : entry.result,
+              coverage: resp.coverage !== undefined ? resp.coverage : entry.coverage,
+              error: undefined, // a hand-authored valid story drops any prior error sentinel
+            };
+          });
+          const failedCount = updated.filter((e) => e && e.error).length;
+          return { ...prev, perStory: updated, failedCount };
+        });
+      }
+      return resp;
+    },
+    [jobId],
+  );
+
   const handleOpenTestCases = useCallback(() => {
     setScreen("testcases");
   }, []);
@@ -1666,6 +1701,7 @@ function App() {
           onPush={handlePush}
           onGenerate={handleGenerateTestCases}
           onRegenerate={handleRegenerateTestCase}
+          onSaveTestCase={handleSaveTestCase}
           regenStates={regenStates}
         />
       );
@@ -2989,9 +3025,11 @@ function PushedScreen({ result, onBack, onNew }) {
             ? ` · ${result.dependency_links_created} links`
             : ""}
         </p>
-        {result?.tc_embedded > 0 && (
+        {(result?.tc_embedded > 0 || result?.tc_skipped > 0) && (
           <p className="text-xs mt-1" style={{ color: "var(--s2j-text-light)" }}>
-            Test cases summarized in {result.tc_embedded} Stories
+            {result.tc_embedded > 0
+              ? `Test cases summarized in ${result.tc_embedded} Stor${result.tc_embedded === 1 ? "y" : "ies"}`
+              : "Test cases were not attached to any Story"}
             {result.tc_skipped > 0
               ? ` (${result.tc_skipped} skipped — ACs changed since generation; regenerate on the Test Cases screen)`
               : ""}

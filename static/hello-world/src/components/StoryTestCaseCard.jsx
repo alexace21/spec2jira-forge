@@ -1,5 +1,6 @@
 import React, { useState, useCallback, useEffect, useRef } from "react";
 import { invoke } from "@forge/bridge";
+import EditableCaseRow from "./EditableCaseRow.jsx";
 
 // ── CoverageBadge ────────────────────────────────────────────────
 // Green = 100% coverage, orange = partial, grey = no ACs.
@@ -66,163 +67,6 @@ function CoverageBadge({ coverage }) {
   );
 }
 
-// ── CaseRow ──────────────────────────────────────────────────────
-// Renders a single test case: header line, concern banner, Given/When/Then,
-// Expected Result, Test data, Covers list.
-function CaseRow({ tc }) {
-  if (!tc || typeof tc !== "object") return null;
-  const type = tc.type || "happy-path";
-  const priority = tc.priority;
-  const title = tc.title || "Untitled";
-
-  const typeBadgeColor = {
-    "happy-path": { fg: "var(--s2j-green-dark)", bg: "var(--s2j-green-bg)", border: "var(--s2j-green-border)" },
-    edge: { fg: "var(--s2j-orange)", bg: "var(--s2j-orange-bg)", border: "var(--s2j-orange-border)" },
-    negative: { fg: "var(--s2j-red)", bg: "var(--s2j-red-bg)", border: "var(--s2j-red-border)" },
-  }[type] || { fg: "var(--s2j-text-muted)", bg: "var(--s2j-bg-section)", border: "var(--s2j-border)" };
-
-  const priorityBadgeColor = priority === "Critical" || priority === "High"
-    ? { fg: "var(--s2j-red)", bg: "var(--s2j-red-bg)", border: "var(--s2j-red-border)" }
-    : priority === "Medium"
-    ? { fg: "var(--s2j-text-light)", bg: "var(--s2j-bg-section)", border: "var(--s2j-border)" }
-    : priority === "Low"
-    ? { fg: "var(--s2j-text-muted)", bg: "var(--s2j-bg-section)", border: "var(--s2j-border)" }
-    : null;
-
-  const given = Array.isArray(tc.given) ? tc.given.filter(Boolean) : [];
-  const when = Array.isArray(tc.when) ? tc.when.filter(Boolean) : [];
-  const then = Array.isArray(tc.then) ? tc.then.filter(Boolean) : [];
-  const testData = Array.isArray(tc.test_data) ? tc.test_data.filter(Boolean) : [];
-  const acTrace = Array.isArray(tc.ac_trace) ? tc.ac_trace.filter(Boolean) : [];
-
-  return (
-    <div
-      className="rounded-lg border p-3 mb-2 text-xs"
-      style={{
-        background: "var(--s2j-bg)",
-        border: "1px solid var(--s2j-border)",
-      }}
-    >
-      {/* Header: type badge · [priority] · title */}
-      <div className="flex items-start gap-2 mb-2 flex-wrap">
-        <span
-          className="text-[10px] px-1.5 py-0.5 rounded font-medium shrink-0"
-          style={{ background: typeBadgeColor.bg, border: `1px solid ${typeBadgeColor.border}`, color: typeBadgeColor.fg }}
-        >
-          @{type}
-        </span>
-        {priorityBadgeColor && (
-          <span
-            className="text-[10px] px-1.5 py-0.5 rounded font-medium shrink-0"
-            style={{ background: priorityBadgeColor.bg, border: `1px solid ${priorityBadgeColor.border}`, color: priorityBadgeColor.fg }}
-          >
-            {priority}
-          </span>
-        )}
-        <span className="font-medium" style={{ color: "var(--s2j-text)" }}>
-          {title}
-        </span>
-      </div>
-
-      {/* Concern banner (orange, emitted AS-IS per §13 carry-forward) */}
-      {tc.concern && (
-        <div
-          className="rounded px-2 py-1 mb-2 text-xs"
-          style={{
-            background: "var(--s2j-orange-bg)",
-            border: "1px solid var(--s2j-orange-border)",
-            color: "var(--s2j-text)",
-          }}
-        >
-          {tc.concern}
-        </div>
-      )}
-
-      {/* Given (preconditions) */}
-      {given.length > 0 && (
-        <div className="mb-1">
-          <span className="font-semibold" style={{ color: "var(--s2j-text-muted)" }}>
-            Given
-          </span>
-          <ul className="mt-0.5 ml-3 list-disc list-inside" style={{ color: "var(--s2j-text-light)" }}>
-            {given.map((g, i) => (
-              <li key={i}>{g}</li>
-            ))}
-          </ul>
-        </div>
-      )}
-
-      {/* When */}
-      {when.length > 0 && (
-        <div className="mb-1">
-          <span className="font-semibold" style={{ color: "var(--s2j-text-muted)" }}>
-            When
-          </span>
-          <ul className="mt-0.5 ml-3 list-disc list-inside" style={{ color: "var(--s2j-text-light)" }}>
-            {when.map((w, i) => (
-              <li key={i}>{w}</li>
-            ))}
-          </ul>
-        </div>
-      )}
-
-      {/* Then */}
-      {then.length > 0 && (
-        <div className="mb-1">
-          <span className="font-semibold" style={{ color: "var(--s2j-text-muted)" }}>
-            Then
-          </span>
-          <ul className="mt-0.5 ml-3 list-disc list-inside" style={{ color: "var(--s2j-text-light)" }}>
-            {then.map((t, i) => (
-              <li key={i}>{t}</li>
-            ))}
-          </ul>
-        </div>
-      )}
-
-      {/* Expected result */}
-      {tc.expected_result && (
-        <div className="mb-1">
-          <span className="font-semibold" style={{ color: "var(--s2j-text-muted)" }}>
-            Expected:{" "}
-          </span>
-          <em style={{ color: "var(--s2j-text)" }}>{tc.expected_result}</em>
-        </div>
-      )}
-
-      {/* Test data */}
-      {testData.length > 0 && (
-        <div className="mb-1">
-          <span className="font-semibold" style={{ color: "var(--s2j-text-muted)" }}>
-            Test data:{" "}
-          </span>
-          <span style={{ color: "var(--s2j-text-light)" }}>{testData.join(", ")}</span>
-        </div>
-      )}
-
-      {/* Covers: ac_trace */}
-      {acTrace.length > 0 && (
-        <div>
-          <span className="font-semibold" style={{ color: "var(--s2j-text-muted)" }}>
-            Covers:
-          </span>
-          <ul className="mt-0.5 ml-3" style={{ color: "var(--s2j-text-muted)" }}>
-            {acTrace.map((t, i) => (
-              <li key={i}>
-                {t.kind === "inferred"
-                  ? "[inferred — no authored AC]"
-                  : t.kind === "shared-ac"
-                  ? `[shared] ${t.ac_text || ""}`
-                  : `[${t.kind || "ac"}] ${t.ac_text || ""}`}
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
-    </div>
-  );
-}
-
 // ── clipboard helper ─────────────────────────────────────────────
 // Returns { ok: boolean, method: 'clipboard'|'download'|'none' } so callers
 // can give specific feedback. Never a silent no-op on the BA's primary export action.
@@ -250,26 +94,57 @@ async function copyToClipboard(text) {
 
 // ── StoryTestCaseCard ────────────────────────────────────────────
 /**
- * StoryTestCaseCard — a <details> accordion for one story's test cases.
+ * StoryTestCaseCard — a <details> accordion for one story's test cases, now EDITABLE.
+ *
+ * At rest (collapsed) it's a summary; expanded, every case is an EditableCaseRow (click-to-edit,
+ * like a FeatureCard). Edits flow to the parent draft via the on*Case callbacks; a per-story
+ * Save bar persists them to KVS (so export + push, which re-read KVS, see them). Regenerate is
+ * dirty-aware (escalates the confirm) and mutually exclusive with Save (last-writer race guard).
  *
  * Props:
- *   entry        — perStory entry from getTestCases ({ storyIdx, storyName, story, result, coverage, error })
+ *   entry        — perStory entry ({ storyIdx, storyName, story, result, coverage, error })
  *   jobId        — string; needed for the per-story export invoke
  *   regenState   — 'idle' | 'pending' | 'polling' | 'done' | 'error'
- *   onRegenerate — fn(storyIdx) — called when the user clicks ↻ Regenerate
+ *   onRegenerate — fn(storyIdx)
+ *   draftResult  — the edited (unsaved) result for this story, or null (→ use entry.result)
+ *   isDirty      — bool; true when draftResult differs from the saved entry
+ *   saveState    — 'idle' | 'saving' | 'saved' | 'error'
+ *   saveError    — string|null
+ *   onCaseChange — fn(caseIdx, nextCase)
+ *   onAddCase    — fn()
+ *   onDeleteCase — fn(caseIdx)
+ *   onSave       — fn()  (persist this story's draft to KVS)
+ *   onRevert     — fn()  (discard this story's draft)
  */
-function StoryTestCaseCard({ entry, jobId, regenState, onRegenerate }) {
+function StoryTestCaseCard({
+  entry,
+  jobId,
+  regenState,
+  onRegenerate,
+  draftResult,
+  isDirty = false,
+  saveState = "idle",
+  saveError = null,
+  onCaseChange,
+  onAddCase,
+  onDeleteCase,
+  onSave,
+  onRevert,
+}) {
   // 'idle' | 'clipboard' | 'download' | 'failed'
   const [copyGherkinState, setCopyGherkinState] = useState("idle");
   const [copyCsvState, setCopyCsvState] = useState("idle");
 
   const storyIdx = entry?.storyIdx;
   const storyName = entry?.storyName || entry?.story?.name || `Story ${storyIdx}`;
-  const result = entry?.result;
-  const coverage = entry?.coverage;
+  const acceptanceCriteria = entry?.story?.acceptance_criteria || [];
+  // The working result = the unsaved draft when present, else the saved entry.result.
+  const result = draftResult || entry?.result;
+  const coverage = entry?.coverage; // last-SAVED coverage (recomputed on save)
   const hasError = !!entry?.error;
   const cases = result && Array.isArray(result.test_cases) ? result.test_cases : [];
   const isPolling = regenState === "polling" || regenState === "pending";
+  const isSaving = saveState === "saving";
 
   // Fix 3: two-step inline confirm — avoids window.confirm (may be blocked in Forge iframe).
   // 'idle' | 'armed'; auto-resets after 4 s if the user doesn't confirm.
@@ -337,13 +212,16 @@ function StoryTestCaseCard({ entry, jobId, regenState, onRegenerate }) {
     } catch (_) {}
   }, [jobId, storyIdx]);
 
+  // Regenerate when this story has unsaved edits → escalate the armed-confirm copy.
+  const regenArmedLabel = isDirty ? "Discard edits & regenerate?" : "Confirm — replace cases?";
+
   return (
     <details
       open={isOpen}
       onToggle={(e) => setIsOpen(e.currentTarget.open)}
       className="mb-3 rounded-lg"
       style={{
-        border: "1px solid var(--s2j-border)",
+        border: `1px solid ${isDirty ? "var(--s2j-blue-border)" : "var(--s2j-border)"}`,
         background: "var(--s2j-bg-section)",
       }}
     >
@@ -357,6 +235,16 @@ function StoryTestCaseCard({ entry, jobId, regenState, onRegenerate }) {
         >
           {storyName}
         </span>
+        {/* Unsaved-edits chip — visible even when collapsed */}
+        {isDirty && (
+          <span
+            className="text-[10px] px-1.5 py-0.5 rounded font-medium"
+            style={{ background: "var(--s2j-blue-bg)", border: "1px solid var(--s2j-blue-border)", color: "var(--s2j-blue)" }}
+            title="This story has unsaved edits — Save to update coverage, export and push"
+          >
+            ● edited
+          </span>
+        )}
         {/* Fix 8: Failed badge — visible without expanding (Audit-9) */}
         {hasError && (
           <span
@@ -386,36 +274,38 @@ function StoryTestCaseCard({ entry, jobId, regenState, onRegenerate }) {
           </span>
         )}
         {/* Fix 3: Two-step inline Regenerate — avoids window.confirm (may be blocked in the Forge sandboxed iframe).
-            First click: arms (button turns red "Confirm — replace cases?"); second click within 4 s fires.
-            Auto-resets to idle after 4 s if the user doesn't confirm. */}
+            First click: arms; second click within 4 s fires. Auto-resets after 4 s.
+            Disabled while saving (mutual exclusion with Save — last-writer race guard). */}
         <button
           type="button"
           onClick={(e) => {
             e.preventDefault();
             e.stopPropagation();
-            if (isPolling) return;
+            if (isPolling || isSaving) return;
             if (confirmArmed === "armed") {
               fireRegen();
             } else {
               armConfirm();
             }
           }}
-          disabled={isPolling}
+          disabled={isPolling || isSaving}
           className="text-[10px] px-2 py-0.5 rounded"
           style={{
             background: confirmArmed === "armed" ? "var(--s2j-red-bg)" : "none",
             border: `1px solid ${confirmArmed === "armed" ? "var(--s2j-red-border)" : "var(--s2j-border)"}`,
-            color: isPolling
+            color: (isPolling || isSaving)
               ? "var(--s2j-text-muted)"
               : confirmArmed === "armed"
               ? "var(--s2j-red)"
               : "var(--s2j-blue)",
-            cursor: isPolling ? "not-allowed" : "pointer",
+            cursor: (isPolling || isSaving) ? "not-allowed" : "pointer",
             transition: "all 0.15s",
           }}
           title={
             isPolling
               ? "Generating…"
+              : isSaving
+              ? "Saving — wait, then regenerate"
               : confirmArmed === "armed"
               ? "Click again to confirm — this will replace current cases"
               : "Re-generate test cases for this story"
@@ -424,25 +314,29 @@ function StoryTestCaseCard({ entry, jobId, regenState, onRegenerate }) {
           {isPolling
             ? "↻ Generating…"
             : confirmArmed === "armed"
-            ? "Confirm — replace cases?"
+            ? regenArmedLabel
             : "↻ Regenerate"}
         </button>
-        {/* Per-story copy buttons — Fix 2: discriminated feedback, never silent */}
+        {/* Per-story copy buttons — Fix 2: discriminated feedback, never silent.
+            Copy/export read SAVED KVS — warn (title) when there are unsaved edits. */}
         {!hasError && result && (
           <>
             <button
               type="button"
-              onClick={(e) => { e.preventDefault(); e.stopPropagation(); handleCopyGherkin(); }}
+              onClick={(e) => { e.preventDefault(); e.stopPropagation(); if (isDirty) return; handleCopyGherkin(); }}
+              disabled={isDirty}
               className="text-[10px] px-2 py-0.5 rounded"
               style={{
                 background: "none",
                 border: `1px solid ${copyGherkinState === "failed" ? "var(--s2j-red-border)" : "var(--s2j-border)"}`,
-                color: copyGherkinState === "failed" ? "var(--s2j-red)" : "var(--s2j-text-muted)",
-                cursor: "pointer",
+                color: copyGherkinState === "failed" && !isDirty ? "var(--s2j-red)" : "var(--s2j-text-muted)",
+                cursor: isDirty ? "not-allowed" : "pointer",
               }}
-              title="Copy Gherkin .feature for this story"
+              title={isDirty ? "Save this story first — export reads the SAVED cases" : "Copy Gherkin .feature for this story"}
             >
-              {copyGherkinState === "clipboard"
+              {isDirty
+                ? "Save to export"
+                : copyGherkinState === "clipboard"
                 ? "✓ Copied"
                 : copyGherkinState === "download"
                 ? "✓ Downloaded"
@@ -452,17 +346,20 @@ function StoryTestCaseCard({ entry, jobId, regenState, onRegenerate }) {
             </button>
             <button
               type="button"
-              onClick={(e) => { e.preventDefault(); e.stopPropagation(); handleCopyCsv(); }}
+              onClick={(e) => { e.preventDefault(); e.stopPropagation(); if (isDirty) return; handleCopyCsv(); }}
+              disabled={isDirty}
               className="text-[10px] px-2 py-0.5 rounded"
               style={{
                 background: "none",
                 border: `1px solid ${copyCsvState === "failed" ? "var(--s2j-red-border)" : "var(--s2j-border)"}`,
-                color: copyCsvState === "failed" ? "var(--s2j-red)" : "var(--s2j-text-muted)",
-                cursor: "pointer",
+                color: copyCsvState === "failed" && !isDirty ? "var(--s2j-red)" : "var(--s2j-text-muted)",
+                cursor: isDirty ? "not-allowed" : "pointer",
               }}
-              title="Copy CSV/manual-table for this story"
+              title={isDirty ? "Save this story first — export reads the SAVED cases" : "Copy CSV/manual-table for this story"}
             >
-              {copyCsvState === "clipboard"
+              {isDirty
+                ? "Save to export"
+                : copyCsvState === "clipboard"
                 ? "✓ Copied"
                 : copyCsvState === "download"
                 ? "✓ Downloaded"
@@ -503,26 +400,118 @@ function StoryTestCaseCard({ entry, jobId, regenState, onRegenerate }) {
           </p>
         )}
 
-        {/* Cases */}
-        {!hasError && cases.map((tc, i) => (
-          <CaseRow key={i} tc={tc} />
-        ))}
-
-        {!hasError && cases.length === 0 && !result?.no_acs && (
-          <p className="text-xs" style={{ color: "var(--s2j-text-muted)" }}>
-            No test cases generated. Try ↻ Regenerate.
+        {/* While a regenerate is in flight, PAUSE editing for this story — a draft created during
+            the 2-10 min poll would shadow the regenerated cases, and a later Save would clobber the
+            regenerate (deep-audit 2026-06-06). The draft was already cleared when regen started. */}
+        {!hasError && isPolling && (
+          <p className="text-xs mb-2 italic" style={{ color: "var(--s2j-text-muted)" }}>
+            ↻ Regenerating this story — editing is paused until the new cases arrive…
           </p>
         )}
 
+        {/* Editable cases */}
+        {!hasError && !isPolling && cases.map((tc, i) => (
+          <EditableCaseRow
+            key={i}
+            tc={tc}
+            caseNumber={i + 1}
+            acceptanceCriteria={acceptanceCriteria}
+            onChange={(next) => onCaseChange && onCaseChange(i, next)}
+            onDelete={() => onDeleteCase && onDeleteCase(i)}
+          />
+        ))}
+
+        {!hasError && !isPolling && cases.length === 0 && (
+          <p className="text-xs mb-2" style={{ color: "var(--s2j-text-muted)" }}>
+            No test cases. Add one below, or ↻ Regenerate.
+          </p>
+        )}
+
+        {/* + Add test case — disabled at the 15-case ceiling (the parse caps at 15; adding a
+            16th would be silently dropped). Hidden while regenerating. */}
+        {!hasError && !isPolling && (cases.length < 15 ? (
+          <button
+            type="button"
+            onClick={() => onAddCase && onAddCase()}
+            className="text-[11px] mb-1"
+            style={{ color: "var(--s2j-blue)" }}
+          >
+            + Add test case
+          </button>
+        ) : (
+          <p className="text-[11px] mb-1" style={{ color: "var(--s2j-text-muted)" }}>
+            Maximum 15 cases per story — delete one to add another.
+          </p>
+        ))}
+
+        {/* Per-story Save bar — appears only when there are unsaved edits.
+            WHY explicit save (unlike the breakdown editor's in-memory edits): test cases are
+            re-read from KVS by BOTH export and the Jira push, so edits must be persisted there. */}
+        {!hasError && isDirty && (
+          <div
+            className="mt-2 flex items-center gap-2 rounded-md px-3 py-2 flex-wrap"
+            style={{
+              background: saveState === "error" ? "var(--s2j-red-bg)" : "var(--s2j-blue-bg)",
+              border: `1px solid ${saveState === "error" ? "var(--s2j-red-border)" : "var(--s2j-blue-border)"}`,
+            }}
+          >
+            <span className="text-xs flex-1 min-w-[160px]" style={{ color: saveState === "error" ? "var(--s2j-red)" : "var(--s2j-blue)" }}>
+              {saveState === "error"
+                ? (saveError || "Save failed — your edits are still here. Try again.")
+                : "Unsaved edits — coverage, export and push use SAVED cases."}
+            </span>
+            <button
+              type="button"
+              onClick={() => onRevert && onRevert()}
+              disabled={isSaving || isPolling}
+              className="text-[11px] px-2 py-1 rounded"
+              style={{
+                background: "none",
+                border: "1px solid var(--s2j-border)",
+                color: "var(--s2j-text-muted)",
+                cursor: (isSaving || isPolling) ? "not-allowed" : "pointer",
+              }}
+              title="Discard your edits to this story"
+            >
+              Revert
+            </button>
+            <button
+              type="button"
+              onClick={() => onSave && onSave()}
+              disabled={isSaving || isPolling}
+              className="text-[11px] px-3 py-1 rounded font-medium"
+              style={{
+                background: "var(--s2j-blue)",
+                border: "1px solid var(--s2j-blue)",
+                color: "#fff",
+                cursor: (isSaving || isPolling) ? "not-allowed" : "pointer",
+                opacity: (isSaving || isPolling) ? 0.7 : 1,
+              }}
+              title={isPolling ? "Regenerating — wait, then Save" : "Save your edits (updates coverage, export and push)"}
+            >
+              {isSaving ? "Saving…" : "Save changes"}
+            </button>
+          </div>
+        )}
+        {!hasError && !isDirty && saveState === "saved" && (
+          <div className="mt-2 text-xs" style={{ color: "var(--s2j-green-dark)" }}>
+            ✓ Saved — coverage, export and push now use your edits.
+          </div>
+        )}
+
         {/* Fix 1: COVERAGE TRUST — render uncovered ACs + stale refs so the badge
-            is actionable. The BA sees WHICH ACs are missing a test case, not just a number.
-            Fields from computeCoverage: uncovered_acs (string[]), stale_refs (string[]). */}
+            is actionable. Reflects the LAST SAVED coverage (recomputed on save). */}
         {!hasError && coverage && (() => {
           const uncovered = Array.isArray(coverage.uncovered_acs) ? coverage.uncovered_acs.filter(Boolean) : [];
           const stale = Array.isArray(coverage.stale_refs) ? coverage.stale_refs.filter(Boolean) : [];
           if (uncovered.length === 0 && stale.length === 0) return null;
           return (
             <div className="mt-3 flex flex-col gap-2">
+              {isDirty && (
+                <p className="text-[11px] italic" style={{ color: "var(--s2j-text-muted)" }}>
+                  Coverage below reflects the last save — Save to recompute against your edits.
+                </p>
+              )}
               {uncovered.length > 0 && (
                 <div
                   className="rounded-lg px-3 py-2 text-xs"
@@ -540,7 +529,7 @@ function StoryTestCaseCard({ entry, jobId, regenState, onRegenerate }) {
                     ))}
                   </ul>
                   <p className="mt-1 italic" style={{ color: "var(--s2j-text-muted)" }}>
-                    ↻ Regenerate this story to attempt coverage.
+                    Add a case + tick the AC under “Covers”, or ↻ Regenerate.
                   </p>
                 </div>
               )}
@@ -571,6 +560,4 @@ function StoryTestCaseCard({ entry, jobId, regenState, onRegenerate }) {
 }
 
 // Fix 5: React.memo — a single-story regen's setState doesn't re-render all N cards.
-// Props are: entry (only its storyIdx slot changes), jobId (stable), regenState (only
-// the one card whose regen fired changes), onRegenerate (stable useCallback).
 export default React.memo(StoryTestCaseCard);

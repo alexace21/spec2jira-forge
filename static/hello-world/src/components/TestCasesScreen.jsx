@@ -1,7 +1,21 @@
-import React, { useState, useCallback } from "react";
+import React, { useState, useCallback, useEffect, useRef } from "react";
 import { invoke } from "@forge/bridge";
 import BackButton from "./BackButton";
 import StoryTestCaseCard from "./StoryTestCaseCard";
+
+// Blank case template for "+ Add test case" (mirrors the schema; ac_trace empty → the parse
+// repairs to a single inferred entry until the BA ticks an AC in the AcTraceEditor checklist).
+const BLANK_CASE = {
+  type: "happy-path",
+  priority: "Medium",
+  title: "New test case",
+  given: [],
+  when: [],
+  then: [],
+  expected_result: "",
+  test_data: [],
+  ac_trace: [],
+};
 
 // ── clipboard helper (same as in StoryTestCaseCard, duplicated to avoid a
 // shared-module dep inside this CRA app — both are tiny) ─────────────────
@@ -30,7 +44,7 @@ async function copyToClipboard(text) {
 // "Copy All — Gherkin" and "Copy All — CSV" buttons.
 // Calls getTestCaseExports with storyIdx=null (all stories), format=…
 // Fix 2: discriminated copy feedback — never a silent no-op on the BA's primary export action.
-function ExportBar({ jobId }) {
+function ExportBar({ jobId, hasUnsavedEdits }) {
   // 'idle' | 'clipboard' | 'download' | 'failed'
   const [gherkinState, setGherkinState] = useState("idle");
   const [csvState, setCsvState] = useState("idle");
@@ -79,6 +93,15 @@ function ExportBar({ jobId }) {
 
   return (
     <div className="flex items-center gap-2 ml-auto">
+      {hasUnsavedEdits && (
+        <span
+          className="text-[10px]"
+          style={{ color: "var(--s2j-orange)" }}
+          title="Stories with unsaved edits export their SAVED version — Save them to include your edits"
+        >
+          ⚠ unsaved edits excluded
+        </span>
+      )}
       <button
         type="button"
         onClick={() => handleExport("gherkin", setGherkinState)}
@@ -318,6 +341,7 @@ function TestCasesScreen({
   onPush,
   onGenerate,
   onRegenerate,
+  onSaveTestCase,
   regenStates = {},
 }) {
   // Stale detection: testCaseResults.breakdownPageVersion < currentVersion
@@ -333,6 +357,111 @@ function TestCasesScreen({
     0;
 
   const perStory = testCaseResults?.perStory || [];
+
+  // ── Edit drafts (human-in-the-loop) ──────────────────────────────
+  // drafts[storyIdx] = the unsaved edited result for that story. Held HERE (above the memoized
+  // cards) so a card re-render / accordion collapse never drops in-progress edits. Edits reach
+  // export + push ONLY after Save persists them to KVS (handleSave → onSaveTestCase → resolver).
+  const [drafts, setDrafts] = useState({});
+  const [saveStates, setSaveStates] = useState({}); // storyIdx → 'idle'|'saving'|'saved'|'error'
+  const [saveErrors, setSaveErrors] = useState({});
+  const savedTimers = useRef({});
+  const pushArmTimer = useRef(null);
+  const backArmTimer = useRef(null);
+  const [pushArmed, setPushArmed] = useState(false);
+  const [backArmed, setBackArmed] = useState(false);
+  useEffect(
+    () => () => {
+      Object.values(savedTimers.current).forEach(clearTimeout);
+      clearTimeout(pushArmTimer.current);
+      clearTimeout(backArmTimer.current);
+    },
+    [],
+  );
+
+  const handleCaseChange = useCallback((storyIdx, caseIdx, nextCase) => {
+    setDrafts((prev) => {
+      const base = prev[storyIdx] || (perStory.find((e) => e && e.storyIdx === storyIdx)?.result) || { test_cases: [], no_acs: false, story_name: "" };
+      const test_cases = (base.test_cases || []).map((c, i) => (i === caseIdx ? nextCase : c));
+      return { ...prev, [storyIdx]: { ...base, test_cases } };
+    });
+    setSaveStates((prev) => ({ ...prev, [storyIdx]: "idle" }));
+  }, [perStory]);
+
+  const handleAddCase = useCallback((storyIdx) => {
+    setDrafts((prev) => {
+      const base = prev[storyIdx] || (perStory.find((e) => e && e.storyIdx === storyIdx)?.result) || { test_cases: [], no_acs: false, story_name: "" };
+      return { ...prev, [storyIdx]: { ...base, test_cases: [...(base.test_cases || []), { ...BLANK_CASE }] } };
+    });
+    setSaveStates((prev) => ({ ...prev, [storyIdx]: "idle" }));
+  }, [perStory]);
+
+  const handleDeleteCase = useCallback((storyIdx, caseIdx) => {
+    setDrafts((prev) => {
+      const base = prev[storyIdx] || (perStory.find((e) => e && e.storyIdx === storyIdx)?.result) || { test_cases: [], no_acs: false, story_name: "" };
+      return { ...prev, [storyIdx]: { ...base, test_cases: (base.test_cases || []).filter((_, i) => i !== caseIdx) } };
+    });
+    setSaveStates((prev) => ({ ...prev, [storyIdx]: "idle" }));
+  }, [perStory]);
+
+  const handleRevert = useCallback((storyIdx) => {
+    setDrafts((prev) => { const n = { ...prev }; delete n[storyIdx]; return n; });
+    setSaveStates((prev) => ({ ...prev, [storyIdx]: "idle" }));
+    setSaveErrors((prev) => ({ ...prev, [storyIdx]: null }));
+  }, []);
+
+  const handleSave = useCallback(async (storyIdx) => {
+    const draft = drafts[storyIdx];
+    if (!draft || !onSaveTestCase) return;
+    setSaveStates((prev) => ({ ...prev, [storyIdx]: "saving" }));
+    setSaveErrors((prev) => ({ ...prev, [storyIdx]: null }));
+    let resp;
+    try {
+      resp = await onSaveTestCase(storyIdx, draft);
+    } catch (_e) {
+      resp = { error: "save_failed", detail: "Could not save (network). Your edits are still here — try again." };
+    }
+    if (resp && resp.ok) {
+      // App.js delta-patched testCaseResults from the SAVED result; drop the local draft so the
+      // card shows the persisted entry (with the authoritative recomputed coverage).
+      setDrafts((prev) => { const n = { ...prev }; delete n[storyIdx]; return n; });
+      setSaveStates((prev) => ({ ...prev, [storyIdx]: "saved" }));
+      clearTimeout(savedTimers.current[storyIdx]);
+      savedTimers.current[storyIdx] = setTimeout(
+        () => setSaveStates((prev) => ({ ...prev, [storyIdx]: "idle" })),
+        3000,
+      );
+    } else {
+      // FAIL LOUD + keep the draft (POLICY: never silent; the BA's work must survive a failed save).
+      setSaveStates((prev) => ({ ...prev, [storyIdx]: "error" }));
+      setSaveErrors((prev) => ({ ...prev, [storyIdx]: (resp && resp.detail) || "Save failed — your edits are still here." }));
+    }
+  }, [drafts, onSaveTestCase]);
+
+  // Regenerate must DISCARD this story's unsaved draft first — else the stale draft shadows the
+  // regenerated cases (the card renders draftResult || entry.result) and a later Save would clobber
+  // the regenerate. Makes the "Discard edits & regenerate?" confirm truthful.
+  const handleRegenerate = useCallback((storyIdx) => {
+    setDrafts((prev) => { const n = { ...prev }; delete n[storyIdx]; return n; });
+    setSaveStates((prev) => ({ ...prev, [storyIdx]: "idle" }));
+    setSaveErrors((prev) => ({ ...prev, [storyIdx]: null }));
+    onRegenerate?.(storyIdx);
+  }, [onRegenerate]);
+
+  const dirtyCount = Object.keys(drafts).length;
+
+  // Back-to-Review dirty guard — TestCasesScreen unmounts on navigation, which would destroy
+  // unsaved drafts. Two-step confirm so a BA never loses unsaved edits silently.
+  const handleBackClick = useCallback(() => {
+    if (dirtyCount > 0 && !backArmed) {
+      setBackArmed(true);
+      clearTimeout(backArmTimer.current);
+      backArmTimer.current = setTimeout(() => setBackArmed(false), 4000);
+      return;
+    }
+    setBackArmed(false);
+    onBack?.();
+  }, [dirtyCount, backArmed, onBack]);
 
   const SCREEN_MAX_WIDTH_STYLE = { maxWidth: "1200px", margin: "0 auto", width: "100%" };
 
@@ -353,7 +482,12 @@ function TestCasesScreen({
           borderBottom: "1px solid var(--s2j-border)",
         }}
       >
-        <BackButton onClick={onBack} className="" label="Back to Review" />
+        <BackButton
+          onClick={handleBackClick}
+          className=""
+          label={dirtyCount > 0 && backArmed ? `⚠ ${dirtyCount} unsaved — leave anyway?` : "Back to Review"}
+          title={dirtyCount > 0 ? "Some stories have unsaved test-case edits — Save them first or they'll be discarded" : undefined}
+        />
         <span
           className="text-[11px]"
           style={{ color: "var(--s2j-text-muted)" }}
@@ -362,16 +496,29 @@ function TestCasesScreen({
         </span>
 
         {/* Export bar — only shown when results exist */}
-        {testCaseResults && jobId && <ExportBar jobId={jobId} />}
+        {testCaseResults && jobId && <ExportBar jobId={jobId} hasUnsavedEdits={dirtyCount > 0} />}
 
-        {/* Continue to Push */}
+        {/* Continue to Push — when stories have unsaved edits, a two-step confirm: push reads
+            SAVED cases from KVS, so unsaved edits won't be embedded unless the BA Saves first. */}
         <button
           type="button"
-          onClick={() => onPush?.(breakdown)}
+          onClick={() => {
+            if (dirtyCount > 0 && !pushArmed) {
+              setPushArmed(true);
+              clearTimeout(pushArmTimer.current);
+              pushArmTimer.current = setTimeout(() => setPushArmed(false), 4000);
+              return;
+            }
+            setPushArmed(false);
+            onPush?.(breakdown);
+          }}
           className="btn-primary text-xs shrink-0"
           style={{ marginLeft: testCaseResults ? "0" : "auto", whiteSpace: "nowrap" }}
+          title={dirtyCount > 0 ? "Some stories have unsaved test-case edits — Save them first to include them in the push" : "Continue to push"}
         >
-          Continue to Push →
+          {dirtyCount > 0 && pushArmed
+            ? `⚠ ${dirtyCount} unsaved — push anyway?`
+            : "Continue to Push →"}
         </button>
       </div>
 
@@ -392,7 +539,7 @@ function TestCasesScreen({
         ) : (
           <>
             {isStale && <StaleBanner />}
-            <SummaryBar testCaseResults={testCaseResults} onRegenerate={onRegenerate} />
+            <SummaryBar testCaseResults={testCaseResults} onRegenerate={handleRegenerate} />
             <div>
               {perStory.map((entry) => (
                 <StoryTestCaseCard
@@ -400,7 +547,16 @@ function TestCasesScreen({
                   entry={entry}
                   jobId={jobId}
                   regenState={regenStates[entry.storyIdx] || "idle"}
-                  onRegenerate={onRegenerate}
+                  onRegenerate={handleRegenerate}
+                  draftResult={drafts[entry.storyIdx] || null}
+                  isDirty={drafts[entry.storyIdx] !== undefined}
+                  saveState={saveStates[entry.storyIdx] || "idle"}
+                  saveError={saveErrors[entry.storyIdx] || null}
+                  onCaseChange={(caseIdx, next) => handleCaseChange(entry.storyIdx, caseIdx, next)}
+                  onAddCase={() => handleAddCase(entry.storyIdx)}
+                  onDeleteCase={(caseIdx) => handleDeleteCase(entry.storyIdx, caseIdx)}
+                  onSave={() => handleSave(entry.storyIdx)}
+                  onRevert={() => handleRevert(entry.storyIdx)}
                 />
               ))}
             </div>

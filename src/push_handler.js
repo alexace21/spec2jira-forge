@@ -656,17 +656,37 @@ export async function startPushSession(breakdown, projectKey, customFields = nul
   // which is the pre-P4 behaviour; never block push on a test-case absence).
   // Build a compact hash map (C2 audit): {[storyIdx]: acSetHash} instead of the
   // full stampedStories array (~40 KB). The map's presence gates the embed.
-  let tcAcHashes = null;
+  let tcHashToIdx = null;
+  let tcTotal = 0;
   if (jobId) {
     try {
       const tcJob = await kvs.get(`tcjob:${jobId}`);
       if (tcJob && tcJob.status === 'completed' && Array.isArray(tcJob.stampedStories)) {
-        tcAcHashes = {};
+        // ⭐ Key by AC-content HASH → the generation storyIdx, so the push MATCHES each pushed
+        // feature to its test cases by CONTENT, not by position. The push order (flattenBreakdown
+        // — capability-grouped from the edited breakdown) differs from the generation order
+        // (job.breakdown.features, flat); position-keying embedded only the coincidentally-first
+        // story (live-smoke bug 2026-06-06). The hash lookup is ALSO the staleness check.
+        // Collision guard (deep-audit 2026-06-06): two stories with the SAME AC set — including
+        // MULTIPLE no-AC stories, which all hash the empty set — would otherwise collapse to one
+        // idx (last writer wins) → the WRONG story's cases embed on a Jira Story (silent
+        // mis-attribution, the exact failure this feature prevents). A genuinely ambiguous hash is
+        // DROPPED → those features get no embed (counted as tc_skipped — honest) instead of a wrong
+        // embed. A SINGLE no-AC story has a unique (empty-set) hash → still embeds correctly (no
+        // regression). The real long-term fix is a stable story_uid minted at generation.
+        tcHashToIdx = {};
+        const tcHashSeen = new Set();
+        const tcHashCollided = new Set();
         for (const st of tcJob.stampedStories) {
           if (st && typeof st.idx === 'number') {
-            tcAcHashes[st.idx] = acSetHash(st.acceptance_criteria);
+            const h = acSetHash(st.acceptance_criteria);
+            if (tcHashSeen.has(h)) tcHashCollided.add(h);
+            else tcHashSeen.add(h);
+            tcHashToIdx[h] = st.idx;
           }
         }
+        for (const h of tcHashCollided) delete tcHashToIdx[h];
+        tcTotal = typeof tcJob.total === 'number' ? tcJob.total : tcJob.stampedStories.length;
       }
     } catch (e) {
       console.warn(`[push] tcjob read failed (non-fatal, no embed): ${String(e?.message || e)}`);
@@ -727,10 +747,12 @@ export async function startPushSession(breakdown, projectKey, customFields = nul
     },
     totals: { stories: features.length, tasks: totalTasks, links: links.length },
     failureDetails: { stories: [], subtasks: [], links: [] },
-    // Test-case embed metadata (P4 audit C2). jobId null → no embed; tcAcHashes null → no embed.
-    // tcAcHashes is a compact {[storyIdx]: acSetHash} map — presence is the gate.
+    // Test-case embed metadata (P4). jobId null → no embed; tcHashToIdx null → no embed.
+    // tcHashToIdx maps AC-content hash → generation storyIdx, so each pushed feature finds its
+    // cases by CONTENT (the push order differs from the generation order); presence gates the embed.
     jobId: jobId || null,
-    tcAcHashes,
+    tcHashToIdx,
+    tcTotal,
   };
   await kvs.set(PUSH_SESSION_PREFIX + sessionId, session);
 
@@ -803,17 +825,8 @@ export async function pushSessionStep(sessionId) {
 function acSetHash(acs) {
   const s = (Array.isArray(acs) ? acs : []).map(normAC).sort().join('|');
   let h = 5381;
-  for (const ch of s) h = ((h << 5) + h ^ ch.charCodeAt(0)) >>> 0;
+  for (const ch of s) h = ((((h << 5) + h) ^ ch.charCodeAt(0)) >>> 0); // djb2-xor: (h*33) ^ c
   return h.toString(36);
-}
-
-// Staleness fingerprint helper (P4 audit C2): true when the live feature's AC set
-// still matches the hash frozen at generation time. Uses the compact tcAcHashes map
-// (not the full tcStampedStories array) so the session KVS value stays small.
-// normAC folding makes a cosmetic AC reorder / label tweak still match, while a real
-// content change (or a different Story sliding into the same index) correctly skips.
-function tcAcsUnchanged(tcAcHashes, idx, feature) {
-  return !!tcAcHashes && tcAcHashes[idx] === acSetHash(feature && feature.acceptance_criteria);
 }
 
 async function stepStories(s) {
@@ -824,11 +837,19 @@ async function stepStories(s) {
   // Fetch per-story test-case entries in parallel when the tc hash map is present.
   // Each entry lives at testcases:<jobId>:<globalIdx> (global index = start + j).
   // Fail-open: a KVS read error → null → no embed for that story (never blocks push).
+  // ⭐ Match each pushed feature to its test cases by AC-CONTENT, not position. The push order
+  // (flattenBreakdown — capability-grouped from the edited breakdown) differs from the generation
+  // order (job.breakdown.features, flat), so position-keying mis-aligned all but the first story.
+  // Look up the generation storyIdx by the feature's AC-hash; the lookup IS the staleness check
+  // (a feature whose ACs match no generated story → no idx → no embed). Fail-open on KVS error.
   let tcEntries = null;
-  if (s.jobId && s.tcAcHashes) {
+  if (s.jobId && s.tcHashToIdx) {
     try {
       tcEntries = await Promise.all(
-        slice.map((_, j) => kvs.get(`testcases:${s.jobId}:${start + j}`).catch(() => null)),
+        slice.map((f) => {
+          const idx = s.tcHashToIdx[acSetHash(f && f.acceptance_criteria)];
+          return idx != null ? kvs.get(`testcases:${s.jobId}:${idx}`).catch(() => null) : Promise.resolve(null);
+        }),
       );
     } catch (e) {
       console.warn(`[push] tc entries fetch failed (non-fatal, no embed): ${String(e?.message || e)}`);
@@ -837,22 +858,16 @@ async function stepStories(s) {
   }
 
   const payloads = slice.map((f, j) => {
-    // ⭐ STALENESS FINGERPRINT (P4 audit C2): bind by AC-set HASH frozen at generation
-    // time, NOT the story name — a name edit still embeds (ACs unchanged), while a real
-    // AC edit / reorder / duplicate-name scenario correctly skips. Counts are updated
-    // only when a candidate exists (story with no generated cases is neither embedded nor skipped).
+    // The content-match above bound the right entry (or null when the feature's ACs match no
+    // generated story → edited/new → correctly no embed). tc_skipped is computed at the end
+    // (tcTotal − tc_embedded) so it reflects generated stories that did not land an embed.
     let tcEntry = null;
-    if (tcEntries) {
-      const candidate = tcEntries[j];
-      if (candidate && !candidate.error) {
-        if (tcAcsUnchanged(s.tcAcHashes, start + j, f)) {
-          tcEntry = candidate;
-          s.counts.tc_embedded++;
-        } else {
-          // Candidate exists but ACs changed since generation → skip embed.
-          s.counts.tc_skipped++;
-        }
-      }
+    const tcCand = tcEntries && tcEntries[j];
+    // Count + embed only when the entry actually has cases — a valid-but-empty entry would
+    // embed nothing, so counting it would over-report tc_embedded (and under-report tc_skipped).
+    if (tcCand && !tcCand.error && tcCand.result && Array.isArray(tcCand.result.test_cases) && tcCand.result.test_cases.length > 0) {
+      tcEntry = tcCand;
+      s.counts.tc_embedded++;
     }
     return buildStoryPayload(s.projectKey, f, s.epicKey, {
       embedTasks: !s.hasSubtasks,
@@ -1014,7 +1029,11 @@ function computeProgress(s) {
 function buildFinalResult(s) {
   const c = s.counts;
   const allSuccess = c.story_failures === 0 && c.subtask_failures === 0 && c.link_failures === 0;
-  console.log(`[push] DONE session=${s.sessionId} - stories=${c.stories_created} subtasks=${c.subtasks_created} links=${c.links_created} embedded=${c.tasks_embedded} tc_embedded=${c.tc_embedded} tc_skipped=${c.tc_skipped} (partial=${!allSuccess})`);
+  // tc_skipped = generated stories that did not land an embed (ACs edited since generation, or a
+  // story dropped from the push). Computed from the total (content-match makes a per-story skip
+  // count ambiguous). 0 on a clean push where every generated story was pushed unchanged.
+  const tcSkipped = Math.max(0, (s.tcTotal || 0) - c.tc_embedded);
+  console.log(`[push] DONE session=${s.sessionId} - stories=${c.stories_created} subtasks=${c.subtasks_created} links=${c.links_created} embedded=${c.tasks_embedded} tc_embedded=${c.tc_embedded} tc_skipped=${tcSkipped} (partial=${!allSuccess})`);
   return {
     partial: !allSuccess,
     result: {
@@ -1028,7 +1047,7 @@ function buildFinalResult(s) {
       subtasks_embedded: !s.hasSubtasks,
       tasks_embedded: c.tasks_embedded,
       tc_embedded: c.tc_embedded,
-      tc_skipped: c.tc_skipped,
+      tc_skipped: tcSkipped,
       epic_key: s.epicKey,
       browse_base: s.browseBase || null,
       created_issues: s.createdStories || [],
