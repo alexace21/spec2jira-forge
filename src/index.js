@@ -2051,7 +2051,7 @@ resolver.define('getTestCases', async ({ payload }) => {
  * SAFETY (design-army verdict, 2026-06-06):
  *   - Re-sanitize the user-edited result through parseTestCaseResult — user input is LESS
  *     trusted than model JSON; the parser owns every bound (drop empty when/then, repair
- *     ac_trace→inferred, priority whitelist, test_data cap, cap-15 AC-covering partition,
+ *     ac_trace→inferred, priority whitelist, test_data cap, cap-20 AC-covering partition,
  *     computeCoverage). One source of truth for bounds (POLICY §4).
  *   - Recompute coverage against the STAMPED ACs (tcjob.stampedStories) — the SAME ACs the
  *     push-embed AC-hash binds on and the original generation used. Never the live breakdown.

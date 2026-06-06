@@ -284,7 +284,8 @@ export function buildSpecSourceSystemText(specSourceText) {
 // clause, the hard maxItems ceiling, and the explicit merge rule.
 //
 // ⭐ SHIPPED CONFIG (production): MODEL = claude-sonnet-4-6 via the Anthropic Message
-//   BATCHES API; max_tokens = 16000 (TC_MAX_OUTPUT_TOKENS in anthropic_client.js). The
+//   BATCHES API; max_tokens = 24000 (TC_MAX_OUTPUT_TOKENS in anthropic_client.js; 16000→24000
+//   2026-06-06 with the ceiling 15→20 raise — headroom so 20 dense cases never truncate). The
 //   async Batches transport means the 25s Forge limit binds ONLY on the POLL resolver
 //   (fetch+parse of the completed JSONL), NOT on generation — so a generous output cap is
 //   free insurance against truncating a dense Story (engineering owns the cap, POLICY §4).
@@ -315,10 +316,10 @@ export function buildSpecSourceSystemText(specSourceText) {
 // ⚠ CONFIRMED 2026-06-05 (harness): Anthropic structured outputs REJECT numeric
 // constraints — "output_config.format.schema: For 'array' type, property 'maxItems'
 // is not supported" (minItems / minimum / maximum likewise; BREAKDOWN_SCHEMA uses none).
-// So the ceiling (≤15 cases), the ≥1 when/then, the non-empty ac_trace, and the 0-100
+// So the ceiling (≤20 cases), the ≥1 when/then, the non-empty ac_trace, and the 0-100
 // confidence band are NOT schema-enforced — they live in the SYSTEM_PROMPT and are
 // enforced in the defensive parse (engineering owns the limit — POLICY §4): the backend
-// caps test_cases to 15 (surfacing tail-loss via coverage, never silent), drops cases
+// caps test_cases to 20 (surfacing tail-loss via coverage, never silent), drops cases
 // with an empty when/then/ac_trace, and clamps confidence_score to 0-100.
 
 export const TEST_CASE_SCHEMA = {
@@ -330,7 +331,7 @@ export const TEST_CASE_SCHEMA = {
     no_acs: { type: 'boolean' }, // true when the Story had NO acceptance_criteria → every case is inferred (loud banner)
     test_cases: {
       type: 'array',
-      // Ceiling of 12 is enforced in the defensive parse + the SYSTEM_PROMPT (Anthropic rejects maxItems). Tail-loss is surfaced via the PURE coverage strip, never silent.
+      // Ceiling of 20 is enforced in the defensive parse + the SYSTEM_PROMPT (Anthropic rejects maxItems; raised 15→20 2026-06-06 for rule-dense decision-table stories). Tail-loss is surfaced via the PURE coverage strip, never silent.
       items: {
         type: 'object',
         additionalProperties: false,
@@ -434,7 +435,7 @@ TEST DATA (optional, per case). Populate test_data ONLY with the concrete, discr
 
 # OUTPUT FORMAT
 
-Return ONLY a JSON object that strictly conforms to the provided schema — no markdown, no prose, no commentary, no code fences. Omit optional fields you cannot fill confidently rather than emitting empty strings or placeholders like "TBD". ac_trace must never be empty for a case — use a kind='inferred' entry when no authored AC backs it. expected_result is mandatory and must be a single observable assertion. Order your output BREADTH-FIRST: emit ONE case for EACH authored acceptance criterion before emitting any second case for the same criterion — so that even if length truncates the response, every criterion already has a case and AC coverage is never sacrificed to length. (A single case MAY trace to more than one acceptance criterion — that counts as coverage for each; breadth-first guarantees no criterion is left uncovered at truncation, NOT that every criterion gets its own dedicated case, so it never conflicts with the merge rule.) Only AFTER every authored criterion has a case do you add depth (additional edge/negative cases), up to a hard ceiling of 15 cases per Story; if the testable surface needs more, keep the highest-value DISTINCT cases and never drop AC coverage silently. Within this breadth-first order the spec's concrete decision rules (Rule 6) rank ALONGSIDE the authored criteria, not after them: before any discretionary depth case, emit a case for each authored AC AND one for each reachable decision-table cell and threshold boundary this story enforces. If even that first pass would exceed 15, keep the cases asserting DISTINCT rule outcomes and boundaries (merging shared-outcome-same-defect cells) and surface the remainder as ONE concern "[RISK|medium] more decision-table cells / threshold boundaries exist than the 15-case ceiling allows; the highest-value distinct ones are covered — author the rest manually" — never drop a rule outcome silently. Depth is sacrificed to the cap first; a rule outcome or boundary, last. Every emitted string is in English.
+Return ONLY a JSON object that strictly conforms to the provided schema — no markdown, no prose, no commentary, no code fences. Omit optional fields you cannot fill confidently rather than emitting empty strings or placeholders like "TBD". ac_trace must never be empty for a case — use a kind='inferred' entry when no authored AC backs it. expected_result is mandatory and must be a single observable assertion. Order your output BREADTH-FIRST: emit ONE case for EACH authored acceptance criterion before emitting any second case for the same criterion — so that even if length truncates the response, every criterion already has a case and AC coverage is never sacrificed to length. (A single case MAY trace to more than one acceptance criterion — that counts as coverage for each; breadth-first guarantees no criterion is left uncovered at truncation, NOT that every criterion gets its own dedicated case, so it never conflicts with the merge rule.) Only AFTER every authored criterion has a case do you add depth (additional edge/negative cases), up to a hard ceiling of 20 cases per Story; if the testable surface needs more, keep the highest-value DISTINCT cases and never drop AC coverage silently. Within this breadth-first order the spec's concrete decision rules (Rule 6) rank ALONGSIDE the authored criteria, not after them: before any discretionary depth case, emit a case for each authored AC AND one for each reachable decision-table cell and threshold boundary this story enforces. MERGE same-outcome cells into ONE clean falsifiable case (e.g. several input-combinations the table maps to the SAME outcome, failing on the same defect, are one case asserting that shared outcome for all of them) — but NEVER hedge DIFFERENT outcomes into one case (a case whose expected_result says "outcome X OR Y" is not falsifiable — split it). If even that merged first pass would exceed 20, keep the cases asserting DISTINCT rule outcomes and boundaries and surface the remainder as ONE concern "[RISK|medium] more decision-table cells / threshold boundaries exist than the 20-case ceiling allows; the highest-value distinct ones are covered — author the rest manually" — never drop a rule outcome silently. Depth is sacrificed to the cap first; a rule outcome or boundary, last. Every emitted string is in English.
 
 # AGILE LENS
 

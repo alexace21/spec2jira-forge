@@ -37,7 +37,7 @@ function feature(name) {
   return f;
 }
 
-async function gen({ story, withSource, maxTokens = 16000 }) {
+async function gen({ story, withSource, maxTokens = 24000 }) {
   const system = [{ type: 'text', text: TEST_CASE_SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } }];
   const hasSpecSource = !!withSource;
   if (hasSpecSource) {
@@ -96,9 +96,13 @@ function markers(cases, list) {
   return list.filter((mk) => blob.includes(mk));
 }
 
+// ceiling-20 re-validation (2026-06-06): WITH-only (§7 already confirmed). Decisioning = the matrix
+// completeness check; Data Lifecycle (3 ACs, no decision table) = the NO-PAD check (must stay at its
+// natural count ~9, not balloon to 20); Affordability/Pricing = regression.
 const TARGETS = [
-  { name: 'Automated Credit Decisioning', ab: true, regress: [] },
-  { name: 'Eligibility Pre-Screening', ab: true, regress: [] },
+  { name: 'Automated Credit Decisioning', ab: false, regress: [] },
+  { name: 'Eligibility Pre-Screening', ab: false, regress: [] },
+  { name: 'Data Lifecycle Management', ab: false, regress: [] },
   { name: 'Affordability Assessment', ab: false, regress: ['40%', '50%', '200', '3.0%'] },
   { name: 'Risk-Based Pricing', ab: false, regress: ['4.90%', '24.90%', '6.90%'] },
 ];

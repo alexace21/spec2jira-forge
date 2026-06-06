@@ -52,7 +52,7 @@
  *   - test_data: empty-string entries filtered; capped at 5 entries
  *   - concern: left as-is (any concern type is valid — no breakdown-vocab assumption)
  *   - test_cases: AC-covering cases (tracing a real AC by ac_text) stably partitioned
- *     BEFORE inferred-only depth, THEN sliced to ≤15 — so the cap never drops AC coverage
+ *     BEFORE inferred-only depth, THEN sliced to ≤20 — so the cap never drops AC coverage
  *     (cost-asymmetry: an uncovered AC is expensive; an extra depth case is a cheap delete)
  * Then computes coverage via computeCoverage.
  *
@@ -137,17 +137,20 @@ export function parseTestCaseResult(raw, story) {
     })
     .filter(Boolean); // remove DROPped nulls
 
-  // Cap at 15 AFTER cleaning — but PARTITION AC-covering cases (those tracing a real AC
-  // by ac_text) BEFORE inferred-only depth, so the cap never drops AC coverage. The system
-  // prompt's breadth-first rule is SOFT (empirically the model occasionally places an
-  // AC-covering case late: a 16-case story lost 1 AC at a pure slice(0,12)); this stable
-  // partition makes the cap provably coverage-safe regardless. Cost-asymmetry (POLICY): an
-  // uncovered AC is expensive; an extra depth case is a cheap one-click delete — so when the
-  // cap must drop a case, it drops inferred depth, never an oracle-backed case.
+  // Cap at 20 AFTER cleaning (15→20 2026-06-06: a full decision-table story — e.g. a 5×3 credit
+  // matrix + ACs + override/uplift rules — genuinely needs ~18-20 distinct falsifiable cases; 15
+  // forced the model to compress/hedge the matrix tail (~8/15 cells in production). 20 + max_tokens
+  // 24K lets the full matrix land WITHOUT padding simple stories, which stay at their natural count
+  // — the cap is a CEILING, not a target). PARTITION AC-covering cases (those tracing a real AC by
+  // ac_text) BEFORE inferred-only depth, so the cap never drops AC coverage. The system prompt's
+  // breadth-first rule is SOFT (the model occasionally places an AC-covering case late); this
+  // stable partition makes the cap provably coverage-safe regardless. Cost-asymmetry (POLICY): an
+  // uncovered AC is expensive; an extra depth case is a cheap one-click delete — so when the cap
+  // must drop a case, it drops inferred depth, never an oracle-backed case.
   const tracesAC = (c) => Array.isArray(c.ac_trace) && c.ac_trace.some((t) => t && t.ac_text && String(t.ac_text).trim());
   const covering = cleaned.filter(tracesAC);
   const depth = cleaned.filter((c) => !tracesAC(c));
-  obj.test_cases = [...covering, ...depth].slice(0, 15);
+  obj.test_cases = [...covering, ...depth].slice(0, 20);
 
   // Compute coverage against the live Story ACs
   const coverage = computeCoverage(story, obj);

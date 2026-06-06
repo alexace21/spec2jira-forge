@@ -39,12 +39,15 @@ export const MODEL_FALLBACK = 'claude-haiku-4-5';
 // time — so a generous cap is free insurance against truncating a dense Story. The
 // reactive sub-chunk was dropped (Sonnet single-call covers ~100% on validated dense
 // stories), so this cap IS the worst-case safety margin. Engineering owns this cap (§4).
-// 16000 (raised from 8000, 2026-06-06): per-story output is bounded by the 15-case CEILING, so
-// this cap tracks the densest SINGLE story (≤15 verbose cases with long verbatim ac_text + the
-// §7 rule-derived cases ≈ ~10K worst case), NOT the spec size (a bigger spec = more stories =
-// more batch requests, each independently capped). It is a CEILING, not a target — normal stories
-// cost the same. If the 15-case ceiling ever rises, raise this with it.
-export const TC_MAX_OUTPUT_TOKENS = 16000;
+// 24000 (8000→16000→24000, 2026-06-06): per-story output is bounded by the 20-case CEILING (raised
+// from 15 so a full decision-table story fits its whole matrix without compressing/hedging). This
+// cap tracks the densest SINGLE story (≤20 verbose cases with long verbatim ac_text + §7 rule-
+// derived cells ≈ ~20K worst case; 24K = headroom so the 20-case CEILING — not the token cap — is
+// what bounds output, never a mid-case truncation), NOT the spec size (a bigger spec = more stories
+// = more batch requests, each independently capped). CEILING, not a target — normal stories cost the
+// same; tracks the case ceiling (raise together). Poll-scale: docs §5 #4 — chunked poll is the
+// >50-dense-story follow-up.
+export const TC_MAX_OUTPUT_TOKENS = 24000;
 
 // Output cap. Sonnet 4.6's max output is 64K tokens — we use ALL of it for
 // maximum headroom (it is a CEILING, not a target: a small spec still emits a
