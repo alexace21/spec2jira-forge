@@ -332,57 +332,63 @@ function StoryTestCaseCard({
             ? regenArmedLabel
             : "↻ Regenerate"}
         </button>
-        {/* Per-story copy buttons — Fix 2: discriminated feedback, never silent.
-            Copy/export read SAVED KVS — warn (title) when there are unsaved edits. */}
+        {/* Per-story copy buttons — discriminated feedback, never silent. Copy/export render the SAVED
+            KVS cases, so when this story has unsaved edits we show ONE clear "save first" hint instead
+            of two disabled-looking buttons (which read as broken) — exporting now would copy the stale
+            saved version. After Save the Copy buttons return. */}
         {!hasError && result && (
-          <>
-            <button
-              type="button"
-              onClick={(e) => { e.preventDefault(); e.stopPropagation(); if (isDirty) return; handleCopyGherkin(); }}
-              disabled={isDirty}
-              className="text-[10px] px-2 py-0.5 rounded"
-              style={{
-                background: "none",
-                border: `1px solid ${copyGherkinState === "failed" ? "var(--s2j-red-border)" : "var(--s2j-border)"}`,
-                color: copyGherkinState === "failed" && !isDirty ? "var(--s2j-red)" : "var(--s2j-text-muted)",
-                cursor: isDirty ? "not-allowed" : "pointer",
-              }}
-              title={isDirty ? "Save this story first — export reads the SAVED cases" : "Copy Gherkin .feature for this story"}
+          isDirty ? (
+            <span
+              className="text-[10px] italic px-2 py-0.5 inline-flex items-center gap-1 rounded"
+              style={{ color: "var(--s2j-text-muted)", border: "1px dashed var(--s2j-border)" }}
+              title="Export copies the SAVED cases — save your edits (above) to include them in the Gherkin/CSV copy"
             >
-              {isDirty
-                ? "Save to export"
-                : copyGherkinState === "clipboard"
-                ? "✓ Copied"
-                : copyGherkinState === "download"
-                ? "✓ Downloaded"
-                : copyGherkinState === "failed"
-                ? "Copy failed — check browser permissions"
-                : "Copy Gherkin"}
-            </button>
-            <button
-              type="button"
-              onClick={(e) => { e.preventDefault(); e.stopPropagation(); if (isDirty) return; handleCopyCsv(); }}
-              disabled={isDirty}
-              className="text-[10px] px-2 py-0.5 rounded"
-              style={{
-                background: "none",
-                border: `1px solid ${copyCsvState === "failed" ? "var(--s2j-red-border)" : "var(--s2j-border)"}`,
-                color: copyCsvState === "failed" && !isDirty ? "var(--s2j-red)" : "var(--s2j-text-muted)",
-                cursor: isDirty ? "not-allowed" : "pointer",
-              }}
-              title={isDirty ? "Save this story first — export reads the SAVED cases" : "Copy CSV/manual-table for this story"}
-            >
-              {isDirty
-                ? "Save to export"
-                : copyCsvState === "clipboard"
-                ? "✓ Copied"
-                : copyCsvState === "download"
-                ? "✓ Downloaded"
-                : copyCsvState === "failed"
-                ? "Copy failed — check browser permissions"
-                : "Copy CSV"}
-            </button>
-          </>
+              ⤓ Save to enable export
+            </span>
+          ) : (
+            <>
+              <button
+                type="button"
+                onClick={(e) => { e.preventDefault(); e.stopPropagation(); handleCopyGherkin(); }}
+                className="text-[10px] px-2 py-0.5 rounded"
+                style={{
+                  background: "none",
+                  border: `1px solid ${copyGherkinState === "failed" ? "var(--s2j-red-border)" : "var(--s2j-border)"}`,
+                  color: copyGherkinState === "failed" ? "var(--s2j-red)" : "var(--s2j-text-muted)",
+                  cursor: "pointer",
+                }}
+                title="Copy Gherkin .feature for this story"
+              >
+                {copyGherkinState === "clipboard"
+                  ? "✓ Copied"
+                  : copyGherkinState === "download"
+                  ? "✓ Downloaded"
+                  : copyGherkinState === "failed"
+                  ? "Copy failed — check browser permissions"
+                  : "Copy Gherkin"}
+              </button>
+              <button
+                type="button"
+                onClick={(e) => { e.preventDefault(); e.stopPropagation(); handleCopyCsv(); }}
+                className="text-[10px] px-2 py-0.5 rounded"
+                style={{
+                  background: "none",
+                  border: `1px solid ${copyCsvState === "failed" ? "var(--s2j-red-border)" : "var(--s2j-border)"}`,
+                  color: copyCsvState === "failed" ? "var(--s2j-red)" : "var(--s2j-text-muted)",
+                  cursor: "pointer",
+                }}
+                title="Copy CSV/manual-table for this story"
+              >
+                {copyCsvState === "clipboard"
+                  ? "✓ Copied"
+                  : copyCsvState === "download"
+                  ? "✓ Downloaded"
+                  : copyCsvState === "failed"
+                  ? "Copy failed — check browser permissions"
+                  : "Copy CSV"}
+              </button>
+            </>
+          )
         )}
       </summary>
 
