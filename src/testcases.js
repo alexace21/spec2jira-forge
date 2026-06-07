@@ -148,9 +148,23 @@ export function parseTestCaseResult(raw, story) {
   // uncovered AC is expensive; an extra depth case is a cheap one-click delete — so when the cap
   // must drop a case, it drops inferred depth, never an oracle-backed case.
   const tracesAC = (c) => Array.isArray(c.ac_trace) && c.ac_trace.some((t) => t && t.ac_text && String(t.ac_text).trim());
-  const covering = cleaned.filter(tracesAC);
-  const depth = cleaned.filter((c) => !tracesAC(c));
-  obj.test_cases = [...covering, ...depth].slice(0, 20);
+  // #2: ALSO protect a case carrying a FORWARDED, breakdown-typed concern (RISK / AMBIGUITY /
+  // EXTERNAL_DEPENDENCY / COMPLIANCE / TECH_DEBT — i.e. NOT a plain author [ASSUMPTION]). Rule 7
+  // promises a flagged-risk case is never dropped at the 20-cap ahead of a discretionary depth
+  // case; the model's breadth-first ordering is SOFT, so this deterministic guard backs that
+  // promise. The "[TYPE|" prefix is a structure WE define → matching it is a pure structural check
+  // (POLICY §4), not meaning-reading. A plain [ASSUMPTION]/untyped concern = an author inference → not protected.
+  const carriesForwardedConcern = (c) => typeof c.concern === 'string'
+    && /^\s*\[(RISK|AMBIGUITY|EXTERNAL_DEPENDENCY|COMPLIANCE|TECH_DEBT)\b/i.test(c.concern);
+  // 3-TIER stable partition (deep-audit 2026-06-07): AC-covering cases keep ABSOLUTE priority — the
+  // cap NEVER drops AC coverage (the original invariant). A forwarded-typed-concern case ranks
+  // SECOND (protected ahead of discretionary depth, backing Rule 7's promise). Plain depth drops
+  // first. ⚠ A 2-class merge (AC ∪ concern in ONE bucket, then slice) could evict an AC-covering
+  // case behind a forwarded-concern case on a >20-case story — this subordination prevents that.
+  const acTracers = cleaned.filter(tracesAC);
+  const concernOnly = cleaned.filter((c) => !tracesAC(c) && carriesForwardedConcern(c));
+  const depth = cleaned.filter((c) => !tracesAC(c) && !carriesForwardedConcern(c));
+  obj.test_cases = [...acTracers, ...concernOnly, ...depth].slice(0, 20);
 
   // Compute coverage against the live Story ACs
   const coverage = computeCoverage(story, obj);

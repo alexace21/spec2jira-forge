@@ -54,9 +54,9 @@ import {
   pollTestCaseBatch,
   fetchTestCaseResults,
 } from './anthropic_client.js';
-import { startPushSession, pushSessionStep } from './push_handler.js';
+import { startPushSession, pushSessionStep, flattenBreakdown } from './push_handler.js';
 import { detectCycles } from './graph.js';
-import { renderGherkin, renderManualTable, parseTestCaseResult } from './testcases.js';
+import { renderGherkin, renderManualTable, parseTestCaseResult, normAC } from './testcases.js';
 import {
   TIERS,
   checkQuota,
@@ -1754,8 +1754,12 @@ resolver.define('pushStep', async ({ payload }) => {
 /**
  * startTestCaseGeneration — submit a test-case batch for all Stories in a job.
  *
- * Payload: { jobId }
+ * Payload: { jobId, breakdown? }
  *   jobId: the completed breakdown job whose features[] we generate test cases for.
+ *   breakdown: the BA's Review-EDITED breakdown (legacy capabilities shape, as the push
+ *     receives it). #1 fix — reverse-adapted via flattenBreakdown and persisted into
+ *     job.breakdown so test-gen + per-Story regenerate + reconnect + the push AC-hash embed
+ *     all read ONE consistent EDITED list. Absent (old client) → falls back to the stored breakdown.
  *
  * Mitigations wired:
  *   #2 (idempotency): if tcjob already exists in batched/completed state, return it.
@@ -1799,6 +1803,31 @@ resolver.define('startTestCaseGeneration', async ({ payload, context }) => {
   if (job.status !== 'completed') {
     return { error: 'breakdown_not_ready', detail: `Breakdown job is in status '${job.status}'; it must be 'completed' before generating test cases.` };
   }
+
+  // ⭐ #1 fix (edited-state) — consume the BA's Review-EDITED breakdown, not the pristine one.
+  // The edits arrive in payload.breakdown (the SAME edited, legacy-shaped breakdown the push
+  // receives). flattenBreakdown reverse-adapts it to v3-native features[] (the exact function +
+  // input the push uses → identical ACs → the push AC-hash embed is guaranteed to match). We
+  // persist the edited features back into the canonical job.breakdown so EVERY downstream reader —
+  // this resolver, per-Story regenerate (~line 2220), getResults/reconnect, and the push embed —
+  // reads ONE consistent edited list (single source of truth). All other job + breakdown fields
+  // (metadata, shared_acceptance_criteria — NOT editable via the breakdown JSON — pageVersion,
+  // usage, model, truncated, …) are preserved. Fail-SOFT: a missing/empty/malformed edited list
+  // never overwrites a good breakdown (POLICY §11 — never silently destroy data); keep the stored one.
+  if (payload && payload.breakdown) {
+    try {
+      const { features: editedFeatures } = flattenBreakdown(payload.breakdown);
+      if (Array.isArray(editedFeatures) && editedFeatures.length > 0) {
+        job.breakdown = { ...job.breakdown, features: editedFeatures };
+        await kvs.set(`${JOB_KEY_PREFIX}${jobId}`, { ...job });
+      } else {
+        console.warn(`[startTCGen] edited breakdown flattened to 0 features — keeping stored breakdown for ${jobId}`);
+      }
+    } catch (e) {
+      console.warn(`[startTCGen] persist edited breakdown failed (keeping stored): ${String(e?.message || e)}`);
+    }
+  }
+
   const stories = (job.breakdown && Array.isArray(job.breakdown.features)) ? job.breakdown.features : [];
   if (stories.length === 0) {
     return { error: 'no_stories', detail: 'The breakdown has no features/stories to generate test cases for.' };
@@ -1808,16 +1837,30 @@ resolver.define('startTestCaseGeneration', async ({ payload, context }) => {
   // immediately without re-submitting (avoids 2× cost on double-click or UI re-mount).
   const existingTcJob = await kvs.get(`${TC_JOB_KEY_PREFIX}${jobId}`);
   if (existingTcJob && (existingTcJob.status === 'batched' || existingTcJob.status === 'completed')) {
-    console.log(`[startTCGen] idempotent return — tcjob ${jobId} already ${existingTcJob.status}`);
-    return { jobId, status: existingTcJob.status, total: existingTcJob.total };
+    // Idempotent return ONLY when the breakdown is UNCHANGED since these cases were generated (a
+    // double-click / re-mount → avoid 2× cost). If the BA EDITED the breakdown (ACs differ from the
+    // stamped set), the existing cases are STALE → fall through and RE-GENERATE: this is the working
+    // refresh behind the #1 "edited since generation" warning (user-triggered — the BA clicks Regenerate;
+    // never auto). The normAC AC-signature matches the push's embed decision, so a trivial reword the
+    // push would still embed does NOT force a costly re-generate. `stories` = the just-persisted EDITED list.
+    const acSig = (storyList) => (Array.isArray(storyList) ? storyList : [])
+      .flatMap((s) => (Array.isArray(s && s.acceptance_criteria) ? s.acceptance_criteria : []))
+      .map(normAC).sort().join('|');
+    if (acSig(existingTcJob.stampedStories) === acSig(stories)) {
+      console.log(`[startTCGen] idempotent return — tcjob ${jobId} already ${existingTcJob.status} (breakdown unchanged)`);
+      return { jobId, status: existingTcJob.status, total: existingTcJob.total };
+    }
+    console.log(`[startTCGen] breakdown edited since generation — re-generating tcjob ${jobId}`);
+    // fall through → re-stamp the edited ACs + submit a fresh batch
   }
 
   const total = stories.length;
   const createdAt = new Date().toISOString();
 
-  // #7 — stamp the story list (idx + name + acceptance_criteria) at submit time. When the
-  // editor edits a Story between submit and fetch, the stamped list preserves the
-  // ORIGINAL ACs that coverage was computed against. P5 reconciles added/deleted stories.
+  // #7 — stamp the story list (idx + name + acceptance_criteria) at submit time. These ACs come
+  // from the EDITED breakdown persisted just above (#1 fix), so coverage is computed against the
+  // BA's edited ACs — and the push AC-hash embed (which hashes tcjob.stampedStories) matches the
+  // pushed (edited) features. P5 reconciles added/deleted stories.
   // LEAN: only {idx, name, acceptance_criteria} — the only fields computeCoverage uses.
   const stampedStories = stories.map((s, i) => ({
     idx: i,
@@ -1847,7 +1890,8 @@ resolver.define('startTestCaseGeneration', async ({ payload, context }) => {
   const specSourceText = await resolveSpecSourceText(jobId, job);
 
   // Submit the N-request batch to Anthropic
-  const submitResult = await submitTestCaseBatch({ stories, sharedAcceptanceCriteria: sharedACs, specSummary, specSourceText, apiKey });
+  const specConcerns = (job.breakdown && Array.isArray(job.breakdown.spec_concerns)) ? job.breakdown.spec_concerns : [];
+  const submitResult = await submitTestCaseBatch({ stories, sharedAcceptanceCriteria: sharedACs, specConcerns, specSummary, specSourceText, apiKey });
   if (submitResult.error) {
     console.error(`[startTCGen] batch submit failed: ${submitResult.error} | ${submitResult.detail}`);
     await kvs.set(`${TC_JOB_KEY_PREFIX}${jobId}`, {
@@ -2244,8 +2288,10 @@ resolver.define('regenerateTestCase', async ({ payload, context }) => {
   const specSourceText = await resolveSpecSourceText(jobId, job);
   const submitResult = await submitTestCaseBatch({
     stories: [story],
+    allStories: stories, // §8 (#2): resolve dependency peers from the FULL feature list, not the 1-element regen batch
     siblingNames: stories.map((s) => s && (s.name || '')),
     sharedAcceptanceCriteria: sharedACs,
+    specConcerns: (job.breakdown && Array.isArray(job.breakdown.spec_concerns)) ? job.breakdown.spec_concerns : [],
     specSummary,
     specSourceText,
     apiKey,

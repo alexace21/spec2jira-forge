@@ -197,7 +197,7 @@ function richADF({ userStory, description, acceptanceCriteria, sourceHeading, em
  *                acceptance_criteria, dependencies, tasks }]
  *   links: [{ source: <featureName>, target: <featureName> }]
  */
-function flattenBreakdown(breakdown) {
+export function flattenBreakdown(breakdown) {
   if (!breakdown) return { epic: null, features: [], links: [] };
 
   const epic =

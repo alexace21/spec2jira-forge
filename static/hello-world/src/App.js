@@ -859,7 +859,8 @@ function App() {
           }
           // Fix 6 (Audit-6/7 reconnect): if TC generation was in-flight when the user
           // reconnected (tcStatus batched/pending), resume polling so completion still lands.
-          // setTcGenerating(true) drives the "⏳ Generating…" button on the reviewing screen.
+          // setTcGenerating(true) drives the "⏳ Generating tests…" state on the Review/Confirm
+          // screen's test-cases button (the in-flight state surfaces there post-#1-redesign).
           if (full.tcStatus === 'batched' || full.tcStatus === 'pending') {
             setTcGenerating(true);
             startTcPolling(statusResult.job_id);
@@ -1134,7 +1135,13 @@ function App() {
     setTcElapsed(0);
     setTcJobStatus({ progress: 0, phase: "Starting…" });
 
-    const result = await invoke("startTestCaseGeneration", { jobId });
+    // #1 fix (edited-state): send the BA's edited breakdown (lifted into pendingBreakdown on the
+    // Review→TestCases nav) so the backend generates test cases for the EDITED stories/ACs, not
+    // the pristine generated ones. Mirrors the push (handleConfirmedPush sends the same shape).
+    const result = await invoke("startTestCaseGeneration", {
+      jobId,
+      breakdown: pendingBreakdown || results?.breakdown,
+    });
 
     if (result.error === "quota_exceeded") {
       setTcGenerating(false); // Fix 6
@@ -1185,7 +1192,7 @@ function App() {
     }
 
     startTcPolling(jobId);
-  }, [jobId, startTcPolling]);
+  }, [jobId, startTcPolling, pendingBreakdown, results]);
 
   const handleRegenerateTestCase = useCallback(
     (storyIdx) => {
@@ -1280,12 +1287,21 @@ function App() {
     [jobId],
   );
 
-  const handleOpenTestCases = useCallback(() => {
+  const handleOpenTestCases = useCallback((edited) => {
+    // Navigate to the Test Cases screen. After the #1 flow redesign this is reached from the
+    // Review/Confirm screen, where pendingBreakdown was ALREADY lifted (handlePush on the
+    // editor→Review step) — so test-gen consumes the EDITED breakdown. The optional `edited` arg
+    // + `.capabilities` guard remain a defensive lift: only a real legacy-shaped breakdown lifts,
+    // never a stray truthy value (e.g. a SyntheticEvent) that would corrupt pendingBreakdown.
+    if (edited && edited.capabilities) setPendingBreakdown(edited);
     setScreen("testcases");
   }, []);
 
   const handleBackFromTestCases = useCallback(() => {
-    setScreen("reviewing");
+    // #1 fix (flow redesign): Test Cases is now reached FROM the Review/Confirm screen (the single
+    // lift point), so Back returns there — not to the editor. (dryRunResult + pendingBreakdown were
+    // set by handlePush on the editor→Review step, so the Review screen re-renders cleanly.)
+    setScreen("confirming");
     // Intentionally does NOT clear testCaseResults — they persist until page change / regenerate
   }, []);
 
@@ -1503,45 +1519,7 @@ function App() {
           >
             {pageData?.title || "(reviewing)"}
           </span>
-          {/* Test Cases button (P5) — routes to the dedicated test cases screen.
-              Shows "✓ Test Cases" when results are already generated (green, signals
-              they're ready). ml-auto is on the Regenerate button (far right), so this
-              one sits between the page title and Regenerate. */}
-          {/* Fix 6: button label reflects tcGenerating state so the BA sees progress
-              even after backing from generatingTests to reviewing. */}
-          <button
-            onClick={tcGenerating ? undefined : handleOpenTestCases}
-            disabled={tcGenerating}
-            className="text-xs flex items-center gap-1.5 ml-auto"
-            style={{
-              background: "none",
-              border: "none",
-              color: tcGenerating
-                ? "var(--s2j-text-muted)"
-                : testCaseResults
-                ? "var(--s2j-green-dark)"
-                : "var(--s2j-blue)",
-              cursor: tcGenerating ? "not-allowed" : "pointer",
-              padding: "4px 8px",
-              borderRadius: "4px",
-              transition: "all 0.15s",
-            }}
-            onMouseEnter={(e) => {
-              if (!tcGenerating) e.currentTarget.style.background = "var(--s2j-border)";
-            }}
-            onMouseLeave={(e) => {
-              e.currentTarget.style.background = "none";
-            }}
-            title={
-              tcGenerating
-                ? "Test cases are being generated in the background…"
-                : testCaseResults
-                ? "View generated test cases"
-                : "Generate and view test cases for this breakdown"
-            }
-          >
-            {tcGenerating ? "⏳ Generating…" : testCaseResults ? "✓ Test Cases" : "Test Cases"}
-          </button>
+          {/* Test-case entry moved to the Review screen (ConfirmScreen) — single lift point (#1 fix). */}
           {/* Regenerate (2026-06-02) — the must-have path back to generation. A
               reopened completed page lands here on the OLD breakdown (routeByPageStatus
               bypasses Ready), so without this a user who edited the spec page had no
@@ -1552,7 +1530,7 @@ function App() {
               marginRight: -8px pins it to the far end of this flex-row top-bar. */}
           <button
             onClick={handleRegenerate}
-            className="text-xs flex items-center gap-1.5"
+            className="text-xs flex items-center gap-1.5 ml-auto"
             style={{
               background: "none",
               border: "none",
@@ -1615,14 +1593,41 @@ function App() {
             initialBreakdown={pendingBreakdown || results.breakdown}
             onPush={handlePush}
             isPushing={isPushing}
-            onOpenTestCases={handleOpenTestCases}
-            testCaseResults={testCaseResults}
-            tcGenerating={tcGenerating}
           />
         </div>
       </div>
     );
   }
+
+  // Edit-after-generate staleness (#1 honest-signal): the BA edited the breakdown AFTER generating
+  // test cases → the cases (stamped against the OLD ACs) are outdated. Compare the current breakdown's
+  // AC-signature to what the LOADED cases were generated against (perStory[].story.acceptance_criteria =
+  // the stamped ACs the push will hash). Frontend-only; surfaces a WARNING — NO auto-regen (the BA's
+  // call whether to push as-is or regenerate, per the cost/agency decision). Normalized EXACTLY like the
+  // backend normAC (curly quotes / NBSP / "AC1:" prefix / backslash folds) so the warning fires precisely
+  // when the push would skip the embed — and the matching idempotency check re-generates on the same
+  // signal. Order-independent across stories + ACs.
+  const tcStaleVsEdits = (() => {
+    if (!testCaseResults || !Array.isArray(testCaseResults.perStory)) return false;
+    const sig = (stories) => {
+      const acs = [];
+      for (const s of Array.isArray(stories) ? stories : []) {
+        for (const ac of Array.isArray(s && s.acceptance_criteria) ? s.acceptance_criteria : []) {
+          const n = String(ac == null ? "" : ac)
+            .replace(/^\s*AC\s*\d+\s*[:.]\s*/i, "").replace(/\\/g, "")
+            .replace(/[‘’‛′]/g, "'").replace(/[“”‟″]/g, '"')
+            .replace(/ /g, " ").replace(/\s+/g, " ").trim().toLowerCase();
+          if (n) acs.push(n);
+        }
+      }
+      return acs.sort().join("|");
+    };
+    const cur = pendingBreakdown || results?.breakdown;
+    const currentStories = cur && Array.isArray(cur.capabilities) ? cur.capabilities.flatMap((c) => c.features || []) : [];
+    if (!currentStories.length) return false; // no current breakdown to compare → never false-warn
+    const genStories = testCaseResults.perStory.map((p) => p && p.story).filter(Boolean);
+    return sig(currentStories) !== sig(genStories);
+  })();
 
   switch (screen) {
     case "loading":
@@ -1684,7 +1689,6 @@ function App() {
       return (
         <GeneratingTestsScreen
           pageTitle={pageData?.title}
-          tcJobStatus={tcJobStatus}
           tcElapsed={tcElapsed}
           onBack={handleBackFromTestCases}
         />
@@ -1700,6 +1704,7 @@ function App() {
           onBack={handleBackFromTestCases}
           onPush={handlePush}
           onGenerate={handleGenerateTestCases}
+          tcStale={tcStaleVsEdits}
           onRegenerate={handleRegenerateTestCase}
           onSaveTestCase={handleSaveTestCase}
           regenStates={regenStates}
@@ -1718,6 +1723,10 @@ function App() {
           onRemoveDependency={handleRemoveDependency}
           onRestoreDependency={handleRestoreDependency}
           testCaseResults={testCaseResults}
+          onGenerateTestCases={handleGenerateTestCases}
+          onOpenTestCases={handleOpenTestCases}
+          tcGenerating={tcGenerating}
+          tcStale={tcStaleVsEdits}
         />
       );
     case "pushing":
@@ -2095,10 +2104,12 @@ function GeneratingScreen({ pageTitle, elapsed, onBack, onStartOver }) {
 // Clones GeneratingScreen for test-case bulk generation.
 // Generation runs on Anthropic's async Batch API (same as the breakdown
 // batch); the same "you can leave" and "taking longer" UX applies.
-function GeneratingTestsScreen({ pageTitle, tcJobStatus, tcElapsed, onBack }) {
-  const progress = tcJobStatus?.progress;
-  const pct = typeof progress === "number" ? Math.round(progress * 100) : null;
-
+function GeneratingTestsScreen({ pageTitle, tcElapsed, onBack }) {
+  // #3 (2026-06-07): NO determinate "% complete". Test-case generation is one async Anthropic BATCH
+  // (N per-story requests that all finish together at the end), so progress sits at 0 the whole run
+  // then jumps to 100 — the old "0% complete" read as BROKEN, most acutely right after a user-clicked
+  // regenerate. An honest INDETERMINATE spinner + the live timer conveys "working, here's how long"
+  // without faking a percentage (mirrors the breakdown GeneratingScreen fix).
   return (
     <div className="p-6" style={SCREEN_MAX_WIDTH_STYLE}>
       {onBack && (
@@ -2136,11 +2147,6 @@ function GeneratingTestsScreen({ pageTitle, tcJobStatus, tcElapsed, onBack }) {
         {pageTitle && (
           <p className="text-sm mt-0.5" style={{ color: "var(--s2j-text-light)" }}>
             {pageTitle}
-          </p>
-        )}
-        {pct !== null && (
-          <p className="text-xs mt-1" style={{ color: "var(--s2j-text-muted)" }}>
-            {pct}% complete
           </p>
         )}
         <p
@@ -2227,6 +2233,10 @@ function ConfirmScreen({
   onRemoveDependency,
   onRestoreDependency,
   testCaseResults,
+  onGenerateTestCases,
+  onOpenTestCases,
+  tcGenerating,
+  tcStale,
 }) {
   const total = dryRunResult?.total_items || 0;
   const epics = dryRunResult?.total_epics || 0;
@@ -2234,6 +2244,12 @@ function ConfirmScreen({
   const tasks = dryRunResult?.total_subtasks || 0;
   const links = dryRunResult?.dependency_links || 0;
   const project = dryRunResult?.project_key || "(Settings)";
+  const tcStaleNow = !!testCaseResults && !!tcStale; // edited-since-generation → amber warning (not green ✓)
+  // 2-step armed confirm for the EXPENSIVE re-run-all (Phase-1 cost fix): a stale re-generate re-runs
+  // ALL stories (full Anthropic cost), so the BA must click twice + see the scope — never a surprise
+  // spend. (Targeted per-story / per-case regeneration is the separate follow-up feature.)
+  const [regenArmed, setRegenArmed] = useState(false);
+  const regenArmTimer = useRef(null);
 
   // Extract v3 native signals от breakdown's _v3_original (preserved by
   // v3AdaptResultPayload at result-load time). Falls back gracefully когато
@@ -2613,6 +2629,71 @@ function ConfirmScreen({
           </div>
         </details>
       )}
+
+      {/* Optional pre-push step (P5) — generate acceptance test cases for these stories. This is
+          THE single entry point to test-case generation (moved here from the editor + top-bar so
+          the BA's edits are always lifted into pendingBreakdown before generating — #1 fix). */}
+      <div
+        className="rounded-lg p-3 mb-3 flex items-center justify-between gap-3"
+        style={{
+          background: tcStaleNow ? "var(--s2j-orange-bg)" : testCaseResults ? "var(--s2j-green-bg)" : "var(--s2j-blue-bg)",
+          border: `1px solid ${tcStaleNow ? "var(--s2j-orange-border)" : testCaseResults ? "var(--s2j-green-border)" : "var(--s2j-blue-border)"}`,
+        }}
+      >
+        <div>
+          <p className="text-xs font-medium" style={{ color: "var(--s2j-text)" }}>
+            {tcStaleNow
+              ? "⚠ Test cases may be outdated"
+              : testCaseResults
+              ? "✓ Acceptance test cases generated"
+              : "Optional: acceptance test cases"}
+          </p>
+          <p className="text-xs" style={{ color: "var(--s2j-text-muted)" }}>
+            {tcStaleNow
+              ? "You edited the breakdown since generating these. Re-running re-generates ALL stories (takes a few minutes, uses compute) — or push as-is; the edited stories simply won't get a test-case summary. Your call."
+              : "BA-grade Gherkin / CSV export + a summary embedded in each Jira Story."}
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={() => {
+            if (testCaseResults && !tcStaleNow) { onOpenTestCases?.(); return; }
+            // Stale re-run-all is expensive (every story re-billed) → arm a 2-step confirm so the BA
+            // consciously consents (Phase-1 cost fix). First click arms; second (within 4s) fires.
+            if (tcStaleNow && !regenArmed) {
+              setRegenArmed(true);
+              clearTimeout(regenArmTimer.current);
+              regenArmTimer.current = setTimeout(() => setRegenArmed(false), 4000);
+              return;
+            }
+            setRegenArmed(false);
+            onGenerateTestCases?.();
+          }}
+          disabled={isPushing || tcGenerating}
+          className="shrink-0"
+          style={{
+            background: tcStaleNow ? "var(--s2j-orange-bg)" : testCaseResults ? "var(--s2j-green-bg)" : "var(--s2j-blue-bg)",
+            border: `1px solid ${tcStaleNow ? "var(--s2j-orange-border)" : testCaseResults ? "var(--s2j-green-border)" : "var(--s2j-blue-border)"}`,
+            color: tcStaleNow ? "var(--s2j-text)" : testCaseResults ? "var(--s2j-green-dark)" : "var(--s2j-blue)",
+            padding: "6px 12px",
+            borderRadius: "6px",
+            fontSize: "13px",
+            fontWeight: 500,
+            cursor: isPushing || tcGenerating ? "not-allowed" : "pointer",
+            whiteSpace: "nowrap",
+          }}
+        >
+          {tcGenerating
+            ? "⏳ Generating tests…"
+            : tcStaleNow
+            ? regenArmed
+              ? `⚠ Re-runs all ${stories} stories — confirm?`
+              : "🔄 Re-run all test cases"
+            : testCaseResults
+            ? "View / edit →"
+            : "🧪 Generate Test Cases"}
+        </button>
+      </div>
 
       {/* Final action */}
       <div

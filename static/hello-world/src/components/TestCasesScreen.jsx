@@ -313,6 +313,32 @@ function StaleBanner() {
   );
 }
 
+// ── EditStaleBanner ──────────────────────────────────────────────
+// Shown when the BREAKDOWN was edited (in-app) since these test cases were generated — the cases
+// (and the per-Story Jira embed) rest on the earlier acceptance criteria. Distinct from StaleBanner
+// (Confluence PAGE-version drift). NO auto-regen — the BA decides: regenerate affected stories, or push as-is.
+function EditStaleBanner() {
+  return (
+    <div
+      className="rounded-lg p-3 mb-4 flex items-start gap-2"
+      style={{
+        background: "var(--s2j-orange-bg)",
+        border: "1px solid var(--s2j-orange-border)",
+      }}
+    >
+      <span aria-hidden="true" style={{ flexShrink: 0 }}>⚠</span>
+      <div>
+        <p className="text-sm font-medium" style={{ color: "var(--s2j-text)" }}>
+          The breakdown was edited since these test cases were generated
+        </p>
+        <p className="text-xs mt-0.5" style={{ color: "var(--s2j-text-light)" }}>
+          These cases (and the summary that embeds in each Jira Story) rest on the earlier acceptance criteria. Regenerate the affected stories (↻ Regenerate per card) to refresh — or push as-is; it's your call.
+        </p>
+      </div>
+    </div>
+  );
+}
+
 // ════════════════════════════════════════════════════════════════
 // TestCasesScreen
 // ════════════════════════════════════════════════════════════════
@@ -325,7 +351,7 @@ function StaleBanner() {
  *   pageTitle         — string; shown in top bar
  *   jobId             — string; needed for export + regenerate invokes
  *   currentVersion    — number|null; current Confluence page version
- *   onBack            — fn() → reviewing screen (does NOT clear testCaseResults)
+ *   onBack            — fn() → Review/Confirm screen (confirming; does NOT clear testCaseResults)
  *   onPush            — fn(breakdown) → confirming screen
  *   onGenerate        — fn() → triggers bulk generation (handleGenerateTestCases)
  *   onRegenerate      — fn(storyIdx) → per-story regen
@@ -337,6 +363,7 @@ function TestCasesScreen({
   pageTitle,
   jobId,
   currentVersion,
+  tcStale,
   onBack,
   onPush,
   onGenerate,
@@ -552,11 +579,15 @@ function TestCasesScreen({
           Acceptance scenarios for every story — export to Gherkin (BDD tools) or CSV (ADO, Jama, TestRail…).
         </p>
 
+        {/* Defensive fallback: post-#1-redesign this screen opens only WITH results (the
+            Review/Confirm screen generates directly), so this branch is normally unreachable —
+            kept so a BA who somehow lands here without results still has a generate path. */}
         {!testCaseResults ? (
           <GeneratePrompt storyCount={storyCount} onGenerate={onGenerate} />
         ) : (
           <>
             {isStale && <StaleBanner />}
+            {tcStale && <EditStaleBanner />}
             <SummaryBar testCaseResults={testCaseResults} onRegenerate={handleRegenerate} />
             <div>
               {perStory.map((entry) => (

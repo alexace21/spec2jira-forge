@@ -617,13 +617,14 @@ export async function fetchBatchResults(resultsUrl, customId, apiKeyOverride = n
  * cost, N-1 cache-reads). Each request's user block is per-Story (not cached).
  *
  * @param {object} args
- * @param {Array<object>} args.stories               the feature/Story objects from job.breakdown.features
+ * @param {Array<object>} args.stories               the Story objects to generate for (bulk: all; regen: a 1-element batch)
+ * @param {Array<object>} [args.allStories]          the FULL breakdown feature list — dependency peers (§8 #2) resolve against this, NOT the (possibly 1-element regen) `stories` batch; defaults to `stories`
  * @param {string[]} [args.sharedAcceptanceCriteria] from breakdown.shared_acceptance_criteria
  * @param {string} [args.specSummary]                from breakdown.metadata.spec_summary
  * @param {string} args.apiKey                       caller MUST pass the resolved key (Managed or BYOK)
  * @returns {Promise<{batchId?, status?, createdAt?, expiresAt?, error?, detail?}>}
  */
-export async function submitTestCaseBatch({ stories, siblingNames, sharedAcceptanceCriteria, specSummary, specSourceText, apiKey }) {
+export async function submitTestCaseBatch({ stories, allStories, siblingNames, sharedAcceptanceCriteria, specConcerns, specSummary, specSourceText, apiKey }) {
   if (!apiKey) {
     return { error: 'not_configured', detail: 'Anthropic API key not configured.' };
   }
@@ -655,6 +656,40 @@ export async function submitTestCaseBatch({ stories, siblingNames, sharedAccepta
     ? siblingNames
     : stories.map((s) => s && (s.name || ''));
 
+  // §8 (#2): resolve each Story's IMMEDIATE cross-feature dependency edges (NOT the transitive
+  // graph) to the peer's one-line, for input-state / integration context. Resolve peers from
+  // allStories (the FULL breakdown feature list) — NOT `stories`, which on the single-Story
+  // regenerate path is a 1-element batch that would otherwise starve EVERY edge (§8 silent miss).
+  const peerStories = (Array.isArray(allStories) && allStories.length) ? allStories : stories;
+  const oneLineOf = (st) => String((st && (st.user_story || st.description)) || '').replace(/\s+/g, ' ').trim().slice(0, 160);
+  const summaryByName = new Map();
+  const dependentsByName = new Map(); // name → [names that list `name` in their dependencies]; built ONCE
+  for (const st of peerStories) {
+    if (st && typeof st.name === 'string' && st.name) summaryByName.set(st.name, oneLineOf(st));
+  }
+  for (const st of peerStories) {
+    const nm = st && st.name;
+    if (typeof nm !== 'string' || !nm) continue;
+    for (const dn of (Array.isArray(st.dependencies) ? st.dependencies : [])) {
+      if (typeof dn !== 'string' || !dn) continue;
+      if (!dependentsByName.has(dn)) dependentsByName.set(dn, []);
+      dependentsByName.get(dn).push(nm);
+    }
+  }
+  // per-edge filter: drop a self-edge and a DANGLING edge (peer absent/deleted) — never the whole section.
+  const resolveEdges = (names, selfName) => {
+    const out = [];
+    for (const n of (Array.isArray(names) ? names : [])) {
+      if (typeof n !== 'string' || !n || n === selfName || !summaryByName.has(n)) continue;
+      out.push({ name: n, oneLine: summaryByName.get(n) || '' });
+    }
+    return out;
+  };
+  const dependencyContextFor = (story) => ({
+    dependsOn: resolveEdges(story && story.dependencies, story && story.name),
+    blocks: resolveEdges(dependentsByName.get(story && story.name), story && story.name),
+  });
+
   const requests = stories.map((story, index) => ({
     custom_id: String(index),
     params: {
@@ -668,9 +703,11 @@ export async function submitTestCaseBatch({ stories, siblingNames, sharedAccepta
             story,
             siblingNames: resolvedSiblingNames,
             sharedAcceptanceCriteria: sharedAcceptanceCriteria || [],
+            specConcerns: specConcerns || [],
             specSummary: specSummary || '',
             category: story && story.category,
             hasSpecSource,
+            dependencyContext: dependencyContextFor(story),
           }),
         },
       ],

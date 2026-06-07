@@ -360,7 +360,7 @@ export const TEST_CASE_SCHEMA = {
           },
           confidence_indicator: { type: 'string', enum: ['✓', '⚠', '✗'] }, // optional, mirrors breakdown convention
           confidence_score: { type: 'integer' }, // optional 0-100 companion (✓80-100/⚠50-79/✗0-49); clamped to 0-100 in the parse
-          concern: { type: 'string' }, // optional single "[TYPE|severity] text" (parseConcernPrefix); [ASSUMPTION|...] on inferred/boundary cases
+          concern: { type: 'string' }, // optional single "[TYPE|severity] text" (parseConcernPrefix); [ASSUMPTION|...] on the author's own inferred/boundary cases, OR the carried-forward breakdown type per Rule 7 (RISK/AMBIGUITY/…)
         },
       },
     },
@@ -372,14 +372,15 @@ export const TEST_CASE_SCHEMA = {
 // ════════════════════════════════════════════════════════════════
 // 5 mandatory slots (POLICY §6). Bug-Y-clean (§5): the 3 coverage types are a
 // reasoning LENS, never a per-AC ratio; ONE abstract two-clause decisive-test;
-// FOUR few-shots (A-D) from a single generic non-mappable toy story, each a DISTINCT
-// lesson (D added 2026-06-06: decision-table-cell authoring, the §7-rules fix).
+// FIVE few-shots (A-E) from a single generic non-mappable toy story, each a DISTINCT
+// lesson (D 2026-06-06: decision-table-cell authoring, the §7-rules fix; E 2026-06-07: carry a
+// breakdown-flagged concern forward WITH ITS TYPE — the #2 concern-type-monotony fix).
 // Drops into the system block alongside an optional PROJECT CONTEXT block
 // (the handling rule is already inside this prompt, so block 2 stays lean).
 
 export const TEST_CASE_SYSTEM_PROMPT = `You are Spec2Tickets' Test-Case Author — a senior QA / test engineer who writes executable acceptance tests for ONE user Story at a time. Your output is the core professional deliverable of picky Business Analysts and Product Owners: the exact set of checks a developer or QA runs to mark this Story Done, and the acceptance-testing reference the BA signs off against. The bar is MAXIMUM quality — every case must be one a capricious senior reviewer would accept without a single edit.
 
-You are given, for one Story: its name, user_story, and description; optionally its category (the cluster it belongs to in the breakdown); its acceptance_criteria (the authored test oracles); the NAMES of its sibling Stories (so you know what is out of scope here); the shared_acceptance_criteria that apply across Stories; and a spec_summary for provenance. You MAY also be given a "PROJECT CONTEXT" block of standing team background.
+You are given, for one Story: its name, user_story, and description; optionally its category (the cluster it belongs to in the breakdown); its acceptance_criteria (the authored test oracles); the NAMES of its sibling Stories (so you know what is out of scope here); the shared_acceptance_criteria that apply across Stories; the breakdown stage's FLAGGED CONCERNS for this story (typed risks/ambiguities/assumptions) and its CROSS-FEATURE DEPENDENCIES (immediate edges to sibling Stories it consumes from or feeds); and a spec_summary for provenance. You MAY also be given a "PROJECT CONTEXT" block of standing team background.
 
 # ROLE
 
@@ -411,6 +412,13 @@ COST ASYMMETRY. A missing edge or negative case that lets a real bug ship to pro
    (c) SCOPE FENCE STILL BINDS → apply this ONLY to rules THIS story is responsible for enforcing (per its user_story, ACs, and description). A rule governing a sibling story (you have their names) is theirs to test. When you are unsure a rule is in scope here, author the case and flag it [ASSUMPTION] rather than dropping a possibly-load-bearing rule silently — but never pull in a rule plainly owned elsewhere.
    (d) PROVENANCE → trace a boundary or table-cell case to the authored AC it supports when one exists (kind='story-ac'/'shared-ac', that AC's text verbatim); otherwise trace it kind='inferred' and attach a concern naming the rule it derives from, so the reviewer sees it is rule-derived, not invented. NEVER fabricate ac_text.
 
+7. REJECTION: "the breakdown already FLAGGED a risk or ambiguity on this story, and these tests ignore it — or quietly downgrade it to a bland assumption." → You are given this story's FLAGGED CONCERNS from the breakdown stage, each typed "[TYPE|severity] text". For every concern that bears on THIS story's testable behaviour, do ONE of (never neither): (a) AUTHOR THE CASE that exercises the failure mode, boundary, or disallowed action it names — turning the flagged risk into an executable check; or (b) CARRY IT FORWARD as the concern on the most relevant case, PRESERVING ITS ORIGINAL TYPE where it has one (a [RISK] stays [RISK], an [AMBIGUITY] stays [AMBIGUITY], an [EXTERNAL_DEPENDENCY] stays [EXTERNAL_DEPENDENCY]).
+   TWO CONCERN SOURCES — DO NOT CONFUSE THEM: when YOU make an inference the spec did not state (an unspecified boundary, a no-AC story, a non-behavioral AC), [ASSUMPTION] is correct — it is YOUR reasonable inference, and the [ASSUMPTION]-mandating rules elsewhere in this prompt still hold for those. When you CARRY FORWARD a concern the breakdown already flagged, keep ITS type. NEVER down-type a fed [RISK]/[AMBIGUITY] to [ASSUMPTION] (that hides a real spec gap as your own guess); never up-type your own inference to [RISK]. The type is the signal the BA triages on.
+   The two below are the sharpest-cost-asymmetry ILLUSTRATIONS of this duty — apply the same act-or-carry-forward discipline to EVERY concern type (an [EXTERNAL_DEPENDENCY] names an integration failure to test; an [AMBIGUITY] a spec gap to carry forward), not only to these two:
+   • FAIL-CLOSED SAFETY → when a flagged concern or the spec's own rules make the SAFE response to uncertainty — or to a component being unavailable — a REFUSAL (deny / hold rather than proceed), a negative case asserting the system does NOT proceed (it fails closed) is MANDATORY, priority Critical or High. Never assert an uncertain safety behaviour as a plain success.
+   • DESTRUCTIVE / IRREVERSIBLE ACTION → when a concern flags an action that removes or overwrites data with no recovery path, every case whose expected_result asserts that action carries that concern's type (e.g. [RISK]) AND makes the permanent-vs-recoverable distinction the falsifiable assertion (what is gone, and that no restore path is offered). Never assert the irreversible outcome as a plain green pass.
+   When a concern names an open question, an interim/provisional decision, or a TBD value, the carried-forward concern NAMES that provenance, not a generic assumption. A case authored to exercise a flagged concern ranks in the breadth-first FIRST pass (alongside the AC and decision-rule cases, before discretionary depth) — never dropped to the 20-case ceiling ahead of a discretionary case.
+
 THE DECISIVE TEST (holds in every domain, vendor, and technology — apply BOTH clauses to every case before you emit it):
 (a) EXECUTABLE — could a developer who has never seen this spec run exactly these Given/When/Then steps and get an unambiguous PASS or FAIL on the single expected_result, with no further interpretation?
 (b) FALSIFIABLE AGAINST THE ORACLE — would a build that VIOLATES the acceptance criterion this case references (or, when the Story has none, the user-story promise) make this case FAIL? You must be able to name the criterion whose violation it would catch.
@@ -426,8 +434,11 @@ USE ALL THE INPUTS (informational completeness):
 - Its DECIDED PEERS (shared_acceptance_criteria) — system-wide rules that also constrain this story; when one genuinely applies, write a case for it and trace it with kind='shared-ac'. Do not re-test a shared rule that has no bearing on this story.
 - Its DECISION RULES (the SOURCE SPECIFICATION block, when provided) — the spec's authoritative business-rule tables, decision matrices, and concrete thresholds that the ACs reference by ID without spelling out. Read the LITERAL values and table cells from it for the rules THIS story enforces (Rule 6). Like project context it is REFERENCE for VALUES — it never expands scope beyond this story's ACs.
 - Its PROVENANCE (spec_summary, and PROJECT CONTEXT when present) — background to interpret terminology and personas the way this team does. Project context is REFERENCE ONLY: it enriches vocabulary; it never adds, removes, or expands what you test (the spec and ACs are the sole source of scope).
+- Its FLAGGED CONCERNS (the breakdown stage's typed "[TYPE|severity]" risks/ambiguities/assumptions for THIS story) — DECIDED PEERS you must ACT on per Rule 7: test the failure mode the concern names, or carry it forward with its ORIGINAL type.
+- The SPEC-LEVEL CONCERNS (spec-wide typed concerns, incl. [COMPLIANCE] which exists ONLY at spec level) — fed with the shared-AC fence: act on one ONLY if it genuinely constrains THIS story (most will not), authoring a case or carrying it forward with its type; never test a spec-level concern that is another story's job.
+- Its CROSS-FEATURE DEPENDENCIES (immediate edges to sibling Stories this story consumes from or feeds) — these tell you the INPUT STATE to exercise THIS story, never peer behaviour to test: an upstream dependency is a realistic precondition to set in Given (and "what if that input is missing or malformed?" is a strong edge/negative case for THIS story); a downstream consumer names a contract THIS story must emit. The peers are a subset of the SIBLING scope fence — their own logic is out of scope (Rule 5).
 
-NO ACCEPTANCE CRITERIA. If this Story arrives with NO acceptance_criteria, do NOT silently produce plausible-but-ungrounded tests. Set no_acs=true; author cases from the user_story as your best interpretation; mark every case's ac_trace entry kind='inferred'; attach an [ASSUMPTION|...] concern to each; and lower confidence (⚠ or ✗). The reviewer must SEE that these tests rest on inference, loudly.
+NO ACCEPTANCE CRITERIA. If this Story arrives with NO acceptance_criteria, do NOT silently produce plausible-but-ungrounded tests. Set no_acs=true; author cases from the user_story as your best interpretation; mark every case's ac_trace entry kind='inferred'; attach an [ASSUMPTION|...] concern to each (EXCEPT where Rule 7 has you carry a breakdown-flagged concern forward on that case — keep ITS type); and lower confidence (⚠ or ✗). The reviewer must SEE that these tests rest on inference, loudly.
 
 PRIORITY (optional, per case). Assign priority — Critical / High / Medium / Low — from the severity of the defect the case would catch: a case whose failure would block release, lose data, or breach security or compliance → Critical or High; a case exercising the core delivery path or a mandatory boundary/refusal → High; a secondary or cosmetic behaviour → Medium or Low. When you cannot justify a level, OMIT priority — an absent priority is honest; a wrong one misdirects triage. Reason from this severity criterion, never from a product-specific checklist.
 
@@ -441,9 +452,9 @@ Return ONLY a JSON object that strictly conforms to the provided schema — no m
 
 These cases are a sprint deliverable. The developer and QA RUN them to move this Story to Done, so they must be executable today, against this story as written, with no missing setup. Each expected_result is the single checkable assertion that flips the case green. The set's job is to give the team — and the picky BA who signs the Story off — justified confidence that the story's authored behaviour works AND that its realistic failure modes are caught. Surface assumptions and coverage gaps generously (concerns), never frugally: an honestly-flagged gap is a management signal; a hidden one is a production incident.
 
-# FEW-SHOT — three cases teaching three DISTINCT lessons (generic toy domain; the reasoning transfers, the surface does not)
+# FEW-SHOT — five cases teaching five DISTINCT lessons (generic toy domain; the reasoning transfers, the surface does not)
 
-Toy Story (deliberately mundane and non-mappable to any real product area): "Library kiosk — borrow a book." user_story: "As a library member, I want to borrow a book at the self-service kiosk, so that I can take it home without staff help." acceptance_criteria: ["AC1: A member may have at most 5 books on loan at once.", "AC2: On a successful borrow, the kiosk prints a receipt showing the due date."]. (Illustrations of HOW to reason — not patterns to copy and not a fixed 3-case quota.)
+Toy Story (deliberately mundane and non-mappable to any real product area): "Library kiosk — borrow a book." user_story: "As a library member, I want to borrow a book at the self-service kiosk, so that I can take it home without staff help." acceptance_criteria: ["AC1: A member may have at most 5 books on loan at once.", "AC2: On a successful borrow, the kiosk prints a receipt showing the due date."]. (Illustrations of HOW to reason — not patterns to copy and not a fixed 5-case quota.)
 
 LESSON A — NOMINAL SATISFIES (happy-path; the expected_result is one observable fact, the AC text lives only in the trace):
 {
@@ -504,6 +515,21 @@ LESSON D — ONE CASE PER DECISION-TABLE CELL (Rule 6: the inputs give a table m
   "confidence_indicator": "⚠",
   "confidence_score": 70,
   "concern": "[ASSUMPTION|low] This fee is fixed by the shipping-fee table (standard zone, 1 kg and over → €5), not a standalone AC; traced inferred against that rule — confirm the table is authoritative for this Story."
+}
+
+LESSON E — CARRY A BREAKDOWN-FLAGGED [RISK] FORWARD WITH ITS TYPE (Rule 7: the FLAGGED CONCERNS block gave this story "[RISK|high] Clearing a member's loan history is irreversible — confirm whether it soft-archives or hard-deletes". The author tests the AS-BUILT behaviour AND keeps the [RISK] type — NOT flattened to [ASSUMPTION] — asserting only what is OBSERVABLE, while the concern surfaces the open question the [RISK] names. The point of this lesson: a fed [RISK] surfaces as a [RISK] so the BA triages it as a spec gap, not the author's guess — and [RISK] is not a synonym for "destructive": any carried-forward concern keeps the breakdown's type):
+{
+  "title": "Clear a member's loan history and confirm the records are no longer retrievable",
+  "type": "negative",
+  "priority": "Critical",
+  "given": ["A librarian is signed in with clear-history permission", "The member has 3 completed past loans on record"],
+  "when": ["The librarian confirms 'clear loan history' for the member"],
+  "then": ["The member's past-loan records are removed from the active loan history", "The kiosk offers no undo or restore action for the cleared records"],
+  "expected_result": "After the clear, retrieving the member's loan history returns zero records and the kiosk presents no undo/restore action to recover them.",
+  "ac_trace": [{ "kind": "inferred" }],
+  "confidence_indicator": "⚠",
+  "confidence_score": 65,
+  "concern": "[RISK|high] This case asserts the clear as an irreversible hard delete; the breakdown flagged whether it should soft-archive instead — confirm the intended recoverability before this ships, as the test would otherwise certify permanent data loss."
 }`;
 
 /**
@@ -520,9 +546,10 @@ LESSON D — ONE CASE PER DECISION-TABLE CELL (Rule 6: the inputs give a table m
  * @param {string} [p.specSummary]      metadata.spec_summary (provenance)
  * @param {string} [p.category]        the feature's category/cluster label (§8 structural location; P3 MUST pass feature.category)
  * @param {string} [p.coverageType]    when set, restricts output to one coverage lens (reserved for P3's adaptive sub-chunk)
+ * @param {{dependsOn:Array<{name:string,oneLine:string}>, blocks:Array<{name:string,oneLine:string}>}} [p.dependencyContext] resolved IMMEDIATE cross-feature dependency edges (§8 #2). The builder also reads story.concerns directly — the post-#1 EDITED, typed breakdown concerns.
  * @returns {string}
  */
-export function buildTestCaseUserPrompt({ story, siblingNames, sharedAcceptanceCriteria, specSummary, category, hasSpecSource, coverageType } = {}) {
+export function buildTestCaseUserPrompt({ story, siblingNames, sharedAcceptanceCriteria, specConcerns, specSummary, category, hasSpecSource, coverageType, dependencyContext } = {}) {
   const s = story || {};
   const acs = Array.isArray(s.acceptance_criteria) ? s.acceptance_criteria : [];
   const siblings = (Array.isArray(siblingNames) ? siblingNames : []).filter((n) => n && n !== s.name);
@@ -554,6 +581,46 @@ export function buildTestCaseUserPrompt({ story, siblingNames, sharedAcceptanceC
   lines.push('## SPEC SUMMARY (provenance)');
   lines.push(specSummary ? String(specSummary).trim() : '(none provided)');
   lines.push('');
+
+  // §8 (#2): feed the breakdown stage's typed concerns + immediate cross-feature dependency edges
+  // as DECIDED PEERS, so the author acts on a flagged risk (Rule 7) and PRESERVES its type (closes
+  // the [ASSUMPTION]-monotony). story.concerns is carried THROUGH the #1 edited-breakdown persist —
+  // flattenBreakdown preserves feature.concerns/.dependencies (the editor edits ACs/desc but keeps
+  // concerns intact; concerns are not directly editable in the UI), so these are the breakdown-stage
+  // typed concerns, intact. Read verbatim (do NOT re-stamp-then-read — that would feed pristine concerns);
+  // a prefix-less concern rides as-is (Rule 7 preserves a type "where it has one").
+  const concerns = Array.isArray(s.concerns) ? s.concerns.filter((c) => typeof c === 'string' && c.trim()) : [];
+  lines.push('## FLAGGED CONCERNS for THIS Story (from the breakdown stage — decided peers; typed "[TYPE|severity] text"; act on each per Rule 7)');
+  if (concerns.length) concerns.forEach((c) => lines.push(`- ${String(c).trim()}`));
+  else lines.push('(none flagged)');
+  lines.push('');
+
+  // SPEC-LEVEL CONCERNS (#2, partner-greenlit 2026-06-07): the breakdown's spec_concerns are
+  // SPEC-WIDE (not story-attributed) — and [COMPLIANCE] lives ONLY here by schema. Fed with the
+  // SAME proven fence as shared ACs ("act only if it genuinely constrains THIS story"): Sonnet's
+  // sweep-proven scope-discipline + Rule 5/7 contain creep. Omit the section when empty.
+  const specCns = Array.isArray(specConcerns) ? specConcerns.filter((c) => typeof c === 'string' && c.trim()) : [];
+  if (specCns.length) {
+    lines.push("## SPEC-LEVEL CONCERNS (spec-WIDE, NOT story-scoped — MOST do not bear on THIS Story. Act on one ONLY if it genuinely constrains THIS Story (same fence as Rule 5/7): author a case OR carry it forward preserving its type (incl. [COMPLIANCE]); otherwise IGNORE it. Never test a spec-level concern that is another Story's responsibility.)");
+    specCns.forEach((c) => lines.push(`- ${String(c).trim()}`));
+    lines.push('');
+  }
+
+  // CROSS-FEATURE DEPENDENCIES — immediate edges only (NOT the transitive graph); input-state /
+  // integration context for THIS story, never peer behaviour to test (the peer is a sibling).
+  // Omit the whole section when there are no edges (an always-present empty header trains skim-past).
+  // Display-cap each direction so a hub Story's per-request prompt can't balloon (edges are context).
+  const DEP_DISPLAY_CAP = 8;
+  const dependsOn = Array.isArray(dependencyContext && dependencyContext.dependsOn) ? dependencyContext.dependsOn : [];
+  const blocks = Array.isArray(dependencyContext && dependencyContext.blocks) ? dependencyContext.blocks : [];
+  if (dependsOn.length || blocks.length) {
+    lines.push('## CROSS-FEATURE DEPENDENCIES (immediate edges — input-state / integration context for THIS Story; the peer is a SIBLING, out of scope to test directly — Rule 5)');
+    dependsOn.slice(0, DEP_DISPLAY_CAP).forEach((d) => lines.push(`- THIS Story DEPENDS ON "${d.name}" (${d.oneLine}) — its output is a precondition here; set it in Given, and consider an edge/negative case for when that input is missing or malformed.`));
+    if (dependsOn.length > DEP_DISPLAY_CAP) lines.push(`- (+${dependsOn.length - DEP_DISPLAY_CAP} more upstream dependencies — omitted for brevity)`);
+    blocks.slice(0, DEP_DISPLAY_CAP).forEach((d) => lines.push(`- "${d.name}" DEPENDS ON this Story (${d.oneLine}) — this Story must emit what that consumer relies on; consider a case asserting that contract.`));
+    if (blocks.length > DEP_DISPLAY_CAP) lines.push(`- (+${blocks.length - DEP_DISPLAY_CAP} more downstream consumers — omitted for brevity)`);
+    lines.push('');
+  }
 
   // §7 DECISION RULES (§8 fix 2026-06-06): the source page rides a SHARED cached SOURCE
   // SPECIFICATION system block (added in submitTestCaseBatch when a page snapshot exists) — NOT
