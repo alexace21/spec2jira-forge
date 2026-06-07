@@ -79,11 +79,11 @@ honest flagged case (§4), not a silent gap.
 | `parseTestCaseResult(raw, story)` → `{result, coverage}` (defensive parse: cap ≤15, drop empty when/then, repair empty ac_trace→inferred, clamp confidence, normalize priority enum, sanitize test_data, OVERWRITE story_name) | §4-cap logic of `fetchBatchResults` | **testcases.js** (with `computeCoverage`) |
 | `startTestCaseGeneration({jobId})` | `startGeneration` (~968-1188, trimmed) | index.js |
 | `pollTestCaseStatus({jobId})` | `pollJobStatus` (~1196-1365) | index.js |
-| `getTestCases({jobId})` → `{perStory, total, completedAt, breakdownPageVersion, failedCount}` (Promise.all over N keys; `story:{name,acceptance_criteria}` on each entry) | `getResults` (~1371-1397) | index.js |
-| `regenerateTestCase({jobId, storyIdx})` → `{storyIdx, result, coverage}` (1-request Sonnet batch) | `submitTestCaseBatch` with `[story]` | index.js |
+| `getTestCases({jobId})` → `{perStory, total, completedAt, breakdownPageVersion, failedCount}` (Promise.all over N keys; `story:{name,acceptance_criteria,_uid}` on each entry) | `getResults` (~1371-1397) | index.js |
+| `regenerateTestCase({jobId, storyIdx, breakdown})` → `{storyIdx, result, coverage, story:{name,acceptance_criteria,_uid}}` (1-request Sonnet batch; persists the edited breakdown skip-if-unchanged, then targets the story by stable `_uid`→name→idx; `pollRegenerateTestCase` syncs the bulk tcjob's stamped story + returns the edited `story` so the per-story staleness clears) | `submitTestCaseBatch` with `[story]` | index.js |
 
 ### KVS shapes (no TTL — match the breakdown job, for reconnect durability)
-- `tcjob:<jobId>` — control: `{jobId, batchId, keySource, total, status('pending'|'batched'|'completed'|'failed'), stampedStories:[{idx,name,acceptance_criteria}], pageVersion, error?, createdAt, completedAt}`. stampedStories is LEAN ({idx,name,acceptance_criteria} only — no storyObj); ~1-2KB/story → ~40-80KB at 39 stories, well under 240KB (#10). **Never merge test-case payloads here** (240KB guard).
+- `tcjob:<jobId>` — control: `{jobId, batchId, keySource, total, status('pending'|'batched'|'completed'|'failed'), stampedStories:[{idx,_uid,name,acceptance_criteria}], pageVersion, error?, createdAt, completedAt}`. stampedStories is LEAN ({idx,name,acceptance_criteria} only — no storyObj); ~1-2KB/story → ~40-80KB at 39 stories, well under 240KB (#10). **Never merge test-case payloads here** (240KB guard).
 - `testcases:<jobId>:<idx>` — per-story: `{storyIdx, storyName, result, coverage, error?}`. Per-story keys (size + duplicate-name safety). ~2-4KB each, well under 240KB.
 
 ---

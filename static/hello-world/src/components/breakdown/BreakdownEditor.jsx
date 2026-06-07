@@ -1,5 +1,6 @@
 import { useState, useMemo, useEffect } from 'react';
 import EditableField from './EditableField.jsx';
+import { newStoryUid } from '../../lib/v3Schema';
 import CapabilityCard from './CapabilityCard.jsx';
 import SharedACPanel from './SharedACPanel.jsx';
 import LabelsEditor from './LabelsEditor.jsx';
@@ -30,7 +31,7 @@ export default function BreakdownEditor({ initialBreakdown, onPush, isPushing = 
   function deleteCapability(i) { if (breakdown.capabilities.length <= 1) return; setBreakdown((p) => ({ ...p, capabilities: p.capabilities.filter((_, idx) => idx !== i) })); }
   function addCapability() {
     setBreakdown((p) => ({ ...p, capabilities: [...p.capabilities, {
-      name: 'New Category', features: [{ name: 'New Feature', user_story: 'As a user, I want [goal], so that [benefit].',
+      name: 'New Category', features: [{ _uid: newStoryUid(), name: 'New Feature', user_story: 'As a user, I want [goal], so that [benefit].',
         acceptance_criteria: ['Acceptance criterion'], priority: 'Medium', story_points: 3, complexity_score: 3,
         tasks: [{ type: 'API', summary: 'New task' }] }]
     }] }));

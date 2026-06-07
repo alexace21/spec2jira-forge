@@ -96,6 +96,31 @@ search space. Inside it, search for the maximum.
 
 ---
 
+## 3.5 Simplicity over complexity — the simple design IS the high-value one
+
+> Partner's framing (2026-06-08, verbatim): *"Simplicity over complexity."* —
+> e.g. a stable `story_uid` instead of fragile index/name-matching heuristics IS
+> simplicity, and improves the design.
+
+When two designs solve the same problem, prefer the one with **fewer moving parts
+and a clearer invariant** — even if it touches more files to introduce. A stable
+identity (a minted `uid`) is SIMPLER than re-deriving identity from position or
+name at every comparison, because the invariant ("this id always means this thing")
+removes a whole class of drift bugs (reorder / rename / restructure mis-targeting).
+Heuristic matching (index → name → content) is *more code at every call site* and
+*more failure modes*; a single source of truth is *less*. **"Simplicity" is measured
+by the invariants a reader must hold in their head, NOT by lines-of-diff today.**
+
+  ❌ Re-derive identity (index/name) at every binding site → N places to drift-wrong.
+  ✅ Mint a stable id once, thread it → the binding is trivially correct everywhere.
+
+This composes with §3 (highest-value): the simplest correct design that deletes a
+bug *class* is usually also the highest-value one. Reach for it even when the quick
+patch (one more heuristic) looks cheaper in the moment — the heuristic is the
+complexity; the stable invariant is the simplicity.
+
+---
+
 ## 4. Pure-function vs LLM — the dispatch rule
 
 The dispatch is binary. Each task is either **deterministic** (answer derivable

@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import FeatureCard from './FeatureCard.jsx';
+import { newStoryUid } from '../../lib/v3Schema';
 
 /**
  * CapabilityCard — Editor for a single Capability (→ JIRA Epic).
@@ -40,6 +41,7 @@ export default function CapabilityCard({ capability, index, onUpdate, onDelete }
 
   function addFeature() {
     const newFeature = {
+      _uid: newStoryUid(),
       name: 'New Feature',
       user_story: 'As a user, I want [goal], so that [benefit].',
       acceptance_criteria: ['Acceptance criterion'],

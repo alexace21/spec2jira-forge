@@ -59,7 +59,13 @@ export function parseConcernPrefix(raw) {
 export function adaptToLegacyShape(v3) {
   if (!v3 || typeof v3 !== 'object') return v3;
 
-  const features = Array.isArray(v3.features) ? v3.features : [];
+  // (POLICY §3.5 simplicity-over-complexity) mint a stable _uid on every feature once
+  // (frontend-first identity) so the test-case staleness + per-card regen bind to IT — surviving
+  // reorder / rename / restructure where index- or name-matching mis-targets. Idempotent: an
+  // already-uid'd feature (reloaded from a persisted breakdown) is left untouched → uid is stable.
+  const features = (Array.isArray(v3.features) ? v3.features : []).map((f) =>
+    f && typeof f === 'object' && !f._uid ? { ...f, _uid: newStoryUid() } : f,
+  );
 
   // Group by category
   const categoryMap = new Map();
@@ -113,8 +119,20 @@ export function adaptToLegacyShape(v3) {
     shared_acceptance_criteria: sharedAC,
     metadata: v3.metadata,
     spec_concerns: v3.spec_concerns,
-    _v3_original: v3,
+    _v3_original: { ...v3, features },
   };
+}
+
+// Stable per-story identity (POLICY §3.5). Minted once on the frontend when a breakdown loads
+// (adaptToLegacyShape above) or a feature is added in the editor, then threaded through edits (the
+// editor spreads feature objects → _uid survives), test-case stamping, and the per-story staleness /
+// per-card regen binding — so identity is robust to reorder / rename / restructure. Function
+// declaration → hoisted, so adaptToLegacyShape may call it above. Prefixed 's_' for readable logs.
+export function newStoryUid() {
+  try {
+    if (typeof crypto !== 'undefined' && crypto.randomUUID) return 's_' + crypto.randomUUID();
+  } catch (_) {}
+  return 's_' + Math.random().toString(36).slice(2, 12) + Date.now().toString(36);
 }
 
 // ════════════════════════════════════════════════════════════

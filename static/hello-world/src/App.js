@@ -1200,7 +1200,9 @@ function App() {
       (async () => {
         let submitResult;
         try {
-          submitResult = await invoke("regenerateTestCase", { jobId, storyIdx });
+          // (b) send the EDITED breakdown so the backend regen reads the BA's edited ACs (not the
+          // generation-time snapshot). The resolver persists it to job.breakdown (mirrors #1).
+          submitResult = await invoke("regenerateTestCase", { jobId, storyIdx, breakdown: pendingBreakdown || results?.breakdown });
         } catch (_invokeErr) {
           setRegenStates((prev) => ({ ...prev, [storyIdx]: "error" }));
           return;
@@ -1232,6 +1234,8 @@ function App() {
                     ...entry,
                     result: st.result !== undefined ? st.result : entry.result,
                     coverage: st.coverage !== undefined ? st.coverage : entry.coverage,
+                    // (c) adopt the EDITED story the regen used → the per-story staleness clears for this card.
+                    story: st.story !== undefined ? st.story : entry.story,
                     error: st.error,
                   };
                 });
@@ -1249,7 +1253,7 @@ function App() {
         }, POLL_MS);
       })();
     },
-    [jobId],
+    [jobId, pendingBreakdown, results],
   );
 
   // handleSaveTestCase — persist ONE story's hand-edits to KVS via saveTestCases, then delta-patch
@@ -1607,8 +1611,8 @@ function App() {
   // backend normAC (curly quotes / NBSP / "AC1:" prefix / backslash folds) so the warning fires precisely
   // when the push would skip the embed — and the matching idempotency check re-generates on the same
   // signal. Order-independent across stories + ACs.
-  const tcStaleVsEdits = (() => {
-    if (!testCaseResults || !Array.isArray(testCaseResults.perStory)) return false;
+  const tcStaleInfo = (() => {
+    if (!testCaseResults || !Array.isArray(testCaseResults.perStory)) return { any: false, staleIdxs: [], removedIdxs: [] };
     const sig = (stories) => {
       const acs = [];
       for (const s of Array.isArray(stories) ? stories : []) {
@@ -1624,10 +1628,41 @@ function App() {
     };
     const cur = pendingBreakdown || results?.breakdown;
     const currentStories = cur && Array.isArray(cur.capabilities) ? cur.capabilities.flatMap((c) => c.features || []) : [];
-    if (!currentStories.length) return false; // no current breakdown to compare → never false-warn
-    const genStories = testCaseResults.perStory.map((p) => p && p.story).filter(Boolean);
-    return sig(currentStories) !== sig(genStories);
+    if (!currentStories.length) return { any: false, staleIdxs: [], removedIdxs: [] }; // no current breakdown to compare → never false-warn
+    // (a) per-story staleness bound to the STABLE _uid (POLICY §3.5) → robust to reorder / rename /
+    // restructure in the editor, where index- or name-matching mis-targets. Falls back to unique-name,
+    // then positional index, for old breakdowns/regens that predate _uid (backward-compatible).
+    // findCur returns the matching current story, or undefined if the stamped story is GONE from the
+    // breakdown (uid + unique-name both absent = removed in the editor).
+    const findCur = (p) => {
+      const s = p.story || {};
+      if (s._uid) { const byUid = currentStories.find((c) => c && c._uid === s._uid); if (byUid) return byUid; }
+      if (s.name) { const named = currentStories.filter((c) => c && c.name === s.name); if (named.length === 1) return named[0]; }
+      return undefined;
+    };
+    const staleIdxs = [];
+    const removedIdxs = [];
+    for (const p of testCaseResults.perStory) {
+      if (!p || !p.story) continue;
+      const cur = findCur(p);
+      if (cur === undefined) {
+        // a uid-bearing stamp with no current match → the story was REMOVED → an ORPHAN card (not "stale").
+        // Legacy stamps (no _uid) keep the old positional comparison rather than false-flagging removed.
+        if (p.story._uid) { removedIdxs.push(p.storyIdx); continue; }
+        if (sig([currentStories[p.storyIdx]]) !== sig([p.story])) staleIdxs.push(p.storyIdx);
+        continue;
+      }
+      if (sig([cur]) !== sig([p.story])) staleIdxs.push(p.storyIdx);
+    }
+    // (#2 fix, Attack 8) drive the GLOBAL banner/ConfirmScreen-amber from the per-story result — ONE
+    // identity model. Prevents a green "✓ generated" while stories are actually stale (e.g. an AC moved
+    // between two stories leaves the global AC multiset unchanged but both stories drifted).
+    const any = staleIdxs.length > 0 || removedIdxs.length > 0;
+    return { any, staleIdxs, removedIdxs };
   })();
+  const tcStaleVsEdits = tcStaleInfo.any;
+  const tcStaleStoryIdxs = tcStaleInfo.staleIdxs;
+  const tcRemovedStoryIdxs = tcStaleInfo.removedIdxs;
 
   switch (screen) {
     case "loading":
@@ -1705,6 +1740,8 @@ function App() {
           onPush={handlePush}
           onGenerate={handleGenerateTestCases}
           tcStale={tcStaleVsEdits}
+          tcStaleStoryIdxs={tcStaleStoryIdxs}
+          tcRemovedStoryIdxs={tcRemovedStoryIdxs}
           onRegenerate={handleRegenerateTestCase}
           onSaveTestCase={handleSaveTestCase}
           regenStates={regenStates}
@@ -2250,6 +2287,9 @@ function ConfirmScreen({
   // spend. (Targeted per-story / per-case regeneration is the separate follow-up feature.)
   const [regenArmed, setRegenArmed] = useState(false);
   const regenArmTimer = useRef(null);
+  // Clear the arm timer on unmount so a pending setRegenArmed(false) never fires on an unmounted
+  // ConfirmScreen (e.g. the BA arms Re-run then clicks "View / edit →" within the 4s window).
+  useEffect(() => () => clearTimeout(regenArmTimer.current), []);
 
   // Extract v3 native signals от breakdown's _v3_original (preserved by
   // v3AdaptResultPayload at result-load time). Falls back gracefully когато
@@ -2654,45 +2694,72 @@ function ConfirmScreen({
               : "BA-grade Gherkin / CSV export + a summary embedded in each Jira Story."}
           </p>
         </div>
-        <button
-          type="button"
-          onClick={() => {
-            if (testCaseResults && !tcStaleNow) { onOpenTestCases?.(); return; }
-            // Stale re-run-all is expensive (every story re-billed) → arm a 2-step confirm so the BA
-            // consciously consents (Phase-1 cost fix). First click arms; second (within 4s) fires.
-            if (tcStaleNow && !regenArmed) {
-              setRegenArmed(true);
-              clearTimeout(regenArmTimer.current);
-              regenArmTimer.current = setTimeout(() => setRegenArmed(false), 4000);
-              return;
-            }
-            setRegenArmed(false);
-            onGenerateTestCases?.();
-          }}
-          disabled={isPushing || tcGenerating}
-          className="shrink-0"
-          style={{
-            background: tcStaleNow ? "var(--s2j-orange-bg)" : testCaseResults ? "var(--s2j-green-bg)" : "var(--s2j-blue-bg)",
-            border: `1px solid ${tcStaleNow ? "var(--s2j-orange-border)" : testCaseResults ? "var(--s2j-green-border)" : "var(--s2j-blue-border)"}`,
-            color: tcStaleNow ? "var(--s2j-text)" : testCaseResults ? "var(--s2j-green-dark)" : "var(--s2j-blue)",
-            padding: "6px 12px",
-            borderRadius: "6px",
-            fontSize: "13px",
-            fontWeight: 500,
-            cursor: isPushing || tcGenerating ? "not-allowed" : "pointer",
-            whiteSpace: "nowrap",
-          }}
-        >
-          {tcGenerating
-            ? "⏳ Generating tests…"
-            : tcStaleNow
-            ? regenArmed
-              ? `⚠ Re-runs all ${stories} stories — confirm?`
-              : "🔄 Re-run all test cases"
-            : testCaseResults
-            ? "View / edit →"
-            : "🧪 Generate Test Cases"}
-        </button>
+        <div className="shrink-0 flex items-center gap-2">
+          {/* Navigate to the Test Cases screen — available whenever test cases exist, INCLUDING the
+              stale state (the screen carries its own stale banner). This is the always-free view/edit
+              path; it NEVER regenerates. Fixes the trap where editing the breakdown left "Re-run all"
+              as the ONLY affordance, blocking access to the existing cases + targeted per-story regen. */}
+          {testCaseResults && (
+            <button
+              type="button"
+              onClick={() => onOpenTestCases?.()}
+              disabled={isPushing || tcGenerating}
+              style={{
+                background: "var(--s2j-green-bg)",
+                border: "1px solid var(--s2j-green-border)",
+                color: "var(--s2j-green-dark)",
+                padding: "6px 12px",
+                borderRadius: "6px",
+                fontSize: "13px",
+                fontWeight: 500,
+                cursor: isPushing || tcGenerating ? "not-allowed" : "pointer",
+                whiteSpace: "nowrap",
+              }}
+            >
+              View / edit →
+            </button>
+          )}
+          {/* Generate (no cases yet, blue) OR Re-run-all (stale → expensive; 2-step armed confirm,
+              orange). NOT shown when fresh — the cases already match the breakdown, so re-running
+              would be a pointless re-spend. */}
+          {(!testCaseResults || tcStaleNow) && (
+            <button
+              type="button"
+              onClick={() => {
+                // Stale re-run-all is expensive (every story re-billed) → arm a 2-step confirm so the BA
+                // consciously consents (Phase-1 cost fix). First click arms; second (within 4s) fires.
+                if (tcStaleNow && !regenArmed) {
+                  setRegenArmed(true);
+                  clearTimeout(regenArmTimer.current);
+                  regenArmTimer.current = setTimeout(() => setRegenArmed(false), 4000);
+                  return;
+                }
+                setRegenArmed(false);
+                onGenerateTestCases?.();
+              }}
+              disabled={isPushing || tcGenerating}
+              style={{
+                background: tcStaleNow ? "var(--s2j-orange-bg)" : "var(--s2j-blue-bg)",
+                border: `1px solid ${tcStaleNow ? "var(--s2j-orange-border)" : "var(--s2j-blue-border)"}`,
+                color: tcStaleNow ? "var(--s2j-text)" : "var(--s2j-blue)",
+                padding: "6px 12px",
+                borderRadius: "6px",
+                fontSize: "13px",
+                fontWeight: 500,
+                cursor: isPushing || tcGenerating ? "not-allowed" : "pointer",
+                whiteSpace: "nowrap",
+              }}
+            >
+              {tcGenerating
+                ? "⏳ Generating tests…"
+                : tcStaleNow
+                ? regenArmed
+                  ? `⚠ Re-runs all ${stories} stories — confirm?`
+                  : "🔄 Re-run all"
+                : "🧪 Generate Test Cases"}
+            </button>
+          )}
+        </div>
       </div>
 
       {/* Final action */}

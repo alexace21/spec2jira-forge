@@ -1864,6 +1864,7 @@ resolver.define('startTestCaseGeneration', async ({ payload, context }) => {
   // LEAN: only {idx, name, acceptance_criteria} — the only fields computeCoverage uses.
   const stampedStories = stories.map((s, i) => ({
     idx: i,
+    _uid: s && s._uid, // (POLICY §3.5) stable identity — per-story staleness + per-card regen bind to THIS
     name: s && (s.name || `Story ${i}`),
     acceptance_criteria: Array.isArray(s && s.acceptance_criteria) ? s.acceptance_criteria : [],
   }));
@@ -2084,7 +2085,7 @@ resolver.define('getTestCases', async ({ payload }) => {
     // P4's renderGherkin/renderManualTable call needs story.name + acceptance_criteria.
     const stamped = (tcJob.stampedStories || []).find((s) => s && s.idx === i);
     const story = stamped
-      ? { name: stamped.name || '', acceptance_criteria: stamped.acceptance_criteria || [] }
+      ? { name: stamped.name || '', acceptance_criteria: stamped.acceptance_criteria || [], _uid: stamped._uid }
       : { name: '', acceptance_criteria: [] };
 
     if (!entry) {
@@ -2261,10 +2262,47 @@ resolver.define('regenerateTestCase', async ({ payload, context }) => {
   if (!job || job.status !== 'completed') {
     return { error: 'breakdown_not_ready', detail: 'Breakdown job must be completed before regenerating test cases.' };
   }
+  // (b) Persist the EDITED breakdown (sent from the Test Cases screen) so this single-story regen
+  // reads the BA's edited ACs — NOT the generation-time snapshot. Mirrors the #1 fix in
+  // startTestCaseGeneration. Without it a per-card regen after an in-app edit reproduces the STALE
+  // cases (it reads job.breakdown.features[storyIdx]). Best-effort: fall back to the stored breakdown.
+  if (payload && payload.breakdown) {
+    try {
+      const { features: editedFeatures } = flattenBreakdown(payload.breakdown);
+      if (Array.isArray(editedFeatures) && editedFeatures.length > 0) {
+        // (#4 skip-if-unchanged) only re-persist when the edited ACs actually differ from the stored
+        // breakdown — avoids a redundant full-breakdown KVS write per regen (e.g. the retry-N-failed loop).
+        const acSig = (fs) => (Array.isArray(fs) ? fs : []).flatMap((s) => (Array.isArray(s && s.acceptance_criteria) ? s.acceptance_criteria : [])).map(normAC).sort().join('|');
+        if (acSig(editedFeatures) !== acSig(job.breakdown && job.breakdown.features)) {
+          job.breakdown = { ...job.breakdown, features: editedFeatures };
+          await kvs.set(`${JOB_KEY_PREFIX}${jobId}`, job);
+        }
+      }
+    } catch (e) {
+      console.error(`[regenTC] edited-breakdown persist failed (using stored): ${String(e?.message || e)}`);
+    }
+  }
   const stories = (job.breakdown && Array.isArray(job.breakdown.features)) ? job.breakdown.features : [];
-  const story = stories[storyIdx];
-  if (!story) {
-    return { error: 'story_not_found', detail: `No story at index ${storyIdx}.` };
+  // (POLICY §3.5) target the story the CARD represents by its STABLE _uid (stamped at generation),
+  // robust to reorder/delete in the editor; fall back to unique stamped-name, then positional index.
+  const stamped = (tcJob && Array.isArray(tcJob.stampedStories)) ? tcJob.stampedStories.find((s) => s && s.idx === storyIdx) : null;
+  let story = null;
+  if (stamped && stamped._uid) {
+    // uid-bearing stamp → resolve by uid, then unique name. If NEITHER matches, the story was REMOVED
+    // from the breakdown (editor delete) → return a clear error rather than positional-falling-back to
+    // a NEIGHBOUR (which would mis-target it + write a DUPLICATE-named card — the live bug found 2026-06-08).
+    story = stories.find((s) => s && s._uid === stamped._uid) || null;
+    if (!story && stamped.name) { const named = stories.filter((s) => s && s.name === stamped.name); if (named.length === 1) story = named[0]; }
+    if (!story) {
+      return { error: 'story_removed', detail: 'This story was removed from the breakdown — it can no longer be regenerated. Push as-is (it will not embed) or remove its test-case card.' };
+    }
+  } else {
+    // legacy (no _uid): name → positional index — pre-uid breakdowns keep the old behaviour.
+    if (stamped && stamped.name) { const named = stories.filter((s) => s && s.name === stamped.name); if (named.length === 1) story = named[0]; }
+    if (!story) story = stories[storyIdx];
+    if (!story) {
+      return { error: 'story_not_found', detail: `No story at index ${storyIdx}.` };
+    }
   }
 
   const sharedACs = (job.breakdown && Array.isArray(job.breakdown.shared_acceptance_criteria))
@@ -2278,7 +2316,7 @@ resolver.define('regenerateTestCase', async ({ payload, context }) => {
   // position is the payload storyIdx (the KVS key suffix + the testcases:<jobId>:<storyIdx> write).
   await kvs.set(`${TC_REGEN_KEY_PREFIX}${jobId}:${storyIdx}`, {
     jobId, storyIdx, status: 'pending', keySource,
-    stampedStories: [{ idx: 0, name: story.name || '', acceptance_criteria: Array.isArray(story.acceptance_criteria) ? story.acceptance_criteria : [] }],
+    stampedStories: [{ idx: 0, _uid: story._uid, name: story.name || '', acceptance_criteria: Array.isArray(story.acceptance_criteria) ? story.acceptance_criteria : [] }],
     createdAt,
   });
 
@@ -2301,7 +2339,7 @@ resolver.define('regenerateTestCase', async ({ payload, context }) => {
     console.error(`[regenTC] submit failed: ${submitResult.error} | ${submitResult.detail}`);
     await kvs.set(`${TC_REGEN_KEY_PREFIX}${jobId}:${storyIdx}`, {
       jobId, storyIdx, status: 'failed', keySource,
-      stampedStories: [{ idx: 0, name: story.name || '', acceptance_criteria: Array.isArray(story.acceptance_criteria) ? story.acceptance_criteria : [] }],
+      stampedStories: [{ idx: 0, _uid: story._uid, name: story.name || '', acceptance_criteria: Array.isArray(story.acceptance_criteria) ? story.acceptance_criteria : [] }],
       createdAt, error: submitResult.error, detail: submitResult.detail,
     });
     return { error: submitResult.error, detail: submitResult.detail };
@@ -2309,7 +2347,7 @@ resolver.define('regenerateTestCase', async ({ payload, context }) => {
 
   await kvs.set(`${TC_REGEN_KEY_PREFIX}${jobId}:${storyIdx}`, {
     jobId, storyIdx, status: 'batched', keySource,
-    stampedStories: [{ idx: 0, name: story.name || '', acceptance_criteria: Array.isArray(story.acceptance_criteria) ? story.acceptance_criteria : [] }],
+    stampedStories: [{ idx: 0, _uid: story._uid, name: story.name || '', acceptance_criteria: Array.isArray(story.acceptance_criteria) ? story.acceptance_criteria : [] }],
     batchId: submitResult.batchId,
     batchStatus: submitResult.status,
     createdAt, submittedAt: new Date().toISOString(), expiresAt: submitResult.expiresAt,
@@ -2381,6 +2419,9 @@ resolver.define('pollRegenerateTestCase', async ({ payload }) => {
 
     const entry = fetchResult.perStory[0];
     const storyName = regenJob.stampedStories[0] && regenJob.stampedStories[0].name || '';
+    // The story this regen used = the EDITED story (regenerateTestCase stamped it from the freshly
+    // persisted job.breakdown). Returned to the frontend + synced into the bulk tcjob below.
+    const editedStory = (regenJob.stampedStories && regenJob.stampedStories[0]) || null;
 
     // Overwrite the shared per-story KVS key (intentional: user clicked Regenerate)
     // #3 — explicit sentinel even for regen errors
@@ -2392,8 +2433,39 @@ resolver.define('pollRegenerateTestCase', async ({ payload }) => {
     const completed = { ...regenJob, status: 'completed', completedAt: new Date().toISOString(), batchStatus: 'ended' };
     await kvs.set(regenKey, completed);
 
+    // (c) Sync the bulk tcjob's stamped story for this idx to the EDITED ACs (= what this regen used)
+    // so the push-embed AC-hash (it hashes tcjob.stampedStories) matches the regenerated story AND the
+    // frontend per-story staleness clears. Non-fatal: the per-story result write above is authoritative.
+    if (entry && !entry.error && editedStory) {
+      try {
+        const bulkTcJob = await kvs.get(`${TC_JOB_KEY_PREFIX}${jobId}`);
+        if (bulkTcJob && Array.isArray(bulkTcJob.stampedStories)) {
+          const pos = bulkTcJob.stampedStories.findIndex((s) => s && s.idx === storyIdx);
+          if (pos >= 0) {
+            bulkTcJob.stampedStories[pos] = {
+              ...bulkTcJob.stampedStories[pos],
+              name: editedStory.name || bulkTcJob.stampedStories[pos].name,
+              acceptance_criteria: Array.isArray(editedStory.acceptance_criteria) ? editedStory.acceptance_criteria : [],
+            };
+            await kvs.set(`${TC_JOB_KEY_PREFIX}${jobId}`, bulkTcJob);
+          }
+        }
+      } catch (e) {
+        console.error(`[pollRegenTC] stampedStories sync failed (non-fatal): ${String(e?.message || e)}`);
+      }
+    }
+
     console.log(`[pollRegenTC] jobId=${jobId} storyIdx=${storyIdx} COMPLETED error=${entry && !!entry.error}`);
-    return { ...completed, result: storyKvsValue.result, coverage: storyKvsValue.coverage, error: storyKvsValue.error };
+    return {
+      ...completed,
+      result: storyKvsValue.result,
+      coverage: storyKvsValue.coverage,
+      error: storyKvsValue.error,
+      // (c) hand the frontend the EDITED story → it patches perStory[idx].story so staleness clears.
+      story: (entry && !entry.error && editedStory)
+        ? { name: editedStory.name || storyName, acceptance_criteria: Array.isArray(editedStory.acceptance_criteria) ? editedStory.acceptance_criteria : [], _uid: editedStory._uid }
+        : undefined,
+    };
   }
 
   return { ...regenJob, batchStatus: pollResult.status, phase: `Unknown batch status: ${pollResult.status}` };

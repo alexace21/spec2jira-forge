@@ -317,7 +317,7 @@ function StaleBanner() {
 // Shown when the BREAKDOWN was edited (in-app) since these test cases were generated — the cases
 // (and the per-Story Jira embed) rest on the earlier acceptance criteria. Distinct from StaleBanner
 // (Confluence PAGE-version drift). NO auto-regen — the BA decides: regenerate affected stories, or push as-is.
-function EditStaleBanner() {
+function EditStaleBanner({ count = 0 }) {
   return (
     <div
       className="rounded-lg p-3 mb-4 flex items-start gap-2"
@@ -331,6 +331,11 @@ function EditStaleBanner() {
         <p className="text-sm font-medium" style={{ color: "var(--s2j-text)" }}>
           The breakdown was edited since these test cases were generated
         </p>
+        {count > 0 && (
+          <p className="text-xs mt-0.5 font-medium" style={{ color: "var(--s2j-orange)" }}>
+            {count} stor{count === 1 ? "y is" : "ies are"} affected (marked below).
+          </p>
+        )}
         <p className="text-xs mt-0.5" style={{ color: "var(--s2j-text-light)" }}>
           These cases (and the summary that embeds in each Jira Story) rest on the earlier acceptance criteria. Regenerate the affected stories (↻ Regenerate per card) to refresh — or push as-is; it's your call.
         </p>
@@ -364,6 +369,8 @@ function TestCasesScreen({
   jobId,
   currentVersion,
   tcStale,
+  tcStaleStoryIdxs = [],
+  tcRemovedStoryIdxs = [],
   onBack,
   onPush,
   onGenerate,
@@ -406,11 +413,14 @@ function TestCasesScreen({
   const backArmTimer = useRef(null);
   const [pushArmed, setPushArmed] = useState(false);
   const [backArmed, setBackArmed] = useState(false);
+  const [refreshArmed, setRefreshArmed] = useState(false);
+  const refreshArmTimer = useRef(null);
   useEffect(
     () => () => {
       Object.values(savedTimers.current).forEach(clearTimeout);
       clearTimeout(pushArmTimer.current);
       clearTimeout(backArmTimer.current);
+      clearTimeout(refreshArmTimer.current);
     },
     [],
   );
@@ -492,6 +502,21 @@ function TestCasesScreen({
     setSaveErrors((prev) => ({ ...prev, [storyIdx]: null }));
     onRegenerate?.(storyIdx);
   }, [onRegenerate, clearShifted]);
+
+  // (#3) "Refresh N affected" — bulk-regenerate every story whose ACs changed (tcStaleStoryIdxs).
+  // Each is a paid generation → a 2-step armed confirm (mirrors the per-card "Discard & regenerate?").
+  const handleRefreshAffected = useCallback(() => {
+    const idxs = Array.isArray(tcStaleStoryIdxs) ? tcStaleStoryIdxs : [];
+    if (!idxs.length) return;
+    if (!refreshArmed) {
+      setRefreshArmed(true);
+      clearTimeout(refreshArmTimer.current);
+      refreshArmTimer.current = setTimeout(() => setRefreshArmed(false), 4000);
+      return;
+    }
+    setRefreshArmed(false);
+    idxs.forEach((idx) => handleRegenerate(idx));
+  }, [tcStaleStoryIdxs, refreshArmed, handleRegenerate]);
 
   const dirtyCount = Object.keys(drafts).length;
 
@@ -587,7 +612,34 @@ function TestCasesScreen({
         ) : (
           <>
             {isStale && <StaleBanner />}
-            {tcStale && <EditStaleBanner />}
+            {tcStale && <EditStaleBanner count={tcStaleStoryIdxs.length} />}
+            {tcStale && tcStaleStoryIdxs.length >= 2 && (() => {
+              // T2 fix: while any affected story is regenerating, DISABLE + show progress (the button used
+              // to stay live + give no feedback while the cards quietly flipped to "Generating…").
+              const bulkBusy = tcStaleStoryIdxs.some((idx) => regenStates[idx] === "pending" || regenStates[idx] === "polling");
+              return (
+                <button
+                  type="button"
+                  onClick={handleRefreshAffected}
+                  disabled={bulkBusy}
+                  className="mb-4 text-xs px-3 py-1.5 rounded"
+                  style={{
+                    background: "var(--s2j-orange-bg)",
+                    border: "1px solid var(--s2j-orange-border)",
+                    color: bulkBusy ? "var(--s2j-text-muted)" : "var(--s2j-orange)",
+                    cursor: bulkBusy ? "not-allowed" : "pointer",
+                    whiteSpace: "nowrap",
+                  }}
+                  title="Regenerate every story whose acceptance criteria changed — each is a paid generation (a few minutes each)"
+                >
+                  {bulkBusy
+                    ? `⏳ Regenerating ${tcStaleStoryIdxs.length} stories…`
+                    : refreshArmed
+                    ? `⚠ Re-runs ${tcStaleStoryIdxs.length} affected stories (uses compute) — confirm?`
+                    : `↻ Refresh ${tcStaleStoryIdxs.length} affected stories`}
+                </button>
+              );
+            })()}
             <SummaryBar testCaseResults={testCaseResults} onRegenerate={handleRegenerate} />
             <div>
               {perStory.map((entry) => (
@@ -595,6 +647,8 @@ function TestCasesScreen({
                   key={entry.storyIdx}
                   entry={entry}
                   jobId={jobId}
+                  isStale={tcStaleStoryIdxs.includes(entry.storyIdx)}
+                  isRemoved={tcRemovedStoryIdxs.includes(entry.storyIdx)}
                   regenState={regenStates[entry.storyIdx] || "idle"}
                   onRegenerate={handleRegenerate}
                   draftResult={drafts[entry.storyIdx] || null}

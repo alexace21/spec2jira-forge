@@ -118,7 +118,7 @@ export default function FeatureCard({ feature, index, onUpdate, onDelete }) {
   }
 
   function addTask() {
-    const newTask = { type: 'API', summary: 'New task' };
+    const newTask = { type: 'API', summary: 'New task', description: '' };
     onUpdate({ ...feature, tasks: [...feature.tasks, newTask] });
     if (!expanded) setExpanded(true);
   }
@@ -345,14 +345,13 @@ export default function FeatureCard({ feature, index, onUpdate, onDelete }) {
               multiline className="text-xs leading-relaxed italic" style={{ color: 'var(--s2j-text-light)' }} />
           </div>
 
-          {feature.description && (
-            <div>
-              <label className="text-[11px] font-medium uppercase tracking-wider mb-1 block"
-                style={{ color: 'var(--s2j-text-muted)' }}>Description</label>
-              <EditableField value={feature.description} onChange={(val) => updateField('description', val)}
-                multiline className="text-xs leading-relaxed" style={{ color: 'var(--s2j-text-light)' }} />
-            </div>
-          )}
+          {/* Always render so a description-less Story can get one (parity with subtasks). */}
+          <div>
+            <label className="text-[11px] font-medium uppercase tracking-wider mb-1 block"
+              style={{ color: 'var(--s2j-text-muted)' }}>Description</label>
+            <EditableField value={feature.description || ''} onChange={(val) => updateField('description', val)}
+              multiline placeholder="Click to add a description…" className="text-xs leading-relaxed" style={{ color: 'var(--s2j-text-light)' }} />
+          </div>
 
           {/* Story Acceptance Criteria */}
           <div className="space-y-1.5">

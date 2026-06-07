@@ -119,6 +119,8 @@ async function copyToClipboard(text) {
 function StoryTestCaseCard({
   entry,
   jobId,
+  isStale = false,
+  isRemoved = false,
   regenState,
   onRegenerate,
   draftResult,
@@ -250,6 +252,26 @@ function StoryTestCaseCard({
         >
           {storyName}
         </span>
+        {/* (a) ACs-changed chip — this story's acceptance criteria changed since these cases were
+            generated; ↻ Regenerate refreshes them. Distinct from the blue "edited" chip (unsaved
+            test-case drafts) and the coverage stale-refs marker (AC-trace drift). */}
+        {isRemoved && !hasError ? (
+          <span
+            className="text-[10px] px-1.5 py-0.5 rounded font-medium"
+            style={{ background: "var(--s2j-red-bg)", border: "1px solid var(--s2j-red-border)", color: "var(--s2j-red)" }}
+            title="This story was removed from the breakdown in the editor — its cases are orphaned and won't embed on push. Remove this card or re-add the story; it cannot be regenerated."
+          >
+            ⊘ Removed from breakdown
+          </span>
+        ) : isStale && !hasError ? (
+          <span
+            className="text-[10px] px-1.5 py-0.5 rounded font-medium"
+            style={{ background: "var(--s2j-orange-bg)", border: "1px solid var(--s2j-orange-border)", color: "var(--s2j-orange)" }}
+            title="This story's acceptance criteria changed since these test cases were generated — Regenerate to refresh"
+          >
+            ⚠ ACs changed
+          </span>
+        ) : null}
         {/* Unsaved-edits chip — visible even when collapsed */}
         {isDirty && (
           <span
@@ -296,28 +318,30 @@ function StoryTestCaseCard({
           onClick={(e) => {
             e.preventDefault();
             e.stopPropagation();
-            if (isPolling || isSaving) return;
+            if (isPolling || isSaving || isRemoved) return;
             if (confirmArmed === "armed") {
               fireRegen();
             } else {
               armConfirm();
             }
           }}
-          disabled={isPolling || isSaving}
+          disabled={isPolling || isSaving || isRemoved}
           className="text-[10px] px-2 py-0.5 rounded"
           style={{
             background: confirmArmed === "armed" ? "var(--s2j-red-bg)" : "none",
             border: `1px solid ${confirmArmed === "armed" ? "var(--s2j-red-border)" : "var(--s2j-border)"}`,
-            color: (isPolling || isSaving)
+            color: (isPolling || isSaving || isRemoved)
               ? "var(--s2j-text-muted)"
               : confirmArmed === "armed"
               ? "var(--s2j-red)"
               : "var(--s2j-blue)",
-            cursor: (isPolling || isSaving) ? "not-allowed" : "pointer",
+            cursor: (isPolling || isSaving || isRemoved) ? "not-allowed" : "pointer",
             transition: "all 0.15s",
           }}
           title={
-            isPolling
+            isRemoved
+              ? "This story was removed from the breakdown — it cannot be regenerated (remove this card or re-add the story)"
+              : isPolling
               ? "Generating…"
               : isSaving
               ? "Saving — wait, then regenerate"
