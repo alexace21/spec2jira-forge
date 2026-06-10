@@ -24,9 +24,10 @@ import { invoke } from "@forge/bridge";
 
 const SEARCH_DEBOUNCE_MS = 350;
 const SEARCH_MIN_QUERY_LEN = 2;
-// (multi-batch dashboard) how often the picker re-reconciles in-flight jobs. Batches take
-// 2-10 min, so 10s is ample (and halves background Anthropic GETs vs the 5s foreground poll).
-const DASH_POLL_MS = 10000;
+// (multi-batch dashboard) how often the picker re-reconciles IN-FLIGHT jobs (the loop STOPS when
+// none remain — see the effect). Batches take 2-10 min, so 15s is ample; bumped 10s→15s to trim
+// KVS reads (the Atlassian read-throughput quota).
+const DASH_POLL_MS = 15000;
 
 // Relative age for a dashboard row ("started 4 min ago"). Frontend-only, cosmetic.
 function relAge(startedAt) {
@@ -97,6 +98,18 @@ function PagePickerScreen({ onSelect, onOpenSettings }) {
   useEffect(() => {
     const signal = { cancelled: false };
     let running = false; // guard against overlapping sweeps if one runs past DASH_POLL_MS
+    // (KVS read fix) The loop exists ONLY to advance batched→completed. When no job is in-flight,
+    // STOP the interval — further sweeps are pure read waste (the dominant quota leak: a picker left
+    // open re-reading every 15s with nothing changing). A new job is always fired from the generating
+    // screen, which unmounts the picker → a fresh mount re-evaluates + re-arms. Returns the in-flight bool.
+    const stopIfIdle = (jobs) => {
+      const inFlight = jobs.some((j) => j.status === "pending" || j.status === "batched");
+      if (!inFlight && dashPollRef.current) {
+        clearInterval(dashPollRef.current);
+        dashPollRef.current = null;
+      }
+      return inFlight;
+    };
     const loadAndReconcile = async () => {
       if (running) return;
       running = true;
@@ -110,9 +123,9 @@ function PagePickerScreen({ onSelect, onOpenSettings }) {
           console.error("getDashboardJobs failed (non-fatal):", e);
           return;
         }
-        // Advance in-flight jobs sequentially (≤1 resolver in flight; quality > speed).
+        if (signal.cancelled) return;
+        if (!stopIfIdle(jobs)) return; // nothing in-flight → interval stopped; done
         const inFlight = jobs.filter((j) => j.status === "pending" || j.status === "batched");
-        if (inFlight.length === 0) return;
         if (!signal.cancelled) setReconciling(true);
         for (const j of inFlight) {
           if (signal.cancelled) return;
@@ -123,10 +136,12 @@ function PagePickerScreen({ onSelect, onOpenSettings }) {
           }
         }
         if (signal.cancelled) return;
-        // Repaint with the advanced statuses (jobs that completed now show under ✓ Ready).
+        // Repaint with advanced statuses, and stop the interval if everything finished this sweep.
         try {
           const r2 = await invoke("getDashboardJobs");
-          if (!signal.cancelled) setDashboardJobs(Array.isArray(r2?.jobs) ? r2.jobs : []);
+          const jobs2 = Array.isArray(r2?.jobs) ? r2.jobs : [];
+          if (!signal.cancelled) setDashboardJobs(jobs2);
+          if (!signal.cancelled) stopIfIdle(jobs2);
         } catch (e) {
           console.error("getDashboardJobs (post-reconcile) failed (non-fatal):", e);
         }
@@ -135,8 +150,9 @@ function PagePickerScreen({ onSelect, onOpenSettings }) {
         if (!signal.cancelled) setReconciling(false);
       }
     };
-    loadAndReconcile();
+    // Install the interval FIRST so the initial sweep can stop it at once if nothing is in-flight.
     dashPollRef.current = setInterval(loadAndReconcile, DASH_POLL_MS);
+    loadAndReconcile();
     return () => {
       signal.cancelled = true;
       clearInterval(dashPollRef.current);

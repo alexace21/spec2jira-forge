@@ -182,6 +182,32 @@ const SETTINGS_MAX_BYTES = 200000;
 // KVS prefix for generation job state (Anthropic batch lifecycle).
 const JOB_KEY_PREFIX = 'job:';
 
+// (KVS-cost optimization 2026-06-10) The heavy job: record holds the full breakdown (~240KB).
+// jobmeta: is a tiny SIBLING (~100B: status/pageTitle/startedAt) the dashboard reads instead of
+// dereferencing the 240KB job: on every reconcile sweep — KVS has NO field projection, so a lean
+// sibling key is the ONLY way to read a subset cheaply (the Atlassian READ-throughput quota fix).
+// JOB_TTL bounds STORAGE (a different quota): an abandoned/orphaned job self-deletes after 30 days,
+// and every re-set renews it, so an actively-used job never expires. setJob() centralizes BOTH —
+// the job: write WITH ttl AND the jobmeta mirror — so no write site can forget either (a missed
+// jobmeta = a silently-stale dashboard group, §11; a missed ttl = an active job expiring on its
+// original-creation clock). It derives jobmeta from value.status, covering every transition.
+const JOB_META_PREFIX = 'jobmeta:';
+const JOB_TTL = { value: 30, unit: 'DAYS' };
+async function setJob(jobId, value) {
+  const jobKey = `${JOB_KEY_PREFIX}${jobId}`;
+  await kvs.set(jobKey, value, { ttl: JOB_TTL });
+  // Best-effort lean mirror — a jobmeta failure must never break generation (job: is authoritative).
+  try {
+    await kvs.set(
+      `${JOB_META_PREFIX}${jobId}`,
+      { status: value.status, pageTitle: value.pageTitle, startedAt: value.submittedAt || value.createdAt },
+      { ttl: JOB_TTL },
+    );
+  } catch (e) {
+    console.warn(`[setJob] jobmeta mirror failed (non-fatal): ${String(e?.message || e)}`);
+  }
+}
+
 // Index: page id → latest generation jobId. Lets a reopened page reconnect to an
 // in-flight batch (getGenerationStatus) instead of showing Ready + spawning a
 // duplicate batch. Written by startGeneration; read by getGenerationStatus.
@@ -871,14 +897,22 @@ resolver.define('getDashboardJobs', async ({ context }) => {
   //      deref per sweep and are evicted by the cap.
   const checked = await Promise.all(
     list.map(async (ref) => {
-      const job = await kvs.get(`${JOB_KEY_PREFIX}${ref.jobId}`).catch(() => null);
-      if (!job) return null; // purged/lost → filtered (never shown)
+      // Read the LEAN jobmeta (~100B) instead of dereferencing the full job: record (~240KB) — the
+      // KVS read-throughput optimization. Back-compat: a job created before jobmeta existed has no
+      // meta → a one-off heavy deref (READ-ONLY, no backfill — preserves the pure-read invariant; it
+      // self-extinguishes as old jobs complete (their next setJob writes jobmeta) or age out of the cap).
+      let meta = await kvs.get(`${JOB_META_PREFIX}${ref.jobId}`).catch(() => null);
+      if (!meta) {
+        const job = await kvs.get(`${JOB_KEY_PREFIX}${ref.jobId}`).catch(() => null);
+        if (!job) return null; // purged/lost → filtered (never shown)
+        meta = { status: job.status, pageTitle: job.pageTitle, startedAt: job.submittedAt || job.createdAt };
+      }
       return {
         jobId: ref.jobId,
         pageId: ref.pageId,
-        pageTitle: ref.pageTitle || job.pageTitle || 'Untitled',
-        status: job.status, // live: pending | batched | completed | failed
-        startedAt: job.submittedAt || job.createdAt || ref.trackedAt,
+        pageTitle: ref.pageTitle || meta.pageTitle || 'Untitled',
+        status: meta.status, // live: pending | batched | completed | failed
+        startedAt: meta.startedAt || ref.trackedAt,
       };
     }),
   );
@@ -1231,7 +1265,7 @@ resolver.define('startGeneration', async ({ payload, context }) => {
   const model = modelMode === 'fallback' ? MODEL_FALLBACK : MODEL_PRIMARY;
 
   // Persist initial job state
-  await kvs.set(`${JOB_KEY_PREFIX}${jobId}`, {
+  await setJob(jobId,{
     jobId,
     pageId: String(pageId),
     pageTitle,
@@ -1277,7 +1311,7 @@ resolver.define('startGeneration', async ({ payload, context }) => {
       capturedAt: new Date().toISOString(),
       content: snapContent,
       truncatedSnapshot: full.length > snapContent.length,
-    });
+    }, { ttl: JOB_TTL }); // self-expire the ~180KB snapshot after 30d if the job is abandoned (storage)
     console.log(`[startGeneration] page snapshot written for job ${jobId} (${snapContent.length} chars${full.length > snapContent.length ? ', byte-trimmed' : ''}) → enables §7-aware test generation`);
   } catch (e) {
     console.warn(`[startGeneration] page snapshot failed (non-fatal; test-gen falls back to no-source): ${String(e?.message || e)}`);
@@ -1319,7 +1353,7 @@ resolver.define('startGeneration', async ({ payload, context }) => {
     console.error(
       `[startGeneration] batch submit failed: ${submitResult.error} | ${submitResult.detail}`,
     );
-    await kvs.set(`${JOB_KEY_PREFIX}${jobId}`, {
+    await setJob(jobId,{
       jobId,
       pageId: String(pageId),
       pageTitle,
@@ -1335,7 +1369,7 @@ resolver.define('startGeneration', async ({ payload, context }) => {
   }
 
   // Successfully submitted — store batchId с job state
-  await kvs.set(`${JOB_KEY_PREFIX}${jobId}`, {
+  await setJob(jobId,{
     jobId,
     pageId: String(pageId),
     pageTitle,
@@ -1492,7 +1526,7 @@ resolver.define('pollJobStatus', async ({ payload }) => {
           error: 'no_results_url',
           detail: 'Batch ended but Anthropic returned no results_url.',
         };
-        await kvs.set(`${JOB_KEY_PREFIX}${jobId}`, failed);
+        await setJob(jobId,failed);
         return failed;
       }
 
@@ -1511,7 +1545,7 @@ resolver.define('pollJobStatus', async ({ payload }) => {
           detail: fetchResult.detail,
           usage: fetchResult.usage || null,
         };
-        await kvs.set(`${JOB_KEY_PREFIX}${jobId}`, failed);
+        await setJob(jobId,failed);
         return failed;
       }
 
@@ -1566,7 +1600,7 @@ resolver.define('pollJobStatus', async ({ payload }) => {
           ? { truncated: true, truncation_note: fetchResult.truncation_note }
           : {}),
       };
-      await kvs.set(`${JOB_KEY_PREFIX}${jobId}`, completed);
+      await setJob(jobId,completed);
 
       // (multi-batch dashboard) NO list write here — the job was added to the per-user tracked
       // list at startGeneration, and getDashboardJobs reads its LIVE status from the job:
@@ -1723,6 +1757,7 @@ resolver.define('purgeJob', async ({ payload, context }) => {
       }
     }
     await kvs.delete(`${JOB_KEY_PREFIX}${jobId}`);
+    await kvs.delete(`${JOB_META_PREFIX}${jobId}`); // lean dashboard mirror (KVS-cost optimization)
     // Delete the source-page snapshot (the §8 test-gen feed stores a full page-content copy in
     // pagesnap:<jobId>). It IS the privacy-critical item this purge exists to remove — without
     // this it would linger ~180KB/job indefinitely, falsifying the "page content removed after
@@ -1949,7 +1984,7 @@ resolver.define('startTestCaseGeneration', async ({ payload, context }) => {
       const { features: editedFeatures } = flattenBreakdown(payload.breakdown);
       if (Array.isArray(editedFeatures) && editedFeatures.length > 0) {
         job.breakdown = { ...job.breakdown, features: editedFeatures };
-        await kvs.set(`${JOB_KEY_PREFIX}${jobId}`, { ...job });
+        await setJob(jobId,{ ...job });
       } else {
         console.warn(`[startTCGen] edited breakdown flattened to 0 features — keeping stored breakdown for ${jobId}`);
       }
@@ -2405,7 +2440,7 @@ resolver.define('regenerateTestCase', async ({ payload, context }) => {
         const acSig = (fs) => (Array.isArray(fs) ? fs : []).flatMap((s) => (Array.isArray(s && s.acceptance_criteria) ? s.acceptance_criteria : [])).map(normAC).sort().join('|');
         if (acSig(editedFeatures) !== acSig(job.breakdown && job.breakdown.features)) {
           job.breakdown = { ...job.breakdown, features: editedFeatures };
-          await kvs.set(`${JOB_KEY_PREFIX}${jobId}`, job);
+          await setJob(jobId,job);
         }
       }
     } catch (e) {
