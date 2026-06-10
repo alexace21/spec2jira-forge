@@ -186,23 +186,28 @@ const JOB_KEY_PREFIX = 'job:';
 // jobmeta: is a tiny SIBLING (~100B: status/pageTitle/startedAt) the dashboard reads instead of
 // dereferencing the 240KB job: on every reconcile sweep — KVS has NO field projection, so a lean
 // sibling key is the ONLY way to read a subset cheaply (the Atlassian READ-throughput quota fix).
-// JOB_TTL bounds STORAGE (a different quota): an abandoned/orphaned job self-deletes after 30 days,
-// and every re-set renews it, so an actively-used job never expires. setJob() centralizes BOTH —
-// the job: write WITH ttl AND the jobmeta mirror — so no write site can forget either (a missed
-// jobmeta = a silently-stale dashboard group, §11; a missed ttl = an active job expiring on its
-// original-creation clock). It derives jobmeta from value.status, covering every transition.
+// setJob() centralizes the job: write + the jobmeta mirror so no write site can forget the mirror
+// (a missed jobmeta = a silently-stale dashboard group, §11). It derives jobmeta from value.status,
+// covering every transition.
+// ⚠ NO TTL (deep audit 2026-06-10): an earlier version put a 30-day TTL here, which SILENTLY EXPIRED
+// the user's BREAKDOWN deliverable — review/reconnect/PUSH are READS and a native KVS TTL renews only
+// on `set`, so a completed-but-unpushed breakdown vanished at completion+30d (§11 silent-data-loss),
+// and pagesnap: expired out from under §7-aware test-gen. So job:/jobmeta:/pagesnap: carry NO TTL —
+// they persist until the explicit purgeJob (on push), restoring the pre-optimization durability.
+// Bounding STORAGE for never-pushed orphans is a SEPARATE follow-up that must be ACCESS-renewed
+// (re-set on getResults/getGenerationStatus) or scheduled, NOT creation-anchored.
 const JOB_META_PREFIX = 'jobmeta:';
-const JOB_TTL = { value: 30, unit: 'DAYS' };
 async function setJob(jobId, value) {
   const jobKey = `${JOB_KEY_PREFIX}${jobId}`;
-  await kvs.set(jobKey, value, { ttl: JOB_TTL });
+  await kvs.set(jobKey, value);
   // Best-effort lean mirror — a jobmeta failure must never break generation (job: is authoritative).
+  // pollJobStatus re-asserts this on its terminal early-return so a failed mirror can't strand a row.
   try {
-    await kvs.set(
-      `${JOB_META_PREFIX}${jobId}`,
-      { status: value.status, pageTitle: value.pageTitle, startedAt: value.submittedAt || value.createdAt },
-      { ttl: JOB_TTL },
-    );
+    await kvs.set(`${JOB_META_PREFIX}${jobId}`, {
+      status: value.status,
+      pageTitle: value.pageTitle,
+      startedAt: value.submittedAt || value.createdAt,
+    });
   } catch (e) {
     console.warn(`[setJob] jobmeta mirror failed (non-fatal): ${String(e?.message || e)}`);
   }
@@ -1311,7 +1316,7 @@ resolver.define('startGeneration', async ({ payload, context }) => {
       capturedAt: new Date().toISOString(),
       content: snapContent,
       truncatedSnapshot: full.length > snapContent.length,
-    }, { ttl: JOB_TTL }); // self-expire the ~180KB snapshot after 30d if the job is abandoned (storage)
+    }); // NO TTL (deep audit): purgeJob deletes pagesnap on push; a creation-anchored TTL silently dropped the §7 source for a breakdown reviewed/edited >30 days later
     console.log(`[startGeneration] page snapshot written for job ${jobId} (${snapContent.length} chars${full.length > snapContent.length ? ', byte-trimmed' : ''}) → enables §7-aware test generation`);
   } catch (e) {
     console.warn(`[startGeneration] page snapshot failed (non-fatal; test-gen falls back to no-source): ${String(e?.message || e)}`);
@@ -1449,6 +1454,17 @@ resolver.define('pollJobStatus', async ({ payload }) => {
 
   // Terminal states return immediately
   if (job.status === 'completed' || job.status === 'failed') {
+    // (deep-audit fix) Re-assert the lean jobmeta mirror from the authoritative job.status. If an
+    // earlier best-effort jobmeta write failed AT the terminal transition, jobmeta would be stuck
+    // 'batched' → the dashboard strands the row under "In progress" AND stop-idle never stops (the
+    // read leak returns). Terminal states never re-transition, so this poll is the only re-sync point.
+    try {
+      await kvs.set(`${JOB_META_PREFIX}${jobId}`, {
+        status: job.status,
+        pageTitle: job.pageTitle,
+        startedAt: job.submittedAt || job.createdAt,
+      });
+    } catch (_) {}
     return job;
   }
 
