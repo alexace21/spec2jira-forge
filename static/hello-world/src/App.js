@@ -262,6 +262,15 @@ function App() {
   // screenRef mirrors screen state so poll callbacks always read the CURRENT value
   // without a stale closure (fix 6: navigate to testcases only when generatingTests).
   const screenRef = useRef("loading");
+  // (A deep-audit fix 2026-06-10) the job id each poll is CURRENTLY tracking. The poll
+  // guards must key on JOB IDENTITY, not just screen name: with one shared pollRef/tcPollRef
+  // and a closure-captured jid, a stale in-flight callback from an ABANDONED job (user hit
+  // Start over → Generate B while A's poll was awaiting) would otherwise pass a bare
+  // screen-name check and (1) hijack to the wrong job and (2) clearInterval the NEWER poll's
+  // interval, orphaning it. startPolling/startTcPolling set these; the guards compare
+  // `jid === current` before navigating, setting status, or clearing the shared ref.
+  const currentPollJobIdRef = useRef(null);
+  const currentTcJobIdRef = useRef(null);
   const [pageData, setPageData] = useState(null);
   const [pageId, setPageId] = useState(null);
   const [error, setError] = useState(null);
@@ -590,45 +599,22 @@ function App() {
           console.error("URL deep-link check failed:", urlErr);
         }
 
-        // ═══ Gate 5 — KVS lastSelected reconnect (active jobs only) ═══
-        // U4 part 33 (2026-05-09) — refined per partner UX directive
-        // 2026-05-08 part 18: "auto-load last breakdown на app return
-        // should route to picker, не resume". Reconnect ONLY когато
-        // last-selected page has ACTIVE job (running/pending) — те
-        // are time-sensitive (user wants monitoring); completed jobs
-        // wait for explicit pick от picker (still 1-click via recent
-        // list which shows last_selected at top). Idle status also
-        // falls through to picker (no work to monitor).
-        //
-        // Net UX change: after completing a run, returning to the app
-        // lands в picker → user picks deliberately whether to review
-        // the completed work, start fresh, or do something else. Active
-        // jobs still surface automatically (monitoring use case).
-        // Failures here are non-fatal — picker fallback covers uncertainty.
-        try {
-          const lastResp = await invoke("getLastSelectedPage");
-          const last = lastResp?.lastSelected;
-          if (last?.id) {
-            const [pageResult, statusResult] = await Promise.all([
-              invoke("fetchPage", { pageId: last.id }),
-              invoke("getGenerationStatus", { pageId: last.id }),
-            ]);
-            if (
-              !pageResult.error &&
-              (statusResult.status === "running" ||
-                statusResult.status === "pending" ||
-                statusResult.status === "batched")
-            ) {
-              await routeByPageStatus(last, pageResult, statusResult);
-              return;
-            }
-          }
-        } catch (reconErr) {
-          // Non-fatal — picker fallback handles uncertainty.
-          console.error("Reconnect attempt failed:", reconErr);
-        }
+        // ═══ Gate 5 — reopen ALWAYS lands on the picker (the dashboard) ═══
+        // (multi-batch dashboard, 2026-06-10 — partner live-acceptance UX finding) Reopening
+        // the app WITHOUT an explicit deep-link always lands on the picker. The picker IS the
+        // live multi-batch dashboard now: every in-flight job shows under "⏳ In progress" (10s
+        // reconcile), completed under "✓ Ready for review", failed under "⚠ Needs attention".
+        // So the OLD Gate-5 behavior — auto-resuming the SINGLE last-selected job's generating
+        // SCREEN when it had an active job — was RETIRED: it hid the other batched jobs behind
+        // one spinner, contradicting the whole "fire several → return → see them ALL" vision.
+        // The monitoring use case the old gate served is now covered better by the dashboard;
+        // from the picker the user clicks any "⏳ In progress" row to drop into that job's
+        // generating screen (route-by-jobId). Explicit deep-links (Gates 3/4 above) still open
+        // their specific page directly — that intent is unambiguous, so they are unchanged.
+        // (The 2026-05-08 "return → picker, не resume" directive is now fully honored — it had
+        // carved out active jobs; the dashboard makes that carve-out unnecessary.)
 
-        // Default entry: page picker.
+        // Default entry: page picker (the dashboard).
         setScreen("picker");
       } catch (err) {
         setError(err.message);
@@ -698,33 +684,54 @@ function App() {
   // ── Polling ───────────────────────────────────────────────────
   const startPolling = useCallback((jid) => {
     clearInterval(pollRef.current);
+    currentPollJobIdRef.current = jid; // this poll now owns pollRef
     pollRef.current = setInterval(async () => {
       try {
         const st = await invoke("pollJobStatus", { jobId: jid });
+        // (A deep-audit fix) Is this callback's job STILL the one this poll tracks? A stale
+        // tick from an abandoned job (a newer startPolling replaced pollRef) must not clear
+        // the newer poll's interval, overwrite its status, or drive the screen. isCurrent
+        // gates every side effect that touches the shared pollRef / current screen.
+        const isCurrent = jid === currentPollJobIdRef.current;
         if (st.error) {
-          clearInterval(pollRef.current);
-          setError(st.error);
-          setScreen("error");
+          if (isCurrent) clearInterval(pollRef.current); // only the owner clears the shared ref
+          // not_found / job-gone: route to error ONLY for the foreground job. Background or
+          // stale → quiet (a cue would point at nothing).
+          if (isCurrent && screenRef.current === "generating") {
+            setError(st.error);
+            setScreen("error");
+          }
           return;
         }
-        setJobStatus(st);
+        // Progress drives the generating screen — only for the tracked job, so a stale tick
+        // can't overwrite the new job's progress.
+        if (isCurrent) setJobStatus(st);
         if (st.status === "completed") {
-          clearInterval(pollRef.current);
-          const full = await invoke("getResults", { jobId: jid });
-          if (full.error) {
-            setError(full.error);
-            setScreen("error");
-          } else {
-            // A freshly-generated breakdown is current by definition — clear any
-            // stale flag lingering from a previous reconnect (e.g. after Regenerate).
-            setStaleBreakdown(null);
-            setResults(v3AdaptResultPayload(full));
-            setScreen("reviewing");
+          if (isCurrent) clearInterval(pollRef.current);
+          // Navigate to review ONLY for the foreground job (tracked AND its generating screen
+          // is up). A background/stale completion just stops polling — the per-user dashboard
+          // on the picker surfaces it durably (⏳→✓), so no screen-yank and no separate cue.
+          if (isCurrent && screenRef.current === "generating") {
+            const full = await invoke("getResults", { jobId: jid });
+            if (full.error) {
+              setError(full.error);
+              setScreen("error");
+            } else {
+              // A freshly-generated breakdown is current by definition — clear any
+              // stale flag lingering from a previous reconnect (e.g. after Regenerate).
+              setStaleBreakdown(null);
+              setResults(v3AdaptResultPayload(full));
+              setScreen("reviewing");
+            }
           }
         } else if (st.status === "failed") {
-          clearInterval(pollRef.current);
-          setError(st.error || "Generation failed");
-          setScreen("error");
+          if (isCurrent) clearInterval(pollRef.current);
+          // Foreground → error screen. A background/stale failure stops quietly — the
+          // dashboard's ⚠ Needs attention group surfaces it durably (§11: shown, not silent).
+          if (isCurrent && screenRef.current === "generating") {
+            setError(st.error || "Generation failed");
+            setScreen("error");
+          }
         }
       } catch (e) {
         console.error("Poll error:", e);
@@ -740,19 +747,27 @@ function App() {
   const startTcPolling = useCallback(
     (jid) => {
       clearInterval(tcPollRef.current);
+      currentTcJobIdRef.current = jid; // this poll now owns tcPollRef
       tcPollRef.current = setInterval(async () => {
         try {
           const st = await invoke("pollTestCaseStatus", { jobId: jid });
+          // (A deep-audit fix, mirrored from the breakdown poll) ignore a stale tick from an
+          // abandoned TC job — a newer startTcPolling owns tcPollRef now; this callback must
+          // not clear its interval, overwrite its status, or drive the screen.
+          const isCurrent = jid === currentTcJobIdRef.current;
           if (st.error) {
-            clearInterval(tcPollRef.current);
-            setTcGenerating(false); // Fix 6
-            const friendly = _classifyBackendError(st, "Test case generation failed");
-            setError(friendly.message);
-            setScreen("error");
+            if (isCurrent) {
+              clearInterval(tcPollRef.current);
+              setTcGenerating(false); // Fix 6
+              const friendly = _classifyBackendError(st, "Test case generation failed");
+              setError(friendly.message);
+              setScreen("error");
+            }
             return;
           }
-          setTcJobStatus(st);
+          if (isCurrent) setTcJobStatus(st);
           if (st.status === "completed") {
+            if (!isCurrent) return; // stale — a newer TC poll owns tcPollRef
             clearInterval(tcPollRef.current);
             const tc = await invoke("getTestCases", { jobId: jid });
             if (tc.error) {
@@ -770,6 +785,7 @@ function App() {
               }
             }
           } else if (st.status === "failed") {
+            if (!isCurrent) return; // stale
             clearInterval(tcPollRef.current);
             setTcGenerating(false); // Fix 6
             const friendly = _classifyBackendError(st, "Test case generation failed");
@@ -885,9 +901,22 @@ function App() {
       setError(null);
 
       try {
+        // Dashboard rows carry their OWN jobId+status (the per-user identity) → route by THAT,
+        // not by getGenerationStatus → the shared per-install page→job index, which a co-worker
+        // generating the same page can overwrite (deep-audit MED: a dashboard click would then
+        // open the OTHER user's job). Recent-list / reconnect rows have no jobId → resolve by page.
+        const statusReq = pageRef.jobId
+          ? Promise.resolve({
+              status: pageRef.jobStatus,
+              job_id: pageRef.jobId,
+              elapsed_seconds: pageRef.startedAt
+                ? Math.max(0, Math.floor((Date.now() - new Date(pageRef.startedAt).getTime()) / 1000))
+                : 0,
+            })
+          : invoke("getGenerationStatus", { pageId: pageRef.id });
         const [pageResult, statusResult] = await Promise.all([
           invoke("fetchPage", { pageId: pageRef.id }),
-          invoke("getGenerationStatus", { pageId: pageRef.id }),
+          statusReq,
         ]);
 
         if (pageResult.error) {
@@ -1372,6 +1401,25 @@ function App() {
     setScreen("ready");
   }, []);
 
+  // handleStartOver (multi-batch, 2026-06-10) — "Start over" on the GENERATING screen. The user
+  // edited the page after starting, so this in-flight run is on a STALE version → ABANDON it.
+  // Reuses handleRegenerate (clears polls + state, routes to Ready) THEN best-effort purges the
+  // job so it disappears from the dashboard immediately — otherwise it lingered as "⏳ In
+  // progress" (pre-dashboard this side effect was invisible; the run keeps going on Anthropic's
+  // side and expires ~24h orphaned — we just stop tracking/surfacing it; partner chose this over
+  // a cancel-batch API). Capture jobId BEFORE handleRegenerate nulls it. (Reviewing's
+  // "Regenerate" deliberately KEEPS its completed job — that breakdown is still useful + resumable;
+  // only the in-flight Start-over abandons.)
+  const handleStartOver = useCallback(() => {
+    const abandonedJobId = jobId;
+    handleRegenerate();
+    if (abandonedJobId) {
+      invoke("purgeJob", { jobId: abandonedJobId }).catch((e) =>
+        console.error("Start-over purge failed (non-fatal):", e),
+      );
+    }
+  }, [jobId, handleRegenerate]);
+
   // handleNewPage — clear page binding, return to picker. Used от
   // PushedScreen "Generate Another" (post-push, user wants different
   // spec).
@@ -1717,7 +1765,7 @@ function App() {
           jobStatus={jobStatus}
           elapsed={elapsed}
           onBack={handleNewPage}
-          onStartOver={handleRegenerate}
+          onStartOver={handleStartOver}
         />
       );
     case "generatingTests":

@@ -19,11 +19,26 @@
  * The picker itself does NOT call recordPageSelection — single source of
  * truth is the parent's flow гate.
  */
-import React, { useEffect, useState, useCallback } from "react";
+import React, { useEffect, useState, useCallback, useRef } from "react";
 import { invoke } from "@forge/bridge";
 
 const SEARCH_DEBOUNCE_MS = 350;
 const SEARCH_MIN_QUERY_LEN = 2;
+// (multi-batch dashboard) how often the picker re-reconciles in-flight jobs. Batches take
+// 2-10 min, so 10s is ample (and halves background Anthropic GETs vs the 5s foreground poll).
+const DASH_POLL_MS = 10000;
+
+// Relative age for a dashboard row ("started 4 min ago"). Frontend-only, cosmetic.
+function relAge(startedAt) {
+  if (!startedAt) return "";
+  const ms = Date.now() - new Date(startedAt).getTime();
+  if (!(ms >= 0)) return "";
+  const min = Math.floor(ms / 60000);
+  if (min < 1) return "just now";
+  if (min < 60) return `${min} min ago`;
+  const hr = Math.floor(min / 60);
+  return hr === 1 ? "1 hr ago" : `${hr} hr ago`;
+}
 
 // Atlassian Marketplace listing URL (where customers leave a review). The public
 // listing isn't live until the app is approved, so this is a placeholder the partner
@@ -33,6 +48,13 @@ const MARKETPLACE_REVIEW_URL = "https://marketplace.atlassian.com/";
 function PagePickerScreen({ onSelect, onOpenSettings }) {
   const [recent, setRecent] = useState([]);
   const [recentLoaded, setRecentLoaded] = useState(false);
+  // (multi-batch dashboard) the per-user tracked jobs (in-progress + completed + failed),
+  // grouped by LIVE status in the render. Reconciled on mount + every DASH_POLL_MS while the
+  // picker is open: getDashboardJobs reports current truth, then we poll each in-flight job
+  // (advances batched→completed in KVS), then repaint. dashPollRef holds the interval.
+  const [dashboardJobs, setDashboardJobs] = useState([]);
+  const [reconciling, setReconciling] = useState(false);
+  const dashPollRef = useRef(null);
 
   const [query, setQuery] = useState("");
   const [results, setResults] = useState([]);
@@ -49,9 +71,7 @@ function PagePickerScreen({ onSelect, onOpenSettings }) {
     (async () => {
       try {
         const r = await invoke("getRecentPages");
-        if (!cancelled) {
-          setRecent(Array.isArray(r?.recent) ? r.recent : []);
-        }
+        if (!cancelled) setRecent(Array.isArray(r?.recent) ? r.recent : []);
       } catch (e) {
         // Non-fatal — recent list просто won't render. Search + manual
         // fallback still work, so не error-screen on this path.
@@ -62,6 +82,64 @@ function PagePickerScreen({ onSelect, onOpenSettings }) {
     })();
     return () => {
       cancelled = true;
+    };
+  }, []);
+
+  // ── Multi-batch dashboard: load + reconcile on mount, then on an interval ──
+  // (multi-batch dashboard) The picker IS the dashboard. While it is open we keep the tracked
+  // jobs live: read current truth, advance each in-flight job by polling it ONE at a time
+  // (each its own resolver, 25s-safe — the same poll the foreground watch makes), then
+  // repaint. This is what makes "fire 3 → lunch → return → see done + running" work: every
+  // fired job was tracked at startGeneration and the job: records persist (no server process;
+  // status only advances when a poll drives it — here, the dashboard drives it). Picker-scoped
+  // by construction (this component mounts only on the picker screen), so it never fights the
+  // foreground generating-screen poll, and unmount cleans the interval.
+  useEffect(() => {
+    const signal = { cancelled: false };
+    let running = false; // guard against overlapping sweeps if one runs past DASH_POLL_MS
+    const loadAndReconcile = async () => {
+      if (running) return;
+      running = true;
+      try {
+        let jobs = [];
+        try {
+          const r = await invoke("getDashboardJobs");
+          jobs = Array.isArray(r?.jobs) ? r.jobs : [];
+          if (!signal.cancelled) setDashboardJobs(jobs);
+        } catch (e) {
+          console.error("getDashboardJobs failed (non-fatal):", e);
+          return;
+        }
+        // Advance in-flight jobs sequentially (≤1 resolver in flight; quality > speed).
+        const inFlight = jobs.filter((j) => j.status === "pending" || j.status === "batched");
+        if (inFlight.length === 0) return;
+        if (!signal.cancelled) setReconciling(true);
+        for (const j of inFlight) {
+          if (signal.cancelled) return;
+          try {
+            await invoke("pollJobStatus", { jobId: j.jobId }); // advances KVS batched→completed
+          } catch (e) {
+            console.error("dashboard reconcile poll failed (non-fatal):", e);
+          }
+        }
+        if (signal.cancelled) return;
+        // Repaint with the advanced statuses (jobs that completed now show under ✓ Ready).
+        try {
+          const r2 = await invoke("getDashboardJobs");
+          if (!signal.cancelled) setDashboardJobs(Array.isArray(r2?.jobs) ? r2.jobs : []);
+        } catch (e) {
+          console.error("getDashboardJobs (post-reconcile) failed (non-fatal):", e);
+        }
+      } finally {
+        running = false;
+        if (!signal.cancelled) setReconciling(false);
+      }
+    };
+    loadAndReconcile();
+    dashPollRef.current = setInterval(loadAndReconcile, DASH_POLL_MS);
+    return () => {
+      signal.cancelled = true;
+      clearInterval(dashPollRef.current);
     };
   }, []);
 
@@ -265,6 +343,62 @@ function PagePickerScreen({ onSelect, onOpenSettings }) {
           or use the manual page ID below.
         </div>
       )}
+
+      {/* ── Live multi-batch dashboard (3 status groups) ──────────
+          The picker IS the dashboard. Every job the user fired (tracked at startGeneration)
+          shows here grouped by LIVE status, reconciled while the picker is open — so "fire 3
+          → lunch → return" shows all 3 with their current state. Reuses PageRow; the row
+          subtitle carries age/status. Clicking a row opens it via onSelect → the parent's
+          routeByPageStatus (in-progress → generating+resume poll, completed → reviewing +
+          stale-check + test-case rehydrate, failed → ready/Generate). A page may also appear
+          in Recent below (different meaning) — harmless overlap, the group header disambiguates. */}
+      {(() => {
+        const inProgress = dashboardJobs.filter((j) => j.status === "pending" || j.status === "batched");
+        const ready = dashboardJobs.filter((j) => j.status === "completed");
+        const failed = dashboardJobs.filter((j) => j.status === "failed");
+        const renderGroup = (title, color, jobs, prefix, subtitleFor) =>
+          jobs.length === 0 ? null : (
+            <div className="mb-6">
+              <p
+                className="text-[11px] font-medium uppercase tracking-wider mb-2"
+                style={{ color }}
+              >
+                {title} ({jobs.length})
+              </p>
+              <ul className="space-y-1" style={{ listStyle: "none", margin: 0, padding: 0 }}>
+                {jobs.map((j) => (
+                  <PageRow
+                    key={`${prefix}-${j.jobId}`}
+                    page={{
+                      id: j.pageId,
+                      title: j.pageTitle,
+                      spaceName: subtitleFor(j),
+                      // Carry the row's OWN job identity so the parent routes by THIS job, not
+                      // the shared page→latest index (deep-audit MED: cross-user wrong-job open).
+                      jobId: j.jobId,
+                      jobStatus: j.status,
+                      startedAt: j.startedAt,
+                    }}
+                    onPick={handlePick}
+                  />
+                ))}
+              </ul>
+            </div>
+          );
+        return (
+          <>
+            {renderGroup(
+              `⏳ In progress${reconciling ? " · checking…" : ""}`,
+              "var(--s2j-text-muted)",
+              inProgress,
+              "p",
+              (j) => `Generating · started ${relAge(j.startedAt) || "moments ago"}`,
+            )}
+            {renderGroup("✓ Ready for review", "var(--s2j-blue)", ready, "r", () => "Completed — not yet pushed")}
+            {renderGroup("⚠ Needs attention", "var(--s2j-red)", failed, "f", () => "Generation failed — reopen to retry")}
+          </>
+        );
+      })()}
 
       {/* ── Recent list ──────────────────────────────────────── */}
       {showRecent && (

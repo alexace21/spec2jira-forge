@@ -709,6 +709,18 @@ resolver.define('getContextProfiles', async ({ payload }) => {
 const RECENT_PAGES_KEY = 'spec2jira_recent_pages';
 const LAST_SELECTED_KEY = 'spec2jira_last_selected_page';
 const MAX_RECENT_PAGES = 10;
+// (multi-batch dashboard) per-USER tracked-jobs list — EVERY job the user fires (not just
+// completions), so the picker dashboard shows in-progress + ready + failed after the user
+// fires several and leaves. Keyed by accountId (reuse usage.js :u:<accountId>), capped,
+// prepend + dedupe-by-page; stores only lightweight refs (never a breakdown — KVS ~240KB).
+// The job: record is the source of truth for live status; this list is just the id-set to
+// check. (Generalizes the earlier per-install "completed jobs" queue — one list, now written
+// at startGeneration instead of only on completion → fire-3-and-leave shows all 3.)
+// NOTE (deliberate mixed model): this dashboard list is per-USER (the vision is per-user
+// isolation), while RECENT_PAGES_KEY/LAST_SELECTED_KEY stay per-INSTALL (legacy, shared) —
+// not an oversight; re-keying the recent list is out of scope.
+const TRACKED_JOBS_PREFIX = 'spec2jira_tracked_jobs:u:';
+const MAX_TRACKED_JOBS = 10;
 const PENDING_DEEP_LINK_KEY = 'spec2jira_pending_deep_link';
 const PENDING_DEEP_LINK_MAX_AGE_MS = 5 * 60 * 1000;
 const SEARCH_MIN_QUERY_LEN = 2;
@@ -807,6 +819,70 @@ resolver.define('recordPageSelection', async ({ payload }) => {
   await kvs.set(RECENT_PAGES_KEY, next);
   await kvs.set(LAST_SELECTED_KEY, entry);
   return { success: true, recent: next };
+});
+
+// (multi-batch dashboard) helper — record a FIRED job into the per-USER tracked-jobs list.
+// Mirrors recordPageSelection (prepend + dedupe + cap). Dedupe by PAGE (not jobId) so
+// re-generating the same page REPLACES its stale row — one latest job per page. Called at
+// startGeneration (every fired job is tracked from submit, so a user who fires several and
+// leaves sees them all). Caller wraps best-effort/fail-soft. accountId scopes the list per
+// user (reuse usage.js :u:<accountId>); 'unknown' is the safe fallback bucket.
+async function recordTrackedJob(accountId, { jobId, pageId, pageTitle }) {
+  if (!jobId || !pageId) return;
+  const key = `${TRACKED_JOBS_PREFIX}${accountId || 'unknown'}`;
+  const stringPageId = String(pageId);
+  const entry = {
+    jobId,
+    pageId: stringPageId,
+    pageTitle: pageTitle || 'Untitled',
+    trackedAt: new Date().toISOString(),
+  };
+  const current = await kvs.get(key);
+  const list = Array.isArray(current) ? current : [];
+  const filtered = list.filter((j) => j.pageId !== stringPageId);
+  const next = [entry, ...filtered].slice(0, MAX_TRACKED_JOBS);
+  await kvs.set(key, next);
+}
+
+// getDashboardJobs — the picker's live multi-batch dashboard. Returns the capped per-USER
+// tracked list, DEREFERENCING each ref against its job record to read the LIVE status
+// (pending|batched|completed|failed) so the frontend can group rows into In progress /
+// Ready for review / Needs attention. Drops a row whose job was purged/lost (`!job`) or is
+// SUPERSEDED by a newer job for the same page (PAGE_JOB_PREFIX mismatch → the click would
+// open the wrong job), self-healing the stored list. Read-only; a glitch returns an empty
+// dashboard, never an error. The frontend reconcile loop advances batched→completed by
+// calling pollJobStatus per in-flight row; this resolver just reports the current truth.
+resolver.define('getDashboardJobs', async ({ context }) => {
+  const accountId = (context && context.accountId) || 'unknown';
+  const key = `${TRACKED_JOBS_PREFIX}${accountId}`;
+  const list = await kvs.get(key);
+  if (!Array.isArray(list) || list.length === 0) return { jobs: [] };
+  // PURE READ (deep-audit fix). Dereference each ref against its job: record for LIVE status;
+  // drop a ref whose job is gone (purged/lost). Two things this DELIBERATELY no longer does:
+  //   1. NO supersede-prune against PAGE_JOB_PREFIX — that index is shared PER-INSTALL, but this
+  //      list is per-USER, so pruning against it dropped a user's OWN in-flight job whenever a
+  //      co-worker regenerated the same page (deep-audit MED, cross-user coupling). Same-page
+  //      supersession for the SAME user is already handled at WRITE time by recordTrackedJob's
+  //      dedupe-by-page; a stale/superseded ref here is simply filtered (never shown) and ages
+  //      out via the cap, and the click routes by the row's OWN jobId so it can't open the wrong job.
+  //   2. NO self-heal write — a read-modify-write here raced a concurrent recordTrackedJob across
+  //      the same user's two tabs and could clobber a just-fired job out of the list (deep-audit
+  //      LOWs). Keeping this a pure read removes that race entirely; dead refs cost only a filtered
+  //      deref per sweep and are evicted by the cap.
+  const checked = await Promise.all(
+    list.map(async (ref) => {
+      const job = await kvs.get(`${JOB_KEY_PREFIX}${ref.jobId}`).catch(() => null);
+      if (!job) return null; // purged/lost → filtered (never shown)
+      return {
+        jobId: ref.jobId,
+        pageId: ref.pageId,
+        pageTitle: ref.pageTitle || job.pageTitle || 'Untitled',
+        status: job.status, // live: pending | batched | completed | failed
+        startedAt: job.submittedAt || job.createdAt || ref.trackedAt,
+      };
+    }),
+  );
+  return { jobs: checked.filter(Boolean) };
 });
 
 resolver.define('setPendingDeepLink', async ({ payload }) => {
@@ -1276,6 +1352,17 @@ resolver.define('startGeneration', async ({ payload, context }) => {
     //            scoped to the creating key). See pollJobStatus.
   });
 
+  // (multi-batch dashboard) track this fired job in the per-user dashboard list so it shows
+  // as ⏳ In progress IMMEDIATELY — and flips to ✓ Ready once a poll/reconcile observes its
+  // completion (getDashboardJobs reads the live job: status). Best-effort/fail-soft: the
+  // job: record above is authoritative; this is an additive index. This is the single write
+  // point (the old completion-path write is dropped) → every fired job is tracked from submit.
+  try {
+    await recordTrackedJob((context && context.accountId) || 'unknown', { jobId, pageId, pageTitle });
+  } catch (e) {
+    console.warn(`[startGeneration] tracked-jobs index write failed (non-fatal): ${String(e?.message || e)}`);
+  }
+
   // Consume one unit of quota — only now that the batch submitted successfully
   // (a failed submit above returned early and never reaches here). Throw-safe:
   // the generation already succeeded, so a metering write failure must not break
@@ -1381,6 +1468,22 @@ resolver.define('pollJobStatus', async ({ payload }) => {
 
     // Batch ended — fetch + parse results
     if (pollResult.status === 'ended') {
+      // (concurrency, deep-audit) Two drivers can poll the SAME job — the dashboard reconcile
+      // loop AND the foreground generating-screen poll (e.g. the user clicks a still-running
+      // dashboard row → routeByPageStatus resumes a foreground poll while a reconcile
+      // `await pollJobStatus` is still in flight). This re-read de-dups only the SERIAL case (a
+      // second poll that STARTS after the first already wrote 'completed' below): it returns the
+      // finalized job and skips the re-fetch/re-repair. It does NOT close the CONCURRENT case —
+      // two polls that both reach here before either writes 'completed' (downstream of
+      // fetchBatchResults + the verifyAndRepairCycles LLM) will both re-read 'batched' and both
+      // proceed, so on a breakdown WITH a dependency cycle the billed cycle-repair LLM can run
+      // twice. ACCEPTED: the result is idempotent (the graph is acyclic+buildable under either
+      // writer; last-writer-wins on two valid repairs) and the duplicate is a rare, cycle-gated
+      // extra call in a seconds-long window — not worth a 'finalizing'-marker state machine here.
+      const fresh = await kvs.get(`${JOB_KEY_PREFIX}${jobId}`).catch(() => null);
+      if (fresh && (fresh.status === 'completed' || fresh.status === 'failed')) {
+        return fresh;
+      }
       if (!pollResult.resultsUrl) {
         const failed = {
           ...job,
@@ -1464,6 +1567,11 @@ resolver.define('pollJobStatus', async ({ payload }) => {
           : {}),
       };
       await kvs.set(`${JOB_KEY_PREFIX}${jobId}`, completed);
+
+      // (multi-batch dashboard) NO list write here — the job was added to the per-user tracked
+      // list at startGeneration, and getDashboardJobs reads its LIVE status from the job:
+      // record (now 'completed'), so it surfaces under ✓ Ready for review automatically. (This
+      // replaces the earlier completion-path queue write, which only captured foreground polls.)
 
       console.log(
         `[pollJobStatus] jobId=${jobId} batchId=${job.batchId} COMPLETED features=${(breakdown.features || []).length} elapsed=${elapsedMs}ms cost=$${costEstimate.total_usd.toFixed(4)}${fetchResult.truncated ? ' [TRUNCATED-PARTIAL]' : ''}`,
@@ -1600,13 +1708,19 @@ resolver.define('getUsage', async ({ context }) => {
  * pushes to JIRA). Best-effort, non-fatal. Backs the privacy policy claim that
  * page content is removed after processing rather than retained indefinitely.
  */
-resolver.define('purgeJob', async ({ payload }) => {
+resolver.define('purgeJob', async ({ payload, context }) => {
   const jobId = payload?.jobId;
   if (!jobId) return { ok: false };
   try {
     const job = await kvs.get(`${JOB_KEY_PREFIX}${jobId}`);
     if (job && job.pageId) {
-      await kvs.delete(`${PAGE_JOB_PREFIX}${String(job.pageId)}`);
+      // Clear the page→job reconnect index ONLY if it still points at THIS job. Purging a
+      // SUPERSEDED job (a newer generation exists for the same page) must NOT blow away the
+      // newer job's reconnect index (deep-audit re-verify note — pre-existing, narrow window).
+      const pageRef = await kvs.get(`${PAGE_JOB_PREFIX}${String(job.pageId)}`).catch(() => null);
+      if (pageRef && pageRef.jobId === jobId) {
+        await kvs.delete(`${PAGE_JOB_PREFIX}${String(job.pageId)}`);
+      }
     }
     await kvs.delete(`${JOB_KEY_PREFIX}${jobId}`);
     // Delete the source-page snapshot (the §8 test-gen feed stores a full page-content copy in
@@ -1614,6 +1728,22 @@ resolver.define('purgeJob', async ({ payload }) => {
     // this it would linger ~180KB/job indefinitely, falsifying the "page content removed after
     // processing" privacy claim (deep-audit 2026-06-06). Fail-open like the rest.
     await kvs.delete(`${PAGE_SNAP_PREFIX}${jobId}`);
+
+    // (multi-batch dashboard) drop this job from the per-user tracked list so a pushed
+    // breakdown stops appearing in the dashboard. Best-effort; getDashboardJobs also
+    // dereferences-and-prunes (job gone → dropped) as the real backstop, so a miss here
+    // self-heals on read — and covers the rare case where a different user pushes the job.
+    try {
+      const acct = (context && context.accountId) || 'unknown';
+      const trackedKey = `${TRACKED_JOBS_PREFIX}${acct}`;
+      const tj = await kvs.get(trackedKey);
+      if (Array.isArray(tj)) {
+        const next = tj.filter((j) => j.jobId !== jobId);
+        if (next.length !== tj.length) await kvs.set(trackedKey, next);
+      }
+    } catch (cjErr) {
+      console.warn(`[purgeJob] tracked-jobs filter failed (non-fatal): ${String(cjErr?.message || cjErr)}`);
+    }
 
     // P4 audit B/Finding-6: also purge test-case KVS entries so generated cases
     // don't linger after the user's content has been pushed. Fail-open: a purge
