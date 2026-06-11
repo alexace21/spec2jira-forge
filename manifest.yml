@@ -60,7 +60,7 @@ modules:
       resource: main
       resolver:
         function: resolver
-      title: Spec2JIRA Settings
+      title: Spec2Tickets Settings
       useAsConfig: true
       # NOTE: confluence:globalSettings does NOT support unlicensedAccess (a hard
       # forge-lint error — verified 2026-06-03). Moot now: the app is licensed-only
