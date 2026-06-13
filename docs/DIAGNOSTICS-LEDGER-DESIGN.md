@@ -23,6 +23,19 @@
 - **NO end-user content** — enforced structurally (see §1 MUST-NOT), not by discipline.
 - Survives `purgeJob` (that's the point). **NO TTL** (KVS TTL is sliding-on-write — would
   silently expire rarely-written diagnostics; the hard-won TTL lesson).
+- **Retention sized for the support window (partner, 2026-06-13):** the gap between a
+  failure and support receiving the diagnostic is ≥14h (≈12h contractual response + the
+  user/admin relaying it) and can stretch to DAYS (the admin may be away). The design
+  holds across this: ledger error records have **NO TTL** and the **dedupe collapses a
+  repeated failure into ONE record (occurrences++)**, so a user hammering the same failure
+  for days never churns the 50-cap — the record persists until 50 DISTINCT (ref,op,class)
+  failures accumulate (far beyond any realistic window) or the user clears. Zone-2 verbatim
+  detail's **30-day TTL** covers even an admin-on-vacation delay. Honest edges: a >30-day
+  delay loses the verbatim (the structured codes/field_names/counts/ref still persist — the
+  actionable diagnosis survives); a single user with 50+ DISTINCT unresolved failures could
+  evict the oldest (info-first eviction protects errors from breadcrumb churn, so this needs
+  50 real distinct errors — implausible in the window). This validates the no-TTL-on-records
+  decision: the SLA window is exactly why the deliverable-trace must not expire.
 - Forge `console.*` stays dev-debug only (14-day retention, customer can disable sharing).
 - **Deployment guard: DEV ONLY until the v5.3.0 Marketplace verdict** — `forge deploy -e
   production` auto-creates a Marketplace version and could entangle the in-flight review.

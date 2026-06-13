@@ -1271,7 +1271,7 @@ function DiagnosticsTab({ refFilter = "", onRefFilterChange }) {
             {clearing
               ? "Clearing…"
               : clearArmed
-                ? "⚠ Click again to clear — sure?"
+                ? "⚠ Click again to confirm"
                 : "Clear diagnostics"}
           </button>
         </div>

@@ -759,10 +759,28 @@ resolver.define('distillStep', async ({ payload, context }) => {
   try {
     result = await distillCategory({ text: s.input, category, apiKey });
   } catch (e) {
-    console.error(`[distill] step ${step} (${category.key}) threw: ${String(e?.message || e)}`);
+    console.error(`[distill] step ${step} (${category.key}) threw: ${String(e?.message || e)} ref=${sessionId}`);
+    // [Q2 fix] the unexpected-throw twin of the API-rejection record below — durable
+    // trace for support (we don't know the class → unknown_error; detail → zone-2).
+    await recordDiagnostic({
+      context,
+      record: { op: 'distill.step', error_class: 'unknown_error', level: 'error', ref: sessionId, surfaced: true },
+    });
+    await writeDiagnosticDetail({ ref: sessionId, text: String(e?.message || e) });
     return { error: 'distill_exception', code: 'UNEXPECTED', detail: String(e?.message || e), step, label: category.label };
   }
   if (result.error) {
+    // [Q2 fix — Managed-Pro durability] a per-category Anthropic failure (esp. auth_rejected
+    // on OUR Managed key, or insufficient_credits/rate_limited/network) used to be a
+    // TRANSIENT FE-only message — nothing in the ledger, gone when the user closed the app.
+    // Record it so support has a durable trace. Class via the shared mapper; the verbatim
+    // detail rides zone-2 (consent-gated), never the content-free record.
+    const { error_class, counts } = classifyDiagGenerationError(result.error);
+    await recordDiagnostic({
+      context,
+      record: { op: 'distill.step', error_class, level: 'error', ref: sessionId, ...(counts ? { counts } : {}), surfaced: true },
+    });
+    await writeDiagnosticDetail({ ref: sessionId, text: String(result.detail || result.error) });
     // Keep the session so the UI can retry THIS step with the same sessionId.
     return { ...mapDistillError(result), step, label: category.label };
   }
@@ -1150,6 +1168,18 @@ resolver.define('fetchPage', async ({ payload }) => {
   }
 
   const data = await response.json();
+  // [S7 fix] Confluence SOFT-deletes to trash → the v2 GET returns a trashed/archived
+  // page with HTTP 200 + content + status:'TRASHED'/'ARCHIVED' (not 404). Without this
+  // guard a deleted page opened + generated a breakdown from stale content. Reject
+  // anything but a live 'current' page (case-insensitive — the v2 API returns the enum
+  // UPPER_CASE despite the lowercase docs). Read is already LIVE (no KVS cache) — this is
+  // the missing status check, not a caching fix.
+  if (data.status && String(data.status).toLowerCase() !== 'current') {
+    return {
+      error: 'page_not_available',
+      detail: 'This page is no longer available (it may have been moved to the trash or archived in Confluence). Pick another page.',
+    };
+  }
   const bodyStorage = data.body?.storage?.value || '';
 
   // snake_case field names — matches App.js UI expectations (preserved
@@ -1462,6 +1492,16 @@ resolver.define('startGeneration', async ({ payload, context }) => {
     };
   }
   const pageData = await pageFetch.json();
+  // [S7 fix — defense-in-depth] same trashed/archived guard as fetchPage: refuse to
+  // generate (and submit a billed batch + write a pagesnap) against a soft-deleted page
+  // that Confluence still serves with HTTP 200. Covers the trash-between-open-and-generate
+  // window too. Live read; status check, not a cache fix.
+  if (pageData.status && String(pageData.status).toLowerCase() !== 'current') {
+    return {
+      error: 'page_not_available',
+      detail: 'This page is no longer available (it may have been moved to the trash or archived in Confluence). Pick another page.',
+    };
+  }
   const pageContent = pageData.body?.storage?.value || '';
   // Capture the Confluence page version at generation time (v2 returns
   // version: { number }). Threaded onto the job record → getResults so the UI can

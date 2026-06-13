@@ -172,6 +172,17 @@ function _classifyBackendError(errorShape, contextLabel = "") {
   // a raw HTTP body or an opaque token. They must come BEFORE Class 7 (the generic
   // pass-through, which would otherwise append the raw `detail` verbatim).
 
+  // Page trashed / archived (soft-deleted) — Confluence still serves it with HTTP 200,
+  // the backend rejects it (S7 fix). Drop the raw token; the detail is already clean.
+  if (/page_not_available/i.test(errorStr)) {
+    return {
+      message:
+        detail ||
+        "This page is no longer available — it may have been moved to the trash or archived in Confluence. Pick another page.",
+      routeToSetup: false,
+    };
+  }
+
   // Confluence permission / scope error — the app couldn't read the page or search
   // because of authorization (403 / missing scope / search/parse failure). Actionable:
   // re-authorize the app. Checked before the numeric confluence_<status> class below.
@@ -448,6 +459,10 @@ function App() {
   // Fix 6: tracks whether a TC generation is in-flight (persists across screen transitions
   // so the reviewing-screen button can show "⏳ Generating…" even after the BA navigates back)
   const [tcGenerating, setTcGenerating] = useState(false);
+  // [polish] captured at push time: was a test-case run in flight when the user
+  // pushed? (the push purges it). Drives a confirmation note on the success screen
+  // so the user doesn't have to open Diagnostics to learn the run was discarded.
+  const [tcDiscardedAtPush, setTcDiscardedAtPush] = useState(false);
   const tcPollRef = useRef(null);
   // Per-story regenerate: { [storyIdx]: 'idle'|'pending'|'polling'|'done'|'error' }
   const [regenStates, setRegenStates] = useState({});
@@ -1224,6 +1239,10 @@ function App() {
   // UI calls startPush (lookup + Epic) then loops pushStep (one bounded JIRA
   // batch per call) until done, showing a progress bar on the "pushing" screen.
   const handleConfirmedPush = useCallback(async () => {
+    // [polish] snapshot whether a TC run is in flight NOW — the push will purge it
+    // (the Create-button warning already told the user; this drives the post-push
+    // confirmation note so they don't have to check Diagnostics to know it happened).
+    setTcDiscardedAtPush(tcGenerating);
     setIsPushing(true);
     setPushProgress(0);
     setPushPhase("starting");
@@ -1323,7 +1342,7 @@ function App() {
       setScreen("error");
       setIsPushing(false);
     }
-  }, [pendingBreakdown, jobId]);
+  }, [pendingBreakdown, jobId, tcGenerating]);
 
   // ── Test-case generation (P5) ─────────────────────────────────
 
@@ -2100,6 +2119,7 @@ function App() {
           onNew={handleNewPage}
           jobId={jobId}
           onOpenDiagnostics={handleOpenDiagnostics}
+          tcDiscarded={tcDiscardedAtPush}
         />
       );
     case "limit_reached":
@@ -3641,7 +3661,7 @@ function PushingScreen({ progress, phase }) {
 
 // ── Pushed (Success) ────────────────────────────────────────────
 
-function PushedScreen({ result, onBack, onNew, jobId = null, onOpenDiagnostics }) {
+function PushedScreen({ result, onBack, onNew, jobId = null, onOpenDiagnostics, tcDiscarded = false }) {
   const total = result?.total_items || result?.created_issues?.length || 0;
   const stories = result?.created_issues || [];
   const browseUrl = (key) =>
@@ -3701,6 +3721,15 @@ function PushedScreen({ result, onBack, onNew, jobId = null, onOpenDiagnostics }
             {result.tc_skipped > 0
               ? ` (${result.tc_skipped} skipped — ACs changed since generation; regenerate on the Test Cases screen)`
               : ""}
+          </p>
+        )}
+        {/* [polish] a test-case run was in flight when the user pushed → it was
+            discarded (the Create-button warning consented to this). Confirm it here
+            so they don't have to open Diagnostics to learn what happened. */}
+        {tcDiscarded && (
+          <p className="text-xs mt-1" style={{ color: "var(--s2j-orange)" }}>
+            ℹ The in-progress test-case generation was discarded — regenerate from the
+            editor after the push if you want them embedded.
           </p>
         )}
       </div>
