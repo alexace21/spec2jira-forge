@@ -70,18 +70,40 @@ export const KVS_API_KEY_NAME = 'anthropic_api_key';
 // ── BYOK key management ────────────────────────────────────
 
 /**
- * Retrieve customer's stored Anthropic API key от Forge KVS secret storage.
- * Returns null когато not configured (Settings UI not completed yet).
+ * [diag Phase 4, A4 — worst offender #2] Stored-key read WITH fault visibility.
+ * Returns { key: string|null, fault: boolean }: fault=true ONLY when the secret
+ * READ threw (a Forge storage fault — the key may still be saved); a clean read
+ * that finds nothing is { key: null, fault: false } (the honest "never set").
+ * Gate sites that map !key → not_configured MUST check fault FIRST, else a
+ * storage fault is misdiagnosed as "no key" and support chases the wrong cause.
  */
-export async function getStoredApiKey() {
+export async function getStoredApiKeyInfo() {
   try {
     const key = await kvs.getSecret(KVS_API_KEY_NAME);
-    return key || null;
+    return { key: key || null, fault: false };
   } catch (e) {
     console.warn(`[anthropic] kvs.getSecret failed: ${String(e?.message || e)}`);
-    return null;
+    return { key: null, fault: true };
   }
 }
+
+/**
+ * Retrieve customer's stored Anthropic API key от Forge KVS secret storage.
+ * Returns null когато not configured (Settings UI not completed yet).
+ * [diag Phase 4, A4] Delegates to getStoredApiKeyInfo — the fault flag collapses
+ * to null here, so every caller that doesn't need the distinction is unchanged.
+ */
+export async function getStoredApiKey() {
+  const { key } = await getStoredApiKeyInfo();
+  return key;
+}
+
+// [diag Phase 4, A4] Honest user-facing text for the storage-FAULT case, shared by every
+// gate site (testConnection below + the index.js resolvers import it) so the wording can
+// never diverge. VERBATIM RULE: not_configured's existing text is UNCHANGED everywhere —
+// this is a NEW code+detail pair, never a replacement.
+export const KEY_STORAGE_FAILED_DETAIL =
+  'We could not READ your stored Anthropic key from Forge storage (a storage fault — your key may still be saved). Try again in a moment; if it persists, contact support@spec2jira.com.';
 
 /**
  * Persist customer's Anthropic API key to Forge KVS secret storage.
@@ -166,7 +188,19 @@ Return the breakdown strictly conforming к the provided JSON schema. Apply the 
  * {ok: false, error: '...', detail: '...'} on failure.
  */
 export async function testConnection(apiKey = null) {
-  const key = apiKey || (await getStoredApiKey());
+  // [diag Phase 4, A4] When no override key was passed, read the stored key WITH fault
+  // visibility: a thrown secret read surfaces as key_storage_failed (the honest cause),
+  // never as not_configured. No recordDiagnostic here — this module has no resolver
+  // context; the index.js testConnection resolver records op 'settings.key' when it
+  // sees this error code.
+  let key = apiKey;
+  if (!key) {
+    const info = await getStoredApiKeyInfo();
+    if (!info.key && info.fault) {
+      return { ok: false, error: 'key_storage_failed', detail: KEY_STORAGE_FAILED_DETAIL };
+    }
+    key = info.key;
+  }
   if (!key) {
     return {
       ok: false,
@@ -856,6 +890,16 @@ export async function fetchTestCaseResults(resultsUrl, stampedStories, apiKey) {
       continue;
     }
 
+    // [diag Phase 4, A5 — worst offender #6] The stop_reason guard the breakdown path has
+    // always had (fetchBatchResults) but the TC path lacked. A story that hit the
+    // TC_MAX_OUTPUT_TOKENS cap used to be misfiled: JSON closed by luck → persisted as a
+    // CLEAN success (silently incomplete cases); JSON unterminated → 'parse_failed' (wrong
+    // cause). Honest split: parse OK + max_tokens → keep the cases, mark `truncated: true`
+    // (additive — the poll resolvers thread it onto the stored per-story value and
+    // pollTestCaseStatus aggregates a truncation_salvaged record); parse FAIL + max_tokens
+    // → sentinel { error: 'truncated' } ('parse_failed' stays for NON-truncated failures).
+    const truncated = message.stop_reason === 'max_tokens';
+
     const outputText = message.content?.[0]?.text || '';
     let parsed;
     try {
@@ -863,7 +907,11 @@ export async function fetchTestCaseResults(resultsUrl, stampedStories, apiKey) {
     } catch (_) {
       // Privacy ("Log End-User Data: No"): the raw model output is content-derived — never
       // persist it (this detail is written to KVS). Keep the failure signal generic.
-      perStory.push({ storyIdx, error: 'parse_failed', detail: `Invalid JSON returned for story index ${storyIdx} (raw output omitted for privacy).` });
+      perStory.push(
+        truncated
+          ? { storyIdx, error: 'truncated', detail: `Output for story index ${storyIdx} hit the ${TC_MAX_OUTPUT_TOKENS}-token cap mid-JSON and could not be recovered. Regenerate this story.` }
+          : { storyIdx, error: 'parse_failed', detail: `Invalid JSON returned for story index ${storyIdx} (raw output omitted for privacy).` },
+      );
       continue;
     }
 
@@ -876,14 +924,18 @@ export async function fetchTestCaseResults(resultsUrl, stampedStories, apiKey) {
     if (parseOutcome.error) {
       perStory.push({ storyIdx, error: parseOutcome.error, detail: parseOutcome.detail });
     } else {
-      perStory.push({ storyIdx, result: parseOutcome.result, coverage: parseOutcome.coverage });
+      // [diag Phase 4, A5] truncated-but-parsed: the cases are KEPT (the pure coverage strip
+      // stays authoritative) with an honest additive flag — never a silent clean success.
+      perStory.push({ storyIdx, result: parseOutcome.result, coverage: parseOutcome.coverage, ...(truncated ? { truncated: true } : {}) });
     }
   }
 
   // Sort by storyIdx (JSONL order is not guaranteed — §design §2).
   perStory.sort((a, b) => a.storyIdx - b.storyIdx);
 
-  console.log(`[tc-batch] results parsed: ${perStory.length} stories, ${perStory.filter((s) => !s.error).length} OK, ${perStory.filter((s) => s.error).length} errors`);
+  // [diag Phase 4, A5] truncated count surfaced in the dev log (the record lands at the poll resolver).
+  const truncatedOk = perStory.filter((s) => !s.error && s.truncated).length;
+  console.log(`[tc-batch] results parsed: ${perStory.length} stories, ${perStory.filter((s) => !s.error).length} OK, ${perStory.filter((s) => s.error).length} errors${truncatedOk ? `, ${truncatedOk} truncated-salvaged` : ''}`);
   return { perStory };
 }
 

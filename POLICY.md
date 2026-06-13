@@ -119,6 +119,16 @@ bug *class* is usually also the highest-value one. Reach for it even when the qu
 patch (one more heuristic) looks cheaper in the moment — the heuristic is the
 complexity; the stable invariant is the simplicity.
 
+**Addendum — Simplicity over over-engineering + SOLID (2026-06-11, partner directive,
+binding):** build what the NAMED use-case needs end-to-end — no speculative abstractions,
+config flags, or extension points for futures nobody has asked for. Prefer extending an
+existing proven pattern over introducing a new shape. **SOLID (§2, priority 3) is the
+boundary discipline** — one responsibility per module/helper, pure functions testable in
+isolation, no hidden state — not an invitation to layer architecture. The acceptance test
+for any piece of design: *which requirement, nameable TODAY, does it serve?* No answer =
+cut it. Complete ≠ maximal: a feature is DONE when its use-case closes end-to-end
+(§9-measured), not when every conceivable extension is scaffolded.
+
 ---
 
 ## 4. Pure-function vs LLM — the dispatch rule

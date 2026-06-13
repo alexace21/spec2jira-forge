@@ -49,6 +49,14 @@ function ExportBar({ jobId, hasUnsavedEdits }) {
   const [gherkinState, setGherkinState] = useState("idle");
   const [csvState, setCsvState] = useState("idle");
   const [exporting, setExporting] = useState(false);
+  // [diag Phase 5, gate A7] honest partial-export marker: the resolver counts the
+  // stories it could NOT include (failed / data missing) — surface that count next
+  // to the Copy buttons so a CSV-only consumer (no in-file marker — RFC-4180) is
+  // never silently handed an incomplete-looking-complete file.
+  const [exportSkipped, setExportSkipped] = useState(0);
+  // [deep-audit P4 F6] exported-but-truncated count — the file may ship incomplete
+  // case lists with zero in-file signal for CSV (Gherkin carries a # marker).
+  const [exportTruncated, setExportTruncated] = useState(0);
 
   const handleExport = useCallback(
     async (format, setState) => {
@@ -61,6 +69,8 @@ function ExportBar({ jobId, hasUnsavedEdits }) {
           format,
         });
         if (resp && !resp.error) {
+          setExportSkipped(Number.isFinite(resp.skipped) ? resp.skipped : 0);
+          setExportTruncated(Number.isFinite(resp.truncated) ? resp.truncated : 0);
           const text = format === "gherkin" ? resp.gherkin : resp.csv;
           if (text) {
             const { ok, method } = await copyToClipboard(text);
@@ -71,9 +81,23 @@ function ExportBar({ jobId, hasUnsavedEdits }) {
               setState("failed");
               setTimeout(() => setState("idle"), 2500);
             }
+          } else {
+            // empty body (e.g. everything skipped) — surface, never a silent no-op
+            setState("failed");
+            setTimeout(() => setState("idle"), 2500);
           }
+        } else {
+          // [deep-audit P5 MED-2] a structured {error} (e.g. not_found after a
+          // post-push purge) used to be a SILENT no-op — against this component's
+          // own "never a silent no-op" contract. Reuse the failed affordance.
+          setState("failed");
+          setTimeout(() => setState("idle"), 2500);
         }
-      } catch (_) {}
+      } catch (_) {
+        // [deep-audit P5 MED-2] invoke rejection — same surfacing rule.
+        setState("failed");
+        setTimeout(() => setState("idle"), 2500);
+      }
       setExporting(false);
     },
     [jobId, exporting],
@@ -93,6 +117,24 @@ function ExportBar({ jobId, hasUnsavedEdits }) {
 
   return (
     <div className="flex items-center gap-2 ml-auto">
+      {exportSkipped > 0 && (
+        <span
+          className="text-[10px]"
+          style={{ color: "var(--s2j-orange)" }}
+          title="These stories have no test cases to export (generation failed or data missing) — see Settings → Diagnostics"
+        >
+          ⚠ {exportSkipped} {exportSkipped === 1 ? "story" : "stories"} not included
+        </span>
+      )}
+      {exportTruncated > 0 && (
+        <span
+          className="text-[10px]"
+          style={{ color: "var(--s2j-orange)" }}
+          title="These stories hit the generation output limit — their case lists may be incomplete. Regenerate them to be sure."
+        >
+          ⚠ {exportTruncated} may be truncated
+        </span>
+      )}
       {hasUnsavedEdits && (
         <span
           className="text-[10px]"

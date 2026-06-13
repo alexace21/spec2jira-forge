@@ -23,6 +23,7 @@ import {
   CONCERN_TYPE_LABEL,
   QUALITY_PALETTE,
 } from "./lib/v3Schema";
+import { classText } from "./lib/diagnosticsView";
 import "./index.css";
 
 // v3.0.0 result-loading helper. Resolver getResults returns either
@@ -274,6 +275,12 @@ function App() {
   const [pageData, setPageData] = useState(null);
   const [pageId, setPageId] = useState(null);
   const [error, setError] = useState(null);
+  // [diag Phase 3, design §5] The diagnostic correlation id (jobId) for the CURRENT error
+  // screen, or null when the failure has no job in scope (page-fetch errors, submit
+  // errors whose response carries no job_id, init failures). Set EXPLICITLY at every
+  // setScreen("error") site — never inferred from possibly-stale jobId state — so the
+  // ErrorScreen ref can never point at an unrelated job's diagnostic record.
+  const [errorRefId, setErrorRefId] = useState(null);
   const [quotaInfo, setQuotaInfo] = useState(null);
 
   // Project Context profiles (P1+): the available named contexts + the one selected
@@ -377,6 +384,27 @@ function App() {
   // NEVER show a false "edited" banner).
   const [staleBreakdown, setStaleBreakdown] = useState(null);
 
+  // Persist-failed degraded mode (diagnostics Phase 0, design §3.1). TRUE when the
+  // completed breakdown could NOT be written to Forge storage (typically the ~240KB KVS
+  // value cap on very large pages) — pollJobStatus terminalized the job and handed the
+  // results forward INLINE (persistFailed: true on the poll response), so they exist ONLY
+  // in this tab's memory. Drives an additive amber banner on the reviewing + confirm
+  // screens ("review and push it now"). Cleared whenever results load normally from
+  // storage (poll getResults path + routeByPageStatus reconnect).
+  const [persistFailed, setPersistFailed] = useState(false);
+
+  // [diag Phase 3, S4] Failure notice for the Ready screen. The dashboard's ⚠ "Needs
+  // attention" click (and any reconnect to a failed job) used to fall through to a
+  // PRISTINE Ready screen — zero failure info, no ref. routeByPageStatus's failed branch
+  // sets { refId, code, detail }; ReadyScreen renders an additive failure card with the
+  // diagnostic ref, and the existing Generate button doubles as the retry. Cleared on
+  // ANY navigation away from Ready (new generation → "generating", different page →
+  // "picker"/"loading", Settings, …) so it can never leak onto another page's Ready.
+  const [genFailureNotice, setGenFailureNotice] = useState(null);
+  useEffect(() => {
+    if (screen !== "ready") setGenFailureNotice(null);
+  }, [screen]);
+
   // Test-case results (P4). null = none generated / not loaded.
   // Shape: the getTestCases resolver return ({ perStory, total, completedAt, ... }).
   // Set on reconnect rehydration (routeByPageStatus completed branch) when
@@ -397,6 +425,17 @@ function App() {
   //     (standalone, no Back). handleOpenSettings is the ONLY place that sets it TRUE.
   const [reinitNonce, setReinitNonce] = useState(0);
   const [settingsFromApp, setSettingsFromApp] = useState(false);
+  // [diag Phase 5, design §5] Which AdminSettings tab to land on + an optional
+  // diagnostic-ref pre-filter for the Diagnostics tab. handleOpenSettings keeps its
+  // historical behavior (Settings tab, no filter); handleOpenDiagnostics — the
+  // [Open Diagnostics] click-nav on failure surfaces — sets both. Cleared when
+  // leaving the admin screen (handleCloseSettings) so a stale ref filter can never
+  // greet a later, unrelated Settings visit.
+  const [settingsInitialTab, setSettingsInitialTab] = useState("settings");
+  const [settingsDiagRefFilter, setSettingsDiagRefFilter] = useState(null);
+  // [P5 LOW-1] which screen [Open Diagnostics] left from — 'pushed' is restored on
+  // close (its purged-job summary is pure client state and unrecoverable otherwise).
+  const settingsReturnScreenRef = useRef(null);
 
   const pollRef = useRef(null);
   const timerRef = useRef(null);
@@ -617,6 +656,7 @@ function App() {
         // Default entry: page picker (the dashboard).
         setScreen("picker");
       } catch (err) {
+        setErrorRefId(null); // [diag Phase 3] init failure — no job in scope
         setError(err.message);
         setScreen("error");
       }
@@ -698,6 +738,7 @@ function App() {
           // not_found / job-gone: route to error ONLY for the foreground job. Background or
           // stale → quiet (a cue would point at nothing).
           if (isCurrent && screenRef.current === "generating") {
+            setErrorRefId(jid); // [diag Phase 3] diagnostic ref for the error screen
             setError(st.error);
             setScreen("error");
           }
@@ -712,16 +753,32 @@ function App() {
           // is up). A background/stale completion just stops polling — the per-user dashboard
           // on the picker surfaces it durably (⏳→✓), so no screen-yank and no separate cue.
           if (isCurrent && screenRef.current === "generating") {
-            const full = await invoke("getResults", { jobId: jid });
-            if (full.error) {
-              setError(full.error);
-              setScreen("error");
-            } else {
-              // A freshly-generated breakdown is current by definition — clear any
-              // stale flag lingering from a previous reconnect (e.g. after Regenerate).
+            if (st.persistFailed === true) {
+              // [diag Phase 0, §3.1 degraded path] The breakdown completed but could NOT be
+              // saved to Forge storage — the poll response carries the full results inline.
+              // SKIP getResults (the job record now holds only a small terminal 'failed'
+              // record — getResults would error and throw the breakdown away) and feed the
+              // inline payload through the SAME adapter the getResults path uses below.
+              // The results live only in this tab → persistFailed drives the amber
+              // review-and-push-now banner on the reviewing/confirm screens.
               setStaleBreakdown(null);
-              setResults(v3AdaptResultPayload(full));
+              setPersistFailed(true);
+              setResults(v3AdaptResultPayload(st));
               setScreen("reviewing");
+            } else {
+              const full = await invoke("getResults", { jobId: jid });
+              if (full.error) {
+                setErrorRefId(jid); // [diag Phase 3] diagnostic ref for the error screen
+                setError(full.error);
+                setScreen("error");
+              } else {
+                // A freshly-generated breakdown is current by definition — clear any
+                // stale flag lingering from a previous reconnect (e.g. after Regenerate).
+                setStaleBreakdown(null);
+                setPersistFailed(false);
+                setResults(v3AdaptResultPayload(full));
+                setScreen("reviewing");
+              }
             }
           }
         } else if (st.status === "failed") {
@@ -729,7 +786,14 @@ function App() {
           // Foreground → error screen. A background/stale failure stops quietly — the
           // dashboard's ⚠ Needs attention group surfaces it durably (§11: shown, not silent).
           if (isCurrent && screenRef.current === "generating") {
-            setError(st.error || "Generation failed");
+            // [diag P5 audit] humanize the terminal CODE via the single FE map — the
+            // raw `st.error` used to render literally ("anthropic_529") while the S4
+            // card and TC poll already humanized. st.detail stays deliberately
+            // unrendered (network_failure carries raw exception prose — the H rule);
+            // zone-2 keeps the verbatim detail for the consent export.
+            setErrorRefId(jid);
+            const t = classText(st.error);
+            setError(st.error ? `${t.title} (${st.error})` : "Generation failed");
             setScreen("error");
           }
         }
@@ -759,9 +823,17 @@ function App() {
             if (isCurrent) {
               clearInterval(tcPollRef.current);
               setTcGenerating(false); // Fix 6
-              const friendly = _classifyBackendError(st, "Test case generation failed");
-              setError(friendly.message);
-              setScreen("error");
+              // [seams-audit HIGH] navigate ONLY when the user is watching the TC
+              // generating screen — a BACKGROUND error must stop quietly. The
+              // reachable yank: push-while-TC-generating → push done → purgeJob
+              // deletes the batched tcjob → the next tick here got not_found and
+              // pulled the user OFF their SUCCESSFUL push summary onto a red error.
+              if (screenRef.current === "generatingTests") {
+                const friendly = _classifyBackendError(st, "Test case generation failed");
+                setErrorRefId(jid); // [diag Phase 3] tcjob: is keyed by the breakdown jobId
+                setError(friendly.message);
+                setScreen("error");
+              }
             }
             return;
           }
@@ -773,6 +845,7 @@ function App() {
             if (tc.error) {
               setTcGenerating(false); // Fix 6
               const friendly = _classifyBackendError(tc, "Failed to load test cases");
+              setErrorRefId(jid); // [diag Phase 3]
               setError(friendly.message);
               setScreen("error");
             } else {
@@ -788,9 +861,15 @@ function App() {
             if (!isCurrent) return; // stale
             clearInterval(tcPollRef.current);
             setTcGenerating(false); // Fix 6
-            const friendly = _classifyBackendError(st, "Test case generation failed");
-            setError(friendly.message);
-            setScreen("error");
+            // [seams-audit HIGH] same background-gate as the error branch above — a
+            // legitimately failed background batch surfaces via the TC screen's own
+            // affordances on return, never by yanking an unrelated screen.
+            if (screenRef.current === "generatingTests") {
+              const friendly = _classifyBackendError(st, "Test case generation failed");
+              setErrorRefId(jid); // [diag Phase 3]
+              setError(friendly.message);
+              setScreen("error");
+            }
           }
         } catch (e) {
           console.error("TC poll error:", e);
@@ -853,6 +932,10 @@ function App() {
           } else {
             setStaleBreakdown(null);
           }
+          // Results just loaded fine FROM storage → any persist-failed flag belongs to a
+          // previous tab-local breakdown (diagnostics Phase 0) — clear it so the banner
+          // never false-fires on a normally-stored breakdown.
+          setPersistFailed(false);
           setResults(v3AdaptResultPayload(full));
           // P4 (§13 BUG-6): stamp jobId so a reconnect→push carries it to startPush —
           // else the push reads tcjob:<null> and the embed is silently skipped.
@@ -883,6 +966,34 @@ function App() {
           }
           return;
         }
+      }
+
+      // [diag Phase 3, S4 — design §5] FAILED branch. Before this, a ⚠ "Needs attention"
+      // dashboard click (or any reconnect to a failed job) fell through to the pristine
+      // Ready screen below — zero failure info, no ref: the exact confusion the diagnostics
+      // feature exists to prevent. Land on Ready WITH a failure card: fetch the stored
+      // user-facing detail (a failed job's getResults returns { error, detail }), stash the
+      // notice, and let the existing Generate button double as the retry. Best-effort — a
+      // getResults glitch still shows the card with the generic body + the diagnostic ref.
+      if (statusResult.status === "failed") {
+        let failCode = statusResult.error || null;
+        let failDetail = null;
+        try {
+          const failed = await invoke("getResults", { jobId: statusResult.job_id });
+          if (failed && failed.error) failCode = failed.error;
+          if (failed && typeof failed.detail === "string" && failed.detail) {
+            failDetail = failed.detail;
+          }
+        } catch (e) {
+          console.error("getResults (failed-job detail) failed (non-fatal):", e);
+        }
+        setGenFailureNotice({
+          refId: statusResult.job_id,
+          code: failCode,
+          detail: failDetail,
+        });
+        setScreen("ready");
+        return;
       }
 
       // Idle / no job → fresh start.
@@ -932,6 +1043,11 @@ function App() {
             setScreen("setup");
             return;
           }
+          // [diag P3 audit NIT-8] a dashboard ⚠ row carries its OWN jobId — the
+          // generation-failure record lives under it; keep the one-click prefilter
+          // even when the PAGE no longer fetches (deleted/permission). Non-dashboard
+          // rows have no jobId → null as before.
+          setErrorRefId(pageRef?.jobId || null);
           setError(friendly.message);
           setScreen("error");
           return;
@@ -954,6 +1070,7 @@ function App() {
 
         await routeByPageStatus(pageRef, pageResult, statusResult);
       } catch (err) {
+        setErrorRefId(pageRef?.jobId || null); // [diag P3 audit NIT-8] keep a dashboard row's ref
         setError(err.message || "Failed to open page");
         setScreen("error");
       }
@@ -963,6 +1080,10 @@ function App() {
 
   // ── Start generation ─────────────────────────────────────────
   const handleGenerate = useCallback(async () => {
+    // [diag Phase 3, S4] A new run supersedes the failure notice (the card promises
+    // "Generating again will start a fresh run"). The screen-change effect also clears
+    // it; this is the explicit belt for the named lifecycle event.
+    setGenFailureNotice(null);
     setScreen("generating");
     setStartTime(Date.now());
     setElapsed(0);
@@ -973,11 +1094,27 @@ function App() {
     // cross-project selection could be submitted before getContextProfiles resolves.
     const effectiveProfileId =
       contextLoadedForPageId === pageData.page_id ? selectedContextProfileId : "none";
-    const result = await invoke("startGeneration", {
-      pageId: pageData.page_id,
-      modelMode: "primary",
-      contextProfileId: effectiveProfileId,
-    });
+    let result;
+    try {
+      result = await invoke("startGeneration", {
+        pageId: pageData.page_id,
+        modelMode: "primary",
+        contextProfileId: effectiveProfileId,
+      });
+    } catch (invokeErr) {
+      // [diag Phase 5, design §2] TERMINAL invoke failure — the resolver rejected or
+      // was killed before returning (25s kill leaves NO backend write), so file the
+      // client-side fallback record (fire-and-forget; the .catch keeps the fallback
+      // from ever cascading), then route to the error screen instead of stranding the
+      // user on the generating spinner. No jobId exists yet for this run
+      // (startGeneration is what mints it) → no ref. invoke_rejected for ALL shapes —
+      // @forge/bridge exposes no structural timeout discriminator.
+      invoke("recordClientDiagnostic", { error_class: "invoke_rejected" }).catch(() => {});
+      setErrorRefId(null);
+      setError(invokeErr?.message || "Generate failed");
+      setScreen("error");
+      return;
+    }
 
     if (result.error === "quota_exceeded") {
       // Managed Pro fair-use cap reached (we run Claude + pay compute, so the
@@ -1000,6 +1137,7 @@ function App() {
       // Managed Pro selected but our server key isn't configured (rare/transient).
       // The backend composes an actionable detail (contact support OR switch to
       // BYOK) — show it directly rather than the generic classifier wrapping.
+      setErrorRefId(null); // [diag Phase 3] fails before a job record exists — no ref
       setError(
         result.detail ||
           "The Managed service is temporarily unavailable. Please contact support, or switch to your own Anthropic API key in Settings.",
@@ -1015,6 +1153,11 @@ function App() {
         setScreen("setup");
         return;
       }
+      // [diag Phase 5, gate MED-1] submit failures carry job_id on the error response
+      // (a job + ledger record + zone-2 detail exist under it backend-side) — surface
+      // that ref so support can correlate. Other start errors carry none → null.
+      // Never reuse the stale jobId state for an unrelated error.
+      setErrorRefId(typeof result.job_id === "string" ? result.job_id : null);
       setError(friendly.message);
       setScreen("error");
       return;
@@ -1098,10 +1241,18 @@ function App() {
         detail && friendly.message && !friendly.message.includes(detail)
           ? `${friendly.message} (${detail})`
           : friendly.message || fallback;
+      // [diag Phase 3] the push diagnostics record under ref jobId (startPush/pushStep
+      // pass it through) — thread it so the error screen's ref matches the record.
+      setErrorRefId(jobId || null);
       setError(message);
       setScreen(friendly.routeToSetup ? "setup" : "error");
       setIsPushing(false);
     };
+
+    // [diag Phase 5] Hoisted so the TERMINAL invoke-catch below can stamp the push
+    // session on the client-side fallback record (sessionId is otherwise block-scoped
+    // inside the try).
+    let pushSessionId = null;
 
     try {
       const start = await invoke("startPush", { breakdown: pendingBreakdown, jobId });
@@ -1114,17 +1265,23 @@ function App() {
       }
       const sessionId = start.session_id;
       if (!sessionId) {
+        setErrorRefId(jobId || null); // [diag Phase 3]
         setError("Push did not start correctly (no session id).");
         setScreen("error");
         setIsPushing(false);
         return;
       }
+      pushSessionId = sessionId; // [diag Phase 5] for the terminal invoke-catch fallback record
       setPushPhase(start.phase || "stories");
 
       // Loop pushStep until done. Safety cap prevents runaway (huge specs
       // chunk in 15s → 2000 steps would be ~30000 items, far beyond any real spec).
       for (let i = 0; i < 2000; i++) {
-        const step = await invoke("pushStep", { sessionId });
+        // jobId rides the payload (deep-audit P2 ref-correlation): the pushStep
+        // CATCH classes (push_exception/session_not_found) have no session to read
+        // a jobId from — without it their records are ref:null and unfindable by
+        // the ref the error screen shows. The backend shape-checks it.
+        const step = await invoke("pushStep", { sessionId, jobId: jobId || undefined });
         if (step.error) {
           fail(step, "Push step failed");
           return;
@@ -1142,12 +1299,26 @@ function App() {
         setPushPhase(step.phase || "");
       }
 
+      setErrorRefId(jobId || null); // [diag Phase 3]
       setError(
         "Push took an unexpectedly large number of steps. Check Jira for created items; contact support@spec2jira.com if items are missing.",
       );
       setScreen("error");
       setIsPushing(false);
     } catch (err) {
+      // [diag Phase 5, design §2] TERMINAL invoke failure — the startPush/pushStep
+      // resolver rejected or was killed (the 25s kill leaves NO backend write), and the
+      // push aborts to the error screen. File the client-side fallback record:
+      // fire-and-forget WITH .catch so the fallback can never cascade into this error
+      // path. invoke_rejected for ALL shapes — @forge/bridge exposes no structural
+      // timeout discriminator (BridgeAPIError is a bare Error subclass; only message
+      // prose differs, and prose matching is banned).
+      invoke("recordClientDiagnostic", {
+        error_class: "invoke_rejected",
+        ref: jobId || undefined,
+        session_ref: pushSessionId || undefined,
+      }).catch(() => {});
+      setErrorRefId(jobId || null); // [diag Phase 3]
       setError(err.message || "Push failed");
       setScreen("error");
       setIsPushing(false);
@@ -1158,6 +1329,12 @@ function App() {
 
   const handleGenerateTestCases = useCallback(async () => {
     if (!jobId) return;
+    // [diag §3.1 / gate M1] persistFailed = the breakdown lives ONLY in this tab (its job
+    // record is a small terminal 'failed' stub). Test-gen reads job.breakdown from storage →
+    // it would return breakdown_not_ready, route to the Error screen, and STRAND the unsaved
+    // breakdown (the one thing the degraded path protects). The Confirm-screen affordance is
+    // hidden in this mode; this guard is defense-in-depth for any other entry point.
+    if (persistFailed) return;
     setScreen("generatingTests");
     setTcGenerating(true); // Fix 6: mark in-flight before the invoke
     setTcStartTime(Date.now());
@@ -1167,10 +1344,26 @@ function App() {
     // #1 fix (edited-state): send the BA's edited breakdown (lifted into pendingBreakdown on the
     // Review→TestCases nav) so the backend generates test cases for the EDITED stories/ACs, not
     // the pristine generated ones. Mirrors the push (handleConfirmedPush sends the same shape).
-    const result = await invoke("startTestCaseGeneration", {
-      jobId,
-      breakdown: pendingBreakdown || results?.breakdown,
-    });
+    let result;
+    try {
+      result = await invoke("startTestCaseGeneration", {
+        jobId,
+        breakdown: pendingBreakdown || results?.breakdown,
+      });
+    } catch (invokeErr) {
+      // [diag Phase 5, design §2] TERMINAL invoke failure — mirrors handleGenerate's
+      // catch (resolver rejected/killed → no backend write possible → client-side
+      // fallback record, fire-and-forget with .catch), then the error screen.
+      invoke("recordClientDiagnostic", {
+        error_class: "invoke_rejected",
+        ref: jobId || undefined,
+      }).catch(() => {});
+      setTcGenerating(false); // Fix 6
+      setErrorRefId(jobId || null);
+      setError(invokeErr?.message || "Test case generation failed");
+      setScreen("error");
+      return;
+    }
 
     if (result.error === "quota_exceeded") {
       setTcGenerating(false); // Fix 6
@@ -1186,6 +1379,7 @@ function App() {
     }
     if (result.error === "managed_unavailable") {
       setTcGenerating(false); // Fix 6
+      setErrorRefId(jobId || null); // [diag Phase 3] TC-gen failure for THIS job
       setError(
         result.detail ||
           "The Managed service is temporarily unavailable. Please contact support, or switch to your own Anthropic API key in Settings.",
@@ -1201,6 +1395,7 @@ function App() {
         setScreen("setup");
         return;
       }
+      setErrorRefId(jobId || null); // [diag Phase 3]
       setError(friendly.message);
       setScreen("error");
       return;
@@ -1221,10 +1416,15 @@ function App() {
     }
 
     startTcPolling(jobId);
-  }, [jobId, startTcPolling, pendingBreakdown, results]);
+  }, [jobId, startTcPolling, pendingBreakdown, results, persistFailed]);
 
   const handleRegenerateTestCase = useCallback(
     (storyIdx) => {
+      // [deep-audit F7] symmetry with handleGenerateTestCases' M1 guard: a
+      // persistFailed breakdown lives only in this tab — the backend would read
+      // the small terminal stub. Provably unreachable today (testCaseResults is
+      // nulled on every path into persistFailed mode), kept as defense-in-depth.
+      if (persistFailed) return;
       setRegenStates((prev) => ({ ...prev, [storyIdx]: "pending" }));
       (async () => {
         let submitResult;
@@ -1266,6 +1466,10 @@ function App() {
                     // (c) adopt the EDITED story the regen used → the per-story staleness clears for this card.
                     story: st.story !== undefined ? st.story : entry.story,
                     error: st.error,
+                    // [deep-audit P4 F1] the A5 flag rides the live response — spread-only
+                    // kept a STALE chip after a clean regen and showed NO chip after a
+                    // still-truncated one (both self-corrected only on remount).
+                    truncated: st.truncated === true ? true : undefined,
                   };
                 });
                 const failedCount = updated.filter((e) => e && e.error).length;
@@ -1282,7 +1486,7 @@ function App() {
         }, POLL_MS);
       })();
     },
-    [jobId, pendingBreakdown, results],
+    [jobId, pendingBreakdown, results, persistFailed],
   );
 
   // handleSaveTestCase — persist ONE story's hand-edits to KVS via saveTestCases, then delta-patch
@@ -1309,6 +1513,10 @@ function App() {
               result: resp.result !== undefined ? resp.result : entry.result,
               coverage: resp.coverage !== undefined ? resp.coverage : entry.coverage,
               error: undefined, // a hand-authored valid story drops any prior error sentinel
+              // [deep-audit P4 F3] clear-on-save semantics, ALIGNED with storage: the
+              // saved entry is the BA's reviewed content — the stored rebuild drops the
+              // A5 flag, so the chip must clear here too (it used to linger till remount).
+              truncated: undefined,
             };
           });
           const failedCount = updated.filter((e) => e && e.error).length;
@@ -1359,6 +1567,7 @@ function App() {
     setRegenStates({});
     setTcJobStatus(null);
     setError(null);
+    setErrorRefId(null); // [diag Phase 3] leaving the error screen — drop its ref
     setJobId(null);
     setJobStatus(null);
     setResults(null);
@@ -1366,6 +1575,7 @@ function App() {
     setPushResult(null);
     setDryRunResult(null);
     setPendingBreakdown(null);
+    setPersistFailed(false); // [deep-audit F6] clear wherever results is nulled (defensive invariant)
     setIsPushing(false);
     setScreen(pageData ? "ready" : "picker");
   }, [pageData]);
@@ -1397,6 +1607,7 @@ function App() {
     setDryRunResult(null);
     setPushResult(null);
     setStaleBreakdown(null);
+    setPersistFailed(false); // [deep-audit F6] clear wherever results is nulled
     setIsPushing(false);
     setScreen("ready");
   }, []);
@@ -1434,6 +1645,7 @@ function App() {
     setRegenStates({});
     setTcJobStatus(null);
     setError(null);
+    setErrorRefId(null); // [diag Phase 3] page unbound — drop any error ref
     setPageId(null);
     setPageData(null);
     setJobId(null);
@@ -1443,6 +1655,7 @@ function App() {
     setPushResult(null);
     setDryRunResult(null);
     setPendingBreakdown(null);
+    setPersistFailed(false); // [deep-audit F6] clear wherever results is nulled
     setIsPushing(false);
     setSelectedContextProfileId("none");
     setContextLoadedForPageId(null);
@@ -1461,14 +1674,40 @@ function App() {
   // (standalone, no Back). handleCloseSettings re-runs the init/config gate (reinitNonce)
   // so a just-configured app routes straight to the picker instead of back to Setup.
   const handleOpenSettings = useCallback(() => {
+    setSettingsInitialTab("settings"); // [diag Phase 5] the Settings entry keeps its historical behavior
+    setSettingsDiagRefFilter(null);
+    setSettingsFromApp(true);
+    setScreen("admin");
+  }, []);
+  // [diag Phase 5, design §5] In-app click-nav to Settings → Diagnostics, pre-filtered
+  // by the failure's diagnostic ref (≤2 clicks from any failure). Used by
+  // DiagnosticRefLine's [Open Diagnostics] on BOTH render sites (ErrorScreen + the
+  // Ready failure card). A null/absent ref opens the tab unfiltered.
+  const handleOpenDiagnostics = useCallback((ref) => {
+    // [deep-audit P5 LOW-1] snapshot the screen we leave — closing Diagnostics used to
+    // reinit to the picker, and for 'pushed' that DESTROYED the (purged-job) push
+    // summary the banner annotates: the partial-failure list + created-issue links
+    // were unrecoverable. 'pushed' is pure client state → restore it on close.
+    settingsReturnScreenRef.current = screenRef.current === "pushed" ? "pushed" : null;
+    setSettingsInitialTab("diagnostics");
+    setSettingsDiagRefFilter(typeof ref === "string" && ref ? ref : null);
     setSettingsFromApp(true);
     setScreen("admin");
   }, []);
   const handleCloseSettings = useCallback(() => {
     setSettingsFromApp(false);
+    setSettingsInitialTab("settings"); // [diag Phase 5] leaving admin — reset the entry tab + ref filter
+    setSettingsDiagRefFilter(null);
+    if (settingsReturnScreenRef.current === "pushed" && pushResult) {
+      // [P5 LOW-1] return to the still-in-state push summary instead of reinit.
+      settingsReturnScreenRef.current = null;
+      setScreen("pushed");
+      return;
+    }
+    settingsReturnScreenRef.current = null;
     setScreen("loading");
     setReinitNonce((n) => n + 1);
-  }, []);
+  }, [pushResult]);
 
   // ── Render ────────────────────────────────────────────────────
   // Admin page has its own full-screen component.
@@ -1478,7 +1717,13 @@ function App() {
   //   • The globalSettings admin module (settingsFromApp === false) renders standalone,
   //     no Back button — it IS the dedicated settings surface.
   if (screen === "admin") {
-    if (!settingsFromApp) return <AdminSettings />;
+    if (!settingsFromApp)
+      return (
+        <AdminSettings
+          initialTab={settingsInitialTab}
+          diagRefFilter={settingsDiagRefFilter}
+        />
+      );
     // Opened from within the app: AdminSettings is maxWidth:640 + p-8 but NOT
     // centered, so on the wide globalPage it floated left ("flies in the air") and
     // the Back button sat detached. Wrap both in a centered 640px frame (matching
@@ -1502,7 +1747,10 @@ function App() {
             ← Back
           </button>
         </div>
-        <AdminSettings />
+        <AdminSettings
+          initialTab={settingsInitialTab}
+          diagRefFilter={settingsDiagRefFilter}
+        />
       </div>
     );
   }
@@ -1641,6 +1889,31 @@ function App() {
               </button>
             </div>
           )}
+          {/* Persist-failed banner (diagnostics Phase 0, §3.1) — the completed breakdown
+              could not be written to Forge storage (typically the ~240KB KVS value cap on
+              very large pages); pollJobStatus handed the results forward inline and they
+              exist ONLY in this tab. ADDITIVE sibling of the stale-page banner (same amber
+              style); no existing copy changed. */}
+          {persistFailed && (
+            <div
+              className="shrink-0 mx-3 mt-3 rounded-lg p-3 flex items-start gap-2"
+              style={{
+                background: "var(--s2j-orange-bg)",
+                border: "1px solid var(--s2j-orange-border)",
+              }}
+            >
+              <span aria-hidden="true" style={{ flexShrink: 0 }}>⚠</span>
+              <div style={{ flex: 1 }}>
+                <p className="text-sm font-medium" style={{ color: "var(--s2j-text)" }}>
+                  This breakdown could not be saved to storage (too large).
+                </p>
+                <p className="text-xs mt-0.5" style={{ color: "var(--s2j-text-light)" }}>
+                  It is loaded in this tab only — review and push it now, or it will be
+                  lost when you leave. Consider splitting very large pages.
+                </p>
+              </div>
+            </div>
+          )}
           <BreakdownEditor
             initialBreakdown={pendingBreakdown || results.breakdown}
             onPush={handlePush}
@@ -1756,6 +2029,8 @@ function App() {
           onGenerate={handleGenerate}
           onBack={handleNewPage}
           onOpenSettings={handleOpenSettings}
+          onOpenDiagnostics={handleOpenDiagnostics}
+          genFailureNotice={genFailureNotice}
         />
       );
     case "generating":
@@ -1801,6 +2076,7 @@ function App() {
           dryRunResult={dryRunResult}
           breakdown={pendingBreakdown}
           truncationNote={results?.truncation_note}
+          persistFailed={persistFailed}
           isPushing={isPushing}
           onConfirm={handleConfirmedPush}
           onBack={handleBackToReview}
@@ -1822,6 +2098,8 @@ function App() {
           result={pushResult}
           onBack={handleBackToReview}
           onNew={handleNewPage}
+          jobId={jobId}
+          onOpenDiagnostics={handleOpenDiagnostics}
         />
       );
     case "limit_reached":
@@ -1830,8 +2108,10 @@ function App() {
       return (
         <ErrorScreen
           error={error}
+          jobId={errorRefId}
           onRetry={handleRetry}
           onBackToPicker={pageData ? handleNewPage : null}
+          onOpenDiagnostics={handleOpenDiagnostics}
         />
       );
     default:
@@ -1876,6 +2156,110 @@ function Spinner({ size = 16 }) {
   );
 }
 
+// [diag Phase 3+5, design §5] Diagnostic-ref line — "Diagnostic ref: <ref> [Copy]" + the
+// "Full report" pointer, now with a LIVE [Open Diagnostics] link-button (Phase 5) that
+// navigates in-app to Settings → Diagnostics pre-filtered by this ref (onOpenDiagnostics
+// → App's handleOpenDiagnostics).
+// Shared by the Ready failure card and ErrorScreen — BOTH render sites get the click-nav
+// through this one component. Renders NOTHING when refId is absent
+// (never an "undefined" ref). Copy mirrors the app's existing clipboard pattern
+// (StoryTestCaseCard/TestCasesScreen): navigator.clipboard + discriminated
+// "✓ Copied"/"Copy failed" feedback with a timed reset — no data-URI download fallback
+// for a short ref string (that fallback exists for large export payloads).
+function DiagnosticRefLine({ refId, onOpenDiagnostics }) {
+  const [copyState, setCopyState] = useState("idle"); // 'idle' | 'copied' | 'failed'
+  // [diag Phase 5, gate fix — null-ref affordance] failures without a correlation id
+  // (page-fetch, managed-unavailable…) still WRITE null-ref ledger records — give them
+  // a path to Diagnostics too: "Recorded in Diagnostics" + an unfiltered open. Render
+  // nothing only when there is neither a ref NOR a navigation handler.
+  if (!refId && !onOpenDiagnostics) return null;
+  if (!refId) {
+    return (
+      <div className="mt-2 text-xs" style={{ color: "var(--s2j-text-muted)" }}>
+        Recorded in Diagnostics
+        <button
+          type="button"
+          onClick={() => onOpenDiagnostics(null)}
+          className="text-xs"
+          style={{
+            background: "none",
+            border: "none",
+            color: "var(--s2j-blue)",
+            textDecoration: "underline",
+            cursor: "pointer",
+            padding: 0,
+            marginLeft: "8px",
+          }}
+          title="Open the Diagnostics tab"
+        >
+          Open Diagnostics
+        </button>
+      </div>
+    );
+  }
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(String(refId));
+      setCopyState("copied");
+      setTimeout(() => setCopyState("idle"), 1500);
+    } catch (_) {
+      setCopyState("failed");
+      setTimeout(() => setCopyState("idle"), 2500);
+    }
+  };
+  return (
+    <div className="mt-2 text-xs" style={{ color: "var(--s2j-text-light)" }}>
+      <span style={{ fontFamily: "monospace" }}>Diagnostic ref: {refId}</span>
+      <button
+        type="button"
+        onClick={handleCopy}
+        className="text-xs"
+        style={{
+          background: "var(--s2j-bg)",
+          border: "1px solid var(--s2j-border)",
+          color: "var(--s2j-text)",
+          cursor: "pointer",
+          padding: "1px 8px",
+          borderRadius: "4px",
+          marginLeft: "8px",
+        }}
+        title="Copy the diagnostic reference (include it when contacting support)"
+      >
+        {copyState === "copied"
+          ? "✓ Copied"
+          : copyState === "failed"
+            ? "Copy failed — check browser permissions"
+            : "Copy"}
+      </button>
+      <div className="mt-1" style={{ color: "var(--s2j-text-muted)" }}>
+        Full report: Settings → Diagnostics
+        {/* [diag Phase 5] live in-app navigation — lands on the Diagnostics tab
+            pre-filtered by this ref (the pointer text above stays as the fallback
+            wayfinding when the handler isn't threaded). */}
+        {onOpenDiagnostics && (
+          <button
+            type="button"
+            onClick={() => onOpenDiagnostics(refId)}
+            className="text-xs"
+            style={{
+              background: "none",
+              border: "none",
+              color: "var(--s2j-blue)",
+              textDecoration: "underline",
+              cursor: "pointer",
+              padding: 0,
+              marginLeft: "8px",
+            }}
+            title="Open the Diagnostics tab filtered to this reference"
+          >
+            Open Diagnostics
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ── Ready ───────────────────────────────────────────────────────
 
 function ReadyScreen({
@@ -1887,6 +2271,8 @@ function ReadyScreen({
   onGenerate,
   onBack,
   onOpenSettings,
+  onOpenDiagnostics,
+  genFailureNotice = null,
 }) {
   // Prices come from getUsage's pricing[] (single source of truth — no hardcoded
   // USD prices in the UI). The hybrid has two paid editions: byokPro (unlimited, own
@@ -1935,6 +2321,43 @@ function ReadyScreen({
       <p className="text-sm mb-4" style={{ color: "var(--s2j-text-light)" }}>
         {(pageData.body_length || 0).toLocaleString()} characters
       </p>
+
+      {/* [diag Phase 3, S4] Last-generation-failed card — the dashboard ⚠ "Needs
+          attention" click / failed-job reconnect lands HERE instead of a context-free
+          Ready screen. ADDITIVE: everything below (usage badge, context picker,
+          Generate) is unchanged; the Generate button doubles as the retry. */}
+      {genFailureNotice && (
+        <div
+          className="rounded-lg p-4 mb-4"
+          style={{
+            background: "var(--s2j-red-bg)",
+            border: "1px solid var(--s2j-red-border)",
+          }}
+        >
+          <p
+            className="text-sm font-medium mb-1"
+            style={{ color: "var(--s2j-red)" }}
+          >
+            ⚠ The last generation for this page failed
+          </p>
+          <p className="text-xs" style={{ color: "var(--s2j-text)" }}>
+            {/* [diag Phase 5] When the stored user-facing detail is absent, humanize the
+                stored error CODE via the diagnosticsView map (Phase-3 stored it un-rendered);
+                the original generic sentence remains the final fallback when neither exists. */}
+            {genFailureNotice.detail ||
+              (genFailureNotice.code
+                ? classText(genFailureNotice.code).title
+                : "The generation could not complete. You can generate again below.")}
+          </p>
+          <p className="text-xs mt-1" style={{ color: "var(--s2j-text-light)" }}>
+            Generating again will start a fresh run.
+          </p>
+          <DiagnosticRefLine
+            refId={genFailureNotice.refId}
+            onOpenDiagnostics={onOpenDiagnostics}
+          />
+        </div>
+      )}
 
       {usage && (
         <div
@@ -2311,6 +2734,7 @@ function ConfirmScreen({
   dryRunResult,
   breakdown,
   truncationNote,
+  persistFailed,
   isPushing,
   onConfirm,
   onBack,
@@ -2390,6 +2814,31 @@ function ConfirmScreen({
             </p>
             <p className="text-xs mt-0.5" style={{ color: "var(--s2j-text-light)" }}>
               {truncationNote}
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* Persist-failed warning (diagnostics Phase 0, §3.1) — the breakdown exists ONLY in
+          this tab (it could not be written to Forge storage); repeated at the push decision
+          point because pushing now is the way to keep it. ADDITIVE sibling of the truncation
+          banner above (same pattern); no existing copy changed. */}
+      {persistFailed && (
+        <div
+          className="rounded-lg p-3 mb-4 flex items-start gap-2"
+          style={{
+            background: "var(--s2j-orange-bg)",
+            border: "1px solid var(--s2j-orange-border)",
+          }}
+        >
+          <span aria-hidden="true" style={{ flexShrink: 0 }}>⚠</span>
+          <div>
+            <p className="text-sm font-medium" style={{ color: "var(--s2j-text)" }}>
+              This breakdown could not be saved to storage (too large).
+            </p>
+            <p className="text-xs mt-0.5" style={{ color: "var(--s2j-text-light)" }}>
+              It is loaded in this tab only — review and push it now, or it will be
+              lost when you leave. Consider splitting very large pages.
             </p>
           </div>
         </div>
@@ -2769,8 +3218,22 @@ function ConfirmScreen({
           )}
           {/* Generate (no cases yet, blue) OR Re-run-all (stale → expensive; 2-step armed confirm,
               orange). NOT shown when fresh — the cases already match the breakdown, so re-running
-              would be a pointless re-spend. */}
-          {(!testCaseResults || tcStaleNow) && (
+              would be a pointless re-spend. NOT shown when persistFailed (gate M1): test-gen reads
+              the stored job.breakdown, which in degraded mode is a small 'failed' stub → the call
+              can only dead-end on the Error screen and strand the unsaved breakdown. */}
+          {persistFailed && !testCaseResults && (
+            <span
+              style={{
+                fontSize: "12px",
+                color: "var(--s2j-text-muted)",
+                whiteSpace: "nowrap",
+              }}
+              title="This breakdown could not be saved to Forge storage, so test-case generation (which reads the saved copy) is unavailable. Push to Jira now to keep your work."
+            >
+              🧪 Test cases unavailable — breakdown not saved
+            </span>
+          )}
+          {!persistFailed && (!testCaseResults || tcStaleNow) && (
             <button
               type="button"
               onClick={() => {
@@ -2823,6 +3286,15 @@ function ConfirmScreen({
         </p>
       </div>
 
+      {/* [seams-audit HIGH (b)] honest consent: pushing now PURGES the in-flight
+          TC batch (post-push purge deletes the tcjob) — the user must know the
+          generating test cases will be discarded and not embedded. */}
+      {tcGenerating && (
+        <p className="text-xs mb-2" style={{ color: "var(--s2j-orange)" }}>
+          ⚠ Test cases are still generating — pushing now discards that run (they
+          will not be embedded in the Jira stories).
+        </p>
+      )}
       <div className="flex gap-3">
         <button onClick={onBack} className="btn-secondary" disabled={isPushing}>
           ← Back to Editor
@@ -3169,7 +3641,7 @@ function PushingScreen({ progress, phase }) {
 
 // ── Pushed (Success) ────────────────────────────────────────────
 
-function PushedScreen({ result, onBack, onNew }) {
+function PushedScreen({ result, onBack, onNew, jobId = null, onOpenDiagnostics }) {
   const total = result?.total_items || result?.created_issues?.length || 0;
   const stories = result?.created_issues || [];
   const browseUrl = (key) =>
@@ -3379,6 +3851,10 @@ function PushedScreen({ result, onBack, onNew }) {
                 support@spec2jira.com
               </a>
             </p>
+            {/* [diag Phase 5, gate MED-3] the partial-push class (the S1 paraphrased-link
+                case) is the feature's highest-value diagnostics class — give the banner
+                the ref + the in-app path to the pre-filtered Diagnostics tab. */}
+            <DiagnosticRefLine refId={jobId} onOpenDiagnostics={onOpenDiagnostics} />
           </div>
         );
       })()}
@@ -3578,7 +4054,7 @@ function LimitReachedScreen({ quota, onBack }) {
   );
 }
 
-function ErrorScreen({ error, onRetry, onBackToPicker }) {
+function ErrorScreen({ error, jobId = null, onRetry, onBackToPicker, onOpenDiagnostics }) {
   // EH1 polish part 27 (2026-05-09) — last-resort defensive HTML strip.
   // Most error paths now route through `_classifyBackendError` which
   // discards HTML detail bodies, but legacy paths (mid-pipeline polling
@@ -3620,6 +4096,10 @@ function ErrorScreen({ error, onRetry, onBackToPicker }) {
         <p className="text-xs" style={{ color: "var(--s2j-text)" }}>
           {displayError}
         </p>
+        {/* [diag Phase 3, design §5] ADDITIVE diagnostic ref under the verbatim error
+            text — the existing message above is never shortened or replaced. Renders
+            nothing when no jobId is in scope for this failure (jobId null). */}
+        <DiagnosticRefLine refId={jobId} onOpenDiagnostics={onOpenDiagnostics} />
       </div>
 
       <button onClick={onRetry} className="btn-secondary">

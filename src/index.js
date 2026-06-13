@@ -38,6 +38,8 @@ import {
   setStoredApiKey,
   clearStoredApiKey,
   getStoredApiKey,
+  getStoredApiKeyInfo, // [diag Phase 4, A4] fault-aware stored-key read
+  KEY_STORAGE_FAILED_DETAIL, // [diag Phase 4, A4] the one honest storage-fault text (never diverges per site)
   testConnection as anthropicTestConnection,
   submitBreakdownBatch,
   pollBatchStatus,
@@ -54,7 +56,7 @@ import {
   pollTestCaseBatch,
   fetchTestCaseResults,
 } from './anthropic_client.js';
-import { startPushSession, pushSessionStep, flattenBreakdown } from './push_handler.js';
+import { startPushSession, pushSessionStep, flattenBreakdown, lookupProject } from './push_handler.js';
 import { detectCycles } from './graph.js';
 import { renderGherkin, renderManualTable, parseTestCaseResult, normAC } from './testcases.js';
 import {
@@ -66,6 +68,25 @@ import {
   pricingTable,
   getActiveTier,
 } from './usage.js';
+// Diagnostic ledger (Phase 0 wiring — docs/DIAGNOSTICS-LEDGER-DESIGN.md). Both write helpers
+// are FAIL-OPEN by contract (never throw into the caller); records are codes/ids/counts only,
+// verbatim detail goes ONLY through writeDiagnosticDetail (the separate §2b zone).
+// Phase 5 adds the READ surface: per-user/all-bucket readers + the second-wall
+// serializer/validator for the tab + export resolvers (§2.10/§2b/§5).
+import {
+  recordDiagnostic,
+  writeDiagnosticDetail,
+  readDiagnostics,
+  readAllDiagnostics,
+  readAggregate,
+  readDiagnosticDetail,
+  clearDiagnostics as clearDiagnosticsBucket,
+  serializeForExport,
+  validateRecord,
+  classifyDiagGenerationError,
+  DIAG_CLASSES,
+  DIAG_APP_VERSION,
+} from './diagnostics.js';
 
 // ── Managed-vs-BYOK Anthropic key resolution (hybrid tiers, 2026-06-03) ──
 // Managed Pro (Advanced edition) ⇒ WE call Anthropic with OUR key, stored as an
@@ -74,25 +95,37 @@ import {
 // the key that created it, so the SOURCE ('managed'|'byok') is recorded on the job
 // at submit and reused at poll — never re-resolved from a license that may have
 // changed (e.g. a trial expiring) mid-batch.
+// [diag Phase 4, A4 — worst offender #2] fault-aware variant: { key, fault } where
+// fault=true ONLY when the BYOK secret READ threw (a Forge storage fault — the key may
+// still be saved). The managed env-var read cannot fault. Gate sites check fault FIRST
+// so a storage fault stops being misdiagnosed as not_configured ("no key" — wrong cause).
+async function anthropicKeyInfoForSource(source) {
+  if (source === 'managed') return { key: process.env.MANAGED_ANTHROPIC_KEY || null, fault: false };
+  return getStoredApiKeyInfo();
+}
+
+// Key-only convenience for the poll legs (they soft-fail on a missing key and retry —
+// recording per tick is banned by design §7, so they deliberately don't see `fault`).
 async function anthropicKeyForSource(source) {
-  if (source === 'managed') return process.env.MANAGED_ANTHROPIC_KEY || null;
-  return getStoredApiKey();
+  const { key } = await anthropicKeyInfoForSource(source);
+  return key;
 }
 
 /**
- * Resolve { apiKey, keySource, tier } for THIS invocation from the license.
+ * Resolve { apiKey, keySource, keyFault, tier } for THIS invocation from the license.
  * keySource is purely tier-driven: Advanced edition (Managed Pro) ⇒ our key,
  * everything else ⇒ the customer's BYOK key. The license is backend-trusted, and
  * every accessing user is now licensed (the in-app Free / guest-access path was
  * removed 2026-06-03), so the old best-effort guest-guard on the spoofable
  * client-supplied accountType is gone — Managed exposure is bounded by the
  * backend-trusted per-user accountId cap (MANAGED_USER_CAP) in checkQuota.
+ * [diag Phase 4, A4] keyFault (additive): true ONLY when the stored-key read THREW.
  */
 async function resolveAnthropicKey(context) {
   const tier = getActiveTier(context);
   const keySource = tier.edition === 'advanced' ? 'managed' : 'byok';
-  const apiKey = await anthropicKeyForSource(keySource);
-  return { apiKey, keySource, tier };
+  const { key: apiKey, fault: keyFault } = await anthropicKeyInfoForSource(keySource);
+  return { apiKey, keySource, keyFault, tier };
 }
 
 /**
@@ -253,17 +286,17 @@ async function resolveSpecSourceText(jobId, job) {
       // snapshot, so test-gen falls back to no-source. Re-running test-gen alone on an old
       // breakdown won't enable §7 — the snapshot is written at GENERATION, so REGENERATE the
       // breakdown after deploying the fix. This log makes a Live-E2E run diagnosable.
-      console.log(`[tcgen] NO source-page snapshot for job ${jobId} → test-gen runs WITHOUT §7 rules (regenerate the breakdown after deploying the §7 fix to enable concrete-value + decision-table coverage)`);
+      console.log(`[tcgen] NO source-page snapshot for job ${jobId} → test-gen runs WITHOUT §7 rules (regenerate the breakdown after deploying the §7 fix to enable concrete-value + decision-table coverage) ref=${jobId}`);
       return '';
     }
     if (job && typeof job.pageVersion === 'number' && typeof snap.pageVersion === 'number' && snap.pageVersion !== job.pageVersion) {
-      console.warn(`[tcgen] page snapshot version ${snap.pageVersion} != job ${job.pageVersion} — skipping source (fallback to no-source)`);
+      console.warn(`[tcgen] page snapshot version ${snap.pageVersion} != job ${job.pageVersion} — skipping source (fallback to no-source) ref=${jobId}`);
       return '';
     }
     console.log(`[tcgen] source-page snapshot loaded for job ${jobId} (${String(snap.content).length} chars) → §7 rules fed to test-gen`);
     return String(snap.content || '');
   } catch (e) {
-    console.warn(`[tcgen] spec-source load failed (non-fatal): ${String(e?.message || e)}`);
+    console.warn(`[tcgen] spec-source load failed (non-fatal): ${String(e?.message || e)} ref=${jobId}`);
     return '';
   }
 }
@@ -395,7 +428,7 @@ function parseRequiredCustomFields(raw) {
  * If omitted/empty, existing key (if any) е preserved.
  * defaultProjectKey е always validated + saved.
  */
-resolver.define('saveSettings', async ({ payload }) => {
+resolver.define('saveSettings', async ({ payload, context }) => {
   const { anthropicApiKey, defaultProjectKey, requiredCustomFieldsJson, contextProfiles } = payload || {};
 
   // Validate project key
@@ -466,6 +499,22 @@ resolver.define('saveSettings', async ({ payload }) => {
     await kvs.set(SETTINGS_KEY, next);
   } catch (e) {
     console.error(`[saveSettings] kvs.set failed: ${String(e?.message || e)}`);
+    // [diag Phase 5, §7-deferred] the PARTIAL-COMMIT window: when a new API key was just
+    // stored above (apiKeyUpdated), this failed settings write leaves the secret committed
+    // but the metadata/profiles not — the user retries against a half-applied state.
+    // counts.key_updated distinguishes that case from a plain settings-write failure.
+    // surfaced:true — the structured error return below IS the user-facing surfacing.
+    await recordDiagnostic({
+      context,
+      record: {
+        op: 'settings.save',
+        error_class: 'kvs_write_failed',
+        level: 'warn',
+        ref: null,
+        counts: { key_updated: apiKeyUpdated ? 1 : 0 },
+        surfaced: true,
+      },
+    });
     return { error: 'Could not save settings (storage error). Try shortening your Project Context profiles, then save again.' };
   }
 
@@ -504,7 +553,7 @@ resolver.define('resetSettings', async () => {
  * Returns { status: 'ok', model } on success or { status: 'error', code, detail }.
  * Compatible с existing AdminSettings.jsx error code mapping.
  */
-resolver.define('testConnection', async ({ payload }) => {
+resolver.define('testConnection', async ({ payload, context }) => {
   // payload may include { anthropicApiKey } when testing a key BEFORE save
   const candidateKey = (payload?.anthropicApiKey || '').trim() || null;
   const result = await anthropicTestConnection(candidateKey);
@@ -514,6 +563,18 @@ resolver.define('testConnection', async ({ payload }) => {
       status: 'ok',
       message: `Connected to Anthropic API (${result.model})`,
     };
+  }
+
+  // [diag Phase 4, A4] A storage FAULT on the stored-key read (anthropic_client returns the
+  // new key_storage_failed code; it cannot record itself — no resolver context there). OUR
+  // class to track: the admin did everything right. The codeMap below intentionally has no
+  // entry → falls to UNEXPECTED; the honest detail text is shown verbatim by the UI.
+  if (result.error === 'key_storage_failed') {
+    console.error('[testConnection] stored-key read FAULTED (storage, not "no key") ref=-');
+    await recordDiagnostic({
+      context,
+      record: { op: 'settings.key', error_class: 'key_storage_failed', level: 'error', ref: null, surfaced: true },
+    });
   }
 
   // Map к error codes (some preserved от v2.x format)
@@ -566,8 +627,18 @@ resolver.define('startDistillSession', async ({ payload, context }) => {
 
   // Distill (Project Context) is an Anthropic call too — resolve the key by tier
   // so Managed installs (no BYOK key) distill with OUR key, BYOK with theirs.
-  const { apiKey, keySource } = await resolveAnthropicKey(context);
+  const { apiKey, keySource, keyFault } = await resolveAnthropicKey(context);
   if (!apiKey) {
+    // [diag Phase 4, A4] storage-fault FIRST: a thrown secret read must not be misdiagnosed
+    // as "no key configured" (keyFault is BYOK-only, so this never masks managed_unavailable).
+    // ref:null — no distill sessionId exists yet at this gate.
+    if (keyFault) {
+      await recordDiagnostic({
+        context,
+        record: { op: 'distill.step', error_class: 'key_storage_failed', level: 'error', ref: null, surfaced: true },
+      });
+      return { error: 'key_storage_failed', code: 'UNEXPECTED', detail: KEY_STORAGE_FAILED_DETAIL };
+    }
     if (keySource === 'managed') {
       console.error('[distill] managed key unavailable (MANAGED_ANTHROPIC_KEY not configured)');
       return { error: 'managed_unavailable', code: 'NOT_CONFIGURED', detail: 'The Managed service is temporarily unavailable. Please contact support@spec2jira.com, or switch to your own Anthropic API key in Settings.' };
@@ -589,7 +660,14 @@ resolver.define('startDistillSession', async ({ payload, context }) => {
         return { error: 'managed_unavailable', code: 'NOT_CONFIGURED', detail: `You've used this month's Managed breakdowns — summarizing is paused until ${q.resetsAtLabel}. For unlimited, switch to BYOK Pro (your own key).` };
       }
     } catch (e) {
-      console.error(`[distill] managed pool check failed (allowing): ${String(e?.message || e)}`);
+      console.error(`[distill] managed pool check failed (allowing): ${String(e?.message || e)} ref=-`);
+      // [deep-audit P4 F4] the THIRD silent fail-open gate (license/quota at the two
+      // generation flows already record) — a persistent metering glitch silently
+      // admits Managed distill on OUR key; support must be able to see it happened.
+      await recordDiagnostic({
+        context,
+        record: { op: 'distill.step', error_class: 'gate_fail_open', level: 'warn', ref: null, surfaced: false },
+      });
     }
   }
 
@@ -608,7 +686,19 @@ resolver.define('startDistillSession', async ({ payload, context }) => {
       : `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 
   const session = { input, clipped, sections: {}, createdAt: Date.now() };
-  await kvs.set(DISTILL_SESSION_PREFIX + sessionId, session);
+  // [diag Phase 5, §7-deferred] this session write used to throw OPAQUELY out of the
+  // resolver (the FE catch showed a raw invoke error). Structured return instead; the
+  // AdminSettings distill flow handles {error} returns (shows detail, offers retry).
+  try {
+    await kvs.set(DISTILL_SESSION_PREFIX + sessionId, session);
+  } catch (e) {
+    console.error(`[distill] session write failed: ${String(e?.message || e)} ref=${sessionId}`);
+    await recordDiagnostic({
+      context,
+      record: { op: 'distill.step', error_class: 'kvs_write_failed', level: 'warn', ref: sessionId, surfaced: true },
+    });
+    return { error: 'kvs_write_failed', detail: 'Could not store the distill session in Forge storage. Please try again.' };
+  }
 
   console.log(`[distill] session ${sessionId} started (${input.length} chars${clipped ? ', input clipped' : ''}, ${DISTILL_CATEGORIES.length} steps)`);
 
@@ -644,8 +734,18 @@ resolver.define('distillStep', async ({ payload, context }) => {
     return { error: 'session_not_found', code: 'UNEXPECTED', detail: 'Distill session expired or not found. Start over.' };
   }
 
-  const { apiKey, keySource } = await resolveAnthropicKey(context);
+  const { apiKey, keySource, keyFault } = await resolveAnthropicKey(context);
   if (!apiKey) {
+    // [diag Phase 4, A4] storage-fault FIRST (see startDistillSession). ref = the distill
+    // sessionId — the §1 schema's distill correlation id (a real minted id: the session
+    // was just loaded above). Session is KEPT so the UI can retry this step.
+    if (keyFault) {
+      await recordDiagnostic({
+        context,
+        record: { op: 'distill.step', error_class: 'key_storage_failed', level: 'error', ref: sessionId, surfaced: true },
+      });
+      return { error: 'key_storage_failed', code: 'UNEXPECTED', detail: KEY_STORAGE_FAILED_DETAIL, step, label: DISTILL_CATEGORIES[step].label };
+    }
     if (keySource === 'managed') {
       console.error('[distill] managed key unavailable (MANAGED_ANTHROPIC_KEY not configured)');
       return { error: 'managed_unavailable', code: 'NOT_CONFIGURED', detail: 'The Managed service is temporarily unavailable. Please contact support@spec2jira.com, or switch to your own Anthropic API key in Settings.', step, label: DISTILL_CATEGORIES[step].label };
@@ -669,7 +769,20 @@ resolver.define('distillStep', async ({ payload, context }) => {
 
   // Persist this section. Track per-section truncation so the UI can nudge "expand".
   s.sections[category.key] = { text: result.section, truncated: !!result.truncated };
-  await kvs.set(key, s);
+  // [diag Phase 5, §7-deferred] same opaque-throw fix as startDistillSession: the section
+  // write failing means THIS step's output was not persisted — structured per-step error
+  // (session KEPT, the FE retry handle re-runs this step; one repeated Haiku call, correct
+  // semantics — the unsaved section must be re-extracted).
+  try {
+    await kvs.set(key, s);
+  } catch (e) {
+    console.error(`[distill] section write failed (step ${step}): ${String(e?.message || e)} ref=${sessionId}`);
+    await recordDiagnostic({
+      context,
+      record: { op: 'distill.step', error_class: 'kvs_write_failed', level: 'warn', ref: sessionId, surfaced: true },
+    });
+    return { error: 'kvs_write_failed', detail: 'Could not store the distill session in Forge storage. Please try again.', step, label: category.label };
+  }
 
   const isLast = step === DISTILL_CATEGORIES.length - 1;
   if (!isLast) {
@@ -684,6 +797,30 @@ resolver.define('distillStep', async ({ payload, context }) => {
 
   // Last step → merge all sections in category order, bound to the store limit, clean up.
   const ordered = DISTILL_CATEGORIES.map((c) => s.sections[c.key]).filter((x) => x && x.text);
+  // [diag Phase 4, (I) — worst offender #12] A category absent/EMPTY at the FINAL MERGE means
+  // the merged profile silently lost a whole section (§8 starvation — e.g. missing Conventions)
+  // with no marker anywhere. Diff EXPECTED (DISTILL_CATEGORIES) vs PRESENT non-empty sections;
+  // record a warn (the ledger carries the COUNT only — codes/counts wall) and return the
+  // dropped labels as an ADDITIVE response field for the Phase 5 surface (the labels are OUR
+  // OWN fixed category names — Domain/Glossary/… — never user content). The merged profile
+  // itself is NEVER marked: it is user-editable content.
+  const droppedCategories = DISTILL_CATEGORIES
+    .filter((c) => !(s.sections[c.key] && s.sections[c.key].text))
+    .map((c) => c.label);
+  if (droppedCategories.length > 0) {
+    console.warn(`[distill] merged profile is MISSING ${droppedCategories.length}/${DISTILL_CATEGORIES.length} categories (${droppedCategories.join(', ')}) ref=${sessionId}`);
+    await recordDiagnostic({
+      context,
+      record: {
+        op: 'distill.step',
+        error_class: 'distill_category_dropped',
+        level: 'warn',
+        ref: sessionId,
+        counts: { dropped: droppedCategories.length },
+        surfaced: false,
+      },
+    });
+  }
   let profile = ordered.map((x) => x.text).join('\n');
   const anyTruncated = ordered.some((x) => x.truncated);
   let trimmed = false;
@@ -704,6 +841,7 @@ resolver.define('distillStep', async ({ payload, context }) => {
     profile,
     truncated: anyTruncated,    // a section hit its per-call token cap (slightly short, but complete-ish)
     overflowTrimmed: trimmed,   // the MERGED profile exceeded the store bound → its TAIL was cut (honest, not "concise")
+    droppedCategories,          // [diag Phase 4 (I)] additive — [] when complete; OUR fixed category labels, for the Phase 5 surface
   };
 });
 
@@ -875,18 +1013,33 @@ async function recordTrackedJob(accountId, { jobId, pageId, pageTitle }) {
   await kvs.set(key, next);
 }
 
-// getDashboardJobs — the picker's live multi-batch dashboard. Returns the capped per-USER
-// tracked list, DEREFERENCING each ref against its job record to read the LIVE status
-// (pending|batched|completed|failed) so the frontend can group rows into In progress /
-// Ready for review / Needs attention. Drops a row whose job was purged/lost (`!job`) or is
-// SUPERSEDED by a newer job for the same page (PAGE_JOB_PREFIX mismatch → the click would
-// open the wrong job), self-healing the stored list. Read-only; a glitch returns an empty
-// dashboard, never an error. The frontend reconcile loop advances batched→completed by
-// calling pollJobStatus per in-flight row; this resolver just reports the current truth.
+// getDashboardJobs — the picker's live multi-batch dashboard. A PURE READ of the capped
+// per-USER tracked list: each ref is dereferenced (lean jobmeta first, heavy job: as the
+// back-compat fallback) for the LIVE status so the frontend can group rows into
+// In progress / Ready for review / Needs attention. Rows whose records are gone are
+// FILTERED AT READ ONLY — the deep-audit removed both the supersede-prune and the
+// self-heal write (they dropped a co-worker's in-flight job via the shared page index).
+// A glitch returns an empty dashboard, never an error. The frontend reconcile loop
+// advances batched→completed by calling pollJobStatus per in-flight row; this resolver
+// just reports the current truth.
 resolver.define('getDashboardJobs', async ({ context }) => {
   const accountId = (context && context.accountId) || 'unknown';
   const key = `${TRACKED_JOBS_PREFIX}${accountId}`;
-  const list = await kvs.get(key);
+  // [diag Phase 5, §7-deferred] this top-list read was the ONE unwrapped throw behind the
+  // docstring's "never an error" claim — now actually true. The record fires ONLY on the
+  // THROW path (rare; the null-ref (op, class) dedupe absorbs repeats from the 15s reconcile
+  // loop); NO write of any kind on the happy path (the read-meter lesson).
+  let list;
+  try {
+    list = await kvs.get(key);
+  } catch (e) {
+    console.warn(`[getDashboardJobs] tracked-list read failed (returning empty dashboard): ${String(e?.message || e)}`);
+    await recordDiagnostic({
+      context,
+      record: { op: 'dashboard.read', error_class: 'kvs_read_failed', level: 'warn', ref: null, surfaced: false },
+    });
+    return { jobs: [] };
+  }
   if (!Array.isArray(list) || list.length === 0) return { jobs: [] };
   // PURE READ (deep-audit fix). Dereference each ref against its job: record for LIVE status;
   // drop a ref whose job is gone (purged/lost). Two things this DELIBERATELY no longer does:
@@ -1151,6 +1304,14 @@ function dedupeSharedAcceptanceCriteria(breakdown) {
   }
 }
 
+// [diag Phase 3] Generation structured-error code → closed-registry diagnostic class:
+// `classifyDiagGenerationError` — MOVED to src/diagnostics.js (Phase-3 contract audit,
+// 2026-06-12) so the single owner of class semantics (§2.9) owns the code→class mapping
+// and the offline table-test (prototype/test_diagnostics.js §16) can pin every producible
+// code. Imported above with the other diagnostics symbols; call sites unchanged (the
+// startGeneration submit-failure site, the pollJobStatus terminal sites, and the test-gen
+// batch/regen submit + poll-terminal + per-story sites — single mapping authority).
+
 /**
  * Start a breakdown generation job using Anthropic Message Batches API.
  * Returns immediately с jobId after submitting batch (~1-2 sec total).
@@ -1175,7 +1336,14 @@ resolver.define('startGeneration', async ({ payload, context }) => {
       return buildLicenseRequired();
     }
   } catch (e) {
-    console.error(`[startGeneration] license check failed (failing open): ${String(e?.message || e)}`);
+    console.error(`[startGeneration] license check failed (failing open): ${String(e?.message || e)} ref=-`);
+    // [diag Phase 3, gate MUST-1] a silent fail-open gate: a persistent license-read
+    // fault admits work with only a console trace. ref:null (pre-jobId) — the
+    // (op, error_class) null-ref dedupe absorbs repeats into occurrences.
+    await recordDiagnostic({
+      context,
+      record: { op: 'generation.start', error_class: 'gate_fail_open', level: 'warn', ref: null, surfaced: false },
+    });
   }
 
   // Resolve the Anthropic key by tier (Managed/Advanced ⇒ our key; else the
@@ -1183,10 +1351,29 @@ resolver.define('startGeneration', async ({ payload, context }) => {
   // quota gate, so a Managed user — who has no BYOK key by design — is never
   // wrongly told to "configure a key". keySource is stored on the job below so
   // the poll leg reuses the SAME key the batch was created with.
-  const { apiKey, keySource } = await resolveAnthropicKey(context);
+  const { apiKey, keySource, keyFault } = await resolveAnthropicKey(context);
   if (!apiKey) {
+    // [diag Phase 4, A4 — worst offender #2] storage-fault FIRST: the stored-key READ threw,
+    // so "not configured" would be a misdiagnosis (the key may still be saved — support used
+    // to chase the wrong cause). keyFault is BYOK-only → never masks managed_unavailable.
+    // ref:null — pre-jobId, same as the other start gates.
+    if (keyFault) {
+      console.error('[startGeneration] stored-key read FAULTED (storage, not "no key") ref=-');
+      await recordDiagnostic({
+        context,
+        record: { op: 'generation.start', error_class: 'key_storage_failed', level: 'error', ref: null, surfaced: true },
+      });
+      return { error: 'key_storage_failed', detail: KEY_STORAGE_FAILED_DETAIL };
+    }
     if (keySource === 'managed') {
-      console.error('[startGeneration] managed key unavailable (MANAGED_ANTHROPIC_KEY not configured)');
+      console.error('[startGeneration] managed key unavailable (MANAGED_ANTHROPIC_KEY not configured) ref=-');
+      // [diag Phase 3, gate SHOULD] OUR-ops outage signal (the env var is ours to
+      // keep configured) — the one Managed failure class where support must act,
+      // so the ledger must carry it.
+      await recordDiagnostic({
+        context,
+        record: { op: 'generation.start', error_class: 'managed_unavailable', level: 'error', ref: null, surfaced: true },
+      });
       return {
         error: 'managed_unavailable',
         detail:
@@ -1226,7 +1413,14 @@ resolver.define('startGeneration', async ({ payload, context }) => {
       return buildQuotaExceeded(quota);
     }
   } catch (e) {
-    console.error(`[startGeneration] quota check failed (failing open): ${String(e?.message || e)}`);
+    console.error(`[startGeneration] quota check failed (failing open): ${String(e?.message || e)} ref=-`);
+    // [diag Phase 3, gate MUST-1] the second silent fail-open gate (Managed cap
+    // can be silently bypassed on a metering glitch — customer-favourable, but
+    // support must be able to see it happened).
+    await recordDiagnostic({
+      context,
+      record: { op: 'generation.start', error_class: 'gate_fail_open', level: 'warn', ref: null, surfaced: false },
+    });
   }
 
   // Fetch page content (asUser so customer permissions apply).
@@ -1238,11 +1432,30 @@ resolver.define('startGeneration', async ({ payload, context }) => {
         route`/wiki/api/v2/pages/${pageId}?body-format=storage`,
       );
   } catch (e) {
+    // [diag Phase 3, gate SHOULD] op confluence.fetch — pre-jobId (ref:null);
+    // network/auth throw on the page read.
+    await recordDiagnostic({
+      context,
+      record: { op: 'confluence.fetch', error_class: 'network_failure', level: 'error', ref: null, surfaced: true },
+    });
     return { error: 'fetch_threw', detail: String(e?.message || e) };
   }
   if (!pageFetch.ok) {
     const text = await pageFetch.text();
-    console.error(`[startGeneration] Confluence HTTP ${pageFetch.status}: ${text.substring(0, 300)}`);
+    console.error(`[startGeneration] Confluence HTTP ${pageFetch.status}: ${text.substring(0, 300)} ref=-`);
+    // [diag Phase 3, gate SHOULD] a recurring 403/410 on the page read is a real
+    // support class (scope/egress/permissions) — content-free status only.
+    await recordDiagnostic({
+      context,
+      record: {
+        op: 'confluence.fetch',
+        error_class: 'confluence_http',
+        level: 'error',
+        ref: null,
+        counts: { http_status: pageFetch.status },
+        surfaced: true,
+      },
+    });
     return {
       error: `confluence_${pageFetch.status}`,
       detail: 'Couldn\'t read this Confluence page (Confluence returned an error). Try reopening the page; if it persists, contact support@spec2jira.com.',
@@ -1268,19 +1481,56 @@ resolver.define('startGeneration', async ({ payload, context }) => {
   const jobId = newJobId();
   const pageTitle = pageData.title || 'Untitled';
   const model = modelMode === 'fallback' ? MODEL_FALLBACK : MODEL_PRIMARY;
+  // Diagnostics owner stamp (Phase 0, design §2.4): job-scoped diagnostic events bucket to
+  // the JOB OWNER's ledger — polls are payload-only and may be driven by ANOTHER user's
+  // client (shared pageJob: index), so bucket-by-invoker would file failures under the wrong
+  // user. Stamped on EVERY full job-record rewrite in this resolver (the 'failed'/'batched'
+  // writes below are fresh literals, not spreads — a stamp only on the initial write would be
+  // erased). Nothing reads it yet (Phase 5 will); it must simply persist.
+  const ownerAccountId = (context && context.accountId) || null;
 
-  // Persist initial job state
-  await setJob(jobId,{
-    jobId,
-    pageId: String(pageId),
-    pageTitle,
-    pageVersion,
-    status: 'pending',
-    model,
-    createdAt: new Date().toISOString(),
-  });
+  // Persist initial job state.
+  // [diag Phase 0, §3 site :1273] This write runs BEFORE the billed Anthropic submit — a KVS
+  // failure must stay FAIL-FAST (no money spent yet; today's throw at least aborted first),
+  // but STRUCTURED instead of an opaque resolver death.
+  try {
+    await setJob(jobId,{
+      jobId,
+      pageId: String(pageId),
+      pageTitle,
+      pageVersion,
+      ownerAccountId,
+      status: 'pending',
+      model,
+      createdAt: new Date().toISOString(),
+    });
+  } catch (e) {
+    console.error('[diag] initial job write failed ref=' + jobId, e);
+    await recordDiagnostic({
+      context,
+      record: { op: 'generation.start', error_class: 'kvs_write_failed', level: 'error', ref: jobId, surfaced: true },
+    });
+    return {
+      error: 'kvs_write_failed',
+      detail:
+        'Could not store the generation job in Forge storage. Please try again — if it persists, contact support@spec2jira.com.',
+      // (deep-audit F5, both lenses) the ledger record above is filed under this
+      // jobId — give the ErrorScreen the ref to correlate (App.js consumes job_id).
+      job_id: jobId,
+    };
+  }
   // Index page → this job so reopening mid-generation reconnects (not a new batch).
-  await kvs.set(`${PAGE_JOB_PREFIX}${String(pageId)}`, { jobId });
+  // [diag Phase 0, §3 site :1283] Fail-soft: on a KVS failure the job still works via the
+  // per-user dashboard — only page-reconnect degrades. Record + continue.
+  try {
+    await kvs.set(`${PAGE_JOB_PREFIX}${String(pageId)}`, { jobId });
+  } catch (e) {
+    console.error('[diag] pageJob index write failed ref=' + jobId, e);
+    await recordDiagnostic({
+      context,
+      record: { op: 'generation.start', error_class: 'kvs_write_failed', level: 'warn', ref: jobId, surfaced: false },
+    });
+  }
 
   // §8 fix (2026-06-06): snapshot the source page into a SIBLING key so per-Story test-case
   // generation can feed the spec's business-rule tables + decision matrices + concrete thresholds
@@ -1319,7 +1569,13 @@ resolver.define('startGeneration', async ({ payload, context }) => {
     }); // NO TTL (deep audit): purgeJob deletes pagesnap on push; a creation-anchored TTL silently dropped the §7 source for a breakdown reviewed/edited >30 days later
     console.log(`[startGeneration] page snapshot written for job ${jobId} (${snapContent.length} chars${full.length > snapContent.length ? ', byte-trimmed' : ''}) → enables §7-aware test generation`);
   } catch (e) {
-    console.warn(`[startGeneration] page snapshot failed (non-fatal; test-gen falls back to no-source): ${String(e?.message || e)}`);
+    console.warn(`[startGeneration] page snapshot failed (non-fatal; test-gen falls back to no-source): ${String(e?.message || e)} ref=${jobId}`);
+    // [diag Phase 3, §2.1 :1312] C-class: test-gen later runs §7-starved (no source spec)
+    // with zero signal anywhere — record so support can explain "weaker tests" reports.
+    await recordDiagnostic({
+      context,
+      record: { op: 'generation.start', error_class: 'pagesnap_write_failed', level: 'warn', ref: jobId, surfaced: false },
+    });
   }
 
   // Resolve the SELECTED Project Context profile to enrich the generation. A
@@ -1340,7 +1596,13 @@ resolver.define('startGeneration', async ({ payload, context }) => {
       await kvs.set(`${PAGE_CONTEXT_PREFIX}${String(pageId)}`, { profileId: contextProfileId });
     }
   } catch (e) {
-    console.warn(`[startGeneration] context profile resolve failed (non-fatal): ${String(e?.message || e)}`);
+    console.warn(`[startGeneration] context profile resolve failed (non-fatal): ${String(e?.message || e)} ref=${jobId}`);
+    // [diag Phase 3, §2.1 :1330] C-class: the breakdown silently generates with an EMPTY
+    // project context — a quality degradation the user chose against and never sees.
+    await recordDiagnostic({
+      context,
+      record: { op: 'generation.start', error_class: 'context_profile_failed', level: 'warn', ref: jobId, surfaced: false },
+    });
   }
 
   // Submit batch к Anthropic (returns batch_id immediately)
@@ -1356,40 +1618,96 @@ resolver.define('startGeneration', async ({ payload, context }) => {
 
   if (submitResult.error) {
     console.error(
-      `[startGeneration] batch submit failed: ${submitResult.error} | ${submitResult.detail}`,
+      `[startGeneration] batch submit failed: ${submitResult.error} | ${submitResult.detail} ref=${jobId}`,
     );
+    // [diag Phase 3] Record the SUBMIT failure ITSELF (the Phase-0 wrap below records only
+    // the bookkeeping-WRITE failure — distinct class, same site). input_too_small is a
+    // user-actionable validation outcome (page content too thin after extraction), not a
+    // support class — deliberately NOT recorded (page_too_small returns even earlier,
+    // before a jobId exists, so it never reaches here; listed for symmetry). Zone-2
+    // carries the verbatim detail under the jobId ref. Plain {context, record} — the
+    // invoker IS the owner at startGeneration time.
+    if (submitResult.error !== 'input_too_small' && submitResult.error !== 'page_too_small') {
+      const diagClass = classifyDiagGenerationError(submitResult.error);
+      await recordDiagnostic({
+        context,
+        record: {
+          op: 'generation.start',
+          error_class: diagClass.error_class,
+          level: 'error',
+          ref: jobId,
+          ...(diagClass.counts ? { counts: diagClass.counts } : {}),
+          surfaced: true,
+        },
+      });
+      if (submitResult.detail) {
+        await writeDiagnosticDetail({ ref: jobId, text: String(submitResult.detail) });
+      }
+    }
+    // [diag Phase 0, §3 site :1361] Bookkeeping write for an ALREADY-failed submit — a KVS
+    // failure here must NEVER mask the original error the user needs to see: record + still
+    // return the original structured error below.
+    try {
+      await setJob(jobId,{
+        jobId,
+        pageId: String(pageId),
+        pageTitle,
+        ownerAccountId,
+        status: 'failed',
+        createdAt: new Date().toISOString(),
+        error: submitResult.error,
+        detail: submitResult.detail,
+      });
+    } catch (e) {
+      console.error('[diag] failed-state bookkeeping write failed ref=' + jobId, e);
+      await recordDiagnostic({
+        context,
+        owner: ownerAccountId,
+        record: { op: 'generation.start', error_class: 'kvs_write_failed', level: 'warn', ref: jobId, surfaced: true },
+      });
+    }
+    return {
+      error: submitResult.error,
+      detail: submitResult.detail,
+      // [diag Phase 5, Phase-3 residual] ADDITIVE: the diagnostic ref. The backend record +
+      // zone-2 detail above live under this jobId, but this error return used to carry no
+      // id → the ErrorScreen showed no ref. The FE pickup is the parallel frontend change.
+      job_id: jobId,
+    };
+  }
+
+  // Successfully submitted — store batchId с job state.
+  // [diag Phase 0, §3 site :1377] This write runs AFTER the billed Anthropic submit — money
+  // is spent, so NEVER abort on a KVS failure: record tracking_degraded + proceed to the
+  // normal success response (the batch is fine; polling/reconnect degrade until the record
+  // self-heals, which without a batchId it won't — that is exactly the support signal).
+  let trackingDegraded = false;
+  try {
     await setJob(jobId,{
       jobId,
       pageId: String(pageId),
       pageTitle,
-      status: 'failed',
+      pageVersion,
+      ownerAccountId,
+      status: 'batched',
+      model,
+      batchId: submitResult.batchId,
+      batchStatus: submitResult.status, // 'in_progress'
       createdAt: new Date().toISOString(),
-      error: submitResult.error,
-      detail: submitResult.detail,
+      submittedAt: new Date().toISOString(),
+      expiresAt: submitResult.expiresAt,
+      keySource, // 'managed'|'byok' — the poll/fetch/cycle-repair legs MUST reuse
+      //            the SAME key the batch was created with (Anthropic batches are
+      //            scoped to the creating key). See pollJobStatus.
     });
-    return {
-      error: submitResult.error,
-      detail: submitResult.detail,
-    };
+  } catch (e) {
+    trackingDegraded = true;
+    console.error('[diag] batched job write failed ref=' + jobId, e);
+    await recordDiagnostic({
+      context,
+      record: { op: 'generation.start', error_class: 'tracking_degraded', level: 'warn', ref: jobId, surfaced: false },
+    });
   }
-
-  // Successfully submitted — store batchId с job state
-  await setJob(jobId,{
-    jobId,
-    pageId: String(pageId),
-    pageTitle,
-    pageVersion,
-    status: 'batched',
-    model,
-    batchId: submitResult.batchId,
-    batchStatus: submitResult.status, // 'in_progress'
-    createdAt: new Date().toISOString(),
-    submittedAt: new Date().toISOString(),
-    expiresAt: submitResult.expiresAt,
-    keySource, // 'managed'|'byok' — the poll/fetch/cycle-repair legs MUST reuse
-    //            the SAME key the batch was created with (Anthropic batches are
-    //            scoped to the creating key). See pollJobStatus.
-  });
 
   // (multi-batch dashboard) track this fired job in the per-user dashboard list so it shows
   // as ⏳ In progress IMMEDIATELY — and flips to ✓ Ready once a poll/reconcile observes its
@@ -1399,7 +1717,15 @@ resolver.define('startGeneration', async ({ payload, context }) => {
   try {
     await recordTrackedJob((context && context.accountId) || 'unknown', { jobId, pageId, pageTitle });
   } catch (e) {
-    console.warn(`[startGeneration] tracked-jobs index write failed (non-fatal): ${String(e?.message || e)}`);
+    console.warn(`[startGeneration] tracked-jobs index write failed (non-fatal): ${String(e?.message || e)} ref=${jobId}`);
+    // [diag Phase 3, §2.1 :1399] C-class: the fired job never appears on the per-user
+    // dashboard. Phase 0 records this same class at the batched-write catch — different
+    // site, same (ref, op, class) → the dedupe coalesces them into one record with
+    // occurrences (documented in design §7, acceptable).
+    await recordDiagnostic({
+      context,
+      record: { op: 'generation.start', error_class: 'tracking_degraded', level: 'warn', ref: jobId, surfaced: false },
+    });
   }
 
   // Consume one unit of quota — only now that the batch submitted successfully
@@ -1418,7 +1744,15 @@ resolver.define('startGeneration', async ({ payload, context }) => {
         resetsAt: quota.resetsAt,
       };
     } catch (e) {
-      console.error(`[startGeneration] quota consume failed (generation still OK): ${String(e?.message || e)}`);
+      console.error(`[startGeneration] quota consume failed (generation still OK): ${String(e?.message || e)} ref=${jobId}`);
+      // [diag Phase 3, §2.1 :1410] C-class: Managed metering silently under-counts (a
+      // revenue signal, invisible to everyone). Same class as the Phase-0 job-write
+      // catches — different site, same (ref, op, class) → dedupe merges into
+      // occurrences (documented in design §7, acceptable).
+      await recordDiagnostic({
+        context,
+        record: { op: 'generation.start', error_class: 'kvs_write_failed', level: 'warn', ref: jobId, surfaced: false },
+      });
     }
   }
 
@@ -1430,6 +1764,10 @@ resolver.define('startGeneration', async ({ payload, context }) => {
     job_id: jobId,
     status: 'batched',
     batchId: submitResult.batchId,
+    // [diag Phase 0] additive flag (§3 site :1377): the batch submitted fine but the job
+    // record could not be updated — the design's "jobId + tracking_degraded warning".
+    // The frontend ignores unknown fields today; a later phase may surface it.
+    ...(trackingDegraded ? { tracking_degraded: true } : {}),
   };
 });
 
@@ -1438,7 +1776,10 @@ resolver.define('startGeneration', async ({ payload, context }) => {
  * Returns the current job state stored в KVS.
  * Use after startGeneration; UI polls every 3-5 seconds.
  */
-resolver.define('pollJobStatus', async ({ payload }) => {
+resolver.define('pollJobStatus', async ({ payload, context }) => {
+  // `context` (Phase 0): recordDiagnostic needs the resolver context for its invoker
+  // fallback bucket; job-scoped records pass owner: job.ownerAccountId (§2.4) since this
+  // poll may be driven by another user's client via the shared pageJob: index.
   const jobId = payload?.jobId;
   if (!jobId) return { error: 'No job ID' };
   const job = await kvs.get(`${JOB_KEY_PREFIX}${jobId}`);
@@ -1542,7 +1883,30 @@ resolver.define('pollJobStatus', async ({ payload }) => {
           error: 'no_results_url',
           detail: 'Batch ended but Anthropic returned no results_url.',
         };
-        await setJob(jobId,failed);
+        // [diag Phase 0, §3 site :1545] Bookkeeping write for an ALREADY-failed state — a KVS
+        // failure must never mask the original error: record + still return the original below.
+        try {
+          await setJob(jobId,failed);
+        } catch (e) {
+          console.error('[diag] failed-state bookkeeping write failed ref=' + jobId, e);
+          await recordDiagnostic({
+            context,
+            owner: job && job.ownerAccountId,
+            record: { op: 'generation.poll', error_class: 'kvs_write_failed', level: 'warn', ref: jobId, surfaced: true },
+          });
+        }
+        // [diag Phase 3] ONE record per terminal transition — the UNDERLYING failure (the
+        // wrap above records only a bookkeeping-WRITE failure; distinct classes). Owner-
+        // bucketed (§2.4): this poll may be driven by another user's client. Zone-2
+        // carries the verbatim detail.
+        await recordDiagnostic({
+          context,
+          owner: job && job.ownerAccountId,
+          record: { op: 'generation.poll', error_class: 'no_results_url', level: 'error', ref: jobId, surfaced: true },
+        });
+        if (failed.detail) {
+          await writeDiagnosticDetail({ ref: jobId, text: String(failed.detail) });
+        }
         return failed;
       }
 
@@ -1553,6 +1917,24 @@ resolver.define('pollJobStatus', async ({ payload }) => {
       );
 
       if (fetchResult.error) {
+        // [deep-audit F1 — concurrent 'ended' divergence] the :1898 terminal guard ran
+        // BEFORE the ~240KB fetchBatchResults await above — the widest window in this
+        // file. A SECOND driver (other tab's reconcile / cross-user pageJob reconnect)
+        // may have completed+persisted the job while OUR fetch was failing transiently;
+        // writing {...job, status:'failed'} here would CLOBBER that completed record —
+        // billed work silently destroyed and masked as failure, never re-fetched (the
+        // terminal early-return). Success-vs-failure divergence is NOT covered by the
+        // accepted two-success residual → re-read and yield to a completed peer.
+        const freshAfterFetch = await kvs.get(`${JOB_KEY_PREFIX}${jobId}`).catch(() => null);
+        // Yield to ANY terminal peer (deep-audit P3 — mirror the serial guard):
+        // completed = billed work preserved; failed = a peer's terminal may be the
+        // SPECIAL kvs_persist_failed stub carrying the "push it now" instructions +
+        // approx_bytes evidence — overwriting it with a transient fetch error would
+        // degrade the support signal. A terminal is a terminal; this guard sits on
+        // the ERROR path only, so local-success-wins is untouched.
+        if (freshAfterFetch && (freshAfterFetch.status === 'completed' || freshAfterFetch.status === 'failed')) {
+          return freshAfterFetch;
+        }
         const failed = {
           ...job,
           status: 'failed',
@@ -1561,7 +1943,40 @@ resolver.define('pollJobStatus', async ({ payload }) => {
           detail: fetchResult.detail,
           usage: fetchResult.usage || null,
         };
-        await setJob(jobId,failed);
+        // [diag Phase 0, §3 site :1564] Same contract as :1545 — never mask the original error.
+        try {
+          await setJob(jobId,failed);
+        } catch (e) {
+          console.error('[diag] failed-state bookkeeping write failed ref=' + jobId, e);
+          await recordDiagnostic({
+            context,
+            owner: job && job.ownerAccountId,
+            record: { op: 'generation.poll', error_class: 'kvs_write_failed', level: 'warn', ref: jobId, surfaced: true },
+          });
+        }
+        // [diag Phase 3] ONE record per terminal transition — the UNDERLYING fetch/parse
+        // failure mapped 1:1 onto the closed registry (results_fetch_<NNN> → anthropic_http
+        // + counts.http_status; batch_request_expired → batch_expired; refused/truncated/
+        // parse_failed/result_row_missing/network_failure → themselves). Zone-2 carries the
+        // verbatim detail under the jobId ref.
+        {
+          const diagClass = classifyDiagGenerationError(failed.error);
+          await recordDiagnostic({
+            context,
+            owner: job && job.ownerAccountId,
+            record: {
+              op: 'generation.poll',
+              error_class: diagClass.error_class,
+              level: 'error',
+              ref: jobId,
+              ...(diagClass.counts ? { counts: diagClass.counts } : {}),
+              surfaced: true,
+            },
+          });
+          if (failed.detail) {
+            await writeDiagnosticDetail({ ref: jobId, text: String(failed.detail) });
+          }
+        }
         return failed;
       }
 
@@ -1591,7 +2006,15 @@ resolver.define('pollJobStatus', async ({ payload }) => {
         // Cycle-repair LLM call reuses the job's key (Managed ⇒ our key, same as submit).
         await verifyAndRepairCycles(breakdown, jobApiKey, fetchResult.model);
       } catch (e) {
-        console.error(`[pollJobStatus] cycle repair failed (non-fatal): ${String(e?.message || e)}`);
+        console.error(`[pollJobStatus] cycle repair failed (non-fatal): ${String(e?.message || e)} ref=${jobId}`);
+        // [diag Phase 3, §2.1 :1590] C-class (§11 worst bug): the whole verify pass threw,
+        // so a silent dependency cycle may survive into the delivered breakdown — record it
+        // so a "Jira sequencing looks wrong" ticket has a cause on file.
+        await recordDiagnostic({
+          context,
+          owner: job && job.ownerAccountId,
+          record: { op: 'generation.complete', error_class: 'cycle_repair_failed', level: 'warn', ref: jobId, surfaced: false },
+        });
       }
 
       // Drop shared ACs that duplicate a feature's AC (redundant in the assign
@@ -1616,7 +2039,113 @@ resolver.define('pollJobStatus', async ({ payload }) => {
           ? { truncated: true, truncation_note: fetchResult.truncation_note }
           : {}),
       };
-      await setJob(jobId,completed);
+      // [diag Phase 0, §3 site :1605-1619 — the §3.1 degraded path] The completed value can
+      // exceed the ~240KB KVS value cap on very large pages. Before this wrap, the unhandled
+      // throw left the job 'batched' forever: the FE poll catch swallowed it and every 5s tick
+      // re-ran the ~240KB results download + the BILLED cycle-repair LLM (when the breakdown
+      // has a cycle) — an infinite spinner that re-bills. On persist failure: terminalize with
+      // a SMALL failed record (spread `job` — the lean pre-completion record — NEVER
+      // `completed`, which is what just failed to fit), record the diagnostic, and hand the
+      // breakdown forward INLINE (persistFailed: true) so the user can still review + push it
+      // from this tab (push consumes the frontend copy — fully in-memory).
+      try {
+        await setJob(jobId,completed);
+      } catch (persistErr) {
+        let approxBytes = 0;
+        try {
+          // BYTES, not UTF-16 chars (deep-audit F8): .length undercounts ~2× on
+          // Cyrillic specs — our own market — against a byte-metered KVS cap; the
+          // pagesnap writer 500 lines up already measures with TextEncoder.
+          approxBytes = new TextEncoder().encode(JSON.stringify(completed)).length;
+        } catch (_) { /* size unknown — keep 0 */ }
+        console.error('[diag] completed persist failed ref=' + jobId + ' bytes=' + approxBytes, persistErr);
+        // Honest wording split (deep-audit, contract-audit LOW): only assert "too
+        // large" when the size actually says so — a transient KVS outage on a small
+        // value must not tell the user to split their page.
+        const persistLikelySize = approxBytes > 200000;
+        // Small terminal record — setJob (not raw kvs.set) so the jobmeta mirror flips the
+        // dashboard row to ⚠ and the reconcile stop-idle sees a terminal state. Own try/catch:
+        // KVS may be down entirely (outage, not size) — the response below still carries the
+        // breakdown forward; the documented residual is a reconcile retry during the outage.
+        try {
+          await setJob(jobId,{
+            ...job,
+            status: 'failed',
+            error: 'kvs_persist_failed',
+            detail: persistLikelySize
+              ? 'The generated breakdown was too large to store (~' + Math.round(approxBytes / 1024) + ' KB). Review and push it now — and consider splitting the page into smaller sections for next time.'
+              : 'The generated breakdown could not be stored (a storage error — not a size problem). Review and push it now; if this repeats, contact support@spec2jira.com.',
+          });
+        } catch (terminalErr) {
+          console.error('[diag] small terminal write ALSO failed ref=' + jobId + ' (KVS may be down)', terminalErr);
+        }
+        await recordDiagnostic({
+          context,
+          owner: job && job.ownerAccountId,
+          record: {
+            op: 'generation.complete',
+            error_class: 'kvs_persist_failed',
+            level: 'error',
+            ref: jobId,
+            // truncated:1 (deep-audit F4): the persistFailed early-return skips the
+            // truncation_salvaged record — keep the degradation visible on THIS one.
+            counts: { approx_bytes: approxBytes, ...(fetchResult.truncated ? { truncated: 1 } : {}) },
+            surfaced: true,
+          },
+        });
+        await writeDiagnosticDetail({ ref: jobId, text: String((persistErr && persistErr.message) || persistErr) });
+        console.log(
+          `[pollJobStatus] jobId=${jobId} batchId=${job.batchId} COMPLETED-BUT-NOT-PERSISTED features=${(breakdown.features || []).length} elapsed=${elapsedMs}ms — returning results inline (persistFailed)`,
+        );
+        // Same shape as the normal completed return below (the FE adapter consumes it
+        // unchanged: breakdown/usage/model/pageVersion/truncated/truncation_note all ride
+        // on `completed`) + persistFailed so the FE skips getResults — which would read the
+        // small failed record above and throw the breakdown away.
+        return { ...completed, persistFailed: true };
+      }
+
+      // [diag Phase 3, design §4 + frozen (D)] Success breadcrumb (info, counts only) — runs
+      // ONLY after the completed persist above succeeded (the persistFailed catch returned
+      // early). Makes "worked until Tuesday" inferable + gives support a timeline; the §2.6
+      // info-first eviction guarantees breadcrumbs can never displace error records.
+      await recordDiagnostic({
+        context,
+        owner: job && job.ownerAccountId,
+        record: {
+          op: 'generation.complete',
+          error_class: 'generation_completed',
+          level: 'info',
+          ref: jobId,
+          // cost_usd (gate row-27): the §2.1 →L "estimateCost computed, never
+          // persisted" row — a content-free number; the breadcrumb is its
+          // natural durable carrier (the console log was its only home).
+          counts: {
+            features: (breakdown.features || []).length,
+            cost_usd: (costEstimate && costEstimate.total_usd) || 0,
+          },
+          surfaced: true,
+        },
+      });
+      if (fetchResult.truncated) {
+        // [diag Phase 3] Distinct WARN for the salvage degradation — a SECOND record by
+        // design (the breadcrumb keeps the timeline; this flags the data loss). The FE's
+        // orange truncation banner IS the surfacing. Zone-2 keeps the truncation note.
+        await recordDiagnostic({
+          context,
+          owner: job && job.ownerAccountId,
+          record: {
+            op: 'generation.complete',
+            error_class: 'truncation_salvaged',
+            level: 'warn',
+            ref: jobId,
+            counts: { features: (breakdown.features || []).length },
+            surfaced: true,
+          },
+        });
+        if (fetchResult.truncation_note) {
+          await writeDiagnosticDetail({ ref: jobId, text: String(fetchResult.truncation_note) });
+        }
+      }
 
       // (multi-batch dashboard) NO list write here — the job was added to the per-user tracked
       // list at startGeneration, and getDashboardJobs reads its LIVE status from the job:
@@ -1630,6 +2159,42 @@ resolver.define('pollJobStatus', async ({ payload }) => {
     }
 
     // Unknown batch status
+    // [diag Phase 3, §2.1 :1632 — frozen (A)] A status outside the known set never
+    // terminalizes, so this branch repeats EVERY poll tick FOREVER (the stuck-job class
+    // — and the GeneratingScreen ignores `phase`, so nothing surfaces). Record ONCE:
+    // flag the job via setJob (try/catch, console-only) and record only while the flag
+    // is unset — a 5s/15s loop × KVS ops must never become a per-tick write storm (the
+    // read-meter lesson; if the flag write itself fails, the (ref, op, class) dedupe
+    // absorbs the retries). The job DELIBERATELY stays 'batched' — no behavior change.
+    if (!job.diagUnknownStatusRecorded) {
+      console.warn(`[pollJobStatus] unknown batch status '${pollResult.status}' — recorded once, job stays batched ref=${jobId}`);
+      // (deep-audit F2) `job` was read at the resolver top — a pollBatchStatus
+      // await sits between; a concurrent driver may have terminalized since.
+      // Never let the flag write regress a terminal record to 'batched'.
+      let freshFlag = null;
+      try {
+        freshFlag = await kvs.get(`${JOB_KEY_PREFIX}${jobId}`).catch(() => null);
+        if (freshFlag && (freshFlag.status === 'completed' || freshFlag.status === 'failed')) {
+          return freshFlag;
+        }
+      } catch (e) {
+        console.error('[diag] unknown-status fresh read failed ref=' + jobId, e);
+      }
+      // RECORD-then-FLAG (deep-audit P3 NIT-4): the inverse order lost the one-time
+      // record forever when the flag write succeeded but the record write failed
+      // (the flag blocks every retry). This way a record-write failure leaves the
+      // flag unset → the next tick retries; a duplicate is dedupe-absorbed.
+      await recordDiagnostic({
+        context,
+        owner: job && job.ownerAccountId,
+        record: { op: 'generation.poll', error_class: 'batch_unknown_status', level: 'error', ref: jobId, surfaced: false },
+      });
+      try {
+        await setJob(jobId, { ...(freshFlag || job), diagUnknownStatusRecorded: true });
+      } catch (e) {
+        console.error('[diag] unknown-status flag write failed ref=' + jobId, e);
+      }
+    }
     return {
       ...job,
       batchStatus: pollResult.status,
@@ -1692,7 +2257,10 @@ resolver.define('getGenerationStatus', async ({ payload }) => {
   // batch — bug 2026-05-30):
   //   - pending/batched → UI reconnects to the generating screen + resumes poll
   //   - completed       → UI reopens the result (BreakdownEditor + Dashboard signals)
-  //   - failed/unknown  → 'idle' → fresh Ready screen
+  //   - failed          → { status:'failed', job_id, error } (Phase 0 unmask; consumed by
+  //                       the Phase 3 failure card — routeByPageStatus's failed branch
+  //                       fetches the detail and renders it on Ready with the diag ref)
+  //   - unknown         → 'idle' → fresh Ready screen
   const pageId = payload?.pageId ? String(payload.pageId) : null;
   if (!pageId) return { status: 'idle' };
 
@@ -1713,6 +2281,13 @@ resolver.define('getGenerationStatus', async ({ payload }) => {
       ? Math.max(0, Math.floor((Date.now() - new Date(startedAt).getTime()) / 1000))
       : 0;
     return { status: job.status, job_id: job.jobId, elapsed_seconds };
+  }
+  if (job.status === 'failed') {
+    // [diag Phase 0 unmask] A failed job used to map to 'idle' → reconnect/dashboard showed a
+    // pristine Ready screen with ZERO failure info. Report the truth so the surfaces can show
+    // it (FE today: falls through to Ready, same route as 'idle' — verified; Phase 3 adds the
+    // failure card).
+    return { status: 'failed', job_id: job.jobId, error: job.error || null };
   }
   return { status: 'idle' };
 });
@@ -1760,7 +2335,12 @@ resolver.define('getUsage', async ({ context }) => {
  */
 resolver.define('purgeJob', async ({ payload, context }) => {
   const jobId = payload?.jobId;
+  const diagJobRef = cleanClientRef(jobId); // [P5 LOW-2] payload id -> strict shape for LEDGER refs only
   if (!jobId) return { ok: false };
+  // [diag Phase 5, §7-deferred] ONE purge_incomplete record per invocation that hit ANY
+  // fail-open miss (a flag, not per-section spam): a partial purge leaves content behind,
+  // silently eroding the "removed when you push" privacy claim — support must see it.
+  let purgeDegraded = false;
   try {
     const job = await kvs.get(`${JOB_KEY_PREFIX}${jobId}`);
     if (job && job.pageId) {
@@ -1793,32 +2373,75 @@ resolver.define('purgeJob', async ({ payload, context }) => {
         if (next.length !== tj.length) await kvs.set(trackedKey, next);
       }
     } catch (cjErr) {
-      console.warn(`[purgeJob] tracked-jobs filter failed (non-fatal): ${String(cjErr?.message || cjErr)}`);
+      purgeDegraded = true;
+      console.warn(`[purgeJob] tracked-jobs filter failed (non-fatal): ${String(cjErr?.message || cjErr)} ref=${jobId}`);
     }
 
     // P4 audit B/Finding-6: also purge test-case KVS entries so generated cases
     // don't linger after the user's content has been pushed. Fail-open: a purge
     // failure must never error the push completion (the page content is the
     // privacy-critical item; test cases are derived data, bounded by the same
-    // instance's KVS). tcregenjob has no wildcard key pattern — leave a TODO.
+    // instance's KVS).
     try {
       const tcJob = await kvs.get(`tcjob:${jobId}`);
-      if (tcJob && typeof tcJob.total === 'number' && tcJob.total > 0) {
-        const perStoryKeys = Array.from({ length: tcJob.total }, (_, i) => `testcases:${jobId}:${i}`);
-        await Promise.all(perStoryKeys.map((k) => kvs.delete(k).catch(() => {})));
+      if (tcJob) {
+        // [seams-audit HIGH (c)] honesty record: pushing while a TC batch is still
+        // in flight discards a BILLED run (the FE warns at the Create button; the
+        // background TC poll now stops quietly) — the ledger keeps the durable trace.
+        if (tcJob.status === 'batched' || tcJob.status === 'pending') {
+          await recordDiagnostic({
+            context,
+            owner: tcJob.ownerAccountId,
+            record: { op: 'purge', error_class: 'tracking_degraded', level: 'warn', ref: jobId, counts: { tc_run_discarded: 1 }, surfaced: true },
+          });
+        }
+        // [deep-audit P4 F5] sweep to the HIGH-WATER mark — a re-generate after an
+        // editor delete re-stamps a SHORTER total; purging only 0..total-1 orphaned
+        // the old tail's per-story keys (content-adjacent) forever.
+        const sweepTo = Math.max(
+          typeof tcJob.total === 'number' ? tcJob.total : 0,
+          Number.isFinite(tcJob.maxTotal) ? tcJob.maxTotal : 0,
+        );
+        if (sweepTo > 0) {
+          const perStoryKeys = Array.from({ length: sweepTo }, (_, i) => `testcases:${jobId}:${i}`);
+          await Promise.all(perStoryKeys.map((k) => kvs.delete(k).catch(() => { purgeDegraded = true; })));
+        }
+        // [diag Phase 5, §7-deferred] tcregenjob purge-leak FIX (closes the old TODO):
+        // per-story regen control records (tcregenjob:<jobId>:<i>) are bounded by the
+        // stamped story count, so enumerate 0..N-1 and delete BEFORE the tcjob record
+        // (it carries the count). Best-effort per key; KVS delete of a non-existent key
+        // is idempotent, so a job with few/no regens costs only cheap no-op deletes.
+        const regenCount = Math.max(
+          Array.isArray(tcJob.stampedStories) ? tcJob.stampedStories.length : 0,
+          sweepTo, // [P4 F5] old-tail regen control records too
+        );
+        if (regenCount > 0) {
+          const regenKeys = Array.from({ length: regenCount }, (_, i) => `${TC_REGEN_KEY_PREFIX}${jobId}:${i}`);
+          await Promise.all(regenKeys.map((k) => kvs.delete(k).catch(() => { purgeDegraded = true; })));
+        }
       }
       await kvs.delete(`tcjob:${jobId}`);
-      // TODO: tcregenjob:<jobId>:<storyIdx> entries have no wildcard — each
-      // regen job is keyed per-story and short-lived; leave cleanup for a
-      // future housekeeping trigger if KVS usage becomes a concern.
     } catch (tcErr) {
-      console.warn(`[purgeJob] tc KVS purge failed (non-fatal): ${String(tcErr?.message || tcErr)}`);
+      purgeDegraded = true;
+      console.warn(`[purgeJob] tc KVS purge failed (non-fatal): ${String(tcErr?.message || tcErr)} ref=${jobId}`);
     }
 
+    if (purgeDegraded) {
+      await recordDiagnostic({
+        context,
+        record: { op: 'purge', error_class: 'purge_incomplete', level: 'warn', ref: diagJobRef, surfaced: false },
+      });
+    }
     console.log(`[purgeJob] removed job ${jobId} (page content + breakdown + test cases) post-push`);
     return { ok: true };
   } catch (e) {
-    console.error(`[purgeJob] failed (non-fatal): ${String(e?.message || e)}`);
+    console.error(`[purgeJob] failed (non-fatal): ${String(e?.message || e)} ref=${jobId}`);
+    // The outer catch is itself a fail-open miss — same single coalesced record
+    // (recordDiagnostic is fail-open by contract, safe inside this catch).
+    await recordDiagnostic({
+      context,
+      record: { op: 'purge', error_class: 'purge_incomplete', level: 'warn', ref: diagJobRef, surfaced: false },
+    });
     return { ok: false };
   }
 });
@@ -1826,6 +2449,33 @@ resolver.define('purgeJob', async ({ payload, context }) => {
 // ════════════════════════════════════════════════════════════
 // JIRA PUSH — chunked asUser() resolver (startPush + looped pushStep); 2026-05-30
 // ════════════════════════════════════════════════════════════
+
+// Compact, defensive serialization of the push failureDetails struct for the
+// zone-2 detail sibling (§2b — the consented verbatim zone; the SAME capped
+// per-item names/reasons the success screen shows). The 4KB cap lives in
+// writeDiagnosticDetail; this only has to never throw and never invent fields.
+function buildPushFailureDetailText(details) {
+  try {
+    if (!details || typeof details !== 'object') return '';
+    const lines = [];
+    for (const st of Array.isArray(details.stories) ? details.stories : []) {
+      lines.push(`story "${st?.name ?? '?'}": ${st?.batchError?.[0]?.message || 'failed'}`);
+    }
+    for (const su of Array.isArray(details.subtasks) ? details.subtasks : []) {
+      lines.push(
+        `subtask "${su?.taskSummary ?? '?'}" (story "${su?.parentFeature ?? '?'}"): ${su?.batchError?.[0]?.message || 'failed'}`,
+      );
+    }
+    for (const li of Array.isArray(details.links) ? details.links : []) {
+      lines.push(
+        `link "${li?.source ?? '?'}" → "${li?.target ?? '?'}": ${li?.reason || li?.detail || li?.error || 'failed'}`,
+      );
+    }
+    return lines.filter(Boolean).join('\n');
+  } catch (_) {
+    return ''; // zone-2 is best-effort — a malformed struct must never break the push response
+  }
+}
 
 /**
  * startPush — begin a chunked JIRA push session.
@@ -1838,9 +2488,19 @@ resolver.define('purgeJob', async ({ payload, context }) => {
  *
  * Returns { ok, sessionId, phase, totals } OR { error, detail }.
  */
-resolver.define('startPush', async ({ payload }) => {
+resolver.define('startPush', async ({ payload, context }) => {
   const { breakdown, projectKey: payloadProjectKey, jobId } = payload || {};
+  // [deep-audit P5 LOW-2] payload-sourced id → LEDGER refs only through the strict
+  // mint-shape check (UUID / ts-base36): a crafted dotted-ASCII "jobId" must not
+  // become pseudo-prose in the admin's view. Business logic keeps the raw jobId.
+  const diagJobRef = cleanClientRef(jobId);
   if (!breakdown) {
+    // (diag Phase 2) a missing breakdown payload is a FRONTEND bug, not a user
+    // mistake — warn-level, but recorded so support sees it in the timeline.
+    await recordDiagnostic({
+      context,
+      record: { op: 'push.step', error_class: 'no_breakdown', level: 'warn', ref: diagJobRef, surfaced: true },
+    });
     return { error: 'no_breakdown', detail: 'No breakdown payload provided' };
   }
 
@@ -1852,6 +2512,10 @@ resolver.define('startPush', async ({ payload }) => {
   // returns license_required defensively upstream.
   const projectKey = await getProjectKey(payloadProjectKey);
   if (!projectKey) {
+    await recordDiagnostic({
+      context,
+      record: { op: 'push.step', error_class: 'no_project_key', level: 'error', ref: diagJobRef, surfaced: true },
+    });
     return {
       error: 'no_project_key',
       detail:
@@ -1863,15 +2527,68 @@ resolver.define('startPush', async ({ payload }) => {
   const settings = await loadSettings();
   const cfParse = parseRequiredCustomFields(settings.requiredCustomFieldsJson);
   const customFields = cfParse.ok ? cfParse.value : null;
+  if (!cfParse.ok) {
+    // (diag, gate F1) a stored-but-unparseable required-custom-fields JSON is
+    // silently ignored here, and the push then fails per-row with a confusing
+    // jira_http 400 — support would chase Jira config while the real cause is
+    // this broken setting. Record the real cause (saveSettings fail-fasts new
+    // values, so this is a legacy/manually-edited value — rare but misleading).
+    await recordDiagnostic({
+      context,
+      // ref:null (deep-audit P2 #5): a settings-scoped condition — ref=jobId made
+      // EVERY pushed job a fresh ring row + agg bump while the broken config
+      // persisted; the (op, class) null-ref dedupe is the designed flood absorber.
+      record: { op: 'push.step', error_class: 'config_invalid', level: 'warn', ref: null, surfaced: false },
+    });
+  }
 
   let outcome;
   try {
     outcome = await startPushSession(breakdown, projectKey, customFields, jobId || null);
   } catch (e) {
-    console.error(`[startPush] threw: ${String(e?.message || e)}`);
+    console.error(`[startPush] threw: ${String(e?.message || e)} ref=${jobId || '-'}`);
+    await recordDiagnostic({
+      context,
+      record: { op: 'push.step', error_class: 'push_exception', level: 'error', ref: diagJobRef, surfaced: true },
+    });
+    await writeDiagnosticDetail({ ref: diagJobRef, text: String(e?.message || e) });
     return { error: 'push_exception', detail: String(e?.message || e) };
   }
   if (!outcome.ok) {
+    // (diag Phase 2) ONE record per startPush-time failure — project lookup AND
+    // Epic create both arrive through this return. error_class maps 1:1 onto
+    // the structured codes; the interpolated jira_<NNN> family normalizes to
+    // 'jira_http' with the status as DATA (never a raw interpolated class).
+    let errorClass = 'unknown_error';
+    let jira;
+    const code = String(outcome.error || '');
+    if (code === 'project_not_found') errorClass = 'project_not_found';
+    else if (code === 'permission_denied') errorClass = 'permission_denied';
+    else if (code === 'jira_fetch_failed') errorClass = 'network_failure';
+    else {
+      const m = /^jira_(\d+)$/.exec(code);
+      if (m) {
+        errorClass = 'jira_http';
+        jira = [{ status: parseInt(m[1], 10) }];
+      }
+    }
+    await recordDiagnostic({
+      context,
+      record: {
+        op: 'push.step',
+        error_class: errorClass,
+        level: 'error',
+        ref: diagJobRef,
+        ...(jira ? { jira } : {}),
+        surfaced: true,
+      },
+    });
+    // Zone-2 (§2b): the verbatim detail (Epic summary / Jira message) is
+    // consented-export material — it never enters the record body. No jobId →
+    // the helper skips (fail-open); there is no sessionId yet at this point.
+    if (outcome.detail) {
+      await writeDiagnosticDetail({ ref: diagJobRef, text: String(outcome.detail) });
+    }
     return { error: outcome.error, detail: outcome.detail };
   }
   return {
@@ -1889,7 +2606,7 @@ resolver.define('startPush', async ({ payload }) => {
  * Returns { done, phase, progress, counts } OR { done:true, result, partial }
  * OR { error, detail }.
  */
-resolver.define('pushStep', async ({ payload }) => {
+resolver.define('pushStep', async ({ payload, context }) => {
   // A pushStep session exists ONLY if startPush created it in KVS, and the app is
   // licensed-only (Paid-via-Atlassian default) so every caller here is a licensed
   // user. A forged sessionId returns session_not_found, and asUser() is the ultimate
@@ -1897,18 +2614,141 @@ resolver.define('pushStep', async ({ payload }) => {
   // session creator is ever added (§13 review note).
   const sessionId = payload?.sessionId;
   if (!sessionId) return { error: 'no_session', detail: 'No session id provided.' };
+  // (deep-audit P2 ref-correlation) the FE sends its jobId so the CATCH-path
+  // records are findable by the ref the error screen shows (the session may be
+  // unreadable — no other jobId source exists here). Payload = untrusted →
+  // shape-checked with the client-ref rule; the bucket stays context-only (§2).
+  const payloadJobRef = cleanClientRef(payload?.jobId);
+  const diagSessionRef = cleanClientRef(sessionId); // [P5 LOW-2] session_ref through the same strict shape
 
   let outcome;
   try {
     outcome = await pushSessionStep(sessionId);
   } catch (e) {
-    console.error(`[pushStep] threw: ${String(e?.message || e)}`);
+    console.error(`[pushStep] threw: ${String(e?.message || e)} ref=${payloadJobRef || 'session:' + sessionId}`);
+    // (diag, gate MED-1) what lands here: a session kvs.get throw OR the per-step
+    // kvs.set (push_handler.js — the documented ~240KB session-size risk path on
+    // very large specs). The push dies user-visibly mid-flight — exactly the
+    // aborted-push class design §4 names — and the session may be unreadable, so
+    // this record is the only durable trace.
+    await recordDiagnostic({
+      context,
+      record: { op: 'push.step', error_class: 'push_exception', level: 'error', ref: payloadJobRef, session_ref: diagSessionRef, surfaced: true },
+    });
+    await writeDiagnosticDetail({ ref: payloadJobRef || sessionId, text: String(e?.message || e) });
     return { error: 'push_exception', detail: String(e?.message || e) };
   }
   if (!outcome.ok) {
+    // (diag Phase 2) the two structured step failures. job_id rides the
+    // step_exception return (additive — the session is loaded there); a
+    // missing/expired session has no jobId to offer → ref stays null.
+    if (outcome.error === 'step_exception') {
+      await recordDiagnostic({
+        context,
+        record: {
+          op: 'push.step',
+          error_class: 'step_exception',
+          level: 'error',
+          ref: outcome.job_id || null,
+          session_ref: diagSessionRef,
+          surfaced: true,
+        },
+      });
+      await writeDiagnosticDetail({
+        ref: outcome.job_id || sessionId,
+        text: String(outcome.detail || ''),
+      });
+    } else if (outcome.error === 'session_not_found') {
+      await recordDiagnostic({
+        context,
+        record: {
+          op: 'push.step',
+          error_class: 'session_not_found',
+          level: 'warn',
+          ref: payloadJobRef, // findable by the ref the user sees (null when absent)
+          session_ref: diagSessionRef,
+          surfaced: true,
+        },
+      });
+    }
     return { error: outcome.error, detail: outcome.detail };
   }
   if (outcome.done) {
+    // (diag Phase 2, design §4) ONE coalesced ledger record per push — never
+    // per item. partial → error record with cause-split counts + the durable
+    // idx/key handles; clean → an info breadcrumb (timeline; the §2.6 eviction
+    // rule means breadcrumbs can never displace error records).
+    const res = outcome.result || {};
+    const d = res.diag || {};
+    const jobRef = outcome.job_id || null;
+    if (outcome.partial) {
+      await recordDiagnostic({
+        context,
+        record: {
+          op: 'push.final',
+          error_class: 'partial_push',
+          level: 'error',
+          ref: jobRef,
+          session_ref: diagSessionRef,
+          // Union of failed STORY idxs + failed subtasks' PARENT feature idxs —
+          // the same index space (feature idx), per §1 "story/task indices"
+          // (gate F3: the subtask idxs were accumulated but write-only). Cap 20
+          // here; the validator re-caps defensively.
+          subject_idxs: [
+            ...new Set([...(d.failedStoryIdxs || []), ...(d.failedSubtaskFeatureIdxs || [])]),
+          ].slice(0, 20),
+          subject_keys: d.failedKeys,
+          jira: d.jira,
+          counts: {
+            stories_created: res.total_stories || 0,
+            stories_failed: (res.failures && res.failures.stories) || 0,
+            subtasks_created: res.total_subtasks || 0,
+            subtasks_failed: (res.failures && res.failures.subtasks) || 0,
+            subtasks_orphaned: d.subtasks_orphaned || 0,
+            links_created: res.dependency_links_created || 0,
+            links_unresolved_story_failed: d.links_unresolved_story_failed || 0,
+            links_unresolved_name_unknown: d.links_unresolved_name_unknown || 0,
+            links_api_failed: d.links_api_failed || 0,
+            tc_embedded: res.tc_embedded || 0,
+            tc_skipped: res.tc_skipped || 0,
+            // tasks_embedded > 0 = the subtask-type-unresolved checklist
+            // fallback fired (gate F2's inferable proxy — no extra flag).
+            tasks_embedded: res.tasks_embedded || 0,
+          },
+          surfaced: true,
+        },
+      });
+      // Zone-2 (§2b): the capped per-item names/reasons the success screen also
+      // shows — the consented verbatim zone, keyed by jobId (fall back to the
+      // sessionId so a jobId-less push still gets its detail sibling).
+      const detailText = buildPushFailureDetailText(res.failures && res.failures.details);
+      if (detailText) {
+        await writeDiagnosticDetail({ ref: jobRef || sessionId, text: detailText });
+      }
+    } else {
+      await recordDiagnostic({
+        context,
+        record: {
+          op: 'push.final',
+          error_class: 'push_completed',
+          level: 'info',
+          ref: jobRef,
+          session_ref: diagSessionRef,
+          counts: {
+            stories_created: res.total_stories || 0,
+            subtasks_created: res.total_subtasks || 0,
+            links_created: res.dependency_links_created || 0,
+            tc_embedded: res.tc_embedded || 0,
+            // gate F4: a CLEAN push can still carry silent degradations — the
+            // tc-embed drop (edited ACs / ambiguous AC-hash) and the checklist
+            // fallback (no subtask type). Counts make them ledger-visible.
+            tc_skipped: res.tc_skipped || 0,
+            tasks_embedded: res.tasks_embedded || 0,
+          },
+          surfaced: true,
+        },
+      });
+    }
     return {
       done: true,
       status: 'completed',
@@ -1956,12 +2796,29 @@ resolver.define('startTestCaseGeneration', async ({ payload, context }) => {
   try {
     if (getActiveTier(context).key === 'unlicensed') return buildLicenseRequired();
   } catch (e) {
-    console.error(`[startTCGen] license check failed (failing open): ${String(e?.message || e)}`);
+    console.error(`[startTCGen] license check failed (failing open): ${String(e?.message || e)} ref=${jobId}`);
+    // [diag Phase 4, (E) — mirrors Phase 3's startGeneration gates] silent fail-open: a
+    // persistent license-read fault admits work with only a console trace. ref = the
+    // breakdown jobId (known here, unlike startGeneration's pre-jobId gate).
+    await recordDiagnostic({
+      context,
+      record: { op: 'testgen.batch', error_class: 'gate_fail_open', level: 'warn', ref: jobId, surfaced: false },
+    });
   }
 
   // Resolve the Anthropic key by tier (#5: keySource-stamp enables same-key reuse at poll)
-  const { apiKey, keySource } = await resolveAnthropicKey(context);
+  const { apiKey, keySource, keyFault } = await resolveAnthropicKey(context);
   if (!apiKey) {
+    // [diag Phase 4, A4] storage-fault FIRST (BYOK-only; never masks managed_unavailable) —
+    // a thrown secret read is NOT "no key configured".
+    if (keyFault) {
+      console.error(`[startTCGen] stored-key read FAULTED (storage, not "no key") ref=${jobId}`);
+      await recordDiagnostic({
+        context,
+        record: { op: 'testgen.batch', error_class: 'key_storage_failed', level: 'error', ref: jobId, surfaced: true },
+      });
+      return { error: 'key_storage_failed', detail: KEY_STORAGE_FAILED_DETAIL };
+    }
     if (keySource === 'managed') {
       console.error('[startTCGen] managed key unavailable (MANAGED_ANTHROPIC_KEY not configured)');
       return { error: 'managed_unavailable', detail: 'The Managed service is temporarily unavailable. Please contact support@spec2jira.com, or switch to your own Anthropic API key in Settings.' };
@@ -1975,7 +2832,13 @@ resolver.define('startTestCaseGeneration', async ({ payload, context }) => {
     quota = await checkQuota(context);
     if (!quota.allowed) return buildQuotaExceeded(quota);
   } catch (e) {
-    console.error(`[startTCGen] quota check failed (failing open): ${String(e?.message || e)}`);
+    console.error(`[startTCGen] quota check failed (failing open): ${String(e?.message || e)} ref=${jobId}`);
+    // [diag Phase 4, (E)] the second silent fail-open gate (Managed cap silently bypassed
+    // on a metering glitch — customer-favourable, but support must see it happened).
+    await recordDiagnostic({
+      context,
+      record: { op: 'testgen.batch', error_class: 'gate_fail_open', level: 'warn', ref: jobId, surfaced: false },
+    });
   }
 
   // Load the completed breakdown job
@@ -2002,10 +2865,23 @@ resolver.define('startTestCaseGeneration', async ({ payload, context }) => {
         job.breakdown = { ...job.breakdown, features: editedFeatures };
         await setJob(jobId,{ ...job });
       } else {
-        console.warn(`[startTCGen] edited breakdown flattened to 0 features — keeping stored breakdown for ${jobId}`);
+        console.warn(`[startTCGen] edited breakdown flattened to 0 features — keeping stored breakdown for ${jobId} ref=${jobId}`);
+        // [diag Phase 4, (E) §2.2 :1998 — worst offender #11] BOTH soft-fallback branches are the
+        // same silent class: test-gen proceeds on the PRISTINE (stored) ACs, not the BA's edits —
+        // re-opening the #1 edited-state bug with zero signal. Same (ref, op, class) as the catch
+        // below → dedupe merges them into one record with occurrences.
+        await recordDiagnostic({
+          context,
+          record: { op: 'testgen.batch', error_class: 'edited_persist_failed', level: 'warn', ref: jobId, surfaced: false },
+        });
       }
     } catch (e) {
-      console.warn(`[startTCGen] persist edited breakdown failed (keeping stored): ${String(e?.message || e)}`);
+      console.warn(`[startTCGen] persist edited breakdown failed (keeping stored): ${String(e?.message || e)} ref=${jobId}`);
+      // [diag Phase 4, (E)] see the sibling branch above — silent pristine-fallback class.
+      await recordDiagnostic({
+        context,
+        record: { op: 'testgen.batch', error_class: 'edited_persist_failed', level: 'warn', ref: jobId, surfaced: false },
+      });
     }
   }
 
@@ -2037,6 +2913,11 @@ resolver.define('startTestCaseGeneration', async ({ payload, context }) => {
 
   const total = stories.length;
   const createdAt = new Date().toISOString();
+  // Diagnostics owner stamp (Phase 0, design §2.4) — mirrors the job: stamp in
+  // startGeneration: tcjob-scoped diagnostic events bucket to the OWNER, not the poller.
+  // Stamped on all three full-record writes in this resolver (fresh literals); every later
+  // tcjob rewrite spreads the loaded record, so it persists. Nothing reads it yet (Phase 5).
+  const ownerAccountId = (context && context.accountId) || null;
 
   // #7 — stamp the story list (idx + name + acceptance_criteria) at submit time. These ACs come
   // from the EDITED breakdown persisted just above (#1 fix), so coverage is computed against the
@@ -2052,16 +2933,43 @@ resolver.define('startTestCaseGeneration', async ({ payload, context }) => {
 
   // Write initial tcjob record (status 'pending' → updated to 'batched' on success).
   // pageVersion is stamped here so getTestCases can read it without a separate job lookup.
+  // [diag F1, §3 row-1 mirror] This write runs BEFORE the billed TC batch submit — a KVS
+  // failure must stay FAIL-FAST (no money spent yet; the old unwrapped throw at least
+  // aborted first), but STRUCTURED instead of an opaque resolver death.
   const pageVersion = job.pageVersion;
-  await kvs.set(`${TC_JOB_KEY_PREFIX}${jobId}`, {
-    jobId,
-    status: 'pending',
+  // [deep-audit P4 F5] high-water mark for the purge sweep: a re-generate after an
+  // editor DELETE re-stamps a SHORTER total — purging only 0..total-1 then orphans
+  // the old tail's per-story keys (stamped names + cases, content-adjacent) forever.
+  const maxTotal = Math.max(
     total,
-    keySource,
-    stampedStories,
-    pageVersion,
-    createdAt,
-  });
+    (existingTcJob && Number.isFinite(existingTcJob.maxTotal) ? existingTcJob.maxTotal : 0),
+    (existingTcJob && Number.isFinite(existingTcJob.total) ? existingTcJob.total : 0),
+  );
+  try {
+    await kvs.set(`${TC_JOB_KEY_PREFIX}${jobId}`, {
+      jobId,
+      status: 'pending',
+      total,
+      maxTotal,
+      keySource,
+      ownerAccountId,
+      stampedStories,
+      pageVersion,
+      createdAt,
+    });
+  } catch (e) {
+    console.error('[diag] initial tcjob write failed ref=' + jobId, e);
+    await recordDiagnostic({
+      context,
+      record: { op: 'testgen.batch', error_class: 'kvs_write_failed', level: 'error', ref: jobId, surfaced: true },
+    });
+    return {
+      error: 'kvs_write_failed',
+      detail:
+        'Could not store the test-generation job in Forge storage. Please try again — if it persists, contact support@spec2jira.com.',
+      job_id: jobId,
+    };
+  }
 
   const sharedACs = (job.breakdown && Array.isArray(job.breakdown.shared_acceptance_criteria))
     ? job.breakdown.shared_acceptance_criteria
@@ -2070,16 +2978,60 @@ resolver.define('startTestCaseGeneration', async ({ payload, context }) => {
 
   // §8 fix: feed the source-page snapshot (the business rules the ACs reference by ID) to test-gen.
   const specSourceText = await resolveSpecSourceText(jobId, job);
+  // [diag Phase 4, (E) §2.2 :248-269 — worst offender #10] No coherent snapshot at the TC SUBMIT
+  // → this whole batch generates §7-STARVED (weaker tests: no concrete thresholds / decision-table
+  // cells) with only a console trace. Recorded ONLY here, the bulk-submit path that decides the
+  // batch's quality — NOT inside resolveSpecSourceText (the per-story regen path would flood a
+  // record per card click; same miss, same job, dedupe would absorb it but the rule is one site).
+  if (!specSourceText) {
+    await recordDiagnostic({
+      context,
+      record: { op: 'testgen.batch', error_class: 'pagesnap_missing', level: 'warn', ref: jobId, surfaced: false },
+    });
+  }
 
   // Submit the N-request batch to Anthropic
   const specConcerns = (job.breakdown && Array.isArray(job.breakdown.spec_concerns)) ? job.breakdown.spec_concerns : [];
   const submitResult = await submitTestCaseBatch({ stories, sharedAcceptanceCriteria: sharedACs, specConcerns, specSummary, specSourceText, apiKey });
   if (submitResult.error) {
-    console.error(`[startTCGen] batch submit failed: ${submitResult.error} | ${submitResult.detail}`);
-    await kvs.set(`${TC_JOB_KEY_PREFIX}${jobId}`, {
-      jobId, status: 'failed', total, keySource, stampedStories, createdAt,
-      error: submitResult.error, detail: submitResult.detail,
-    });
+    console.error(`[startTCGen] batch submit failed: ${submitResult.error} | ${submitResult.detail} ref=${jobId}`);
+    // [diag Phase 4, (C)] TC-batch terminal SUBMIT failure — class via the REUSED generation
+    // mapper (same Anthropic code families: auth_rejected/402/429/anthropic_<NNN>/no_batch_id/
+    // network_failure — single mapping authority, no duplicate table). Zone-2 carries the
+    // verbatim detail under the jobId ref. The invoker IS the owner at start time.
+    {
+      const diagClass = classifyDiagGenerationError(submitResult.error);
+      await recordDiagnostic({
+        context,
+        record: {
+          op: 'testgen.batch',
+          error_class: diagClass.error_class,
+          level: 'error',
+          ref: jobId,
+          ...(diagClass.counts ? { counts: diagClass.counts } : {}),
+          surfaced: true,
+        },
+      });
+      if (submitResult.detail) {
+        await writeDiagnosticDetail({ ref: jobId, text: String(submitResult.detail) });
+      }
+    }
+    // [diag F1, §3 row-3 mirror] Bookkeeping write for an ALREADY-failed submit — a KVS
+    // failure here must NEVER mask the original error the user needs to see: record + still
+    // return the original structured error below.
+    try {
+      await kvs.set(`${TC_JOB_KEY_PREFIX}${jobId}`, {
+        jobId, status: 'failed', total, maxTotal, keySource, ownerAccountId, stampedStories, createdAt,
+        error: submitResult.error, detail: submitResult.detail,
+      });
+    } catch (e) {
+      console.error('[diag] failed-state tcjob bookkeeping write failed ref=' + jobId, e);
+      await recordDiagnostic({
+        context,
+        owner: ownerAccountId,
+        record: { op: 'testgen.batch', error_class: 'kvs_write_failed', level: 'warn', ref: jobId, surfaced: true },
+      });
+    }
     return { error: submitResult.error, detail: submitResult.detail };
   }
 
@@ -2090,27 +3042,57 @@ resolver.define('startTestCaseGeneration', async ({ payload, context }) => {
     try {
       await consumeQuota(quota.usageKey);
     } catch (e) {
-      console.error(`[startTCGen] quota consume failed (generation still OK): ${String(e?.message || e)}`);
+      console.error(`[startTCGen] quota consume failed (generation still OK): ${String(e?.message || e)} ref=${jobId}`);
+      // [diag Phase 4, (E)] Managed metering silently under-counts (a revenue signal,
+      // invisible to everyone) — same class+pattern as startGeneration's consume catch.
+      await recordDiagnostic({
+        context,
+        record: { op: 'testgen.batch', error_class: 'kvs_write_failed', level: 'warn', ref: jobId, surfaced: false },
+      });
     }
   }
 
   // #5 — persist keySource + #7 persist stampedStories + batchId + pageVersion
-  await kvs.set(`${TC_JOB_KEY_PREFIX}${jobId}`, {
+  // [diag F1, §3 row-4 mirror] This write runs AFTER the billed TC batch submit — money is
+  // spent, so NEVER abort on a KVS failure: record tracking_degraded + proceed to the normal
+  // success response. Without a batchId the tcjob stays 'pending' and won't self-heal (the
+  // poll returns it untouched; a re-click re-submits a fresh billed batch) — that is exactly
+  // the support signal this record carries.
+  let trackingDegraded = false;
+  try {
+    await kvs.set(`${TC_JOB_KEY_PREFIX}${jobId}`, {
+      jobId,
+      status: 'batched',
+      total,
+      maxTotal,
+      keySource,
+      ownerAccountId,
+      stampedStories,
+      pageVersion,
+      batchId: submitResult.batchId,
+      batchStatus: submitResult.status,
+      createdAt,
+      submittedAt: new Date().toISOString(),
+      expiresAt: submitResult.expiresAt,
+    });
+  } catch (e) {
+    trackingDegraded = true;
+    console.error('[diag] batched tcjob write failed ref=' + jobId, e);
+    await recordDiagnostic({
+      context,
+      record: { op: 'testgen.batch', error_class: 'tracking_degraded', level: 'warn', ref: jobId, surfaced: false },
+    });
+  }
+
+  console.log(`[startTCGen] jobId=${jobId} batchId=${submitResult.batchId} stories=${total}`);
+  return {
     jobId,
     status: 'batched',
     total,
-    keySource,
-    stampedStories,
-    pageVersion,
-    batchId: submitResult.batchId,
-    batchStatus: submitResult.status,
-    createdAt,
-    submittedAt: new Date().toISOString(),
-    expiresAt: submitResult.expiresAt,
-  });
-
-  console.log(`[startTCGen] jobId=${jobId} batchId=${submitResult.batchId} stories=${total}`);
-  return { jobId, status: 'batched', total };
+    // [diag F1] additive flag (§3 row-4): the batch submitted fine but the tcjob record
+    // could not be updated. The frontend ignores unknown fields today.
+    ...(trackingDegraded ? { tracking_degraded: true } : {}),
+  };
 });
 
 /**
@@ -2124,14 +3106,19 @@ resolver.define('startTestCaseGeneration', async ({ payload, context }) => {
  *   #5 (managed key guard): soft-fail if the managed key vanished mid-flight.
  *   #10 (240KB guard): per-story payloads go to testcases:<jobId>:<idx>, never merged into tcjob.
  */
-resolver.define('pollTestCaseStatus', async ({ payload }) => {
+resolver.define('pollTestCaseStatus', async ({ payload, context }) => {
+  // `context` (diag Phase 4): recordDiagnostic's invoker-fallback bucket; tcjob-scoped
+  // records pass owner: tcJob.ownerAccountId (§2.4 — the Phase 0 stamp) since this poll
+  // may be driven by another user's client.
   const { jobId } = payload || {};
   if (!jobId) return { error: 'no_job_id', detail: 'jobId is required.' };
 
   const tcJob = await kvs.get(`${TC_JOB_KEY_PREFIX}${jobId}`);
   if (!tcJob) return { error: 'not_found', detail: `tcjob ${jobId} not found.` };
 
-  // Terminal states — return immediately (avoid redundant Anthropic polls)
+  // Terminal states — return immediately (avoid redundant Anthropic polls).
+  // [diag Phase 4, (C)] this early-return is ALSO the re-record guard: once 'completed' is
+  // persisted below, a re-poll can never reach the transition block again.
   if (tcJob.status === 'completed' || tcJob.status === 'failed') return tcJob;
 
   // Re-resolve the key via the STAMPED keySource (same key the batch was created with —
@@ -2179,15 +3166,81 @@ resolver.define('pollTestCaseStatus', async ({ payload }) => {
   // Batch ended — fetch JSONL + parse all N results
   if (pollResult.status === 'ended') {
     if (!pollResult.resultsUrl) {
+      // [deep-audit P4 F2] yield to ANY terminal peer before the failed write — the
+      // pollTestCaseBatch await sits between the top terminal guard and here. A
+      // clobber of a peer's 'completed' makes the per-story results STATUS-GATED
+      // UNREACHABLE (getTestCases/exports require 'completed') and the natural
+      // user retry RE-SUBMITS the full billed TC batch (~$1-3.67 — the most
+      // expensive call in the product) for work that already succeeded.
+      const freshTc1 = await kvs.get(`${TC_JOB_KEY_PREFIX}${jobId}`).catch(() => null);
+      if (freshTc1 && (freshTc1.status === 'completed' || freshTc1.status === 'failed')) {
+        return freshTc1;
+      }
       const failed = { ...tcJob, status: 'failed', completedAt: new Date().toISOString(), error: 'no_results_url', detail: 'Batch ended but Anthropic returned no results_url.' };
-      await kvs.set(`${TC_JOB_KEY_PREFIX}${jobId}`, failed);
+      // [diag F1, §3 row-3 mirror] failed-bookkeeping write — never mask the original
+      // failure: record + fall through to the terminal record + the original return.
+      // (On a write throw the tcjob stays 'batched' in KVS → the next poll re-runs this
+      // path and retries the write; the re-fired records dedupe into occurrences.)
+      try {
+        await kvs.set(`${TC_JOB_KEY_PREFIX}${jobId}`, failed);
+      } catch (e) {
+        console.error('[diag] failed-state tcjob bookkeeping write failed ref=' + jobId, e);
+        await recordDiagnostic({
+          context,
+          owner: tcJob.ownerAccountId,
+          record: { op: 'testgen.poll', error_class: 'kvs_write_failed', level: 'warn', ref: jobId, surfaced: true },
+        });
+      }
+      // [diag Phase 4, (C)] terminal TC-batch failure — ONE record at the batched→failed
+      // transition (the top early-return blocks re-records), class via the REUSED mapper,
+      // owner-bucketed (§2.4); zone-2 carries the verbatim detail.
+      {
+        const diagClass = classifyDiagGenerationError(failed.error);
+        await recordDiagnostic({
+          context,
+          owner: tcJob.ownerAccountId,
+          record: { op: 'testgen.batch', error_class: diagClass.error_class, level: 'error', ref: jobId, ...(diagClass.counts ? { counts: diagClass.counts } : {}), surfaced: true },
+        });
+        await writeDiagnosticDetail({ ref: jobId, text: String(failed.detail) });
+      }
       return failed;
     }
 
     const fetchResult = await fetchTestCaseResults(pollResult.resultsUrl, tcJob.stampedStories, jobApiKey);
     if (fetchResult.error) {
+      // [deep-audit P4 F2] the widest window — a full results download sits above;
+      // same yield-to-any-terminal guard as the generation poll (see the no_results_url
+      // site for the cost rationale).
+      const freshTc2 = await kvs.get(`${TC_JOB_KEY_PREFIX}${jobId}`).catch(() => null);
+      if (freshTc2 && (freshTc2.status === 'completed' || freshTc2.status === 'failed')) {
+        return freshTc2;
+      }
       const failed = { ...tcJob, status: 'failed', completedAt: new Date().toISOString(), error: fetchResult.error, detail: fetchResult.detail };
-      await kvs.set(`${TC_JOB_KEY_PREFIX}${jobId}`, failed);
+      // [diag F1, §3 row-3 mirror] same failed-bookkeeping contract as the no_results_url
+      // site above — record + still return the original failed object.
+      try {
+        await kvs.set(`${TC_JOB_KEY_PREFIX}${jobId}`, failed);
+      } catch (e) {
+        console.error('[diag] failed-state tcjob bookkeeping write failed ref=' + jobId, e);
+        await recordDiagnostic({
+          context,
+          owner: tcJob.ownerAccountId,
+          record: { op: 'testgen.poll', error_class: 'kvs_write_failed', level: 'warn', ref: jobId, surfaced: true },
+        });
+      }
+      // [diag Phase 4, (C)] terminal results-FETCH failure — same contract as above
+      // (results_fetch_<NNN> → anthropic_http + counts.http_status via the mapper).
+      {
+        const diagClass = classifyDiagGenerationError(failed.error);
+        await recordDiagnostic({
+          context,
+          owner: tcJob.ownerAccountId,
+          record: { op: 'testgen.batch', error_class: diagClass.error_class, level: 'error', ref: jobId, ...(diagClass.counts ? { counts: diagClass.counts } : {}), surfaced: true },
+        });
+        if (failed.detail) {
+          await writeDiagnosticDetail({ ref: jobId, text: String(failed.detail) });
+        }
+      }
       return failed;
     }
 
@@ -2198,16 +3251,34 @@ resolver.define('pollTestCaseStatus', async ({ payload }) => {
     // #3 — explicit sentinel for error rows: the KVS entry ALWAYS exists (success or error),
     // so the P5 screen can detect "failed — regenerate" rather than rendering blank.
     // #10 — payloads go to testcases:<jobId>:<idx>, never merged into tcjob.
-    await Promise.all(
-      perStory.map((entry) => {
-        const stamped = (tcJob.stampedStories || []).find((s) => s && s.idx === entry.storyIdx);
-        const storyName = (stamped && stamped.name) || '';
-        const kvsValue = entry.error
-          ? { storyIdx: entry.storyIdx, storyName, error: entry.error, detail: entry.detail }
-          : { storyIdx: entry.storyIdx, storyName, result: entry.result, coverage: entry.coverage };
-        return kvs.set(`${TC_STORY_KEY_PREFIX}${jobId}:${entry.storyIdx}`, kvsValue);
-      }),
-    );
+    // [diag Phase 4, (F)] one rejected write used to reject the WHOLE completion → an opaque
+    // resolver error with the tcjob stranded 'batched'. The retry semantic already existed
+    // (tcjob stays 'batched' → the next poll re-fetches the already-ended batch + re-writes,
+    // idempotent); we replace ONLY the opaque throw with a structured soft response.
+    try {
+      await Promise.all(
+        perStory.map((entry) => {
+          const stamped = (tcJob.stampedStories || []).find((s) => s && s.idx === entry.storyIdx);
+          const storyName = (stamped && stamped.name) || '';
+          const kvsValue = entry.error
+            ? { storyIdx: entry.storyIdx, storyName, error: entry.error, detail: entry.detail }
+            // [diag Phase 4, A5] thread the truncation flag onto the stored per-story value
+            // (additive — absent on clean entries; Phase 5 may render it per-card).
+            : { storyIdx: entry.storyIdx, storyName, result: entry.result, coverage: entry.coverage, ...(entry.truncated ? { truncated: true } : {}) };
+          return kvs.set(`${TC_STORY_KEY_PREFIX}${jobId}:${entry.storyIdx}`, kvsValue);
+        }),
+      );
+    } catch (e) {
+      console.error(`[pollTCStatus] per-story KVS write failed (tcjob stays batched; next poll retries): ${String(e?.message || e)} ref=${jobId}`);
+      await recordDiagnostic({
+        context,
+        owner: tcJob.ownerAccountId,
+        record: { op: 'testgen.poll', error_class: 'kvs_write_failed', level: 'error', ref: jobId, surfaced: true },
+      });
+      // Soft-fail shape (matches the poll-error/key-vanish soft-fails above): status stays
+      // 'batched' (spread, unmodified) so the UI keeps polling and the next tick retries.
+      return { ...tcJob, phase: 'Storing results failed — retrying on the next poll…' };
+    }
 
     const completedAt = new Date().toISOString();
     const failedCount = perStory.filter((e) => e.error).length;
@@ -2219,9 +3290,94 @@ resolver.define('pollTestCaseStatus', async ({ payload }) => {
       failedCount,
     };
     // #10 — do NOT merge perStory payloads into tcjob (240KB KVS value-size guard)
-    await kvs.set(`${TC_JOB_KEY_PREFIX}${jobId}`, completed);
+    // [diag F1, (d) completed-flip wrap — same retry contract as (F)] the per-story results
+    // are already persisted above; a failed completed-flip used to throw OPAQUELY with the
+    // tcjob stranded 'batched'. Keep that retry semantic (status stays 'batched' → the next
+    // poll re-fetches the ended batch + re-writes, idempotent, no re-bill) but structured.
+    // NO degraded inline path — test cases are re-runnable, unlike the breakdown (§3.1).
+    // The coalesced records below stay coupled to the PERSISTED transition: on a soft
+    // return they do not fire this tick (nothing was persisted) — the retry writes them.
+    try {
+      await kvs.set(`${TC_JOB_KEY_PREFIX}${jobId}`, completed);
+    } catch (e) {
+      console.error('[diag] completed tcjob write failed (stays batched; next poll retries) ref=' + jobId, e);
+      await recordDiagnostic({
+        context,
+        owner: tcJob.ownerAccountId,
+        record: { op: 'testgen.poll', error_class: 'kvs_write_failed', level: 'error', ref: jobId, surfaced: true },
+      });
+      return { ...tcJob, phase: 'Storing results failed — retrying on the next poll…' };
+    }
 
-    console.log(`[pollTCStatus] jobId=${jobId} COMPLETED stories=${perStory.length} failed=${failedCount}`);
+    // [diag Phase 4, (C)] Coalesced TC-batch records — written ONCE, at the batched→completed
+    // transition THIS invocation just persisted (§4: one record per flow-step, never per
+    // story). Serial re-polls cannot re-record (the terminal early-return at the top); the
+    // rare CONCURRENT double-poll (two in flight before either persists 'completed') is
+    // absorbed by the (ref, op, class) dedupe into occurrences — same accepted residual as
+    // the generation path.
+    const failedEntries = perStory.filter((e) => e.error);
+    const truncatedEntries = perStory.filter((e) => !e.error && e.truncated);
+    if (failedCount > 0) {
+      // Some stories failed → ONE error record, counts CAUSE-SPLIT from the per-story error
+      // sentinels (row_missing / batch_request_* / no_message / refused / parse_failed /
+      // truncated→truncated_failed — kept distinct from the salvaged count below). The TC
+      // screen already shows "N failed" + per-card regenerate — that IS the surfacing.
+      const causeCounts = {};
+      for (const e of failedEntries) {
+        const k = e.error === 'truncated' ? 'truncated_failed' : String(e.error).slice(0, 40);
+        causeCounts[k] = (causeCounts[k] || 0) + 1;
+      }
+      await recordDiagnostic({
+        context,
+        owner: tcJob.ownerAccountId,
+        record: {
+          op: 'testgen.batch',
+          error_class: 'partial_testgen',
+          level: 'error',
+          ref: jobId,
+          subject_idxs: failedEntries.map((e) => e.storyIdx).slice(0, 20),
+          counts: { ok: perStory.length - failedCount, failed: failedCount, ...causeCounts },
+          surfaced: true,
+        },
+      });
+      // Zone-2 (§2b): compact per-story summary — story NAMES are allowed in the consented
+      // verbatim sibling, never in the ledger record.
+      const detailText = failedEntries
+        .map((e) => {
+          const st = (tcJob.stampedStories || []).find((s) => s && s.idx === e.storyIdx);
+          return `story ${e.storyIdx} "${(st && st.name) || '?'}": ${e.error}`;
+        })
+        .join('\n');
+      await writeDiagnosticDetail({ ref: jobId, text: detailText });
+    } else {
+      // Clean completion → info breadcrumb (counts only; §2.6 info-first eviction means
+      // breadcrumbs can never displace error records).
+      await recordDiagnostic({
+        context,
+        owner: tcJob.ownerAccountId,
+        record: { op: 'testgen.batch', error_class: 'testgen_completed', level: 'info', ref: jobId, counts: { stories: perStory.length }, surfaced: true },
+      });
+    }
+    if (truncatedEntries.length > 0) {
+      // [diag Phase 4, A5+(C)] truncated-but-salvaged stories persisted as successes — an
+      // ADDITIONAL warn by design (the partial/breadcrumb record keeps the outcome; this one
+      // flags the silent depth-loss). surfaced:false — no UI renders the flag until Phase 5.
+      await recordDiagnostic({
+        context,
+        owner: tcJob.ownerAccountId,
+        record: {
+          op: 'testgen.batch',
+          error_class: 'truncation_salvaged',
+          level: 'warn',
+          ref: jobId,
+          subject_idxs: truncatedEntries.map((e) => e.storyIdx).slice(0, 20),
+          counts: { truncated_stories: truncatedEntries.length },
+          surfaced: false,
+        },
+      });
+    }
+
+    console.log(`[pollTCStatus] jobId=${jobId} COMPLETED stories=${perStory.length} failed=${failedCount}${truncatedEntries.length ? ` truncated=${truncatedEntries.length}` : ''} ref=${jobId}`);
     return completed;
   }
 
@@ -2320,6 +3476,7 @@ resolver.define('getTestCases', async ({ payload }) => {
  */
 resolver.define('saveTestCases', async ({ payload, context }) => {
   const { jobId, storyIdx, result } = payload || {};
+  const diagJobRef = cleanClientRef(jobId); // [P5 LOW-2]
   if (!jobId) return { error: 'no_job_id', detail: 'jobId is required.' };
   if (typeof storyIdx !== 'number' || !Number.isInteger(storyIdx) || storyIdx < 0) {
     return { error: 'bad_story_idx', detail: 'storyIdx must be a non-negative integer.' };
@@ -2371,13 +3528,23 @@ resolver.define('saveTestCases', async ({ payload, context }) => {
     return { error: 'empty_result', detail: 'A saved story must keep at least one test case (each with a When and a Then). Add a case, or use Regenerate.' };
   }
 
-  // Overwrite the ONE per-story key — byte-identical shape to the bulk/regen success entry,
-  // so getTestCases / export / push consume it unchanged.
+  // Overwrite the ONE per-story key — same shape the bulk/regen success entry has,
+  // so getTestCases / export / push consume it unchanged. DELIBERATE difference
+  // (deep-audit P4 F3): the A5 `truncated` flag is NOT carried over — saving is the
+  // BA's review act; the FE save patch clears the chip in the same breath, keeping
+  // screen and storage aligned (clear-on-save semantics).
   const entry = { storyIdx, storyName: story.name, result: parsed.result, coverage: parsed.coverage };
   try {
     await kvs.set(`${TC_STORY_KEY_PREFIX}${jobId}:${storyIdx}`, entry);
   } catch (e) {
-    console.error(`[saveTC] KVS write failed jobId=${jobId} storyIdx=${storyIdx}: ${String(e?.message || e)}`);
+    console.error(`[saveTC] KVS write failed jobId=${jobId} storyIdx=${storyIdx}: ${String(e?.message || e)} ref=${jobId}`);
+    // [diag Phase 5, gate fix] the registered-but-unwired testgen.save op gets its
+    // writer: the failed save is fail-loud on screen (type-A) but the ledger keeps
+    // the durable trace (a REPEATING save failure = a KVS problem support must see).
+    await recordDiagnostic({
+      context,
+      record: { op: 'testgen.save', error_class: 'kvs_write_failed', level: 'warn', ref: diagJobRef, subject: { kind: 'idx', id: storyIdx }, surfaced: true },
+    });
     return { error: 'save_failed', detail: 'Could not save your edits (storage error). Your changes are still on screen — try Save again.' };
   }
 
@@ -2422,18 +3589,37 @@ resolver.define('regenerateTestCase', async ({ payload, context }) => {
 
   // Resolve the key (#5: regen key must match the bulk batch's keySource for cost/auth consistency)
   const tcJob = await kvs.get(`${TC_JOB_KEY_PREFIX}${jobId}`);
+  // [diag Phase 4] owner stamp for the regen control record (mirrors Phase 0's tcjob stamp):
+  // pollRegenerateTestCase is payload-only and may be driven by another user's client, so its
+  // records must bucket to the OWNER (§2.4) — bulk tcjob owner when stamped, else the invoker.
+  const regenOwnerAccountId = (tcJob && tcJob.ownerAccountId) || (context && context.accountId) || null;
   // Use the bulk tcjob's keySource when available (same billing source as the original batch);
   // fall back to resolveAnthropicKey for the first-ever regen on a job with no bulk tcjob.
-  let apiKey, keySource;
+  // [diag Phase 4, A4] both branches use the fault-aware read — a thrown secret read is a
+  // storage fault, NOT "no key configured".
+  let apiKey, keySource, keyFault = false;
   if (tcJob && tcJob.keySource) {
     keySource = tcJob.keySource;
-    apiKey = await anthropicKeyForSource(keySource);
+    const info = await anthropicKeyInfoForSource(keySource);
+    apiKey = info.key;
+    keyFault = info.fault;
   } else {
     const resolved = await resolveAnthropicKey(context);
     apiKey = resolved.apiKey;
     keySource = resolved.keySource;
+    keyFault = resolved.keyFault;
   }
   if (!apiKey) {
+    // [diag Phase 4, A4] storage-fault FIRST (BYOK-only; never masks managed_unavailable).
+    if (keyFault) {
+      console.error(`[regenTC] stored-key read FAULTED (storage, not "no key") ref=${jobId}`);
+      await recordDiagnostic({
+        context,
+        owner: regenOwnerAccountId,
+        record: { op: 'testgen.regen', error_class: 'key_storage_failed', level: 'error', ref: jobId, surfaced: true },
+      });
+      return { error: 'key_storage_failed', detail: KEY_STORAGE_FAILED_DETAIL };
+    }
     if (keySource === 'managed') return { error: 'managed_unavailable', detail: 'The Managed service is temporarily unavailable. Please contact support@spec2jira.com.' };
     return { error: 'not_configured', detail: 'Anthropic API key not configured.' };
   }
@@ -2458,9 +3644,27 @@ resolver.define('regenerateTestCase', async ({ payload, context }) => {
           job.breakdown = { ...job.breakdown, features: editedFeatures };
           await setJob(jobId,job);
         }
+      } else {
+        // [diag Phase 4, gate symmetry] a 0-features flatten is the SAME silent
+        // pristine-fallback as the catch below (startTCGen records both branches).
+        console.error(`[regenTC] edited-breakdown flatten produced 0 features (using stored) ref=${jobId}`);
+        await recordDiagnostic({
+          context,
+          owner: regenOwnerAccountId,
+          record: { op: 'testgen.regen', error_class: 'edited_persist_failed', level: 'warn', ref: jobId, surfaced: false },
+        });
       }
     } catch (e) {
-      console.error(`[regenTC] edited-breakdown persist failed (using stored): ${String(e?.message || e)}`);
+      console.error(`[regenTC] edited-breakdown persist failed (using stored): ${String(e?.message || e)} ref=${jobId}`);
+      // [diag Phase 4, (E) §2.2 :2450 — worst offender #11] silent pristine-fallback: this regen
+      // reads the STORED (possibly stale) ACs, not the BA's edits. Same class as the
+      // startTestCaseGeneration site; op = THIS flow's step (testgen.regen), so the two sites
+      // stay distinguishable in the ledger (each site's own retries dedupe-merge).
+      await recordDiagnostic({
+        context,
+        owner: regenOwnerAccountId,
+        record: { op: 'testgen.regen', error_class: 'edited_persist_failed', level: 'warn', ref: jobId, surfaced: false },
+      });
     }
   }
   const stories = (job.breakdown && Array.isArray(job.breakdown.features)) ? job.breakdown.features : [];
@@ -2495,11 +3699,29 @@ resolver.define('regenerateTestCase', async ({ payload, context }) => {
   // Write the regen control key (separate from the bulk tcjob). NOTE: stampedStories uses
   // idx:0 — the batch-LOCAL index matching the 1-request custom_id "0"; the real breakdown
   // position is the payload storyIdx (the KVS key suffix + the testcases:<jobId>:<storyIdx> write).
-  await kvs.set(`${TC_REGEN_KEY_PREFIX}${jobId}:${storyIdx}`, {
-    jobId, storyIdx, status: 'pending', keySource,
-    stampedStories: [{ idx: 0, _uid: story._uid, name: story.name || '', acceptance_criteria: Array.isArray(story.acceptance_criteria) ? story.acceptance_criteria : [] }],
-    createdAt,
-  });
+  // [diag Phase 4] ownerAccountId stamped on all three full-record writes (fresh literals).
+  // [diag F1, §3 row-1 mirror] BEFORE the billed 1-request submit — fail-fast (no money
+  // spent yet), structured instead of an opaque resolver death.
+  try {
+    await kvs.set(`${TC_REGEN_KEY_PREFIX}${jobId}:${storyIdx}`, {
+      jobId, storyIdx, status: 'pending', keySource, ownerAccountId: regenOwnerAccountId,
+      stampedStories: [{ idx: 0, _uid: story._uid, name: story.name || '', acceptance_criteria: Array.isArray(story.acceptance_criteria) ? story.acceptance_criteria : [] }],
+      createdAt,
+    });
+  } catch (e) {
+    console.error('[diag] initial tcregenjob write failed ref=' + jobId, e);
+    await recordDiagnostic({
+      context,
+      owner: regenOwnerAccountId,
+      record: { op: 'testgen.regen', error_class: 'kvs_write_failed', level: 'error', ref: jobId, subject: { kind: 'idx', id: storyIdx }, surfaced: true },
+    });
+    return {
+      error: 'kvs_write_failed',
+      detail:
+        'Could not store the regeneration job in Forge storage. Please try again — if it persists, contact support@spec2jira.com.',
+      job_id: jobId,
+    };
+  }
 
   // Submit a 1-request batch (all siblings passed as context — scope fence is important
   // for a correct regenerate; quality-consistent with the bulk Sonnet call #9)
@@ -2517,25 +3739,76 @@ resolver.define('regenerateTestCase', async ({ payload, context }) => {
   });
 
   if (submitResult.error) {
-    console.error(`[regenTC] submit failed: ${submitResult.error} | ${submitResult.detail}`);
-    await kvs.set(`${TC_REGEN_KEY_PREFIX}${jobId}:${storyIdx}`, {
-      jobId, storyIdx, status: 'failed', keySource,
-      stampedStories: [{ idx: 0, _uid: story._uid, name: story.name || '', acceptance_criteria: Array.isArray(story.acceptance_criteria) ? story.acceptance_criteria : [] }],
-      createdAt, error: submitResult.error, detail: submitResult.detail,
-    });
+    console.error(`[regenTC] submit failed: ${submitResult.error} | ${submitResult.detail} ref=${jobId}`);
+    // [diag Phase 4, (C)] regen terminal SUBMIT failure — class via the REUSED generation
+    // mapper; subject pins WHICH story's card failed; zone-2 carries the verbatim detail.
+    {
+      const diagClass = classifyDiagGenerationError(submitResult.error);
+      await recordDiagnostic({
+        context,
+        owner: regenOwnerAccountId,
+        record: {
+          op: 'testgen.regen',
+          error_class: diagClass.error_class,
+          level: 'error',
+          ref: jobId,
+          subject: { kind: 'idx', id: storyIdx },
+          ...(diagClass.counts ? { counts: diagClass.counts } : {}),
+          surfaced: true,
+        },
+      });
+      if (submitResult.detail) {
+        await writeDiagnosticDetail({ ref: jobId, text: String(submitResult.detail) });
+      }
+    }
+    // [diag F1, §3 row-3 mirror] failed-submit bookkeeping — never mask the original error:
+    // record + still return the original structured error below.
+    try {
+      await kvs.set(`${TC_REGEN_KEY_PREFIX}${jobId}:${storyIdx}`, {
+        jobId, storyIdx, status: 'failed', keySource, ownerAccountId: regenOwnerAccountId,
+        stampedStories: [{ idx: 0, _uid: story._uid, name: story.name || '', acceptance_criteria: Array.isArray(story.acceptance_criteria) ? story.acceptance_criteria : [] }],
+        createdAt, error: submitResult.error, detail: submitResult.detail,
+      });
+    } catch (e) {
+      console.error('[diag] failed-state tcregenjob bookkeeping write failed ref=' + jobId, e);
+      await recordDiagnostic({
+        context,
+        owner: regenOwnerAccountId,
+        record: { op: 'testgen.regen', error_class: 'kvs_write_failed', level: 'warn', ref: jobId, subject: { kind: 'idx', id: storyIdx }, surfaced: true },
+      });
+    }
     return { error: submitResult.error, detail: submitResult.detail };
   }
 
-  await kvs.set(`${TC_REGEN_KEY_PREFIX}${jobId}:${storyIdx}`, {
-    jobId, storyIdx, status: 'batched', keySource,
-    stampedStories: [{ idx: 0, _uid: story._uid, name: story.name || '', acceptance_criteria: Array.isArray(story.acceptance_criteria) ? story.acceptance_criteria : [] }],
-    batchId: submitResult.batchId,
-    batchStatus: submitResult.status,
-    createdAt, submittedAt: new Date().toISOString(), expiresAt: submitResult.expiresAt,
-  });
+  // [diag F1, §3 row-4 mirror] AFTER the billed submit — money is spent, NEVER abort:
+  // record tracking_degraded + proceed to the normal success response. Without a batchId
+  // the control record stays 'pending' (the poll returns it untouched; a re-click
+  // re-submits a fresh billed batch) — exactly the support signal this record carries.
+  let trackingDegraded = false;
+  try {
+    await kvs.set(`${TC_REGEN_KEY_PREFIX}${jobId}:${storyIdx}`, {
+      jobId, storyIdx, status: 'batched', keySource, ownerAccountId: regenOwnerAccountId,
+      stampedStories: [{ idx: 0, _uid: story._uid, name: story.name || '', acceptance_criteria: Array.isArray(story.acceptance_criteria) ? story.acceptance_criteria : [] }],
+      batchId: submitResult.batchId,
+      batchStatus: submitResult.status,
+      createdAt, submittedAt: new Date().toISOString(), expiresAt: submitResult.expiresAt,
+    });
+  } catch (e) {
+    trackingDegraded = true;
+    console.error('[diag] batched tcregenjob write failed ref=' + jobId, e);
+    await recordDiagnostic({
+      context,
+      owner: regenOwnerAccountId,
+      record: { op: 'testgen.regen', error_class: 'tracking_degraded', level: 'warn', ref: jobId, subject: { kind: 'idx', id: storyIdx }, surfaced: false },
+    });
+  }
 
   console.log(`[regenTC] jobId=${jobId} storyIdx=${storyIdx} batchId=${submitResult.batchId}`);
-  return { jobId, storyIdx, status: 'batched', batchId: submitResult.batchId };
+  return {
+    jobId, storyIdx, status: 'batched', batchId: submitResult.batchId,
+    // [diag F1] additive (§3 row-4); the frontend ignores unknown fields today.
+    ...(trackingDegraded ? { tracking_degraded: true } : {}),
+  };
 });
 
 /**
@@ -2547,7 +3820,10 @@ resolver.define('regenerateTestCase', async ({ payload, context }) => {
  *   #3 (explicit sentinel): error rows write an explicit error entry, never blank.
  *   #5 (managed key guard): soft-fail if managed key vanished.
  */
-resolver.define('pollRegenerateTestCase', async ({ payload }) => {
+resolver.define('pollRegenerateTestCase', async ({ payload, context }) => {
+  // `context` (diag Phase 4): recordDiagnostic's invoker-fallback bucket; regen-scoped
+  // records pass owner: regenJob.ownerAccountId (stamped by regenerateTestCase this phase;
+  // legacy regen records without it fall back to the invoker — design §2.4).
   const { jobId, storyIdx } = payload || {};
   if (!jobId || typeof storyIdx !== 'number') {
     return { error: 'bad_args', detail: 'jobId and numeric storyIdx are required.' };
@@ -2586,15 +3862,73 @@ resolver.define('pollRegenerateTestCase', async ({ payload }) => {
 
   if (pollResult.status === 'ended') {
     if (!pollResult.resultsUrl) {
+      // [deep-audit P4 F2] yield to a terminal peer (the pollTestCaseBatch await sits
+      // above) — same guard family as the bulk TC poll; a regen re-run is cheap
+      // (~$0.065) but the guard is 3 lines and keeps the terminal-is-terminal rule.
+      const freshRg1 = await kvs.get(regenKey).catch(() => null);
+      if (freshRg1 && (freshRg1.status === 'completed' || freshRg1.status === 'failed')) {
+        return freshRg1;
+      }
       const failed = { ...regenJob, status: 'failed', completedAt: new Date().toISOString(), error: 'no_results_url', detail: 'Batch ended but Anthropic returned no results_url.' };
-      await kvs.set(regenKey, failed);
+      // [diag F1, §3 row-3 mirror] failed-bookkeeping write — never mask the original
+      // failure: record + fall through to the terminal record + the original return.
+      try {
+        await kvs.set(regenKey, failed);
+      } catch (e) {
+        console.error('[diag] failed-state tcregenjob bookkeeping write failed ref=' + jobId, e);
+        await recordDiagnostic({
+          context,
+          owner: regenJob.ownerAccountId,
+          record: { op: 'testgen.regen', error_class: 'kvs_write_failed', level: 'warn', ref: jobId, subject: { kind: 'idx', id: storyIdx }, surfaced: true },
+        });
+      }
+      // [diag Phase 4, (C)] regen terminal failure — ONE record at the batched→failed
+      // transition (the terminal early-return at the top blocks re-records); class via the
+      // REUSED mapper; subject pins the story; zone-2 carries the verbatim detail.
+      {
+        const diagClass = classifyDiagGenerationError(failed.error);
+        await recordDiagnostic({
+          context,
+          owner: regenJob.ownerAccountId,
+          record: { op: 'testgen.regen', error_class: diagClass.error_class, level: 'error', ref: jobId, subject: { kind: 'idx', id: storyIdx }, ...(diagClass.counts ? { counts: diagClass.counts } : {}), surfaced: true },
+        });
+        await writeDiagnosticDetail({ ref: jobId, text: String(failed.detail) });
+      }
       return failed;
     }
 
     const fetchResult = await fetchTestCaseResults(pollResult.resultsUrl, regenJob.stampedStories, jobApiKey);
     if (fetchResult.error) {
+      // [deep-audit P4 F2] widest regen window (the results download sits above).
+      const freshRg2 = await kvs.get(regenKey).catch(() => null);
+      if (freshRg2 && (freshRg2.status === 'completed' || freshRg2.status === 'failed')) {
+        return freshRg2;
+      }
       const failed = { ...regenJob, status: 'failed', completedAt: new Date().toISOString(), error: fetchResult.error, detail: fetchResult.detail };
-      await kvs.set(regenKey, failed);
+      // [diag F1, §3 row-3 mirror] same failed-bookkeeping contract as the no_results_url
+      // site above — record + still return the original failed object.
+      try {
+        await kvs.set(regenKey, failed);
+      } catch (e) {
+        console.error('[diag] failed-state tcregenjob bookkeeping write failed ref=' + jobId, e);
+        await recordDiagnostic({
+          context,
+          owner: regenJob.ownerAccountId,
+          record: { op: 'testgen.regen', error_class: 'kvs_write_failed', level: 'warn', ref: jobId, subject: { kind: 'idx', id: storyIdx }, surfaced: true },
+        });
+      }
+      // [diag Phase 4, (C)] regen terminal results-FETCH failure — same contract as above.
+      {
+        const diagClass = classifyDiagGenerationError(failed.error);
+        await recordDiagnostic({
+          context,
+          owner: regenJob.ownerAccountId,
+          record: { op: 'testgen.regen', error_class: diagClass.error_class, level: 'error', ref: jobId, subject: { kind: 'idx', id: storyIdx }, ...(diagClass.counts ? { counts: diagClass.counts } : {}), surfaced: true },
+        });
+        if (failed.detail) {
+          await writeDiagnosticDetail({ ref: jobId, text: String(failed.detail) });
+        }
+      }
       return failed;
     }
 
@@ -2606,13 +3940,67 @@ resolver.define('pollRegenerateTestCase', async ({ payload }) => {
 
     // Overwrite the shared per-story KVS key (intentional: user clicked Regenerate)
     // #3 — explicit sentinel even for regen errors
+    // [diag Phase 4, A5] truncated flag threaded onto the stored value (same as the bulk path).
     const storyKvsValue = entry && !entry.error
-      ? { storyIdx, storyName, result: entry.result, coverage: entry.coverage }
+      ? { storyIdx, storyName, result: entry.result, coverage: entry.coverage, ...(entry.truncated ? { truncated: true } : {}) }
       : { storyIdx, storyName, error: (entry && entry.error) || 'regen_failed', detail: (entry && entry.detail) || 'Regen parse failed.' };
-    await kvs.set(`${TC_STORY_KEY_PREFIX}${jobId}:${storyIdx}`, storyKvsValue);
-
+    // [diag Phase 4, (G) — worst offender #8, DETECTION half] A failed regen is about to
+    // overwrite the SHARED testcases:<jobId>:<idx> key. If that key held GOOD cases, the
+    // overwrite DESTROYS them with no undo — read the prior value (1 KVS get, rare error
+    // path) and record the destruction. The overwrite behaviour itself is UNCHANGED — the
+    // keep-prior-good fix is the Layer-1 behavioral half, not this phase.
+    if (storyKvsValue.error) {
+      let priorHeldGood = false;
+      try {
+        const prior = await kvs.get(`${TC_STORY_KEY_PREFIX}${jobId}:${storyIdx}`);
+        priorHeldGood = !!(prior && !prior.error && prior.result
+          && Array.isArray(prior.result.test_cases) && prior.result.test_cases.length > 0);
+      } catch (_) { /* detection is best-effort — never block the write path */ }
+      if (priorHeldGood) {
+        await recordDiagnostic({
+          context,
+          owner: regenJob.ownerAccountId,
+          record: { op: 'testgen.regen', error_class: 'regen_overwrote_good', level: 'error', ref: jobId, subject: { kind: 'idx', id: storyIdx }, surfaced: true },
+        });
+      }
+      // [diag Phase 4, gate symmetry] the regen ENTRY itself failed (refused /
+      // parse_failed / truncated / row_missing / batch_request_*) — mirror the
+      // bulk path's per-cause record so a targeted-retry failure leaves a
+      // durable trace beyond the transient card ⚠ (the bulk partial_testgen
+      // record only covers the ORIGINAL batch, not this regen attempt).
+      await recordDiagnostic({
+        context,
+        owner: regenJob.ownerAccountId,
+        record: {
+          op: 'testgen.regen',
+          ...classifyDiagGenerationError(storyKvsValue.error),
+          level: 'error',
+          ref: jobId,
+          subject: { kind: 'idx', id: storyIdx },
+          surfaced: true,
+        },
+      });
+    }
+    // [diag F1, (F)/(d)-mirror for the regen flow] the per-story result write + the
+    // completed control-flip form ONE persist step with ONE correct catch semantic: the
+    // regen stays 'batched' → the next poll re-fetches the ended batch + re-writes
+    // (idempotent, no re-bill) — structured soft return instead of an opaque death. NO
+    // degraded inline path — a regen is re-runnable. (A throw re-fires the (G)/per-cause
+    // records next tick — the (ref, op, class) dedupe absorbs them into occurrences,
+    // the accepted (F) pattern.)
     const completed = { ...regenJob, status: 'completed', completedAt: new Date().toISOString(), batchStatus: 'ended' };
-    await kvs.set(regenKey, completed);
+    try {
+      await kvs.set(`${TC_STORY_KEY_PREFIX}${jobId}:${storyIdx}`, storyKvsValue);
+      await kvs.set(regenKey, completed);
+    } catch (e) {
+      console.error('[diag] regen result/completed write failed (stays batched; next poll retries) ref=' + jobId, e);
+      await recordDiagnostic({
+        context,
+        owner: regenJob.ownerAccountId,
+        record: { op: 'testgen.regen', error_class: 'kvs_write_failed', level: 'error', ref: jobId, subject: { kind: 'idx', id: storyIdx }, surfaced: true },
+      });
+      return { ...regenJob, phase: 'Storing results failed — retrying on the next poll…' };
+    }
 
     // (c) Sync the bulk tcjob's stamped story for this idx to the EDITED ACs (= what this regen used)
     // so the push-embed AC-hash (it hashes tcjob.stampedStories) matches the regenerated story AND the
@@ -2632,16 +4020,29 @@ resolver.define('pollRegenerateTestCase', async ({ payload }) => {
           }
         }
       } catch (e) {
-        console.error(`[pollRegenTC] stampedStories sync failed (non-fatal): ${String(e?.message || e)}`);
+        console.error(`[pollRegenTC] stampedStories sync failed (non-fatal): ${String(e?.message || e)} ref=${jobId}`);
+        // [diag Phase 4, gate F2 — the one →L row both nets missed] silent stamp
+        // drift: the staleness chip never clears + the push-embed AC-hash diverges
+        // → the embed silently skips this story at push. Same-tuple retries
+        // dedupe-merge into occurrences.
+        await recordDiagnostic({
+          context,
+          owner: regenJob.ownerAccountId,
+          record: { op: 'testgen.regen', error_class: 'kvs_write_failed', level: 'warn', ref: jobId, surfaced: false },
+        });
       }
     }
 
-    console.log(`[pollRegenTC] jobId=${jobId} storyIdx=${storyIdx} COMPLETED error=${entry && !!entry.error}`);
+    console.log(`[pollRegenTC] jobId=${jobId} storyIdx=${storyIdx} COMPLETED error=${entry && !!entry.error} ref=${jobId}`);
     return {
       ...completed,
       result: storyKvsValue.result,
       coverage: storyKvsValue.coverage,
       error: storyKvsValue.error,
+      // [deep-audit P4 F1] the A5 flag must ride the LIVE regen response — without it
+      // the FE patch kept a STALE chip (clean regen) or showed NO chip (still-truncated
+      // regen) until a remount re-read storage.
+      ...(storyKvsValue.truncated ? { truncated: true } : {}),
       // (c) hand the frontend the EDITED story → it patches perStory[idx].story so staleness clears.
       story: (entry && !entry.error && editedStory)
         ? { name: editedStory.name || storyName, acceptance_criteria: Array.isArray(editedStory.acceptance_criteria) ? editedStory.acceptance_criteria : [], _uid: editedStory._uid }
@@ -2666,8 +4067,10 @@ resolver.define('pollRegenerateTestCase', async ({ payload }) => {
  * Returns: { gherkin?, csv? } or { error, detail }
  *   confidence is NEVER exported (opts { includeConfidence: false }).
  */
-resolver.define('getTestCaseExports', async ({ payload }) => {
+resolver.define('getTestCaseExports', async ({ payload, context }) => {
+  // `context` (diag Phase 4, A7): for the export_partial/export_failed records below.
   const { jobId, storyIdx, format = 'both' } = payload || {};
+  const diagJobRef = cleanClientRef(jobId); // [P5 LOW-2]
   if (!jobId) return { error: 'no_job_id', detail: 'jobId is required.' };
 
   const tcJob = await kvs.get(`${TC_JOB_KEY_PREFIX}${jobId}`).catch(() => null);
@@ -2696,10 +4099,26 @@ resolver.define('getTestCaseExports', async ({ payload }) => {
   const csvParts = [];
   let csvHeaderEmitted = false;
 
+  // [diag Phase 4, A7 — worst offender #7] Every non-exported story is now COUNTED
+  // (missing entry / error sentinel / render threw) instead of a bare `continue` — an
+  // 8-story file used to look complete when 2 stories silently failed. A render throw now
+  // skips ONLY that story (it used to kill the whole export). Clean exports are
+  // byte-identical: same parts, same joins, marker only when something was skipped.
+  const skippedIdxs = [];
+  const truncatedIdxs = []; // [P4 F6] exported but A5-flagged stories
+  let exportedCount = 0;
+
   for (let i = 0; i < indices.length; i++) {
     const idx = indices[i];
     const entry = entries[i];
-    if (!entry || entry.error) continue; // skip error/missing entries gracefully
+    if (!entry || entry.error) {
+      skippedIdxs.push(idx); // missing / failed-generation entry — counted, no longer silent
+      continue;
+    }
+    // [deep-audit P4 F6] a truncated-but-salvaged story exports NORMALLY — count it so
+    // the marker + the FE note can say "may be truncated" (the chip was screen-only;
+    // the .feature/CSV shipped possibly-incomplete cases with zero honesty signal).
+    if (entry.truncated === true) truncatedIdxs.push(idx);
 
     const stamped = stampedStories.find((s) => s && s.idx === idx);
     const story = stamped
@@ -2707,31 +4126,477 @@ resolver.define('getTestCaseExports', async ({ payload }) => {
       : { name: entry.storyName || '', acceptance_criteria: [] };
 
     const result = entry.result;
-    if (!result) continue;
-
-    if (format === 'gherkin' || format === 'both') {
-      const g = renderGherkin(result, story, renderOpts);
-      if (g) gherkinParts.push(g);
+    if (!result) {
+      skippedIdxs.push(idx);
+      continue;
     }
-    if (format === 'csv' || format === 'both') {
-      const { csv } = renderManualTable(result, story, { ...renderOpts, headerRow: !csvHeaderEmitted });
-      if (csv) {
-        csvParts.push(csv);
+
+    try {
+      // Render to locals FIRST, push after BOTH succeeded — a throw mid-story can never
+      // leave a half-exported story (gherkin pushed, csv missing).
+      let g = null;
+      let c = null;
+      if (format === 'gherkin' || format === 'both') {
+        g = renderGherkin(result, story, renderOpts);
+      }
+      if (format === 'csv' || format === 'both') {
+        const { csv } = renderManualTable(result, story, { ...renderOpts, headerRow: !csvHeaderEmitted });
+        c = csv;
+      }
+      if (g) gherkinParts.push(g);
+      if (c) {
+        csvParts.push(c);
         csvHeaderEmitted = true;
       }
+      exportedCount++;
+    } catch (e) {
+      console.error(`[tcExport] render threw for story ${idx} — story skipped, export continues: ${String(e?.message || e)} ref=${jobId}`);
+      skippedIdxs.push(idx);
     }
   }
 
   const out = {};
 
   if (format === 'gherkin' || format === 'both') {
-    out.gherkin = gherkinParts.join('\n\n');
+    const body = gherkinParts.join('\n\n');
+    // [diag Phase 4, A7 + F6] In-file honesty markers — GHERKIN ONLY (`#` comments are
+    // valid .feature syntax; CSV gets NO in-data marker — RFC-4180 has no comment concept
+    // and an injected row would corrupt tool imports). Absent on a clean export
+    // (byte-identical).
+    const markers = [];
+    if (skippedIdxs.length > 0) {
+      markers.push(`# NOTE: ${skippedIdxs.length} of ${indices.length} stories are NOT included (generation failed or data missing) — see Settings → Diagnostics`);
+    }
+    if (truncatedIdxs.length > 0) {
+      markers.push(`# NOTE: ${truncatedIdxs.length} ${truncatedIdxs.length === 1 ? 'story' : 'stories'} may be TRUNCATED (the generation hit its output limit — the case list may be incomplete) — regenerate to be sure`);
+    }
+    out.gherkin = markers.length > 0 ? `${markers.join('\n')}\n${body}` : body;
   }
   if (format === 'csv' || format === 'both') {
     out.csv = csvParts.join('\n');
   }
 
+  if (skippedIdxs.length > 0) {
+    // [diag Phase 4, A7] export_partial (warn) — or export_failed (error) when EVERYTHING
+    // was skipped (the file is empty pretense). surfaced:true — the gherkin marker + the
+    // additive response fields are the surfacing.
+    const allSkipped = exportedCount === 0;
+    await recordDiagnostic({
+      context,
+      owner: tcJob.ownerAccountId,
+      record: {
+        op: 'testgen.export',
+        error_class: allSkipped ? 'export_failed' : 'export_partial',
+        level: allSkipped ? 'error' : 'warn',
+        ref: diagJobRef,
+        subject_idxs: skippedIdxs.slice(0, 20),
+        counts: { exported: exportedCount, skipped: skippedIdxs.length },
+        surfaced: true,
+      },
+    });
+  }
+
+  // [diag Phase 4, A7] additive response fields — the FE renders "N stories not
+  // included" + (F6) "N may be truncated" next to the Copy buttons.
+  out.skipped = skippedIdxs.length;
+  out.skipped_idxs = skippedIdxs;
+  out.truncated = truncatedIdxs.length;
+  out.truncated_idxs = truncatedIdxs;
+
   return out;
+});
+
+// ════════════════════════════════════════════════════════════
+// DIAGNOSTICS SURFACES — Phase 5 (docs/DIAGNOSTICS-LEDGER-DESIGN.md §2.10/§2b/§5)
+// Read / export / health / client-fallback / clear resolvers over the Phase 0-4
+// ledger. FROZEN CONTRACTS — the frontend Diagnostics tab is built against
+// exactly these shapes; do not change them unilaterally.
+// ════════════════════════════════════════════════════════════
+
+/**
+ * Live Jira ADMINISTER check (§2.10 admin gate). Per REQUEST, no caching — an
+ * admin demoted mid-session loses 'all' scope on their next call. Covered by the
+ * already-held classic read:jira-work scope (NO manifest delta). ANY error /
+ * non-OK / missing field → false: the caller silently falls back to 'mine'
+ * (never trust the client toggle, never surface an error for the check itself —
+ * a Confluence-admin-without-Jira-access lands here by design, documented edge).
+ */
+async function checkJiraAdminister() {
+  try {
+    const resp = await api
+      .asUser()
+      .requestJira(route`/rest/api/3/mypermissions?permissions=ADMINISTER`);
+    if (!resp.ok) return false;
+    const data = await resp.json();
+    return data?.permissions?.ADMINISTER?.havePermission === true;
+  } catch (e) {
+    return false;
+  }
+}
+
+/**
+ * Sanitize the install-wide aggregate sidecar for serving: keep ONLY closed-
+ * registry classes with finite numbers — the same second-wall stance the record
+ * path takes (a tampered/legacy :agg value cannot push prose keys to the FE).
+ */
+function sanitizeAggregate(aggRaw) {
+  const agg = aggRaw && typeof aggRaw === 'object' && !Array.isArray(aggRaw) ? aggRaw : {};
+  const out = {};
+  for (const cls of DIAG_CLASSES) {
+    const e = agg[cls];
+    if (e && typeof e === 'object' && Number.isFinite(e.count) && Number.isFinite(e.lastTs)) {
+      out[cls] = { count: e.count, lastTs: e.lastTs };
+    }
+  }
+  return out;
+}
+
+// Re-run a stored ring through validateRecord — the SECOND WALL on the serve
+// path (mirrors serializeForExport): a tampered/legacy KVS entry cannot reach
+// the frontend with a smuggled free-text field.
+function validateRing(ring) {
+  return (Array.isArray(ring) ? ring : [])
+    .filter((r) => r && typeof r === 'object' && !Array.isArray(r))
+    .map((r) => validateRecord(r).record);
+}
+
+/**
+ * getDiagnostics — the Diagnostics tab read (FROZEN contract).
+ *
+ *   { scope: 'mine'|'all' } → {
+ *     isAdmin,            // live ADMINISTER result (FE shows the toggle on it)
+ *     scope,              // the scope actually SERVED (non-admin 'all' → 'mine')
+ *     records?,           // scope 'mine': the caller's bucket, validated
+ *     buckets?,           // scope 'all': [{ accountId, records }] per user
+ *     aggregate,          // the :agg install-wide silent-class counters
+ *   }
+ *
+ * The WHOLE body fails open to an empty 'mine' payload — a diagnostics surface
+ * must never itself crash (§5); console.warn is the only trace.
+ */
+resolver.define('getDiagnostics', async ({ payload, context }) => {
+  try {
+    const requested = payload && payload.scope === 'all' ? 'all' : 'mine';
+    const isAdmin = await checkJiraAdminister();
+    const scope = requested === 'all' && isAdmin ? 'all' : 'mine';
+    const aggregate = sanitizeAggregate(await readAggregate());
+    if (scope === 'all') {
+      const buckets = (await readAllDiagnostics()).map((b) => ({
+        accountId: b.accountId,
+        records: validateRing(b.records),
+      }));
+      return { isAdmin, scope, buckets, aggregate };
+    }
+    const accountId = (context && typeof context.accountId === 'string' && context.accountId) || null;
+    const records = accountId ? validateRing(await readDiagnostics({ accountId })) : [];
+    return { isAdmin, scope, records, aggregate };
+  } catch (e) {
+    console.warn(`[diag] getDiagnostics failed (fail-open): ${String(e?.message || e)}`);
+    return { isAdmin: false, scope: 'mine', records: [], aggregate: {} };
+  }
+});
+
+/**
+ * getDiagnosticsExport — the user-carried support report (FROZEN contract).
+ *
+ * serializeForExport is THE second wall (every record re-validated; envelope
+ * whitelist-built {app_version, exported_at, tier}). refFilter narrows records
+ * to ref===refFilter BEFORE serializing (the per-failure copy). includeDetails
+ * === true — the §2b EXPLICIT consent, never the default — appends, AFTER the
+ * JSON so it stays parseable, one plain-text zone-2 section per distinct ref
+ * present in the exported records that has a detail sibling (≤50 reads, an
+ * explicit user click each time). Scope rules identical to getDiagnostics
+ * (admin may export 'all'; the ADMINISTER check runs only when 'all' is asked).
+ */
+resolver.define('getDiagnosticsExport', async ({ payload, context }) => {
+  const envelope = {
+    app_version: DIAG_APP_VERSION,
+    exported_at: new Date().toISOString(),
+    tier: (() => {
+      try {
+        return getActiveTier(context).key;
+      } catch (_) {
+        return null; // a license-read glitch must never block the export
+      }
+    })(),
+  };
+  try {
+    const requested = payload && payload.scope === 'all' ? 'all' : 'mine';
+    const includeDetails = !!(payload && payload.includeDetails === true);
+    const refFilter =
+      payload && typeof payload.refFilter === 'string' && payload.refFilter ? payload.refFilter : null;
+
+    let scope = 'mine';
+    if (requested === 'all' && (await checkJiraAdminister())) scope = 'all';
+
+    let raw;
+    if (scope === 'all') {
+      // Flat record list: the record body is identity-free by §1 (accountIds are
+      // bucket KEYS, never fields), so a flattened admin export leaks nothing new.
+      raw = (await readAllDiagnostics()).flatMap((b) => (Array.isArray(b.records) ? b.records : []));
+    } else {
+      const accountId = (context && typeof context.accountId === 'string' && context.accountId) || null;
+      raw = accountId ? await readDiagnostics({ accountId }) : [];
+    }
+    const validated = validateRing(raw);
+    // [gate MED-2] substring/case-insensitive — MIRROR the tab's display filter: a
+    // hand-typed partial ref that SHOWS rows on screen must export those same rows
+    // (exact-match here silently produced an empty report — a silent miss in the
+    // support carrier itself).
+    // [P5 audit] cap (hygiene) + strip a leading 'session:' — the row text renders
+    // `session:<id>` for null-ref rows; pasting that token must still match.
+    const refLc = refFilter ? refFilter.slice(0, 200).replace(/^session:/i, '').toLowerCase() : null;
+    const matchesEitherRef = (r) =>
+      (typeof r.ref === 'string' && r.ref.toLowerCase().includes(refLc)) ||
+      (typeof r.session_ref === 'string' && r.session_ref.toLowerCase().includes(refLc));
+    const records = refLc ? validated.filter(matchesEitherRef) : validated;
+
+    // [P5 audit MED-1] the envelope carries the SERVED scope (whitelist-enum'd in the
+    // serializer) — a silent admin→mine fallback must be visible in the artifact.
+    envelope.scope = scope;
+    let report = serializeForExport(records, envelope);
+
+    if (includeDetails) {
+      // §2b consent gate passed at click-time: append zone-2 verbatim details OUTSIDE
+      // the JSON (clearly delimited plain-text sections) — distinct refs, ≤50 reads.
+      // [deep-audit P2 N2] collect BOTH correlation ids — a ref:null record's zone-2
+      // lives under its session_ref (the aborted-push class); ref-only made it
+      // write-only storage.
+      const refs = [
+        ...new Set(
+          records
+            .flatMap((r) => [r.ref, r.session_ref])
+            .filter((r) => typeof r === 'string' && r),
+        ),
+      ].slice(0, 50);
+      for (const ref of refs) {
+        const text = await readDiagnosticDetail({ ref });
+        if (text) report += `\n--- detail ref=${ref} ---\n${text}`;
+      }
+    }
+    return { report };
+  } catch (e) {
+    console.warn(`[diag] getDiagnosticsExport failed (fail-open): ${String(e?.message || e)}`);
+    return { report: serializeForExport([], envelope) }; // still { report } — never an error shape
+  }
+});
+
+// Health-probe code normalizers — content-free tokens per the frozen contract.
+// Interpolated families (anthropic_<NNN> / jira_<NNN> / confluence_<NNN>) normalize
+// to the FAMILY token, never a raw interpolated string (the §1 rule applied to codes).
+function healthAnthropicCode(error) {
+  const c = String(error || '');
+  if (
+    c === 'not_configured' ||
+    c === 'key_storage_failed' ||
+    c === 'auth_rejected' ||
+    c === 'insufficient_credits' ||
+    c === 'rate_limited' ||
+    c === 'network_failure'
+  ) {
+    return c;
+  }
+  if (/^anthropic_\d+$/.test(c)) return 'anthropic_http';
+  return 'unknown_error';
+}
+function healthJiraCode(error) {
+  const c = String(error || '');
+  if (c === 'project_not_found' || c === 'permission_denied') return c;
+  if (c === 'jira_fetch_failed') return 'network_failure';
+  if (/^jira_\d+$/.test(c)) return 'jira_http';
+  return 'unknown_error';
+}
+
+/**
+ * runHealthCheck — proactive config probe (§5; FROZEN contract). Four probes IN
+ * ORDER, REUSE-ONLY (testConnection / the searchPages CQL route+scope /
+ * push_handler's lookupProject / a kvs round-trip), each inside its own
+ * try/catch so a probe failure NEVER throws out, NO retries, one HTTP call per
+ * probe (lookupProject adds its two fast field/priority lookups) → well under
+ * the 25s resolver limit. Returns { ok, probes:[{name, ok, code}] } and writes
+ * ONE ledger record: op 'health.check', health_ok | health_degraded,
+ * level info|warn, ref null, counts { <probeName>: 0|1 }, surfaced true.
+ * Most support tickets are config issues — this closes them in one click.
+ */
+resolver.define('runHealthCheck', async ({ context }) => {
+  const probes = [];
+  try {
+    // ── Probe 1: 'anthropic_key' — the key path THIS tier generates with (Managed ⇒
+    // OUR env key, BYOK ⇒ the stored secret), tested exactly the way the Settings
+    // "Test Connection" does (testConnection with the resolved key). A4 split: a
+    // stored-key READ fault is 'key_storage_failed' (the key may still be saved),
+    // never misdiagnosed as "not configured".
+    try {
+      const { apiKey, keySource, keyFault } = await resolveAnthropicKey(context);
+      if (keyFault) {
+        probes.push({ name: 'anthropic_key', ok: false, code: 'key_storage_failed' });
+      } else if (!apiKey) {
+        probes.push({
+          name: 'anthropic_key',
+          ok: false,
+          // Managed with our env key unset = OUR ops outage class; BYOK with no
+          // stored key = the honest "never set".
+          code: keySource === 'managed' ? 'managed_unavailable' : 'not_configured',
+        });
+      } else {
+        const result = await anthropicTestConnection(apiKey);
+        probes.push(
+          result.ok
+            ? { name: 'anthropic_key', ok: true, code: 'ok' }
+            : { name: 'anthropic_key', ok: false, code: healthAnthropicCode(result.error) },
+        );
+      }
+    } catch (e) {
+      probes.push({ name: 'anthropic_key', ok: false, code: 'network_failure' });
+    }
+
+    // ── Probe 2: 'confluence_read' — the SAME CQL search endpoint + scope searchPages
+    // uses (search:confluence), bounded to 1 result. Non-OK statuses normalize to the
+    // 'confluence_http' family token; the Forge egress block is its own code.
+    try {
+      const cql = 'type=page';
+      const resp = await api
+        .asUser()
+        .requestConfluence(route`/wiki/rest/api/search?cql=${cql}&limit=1`);
+      if (resp.headers.get('forge-proxy-error') === 'BLOCKED_EGRESS') {
+        probes.push({ name: 'confluence_read', ok: false, code: 'egress_blocked' });
+      } else if (resp.ok) {
+        probes.push({ name: 'confluence_read', ok: true, code: 'ok' });
+      } else {
+        probes.push({ name: 'confluence_read', ok: false, code: 'confluence_http' });
+      }
+    } catch (e) {
+      probes.push({ name: 'confluence_read', ok: false, code: 'network_failure' });
+    }
+
+    // ── Probe 3: 'jira_project' — push_handler's lookupProject (the push preflight:
+    // project access + dynamic subtask type + SP/priority field resolution) with the
+    // CONFIGURED default project key; 'no_project_key' when unset (config gap — the
+    // exact class the health check exists to catch before a push fails on it).
+    try {
+      const projectKey = await getProjectKey(null);
+      if (!projectKey) {
+        probes.push({ name: 'jira_project', ok: false, code: 'no_project_key' });
+      } else {
+        const lookup = await lookupProject(projectKey);
+        probes.push(
+          lookup.ok
+            ? { name: 'jira_project', ok: true, code: 'ok' }
+            : { name: 'jira_project', ok: false, code: healthJiraCode(lookup.error) },
+        );
+      }
+    } catch (e) {
+      probes.push({ name: 'jira_project', ok: false, code: 'network_failure' });
+    }
+
+    // ── Probe 4: 'kvs_rw' — write+read+delete a content-free probe key.
+    // (gate LOW) the delete rides a finally so a get-throw can't orphan the probe
+    // key. The key is shared per install — a concurrent health check can race it
+    // into a false-negative (rare; re-run resolves; named residual).
+    try {
+      const probeKey = 'spec2jira_diag:healthprobe';
+      let readBack = null;
+      try {
+        await kvs.set(probeKey, { ts: Date.now() });
+        readBack = await kvs.get(probeKey);
+      } finally {
+        try { await kvs.delete(probeKey); } catch (_) { /* best-effort cleanup */ }
+      }
+      probes.push(
+        readBack && typeof readBack === 'object'
+          ? { name: 'kvs_rw', ok: true, code: 'ok' }
+          : { name: 'kvs_rw', ok: false, code: 'kvs_failed' },
+      );
+    } catch (e) {
+      probes.push({ name: 'kvs_rw', ok: false, code: 'kvs_failed' });
+    }
+
+    const allOk = probes.every((p) => p.ok);
+    const counts = {};
+    for (const p of probes) counts[p.name] = p.ok ? 1 : 0;
+    await recordDiagnostic({
+      context,
+      record: {
+        op: 'health.check',
+        error_class: allOk ? 'health_ok' : 'health_degraded',
+        level: allOk ? 'info' : 'warn',
+        ref: null,
+        counts,
+        surfaced: true,
+      },
+    });
+    return { ok: allOk, probes };
+  } catch (e) {
+    console.warn(`[diag] runHealthCheck failed (fail-open): ${String(e?.message || e)}`);
+    return { ok: false, probes }; // whatever completed before the (unexpected) throw
+  }
+});
+
+// recordClientDiagnostic whitelist (§2 — the abuse surface: ANY user can invoke).
+// op is FIXED server-side; only the two client-fallback classes are accepted;
+// refs must be id-SHAPED — UUID or `<ts>-<base36>` (both jobId/sessionId mint
+// shapes) — never free text. Everything else is dropped or rejected.
+const CLIENT_DIAG_CLASSES = new Set(['invoke_rejected', 'invoke_timeout']);
+const CLIENT_UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+const CLIENT_TS_BASE36_RE = /^\d{10,16}-[a-z0-9]{1,24}$/;
+function cleanClientRef(v) {
+  if (typeof v !== 'string' || v.length === 0 || v.length > 80) return null;
+  return CLIENT_UUID_RE.test(v) || CLIENT_TS_BASE36_RE.test(v) ? v : null;
+}
+
+/**
+ * recordClientDiagnostic — the FRONTEND fallback writer (FROZEN contract): a 25s
+ * resolver kill / client-side invoke rejection leaves NO backend write, so the
+ * hardest failures would otherwise have no record at all. STRICT whitelist:
+ * op FIXED to 'invoke.failed'; error_class ONLY from {'invoke_rejected',
+ * 'invoke_timeout'} else {ok:false}; ref/session_ref shape-validated (else
+ * dropped, record still written); subject_idxs ints cap 20; bucket =
+ * context.accountId ONLY (falsy → skip, {ok:false}). recordDiagnostic
+ * re-validates everything (the double wall); abuse radius = the caller's OWN
+ * 50-ring, and the (ref, op, class) dedupe absorbs spam into occurrences.
+ */
+resolver.define('recordClientDiagnostic', async ({ payload, context }) => {
+  try {
+    if (!(context && typeof context.accountId === 'string' && context.accountId)) {
+      return { ok: false };
+    }
+    const errorClass = payload && payload.error_class;
+    if (!CLIENT_DIAG_CLASSES.has(errorClass)) return { ok: false };
+    const ref = cleanClientRef(payload && payload.ref);
+    const sessionRef = cleanClientRef(payload && payload.session_ref);
+    const idxs = Array.isArray(payload && payload.subject_idxs)
+      ? payload.subject_idxs.filter((n) => Number.isInteger(n) && n >= 0).slice(0, 20)
+      : null;
+    const res = await recordDiagnostic({
+      context,
+      record: {
+        op: 'invoke.failed', // FIXED server-side — never read from the payload
+        error_class: errorClass,
+        level: 'error',
+        ref, // null when dropped — the record still stands (null-ref dedupe applies)
+        ...(sessionRef ? { session_ref: sessionRef } : {}),
+        ...(idxs && idxs.length ? { subject_idxs: idxs } : {}),
+        surfaced: true, // the client records this precisely because the user SAW the failure
+      },
+    });
+    return { ok: !!(res && res.ok) };
+  } catch (e) {
+    return { ok: false }; // never throw into the FE's own failure handler
+  }
+});
+
+/**
+ * clearDiagnostics — delete the caller's OWN bucket only (GDPR-erasure
+ * self-service, §5; FROZEN contract). The install-wide :agg sidecar is
+ * content-free and shared — deliberately untouched. Zone-2 details expire on
+ * their own ~30-day TTL (transient by design).
+ */
+resolver.define('clearDiagnostics', async ({ context }) => {
+  const accountId =
+    (context && typeof context.accountId === 'string' && context.accountId) || null;
+  if (!accountId) return { ok: false };
+  const res = await clearDiagnosticsBucket({ accountId });
+  return { ok: !!(res && res.ok) };
 });
 
 // ── Export handler bound к manifest function key "resolver" ──

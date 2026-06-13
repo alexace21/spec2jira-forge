@@ -297,6 +297,23 @@ function StoryTestCaseCard({
         )}
         {/* Coverage badge */}
         {!hasError && coverage && <CoverageBadge coverage={coverage} />}
+        {/* [diag Phase 4/5] Truncated-but-salvaged chip — this story's generation hit the
+            output token cap and complete cases were recovered (entry.truncated, the additive
+            flag on the stored per-story value): the LAST cases may be missing even where
+            coverage reads complete. ADDITIVE; mirrors the sibling chip pattern. */}
+        {!hasError && entry?.truncated === true && (
+          <span
+            className="text-[10px] px-1.5 py-0.5 rounded font-medium"
+            style={{
+              background: "var(--s2j-orange-bg)",
+              border: "1px solid var(--s2j-orange-border)",
+              color: "var(--s2j-orange)",
+            }}
+            title="Generation hit the output limit for this story — complete cases were recovered, but the last ones may be missing. Regenerate to be sure."
+          >
+            ⚠ may be truncated
+          </span>
+        )}
         {/* Case count */}
         {!hasError && cases.length > 0 && (
           <span
