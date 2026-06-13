@@ -372,6 +372,25 @@ need the full ceremony; use judgment, and when unsure lean toward orchestration 
 partner's stated preference: more efficient, more detailed, higher quality). The opt-in
 is **STANDING** — do not wait to be re-asked each task.
 
+**⭐ Conductor-holds-context rule (2026-06-13, partner directive — binding; the guard
+against performative orchestration):** delegate work that genuinely BENEFITS from what
+an agent adds — independent fresh-eyes lenses, adversarial fan-out, parallel coverage,
+or simply more hands. Do NOT delegate work where the conductor holds context an agent
+would LACK and could not be cheaply handed — synthesis of a long arc (handover notes,
+commit messages, the through-line of a multi-session effort), integrating reports
+already gathered, or a decision that needs the whole history in one head. Spawning
+agents for those DEGRADES the result (the agent starts blind) and wastes tokens —
+**that is performative orchestration, and it is a defect, not diligence.** The test
+before delegating one piece: *would an agent have MORE or LESS context/capability than
+me for THIS specific piece?* More → delegate. Less → do it directly, and say why.
+⚠ This rule holds **even under a standing "use agents / Ultracode" directive** — that
+directive pushes toward orchestration for the SUBSTANTIVE work, never toward faking it
+on synthesis the conductor is uniquely positioned to do. Forgetting this under
+orchestration-pressure (delegating a handover/commit/synthesis to look thorough) is the
+exact inattention this rule exists to catch. Composes with §3 (highest-value) and §13
+(the conductor owns the policy; the agents apply it — but the conductor still does the
+conductor's own work).
+
 ---
 
 *The four load-bearing sections, read in order: the LENS (§0) → A→D→S (§1) →
