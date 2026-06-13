@@ -3823,6 +3823,16 @@ function PushedScreen({ result, onBack, onNew, jobId = null, onOpenDiagnostics }
               }`
             : null) ||
           null;
+        // Truncate the banner reason at a WORD boundary + ellipsis (it was a hard
+        // mid-word substring(0,200) → "…Required custom fie"); the full reason is
+        // always in Settings → Diagnostics (Copy report).
+        const reasonText = (() => {
+          const full = String(firstDetail || "");
+          if (full.length <= 220) return full;
+          const cut = full.slice(0, 220);
+          const sp = cut.lastIndexOf(" ");
+          return (sp > 160 ? cut.slice(0, sp) : cut) + "…";
+        })();
         return (
           <div
             className="rounded-lg p-3 mb-4"
@@ -3839,7 +3849,7 @@ function PushedScreen({ result, onBack, onNew, jobId = null, onOpenDiagnostics }
             </p>
             {firstDetail && (
               <p className="text-xs mb-1" style={{ color: "var(--s2j-text-muted)" }}>
-                Reason: {String(firstDetail).substring(0, 200)}
+                Reason: {reasonText}
               </p>
             )}
             <p className="text-xs" style={{ color: "var(--s2j-text-muted)" }}>

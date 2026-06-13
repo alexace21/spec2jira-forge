@@ -367,22 +367,66 @@ async function createSingleIssue(payload) {
  * body is logged separately (console.error) — it never reaches the user.
  * Parses defensively: any malformed body falls back to a generic HTTP-status line.
  */
+/**
+ * Walk a Jira error body of ANY shape and pull out human reasons + the rejected
+ * FIELD IDs (content-free keys only — never numeric element indices). Jira's
+ * bulk endpoint returns at least three shapes, all handled here (Live-E2E found
+ * shape (b) on the all-stories-rejected case — the old code did
+ * `String(<detail-object>)` → "[object Object]" and captured zero field names):
+ *   (a) flat field map:        { errors: { customfield_X: "reason" }, errorMessages: [] }
+ *   (b) indexed whole-bulk 400: { errors: { "0": <detail-obj>, "1": <detail-obj> } }
+ *   (c) nested per-element:     { elementErrors: { errors: {…}, errorMessages: [] } }
+ * Returns { reasons, fieldNames } (deduped, capped). VALUES are content (a field
+ * reason can echo a submitted value) → they ride `reasons` (zone-2/consent-gated
+ * + the user-facing message), NEVER `fieldNames` (the content-free ledger key).
+ */
+export function parseJiraErrorDetail(body) {
+  const reasons = [];
+  const fieldNames = [];
+  const seenReason = new Set();
+  const seenField = new Set();
+  const isIndexKey = (k) => /^\d+$/.test(k); // element-index, NOT a field id
+  const addReason = (s) => {
+    const c = String(s == null ? '' : s).trim();
+    if (c && !seenReason.has(c) && reasons.length < 20) { seenReason.add(c); reasons.push(c); }
+  };
+  const addField = (f) => {
+    if (typeof f !== 'string' || isIndexKey(f)) return;
+    if (!seenField.has(f) && fieldNames.length < 20) { seenField.add(f); fieldNames.push(f); }
+  };
+  const walk = (node, depth) => {
+    if (!node || typeof node !== 'object' || depth > 5) return;
+    if (Array.isArray(node)) { for (const el of node) walk(el, depth + 1); return; }
+    // errorMessages members are strings in every Jira shape; a non-string member
+    // (hostile/odd input) must NOT become "[object Object]" — skip it (P5-review LOW).
+    if (Array.isArray(node.errorMessages)) for (const m of node.errorMessages) if (typeof m === 'string') addReason(m);
+    if (node.errors && typeof node.errors === 'object') {
+      // (P5-review MED) the DOCUMENTED /issue/bulk failure body returns `errors` as a
+      // top-level ARRAY [{status, elementErrors, failedElementNumber}] — descend it too;
+      // only-object-map was the original 'shape-agnostic' gap.
+      if (Array.isArray(node.errors)) {
+        for (const el of node.errors) walk(el, depth + 1);
+      } else {
+        for (const [key, val] of Object.entries(node.errors)) {
+          if (typeof val === 'string') { addField(key); addReason(`${key}: ${val.trim()}`); }
+          else if (val && typeof val === 'object') walk(val, depth + 1); // indexed/nested detail
+        }
+      }
+    }
+    if (node.elementErrors && typeof node.elementErrors === 'object') walk(node.elementErrors, depth + 1);
+  };
+  walk(body, 0);
+  return { reasons, fieldNames };
+}
+
+/**
+ * Build a CLEAN, customer-facing message from a Jira error body (any shape, via
+ * parseJiraErrorDetail). The raw body is logged separately; it never reaches the
+ * user. Malformed/unparseable → a generic HTTP-status line.
+ */
 function jiraErrorMessage(status, rawText) {
   try {
-    const body = JSON.parse(rawText);
-    const reasons = [];
-    if (Array.isArray(body?.errorMessages)) {
-      for (const m of body.errorMessages) {
-        const clean = String(m || '').trim();
-        if (clean) reasons.push(clean);
-      }
-    }
-    if (body?.errors && typeof body.errors === 'object') {
-      for (const [field, msg] of Object.entries(body.errors)) {
-        const clean = String(msg || '').trim();
-        if (clean) reasons.push(`${field}: ${clean}`);
-      }
-    }
+    const { reasons } = parseJiraErrorDetail(JSON.parse(rawText));
     if (reasons.length > 0) {
       return `Jira rejected this item: ${reasons.join('; ')}. If a required field is missing, add it under Advanced → Required custom fields in Settings (or set a default in Jira), then retry.`;
     }
@@ -428,9 +472,14 @@ async function bulkCreateIssues(issuesArray) {
     // `status` is additive (diag Phase 2): the whole-call HTTP status would
     // otherwise be invisible to the ledger; the UI reads only `.message`.
     console.error(`[push] bulk create HTTP ${response.status}: ${text.substring(0, 300)}`);
+    // Extract the content-free field IDs so the ledger's jira[] carries them on
+    // the WHOLE-CALL rejection too (Live-E2E gap: this path used to hand the diag
+    // only {status} — the all-stories-rejected case lost the field names entirely).
+    let wholeCallFields = [];
+    try { wholeCallFields = parseJiraErrorDetail(JSON.parse(text)).fieldNames; } catch (_) { /* non-JSON */ }
     return {
       issues: new Array(issuesArray.length).fill(null),
-      errors: [{ status: response.status, message: jiraErrorMessage(response.status, text) }],
+      errors: [{ status: response.status, field_names: wholeCallFields, message: jiraErrorMessage(response.status, text) }],
     };
   }
 
@@ -447,6 +496,9 @@ async function bulkCreateIssues(issuesArray) {
     errors.push({
       index: err.failedElementNumber,
       ...elErr,
+      // Content-free rejected field IDs for the ledger (shape-agnostic — survives
+      // the nested per-element shape too); the diag prefers this over re-walking.
+      field_names: parseJiraErrorDetail(elErr).fieldNames,
       // Clean, customer-facing reason for the success screen (this 200-OK
       // per-element path is the common partial-failure case; raw body never shown).
       message: jiraErrorMessage(elErr.status || response.status, JSON.stringify(elErr)),
@@ -894,7 +946,15 @@ function diagAddJiraErrors(s, batchErrors) {
   const sigOf = (status, names) => `${status}|${names.slice().sort().join(',')}`;
   for (const be of batchErrors) {
     if (!be || typeof be !== 'object') continue;
-    const fieldNames = Object.keys(be?.elementErrors?.errors || be?.errors || {}).slice(0, 20);
+    // Prefer the pre-extracted, shape-agnostic field IDs (bulkCreateIssues now
+    // attaches them for both the whole-call AND per-element paths); the raw-shape
+    // walk is the legacy fallback. Either way drop numeric element-index keys —
+    // the indexed whole-bulk shape would otherwise store "0".."4" as field names.
+    const fieldNames = (
+      Array.isArray(be.field_names) && be.field_names.length
+        ? be.field_names
+        : Object.keys(be?.elementErrors?.errors || be?.errors || {})
+    ).filter((n) => typeof n === 'string' && !/^\d+$/.test(n)).slice(0, 20);
     const rawStatus = be?.status ?? be?.elementErrors?.status;
     const status = Number.isInteger(rawStatus) ? rawStatus : null;
     if (status === null && fieldNames.length === 0) continue; // nothing diagnostic to keep
