@@ -42,6 +42,7 @@ export default function CapabilityCard({ capability, index, onUpdate, onDelete }
   function addFeature() {
     const newFeature = {
       _uid: newStoryUid(),
+      _orig_name: 'New Feature', // Task #3: mint _orig_name WITH _uid so every feature upholds the invariant adaptToLegacyShape sets (dep-name→uid binding relies on it)
       name: 'New Feature',
       user_story: 'As a user, I want [goal], so that [benefit].',
       acceptance_criteria: ['Acceptance criterion'],

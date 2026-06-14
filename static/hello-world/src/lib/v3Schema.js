@@ -63,9 +63,15 @@ export function adaptToLegacyShape(v3) {
   // (frontend-first identity) so the test-case staleness + per-card regen bind to IT — surviving
   // reorder / rename / restructure where index- or name-matching mis-targets. Idempotent: an
   // already-uid'd feature (reloaded from a persisted breakdown) is left untouched → uid is stable.
-  const features = (Array.isArray(v3.features) ? v3.features : []).map((f) =>
-    f && typeof f === 'object' && !f._uid ? { ...f, _uid: newStoryUid() } : f,
-  );
+  // Task #3 (name→uid links): ALSO freeze _orig_name = the GENERATION name (canonical HERE —
+  // this runs at load, BEFORE any editor rename). Dependency strings stay frozen generation names
+  // too, so the push (flattenBreakdown) maps a frozen dep-name → _orig_name → _uid and a rename can
+  // never break the link. Both fields are captured in the SAME idempotent pass and ride edits via spread.
+  const features = (Array.isArray(v3.features) ? v3.features : []).map((f) => {
+    if (!f || typeof f !== 'object') return f;
+    if (f._uid && f._orig_name) return f; // both already minted → stable, untouched
+    return { ...f, _uid: f._uid || newStoryUid(), _orig_name: f._orig_name || f.name };
+  });
 
   // Group by category
   const categoryMap = new Map();

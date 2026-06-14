@@ -222,11 +222,30 @@ export function flattenBreakdown(breakdown) {
   // Build dependency edges. feature.dependencies[] contains names of features
   // that THIS feature depends на. JIRA semantics: outwardIssue blocks
   // inwardIssue. So if B depends on A: outwardIssue=A, inwardIssue=B.
+  // Task #3 (name→uid): bind each edge to the endpoints' stable _uid so a rename
+  // in the editor never breaks the link. Dependency STRINGS are frozen generation
+  // names; each feature's _orig_name (frozen at adaptToLegacyShape, when names were
+  // canonical) maps a frozen dep-name → that feature's _uid. A rename changes f.name
+  // but neither the dep string nor _orig_name → the frozen-to-frozen match still
+  // resolves to the right _uid at push. Names ride along for display, the unresolved
+  // reason, and the legacy name-fallback. PURE FUNCTION (§4): deterministic identity,
+  // no LLM; dependencies[] stays name-canonical so every OTHER consumer is untouched.
+  const nameToUids = {}; // _orig_name → [uid…]; an array so an ambiguous duplicate name stays UNBOUND
+  for (const f of features) {
+    const key = f && (f._orig_name || f.name);
+    if (key == null) continue;
+    (nameToUids[key] || (nameToUids[key] = [])).push((f && f._uid) || null);
+  }
   const links = [];
   for (const f of features) {
     const deps = f.dependencies || [];
-    for (const depTarget of deps) {
-      links.push({ source: depTarget, target: f.name });
+    for (const depName of deps) {
+      const cand = nameToUids[depName];
+      // Bind ONLY on a unique name match. A duplicate name (cand.length > 1) is an
+      // ambiguous reference the LLM itself created → leave it name-bound (resolves
+      // last-wins at push = no worse than today); a missing name → null (paraphrase).
+      const sourceUid = cand && cand.length === 1 ? cand[0] : null;
+      links.push({ source: depName, target: f.name, sourceUid, targetUid: (f && f._uid) || null });
     }
   }
 
@@ -791,6 +810,7 @@ export async function startPushSession(breakdown, projectKey, customFields = nul
     features,
     links,
     storyKeyMap: {},
+    uidKeyMap: {}, // Task #3: stable _uid → Jira key (rename-proof resolution, dual-keyed with storyKeyMap)
     createdStories: [],
     phase: features.length > 0 ? 'stories' : links.length > 0 ? 'links' : 'done',
     cursor: 0,
@@ -909,7 +929,7 @@ function newPushDiag() {
     failedSubtaskFeatureIdxs: [], // parent feature idx per failed subtask — deduped, cap 20
     failedKeys: [], // Jira issue keys connected to failures — key-shape only, deduped, cap 20
     links_unresolved_story_failed: 0, // preflight: endpoint is a real feature whose Story failed
-    links_unresolved_name_unknown: 0, // preflight: endpoint name matches NO feature (model paraphrase)
+    links_unresolved_name_unknown: 0, // preflight: endpoint name matches NO surviving feature (model paraphrase or a user-deleted endpoint)
     links_api_failed: 0, // link-create API failures — distinct from preflight-unresolved
   };
 }
@@ -919,6 +939,14 @@ function newPushDiag() {
 function ensureDiag(s) {
   if (!s.diag) s.diag = newPushDiag();
   return s.diag;
+}
+
+// Lazily default the uid→key map (Task #3). A session created by a PRE-deploy
+// startPushSession has no s.uidKeyMap → default it so a deploy mid-push can't
+// crash the write below (and every read guards with `s.uidKeyMap || {}`).
+function ensureUidKeyMap(s) {
+  if (!s.uidKeyMap) s.uidKeyMap = {};
+  return s.uidKeyMap;
 }
 
 // Jira issue-key shape (the ledger validates the same way; pre-filter here so
@@ -1042,6 +1070,9 @@ async function stepStories(s) {
   for (let j = 0; j < bulk.issues.length; j++) {
     if (bulk.issues[j]) {
       s.storyKeyMap[slice[j].name] = bulk.issues[j].key;
+      // Task #3: dual-key by stable _uid alongside name so dependency links AND
+      // subtask-parent lookups resolve uid-first (rename-proof), name-fallback.
+      if (slice[j]._uid) ensureUidKeyMap(s)[slice[j]._uid] = bulk.issues[j].key;
       // Append-only list (preserves duplicate-named stories, unlike the
       // name-keyed storyKeyMap) so the success screen can deep-link every
       // created Story, not just the last one per name.
@@ -1076,7 +1107,8 @@ async function stepStories(s) {
     } else {
       if (!s.hasSubtasks) {
         for (const f of s.features) {
-          if (s.storyKeyMap[f.name]) {
+          // uid-first / name-fallback (Task #3) — match the parent-key lookup below.
+          if ((f._uid && (s.uidKeyMap || {})[f._uid]) || s.storyKeyMap[f.name]) {
             s.counts.tasks_embedded += (f.tasks || []).filter((t) => t && (t.summary || '').trim()).length;
           }
         }
@@ -1091,7 +1123,8 @@ function buildFlatTasks(s) {
   let orphaned = 0;
   for (let fi = 0; fi < s.features.length; fi++) {
     const f = s.features[fi];
-    const parentKey = s.storyKeyMap[f.name];
+    // uid-first / name-fallback (Task #3) so a renamed Story still parents its subtasks.
+    const parentKey = (f._uid && (s.uidKeyMap || {})[f._uid]) || s.storyKeyMap[f.name];
     if (!parentKey) {
       // (diag Phase 2) the parent Story failed to create → its subtasks are
       // skipped here. Previously a silent drop with zero trace (§2.3 worst
@@ -1166,15 +1199,19 @@ async function stepSubtasks(s) {
   }
 }
 
-function buildResolvableLinks(s) {
+export function buildResolvableLinks(s) {
   const resolvable = [];
   const unresolved = [];
-  for (const { source, target } of s.links) {
-    const sourceKey = s.storyKeyMap[source];
-    const targetKey = s.storyKeyMap[target];
+  const uidKeyMap = s.uidKeyMap || {};
+  for (const { source, target, sourceUid, targetUid } of s.links) {
+    // Task #3: resolve by stable _uid FIRST (rename-proof), fall back to NAME
+    // (legacy / pre-uid breakdowns + ambiguous duplicate names). The rename case
+    // that used to lie "source X not created" now resolves and never reaches here.
+    const sourceKey = (sourceUid && uidKeyMap[sourceUid]) || s.storyKeyMap[source];
+    const targetKey = (targetUid && uidKeyMap[targetUid]) || s.storyKeyMap[target];
     if (!sourceKey || !targetKey) {
       unresolved.push({
-        source, target,
+        source, target, sourceUid, targetUid,
         reason: !sourceKey ? `source "${source}" not created` : `target "${target}" not created`,
       });
       continue;
@@ -1182,6 +1219,41 @@ function buildResolvableLinks(s) {
     resolvable.push({ source, target, sourceKey, targetKey });
   }
   return { resolvable, unresolved };
+}
+
+// Classify each genuinely-unresolved link into ONE honest cause (Task #3). With
+// uid-binding a RENAME resolves (never reaches here) — INCLUDING a renamed source
+// whose Story merely FAILED, which now correctly reads story_failed (its _uid is
+// still a live feature) where the old name-only split mislabeled it name_unknown.
+// ONE cause per link (precedence name_unknown > story_failed, preserving the
+// pre-Task-#3 ordering) → the counts sum to unresolved.length. Pure function,
+// exported for the offline test.
+// NOTE: a user-DELETED endpoint reads name_unknown (its dep string maps to no
+// surviving feature → sourceUid:null), same as before Task #3. Distinguishing a
+// delete from a model paraphrase would need a frozen generation-name→uid roster
+// carried from adaptToLegacyShape (a deleted feature's _uid is already gone from
+// s.features, so it can't be derived at push); deliberately DEFERRED — a hollow
+// always-zero "endpoint_deleted" bucket was removed here as unreachable dead code
+// (deep-audit catch — it could only fire on an input the pipeline can't produce).
+export function classifyUnresolvedLinks(unresolved, ctx) {
+  const featureUids = (ctx && ctx.featureUids) || new Set();
+  const featureNames = (ctx && ctx.featureNames) || new Set();
+  const storyKeyMap = (ctx && ctx.storyKeyMap) || {};
+  const uidKeyMap = (ctx && ctx.uidKeyMap) || {};
+  const classify = (uid, name) => {
+    if (uid && featureUids.has(uid)) return 'story_failed'; // _uid is a live feature → its Story create failed (cascade)
+    if (featureNames.has(name)) return 'story_failed';      // legacy name-only: name IS a feature → its Story failed
+    return 'name_unknown';                                  // matches no feature → model paraphrase (or a deleted endpoint)
+  };
+  let story_failed = 0, name_unknown = 0;
+  for (const u of unresolved || []) {
+    const causes = [];
+    if (!(u.sourceUid && uidKeyMap[u.sourceUid]) && !storyKeyMap[u.source]) causes.push(classify(u.sourceUid, u.source));
+    if (!(u.targetUid && uidKeyMap[u.targetUid]) && !storyKeyMap[u.target]) causes.push(classify(u.targetUid, u.target));
+    if (causes.includes('name_unknown')) name_unknown++;
+    else story_failed++;
+  }
+  return { story_failed, name_unknown };
 }
 
 async function stepLinks(s) {
@@ -1195,23 +1267,27 @@ async function stepLinks(s) {
     // matches NO feature → the model paraphrased the dependency (the S1 class
     // behind the misleading "not created" reason). SET (=), not += — a
     // step_exception retry re-enters with cursor 0 and must not double-count.
-    const featureNames = new Set(s.features.map((f) => f && f.name));
-    let storyFailed = 0;
-    let nameUnknown = 0;
+    const uidKeyMap = s.uidKeyMap || {};
+    const split = classifyUnresolvedLinks(unresolved, {
+      featureUids: new Set(s.features.map((f) => f && f._uid).filter(Boolean)),
+      featureNames: new Set(s.features.map((f) => f && f.name)),
+      storyKeyMap: s.storyKeyMap,
+      uidKeyMap,
+    });
     for (const u of unresolved) {
-      const missing = [u.source, u.target].filter((n) => !s.storyKeyMap[n]);
-      if (missing.some((n) => !featureNames.has(n))) nameUnknown++;
-      else storyFailed++;
-      // The endpoint that DID create is a durable support anchor (key-shaped only).
-      if (s.storyKeyMap[u.source]) diagAddFailedKey(s, s.storyKeyMap[u.source]);
-      if (s.storyKeyMap[u.target]) diagAddFailedKey(s, s.storyKeyMap[u.target]);
+      // The endpoint that DID create is a durable support anchor (key-shaped only) —
+      // uid-first / name-fallback, mirroring buildResolvableLinks.
+      const srcKey = (u.sourceUid && uidKeyMap[u.sourceUid]) || s.storyKeyMap[u.source];
+      const tgtKey = (u.targetUid && uidKeyMap[u.targetUid]) || s.storyKeyMap[u.target];
+      if (srcKey) diagAddFailedKey(s, srcKey);
+      if (tgtKey) diagAddFailedKey(s, tgtKey);
       if (s.failureDetails.links.length < 10) s.failureDetails.links.push(u);
     }
-    diag.links_unresolved_story_failed = storyFailed;
-    diag.links_unresolved_name_unknown = nameUnknown;
+    diag.links_unresolved_story_failed = split.story_failed;
+    diag.links_unresolved_name_unknown = split.name_unknown;
     // (A2 fix, half 1) preflight unresolved are logged ONCE here — they are not
     // chunk API outcomes, so they no longer inflate the chunk log below.
-    console.log(`[push] links preflight: ${unresolved.length} unresolved (story_failed=${storyFailed}, name_unknown=${nameUnknown}) ref=${s.jobId || '-'}`);
+    console.log(`[push] links preflight: ${unresolved.length} unresolved (story_failed=${split.story_failed}, name_unknown=${split.name_unknown}) ref=${s.jobId || '-'}`);
   }
   const start = s.cursor;
   const end = Math.min(start + LINK_CHUNK, resolvable.length);
