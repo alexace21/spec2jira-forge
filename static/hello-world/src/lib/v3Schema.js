@@ -158,7 +158,7 @@ export function newStoryUid() {
  *     parsedSpecConcerns: [{type, severity, text}],
  *     parsedFeatureConcerns: [{featureName, type, severity, text}],
  *     categories: [{name, featureCount}],
- *     dependencyEdges: [{source, target}],
+ *     dependencyEdges: [{source, target, targetDisplay}], // target = FROZEN dep string (mutation key); targetDisplay = current name (display)
  *     epicSummary: string | null,
  *     hasEpic: boolean,
  *   }
@@ -196,6 +196,16 @@ export function extractV3Signals(breakdown) {
   let scoreSum = 0;
   let scoreCount = 0;
 
+  // Task #4: frozen _orig_name → CURRENT name, so a dependency edge (whose target is
+  // the depended-on feature's FROZEN generation name) can DISPLAY the current name
+  // after a rename. Display-only — the frozen string stays the remove/restore mutation
+  // key. First-match on a duplicate _orig_name (rare; the mutation is unaffected).
+  const origToCurrent = new Map();
+  for (const f of features) {
+    const k = f && (f._orig_name || f.name);
+    if (k != null && !origToCurrent.has(k)) origToCurrent.set(k, f.name);
+  }
+
   for (const f of features) {
     totalTasks += (f.tasks || []).length;
     totalFeatureACs += (f.acceptance_criteria || []).length;
@@ -221,7 +231,9 @@ export function extractV3Signals(breakdown) {
     }
 
     for (const depTarget of f.dependencies || []) {
-      dependencyEdges.push({ source: f.name, target: depTarget });
+      // target = the FROZEN dep string (the remove/restore mutation key); targetDisplay
+      // = the depended-on feature's CURRENT name for the Review display (Task #4).
+      dependencyEdges.push({ source: f.name, target: depTarget, targetDisplay: origToCurrent.get(depTarget) || depTarget });
     }
 
     for (const concernRaw of f.concerns || []) {

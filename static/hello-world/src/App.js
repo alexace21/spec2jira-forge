@@ -3345,7 +3345,7 @@ function ConfirmScreen({
 // source feature, AND lets the reviewer remove an edge that doesn't belong (e.g.
 // an over-inferred dependency) before pushing.
 //
-// Data: edges = signals.dependencyEdges = [{source, target}] where `source` is
+// Data: edges = signals.dependencyEdges = [{source, target, targetDisplay}] where `source` is
 // the feature that depends on `target` (v3Schema.extractV3Signals; mirrors
 // prompts.js rule 11 — feature.dependencies lists what THIS feature needs). In
 // JIRA each edge becomes a Story-blocks-Story link — `target` blocks `source`
@@ -3358,12 +3358,23 @@ function ConfirmScreen({
 function DependencyStructure({ edges, onRemove, onRestore }) {
   const [removed, setRemoved] = useState([]);
 
+  // Task #4: the target string is the FROZEN dep name (the depended-on feature's
+  // generation name) — it stays the mutation/tracking key everywhere (remove/restore
+  // filter dependencies[] by it). labelOf resolves it to that feature's CURRENT name
+  // for DISPLAY only, so after a rename the Review shows the current name, not the
+  // stale original. Fallback to the raw string (legacy / paraphrase / deleted dep).
+  const displayOf = new Map();
+  for (const e of edges || []) {
+    if (e && e.target != null) displayOf.set(e.target, e.targetDisplay || e.target);
+  }
+  const labelOf = (t) => displayOf.get(t) || t;
+
   const handleRemove = (source, target) => {
     onRemove?.(source, target);
     setRemoved((prev) =>
       prev.some((r) => r.source === source && r.target === target)
         ? prev
-        : [...prev, { source, target }],
+        : [...prev, { source, target, display: labelOf(target) }],
     );
   };
   const handleRestore = (source, target) => {
@@ -3452,13 +3463,13 @@ function DependencyStructure({ edges, onRemove, onRestore }) {
                           <span style={{ color: "var(--s2j-blue)", flexShrink: 0 }}>
                             depends on →
                           </span>
-                          <span style={{ color: "var(--s2j-text-light)" }}>{t}</span>
+                          <span style={{ color: "var(--s2j-text-light)" }}>{labelOf(t)}</span>
                         </span>
                         <button
                           type="button"
                           onClick={() => handleRemove(source, t)}
-                          title={`Remove this dependency — "${source}" will no longer be blocked by "${t}" in Jira`}
-                          aria-label={`Remove dependency: ${source} depends on ${t}`}
+                          title={`Remove this dependency — "${source}" will no longer be blocked by "${labelOf(t)}" in Jira`}
+                          aria-label={`Remove dependency: ${source} depends on ${labelOf(t)}`}
                           style={{
                             background: "transparent",
                             border: "none",
@@ -3512,7 +3523,7 @@ function DependencyStructure({ edges, onRemove, onRestore }) {
                     minWidth: 0,
                   }}
                 >
-                  {r.source} → {r.target}
+                  {r.source} → {r.display || r.target}
                 </span>
                 <button
                   type="button"
