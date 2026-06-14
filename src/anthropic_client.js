@@ -646,6 +646,58 @@ export async function fetchBatchResults(resultsUrl, customId, apiKeyOverride = n
 // ────────────────────────────────────────────────────────────────────────────────────
 
 /**
+ * Build the per-Story cross-feature dependency-context resolver for a test-gen batch.
+ * Resolves a Story's IMMEDIATE edges (its dependsOn + the reverse "blocks") to the peer's
+ * CURRENT name + one-line, keyed by the FROZEN _orig_name so a peer (or this Story) renamed
+ * in the editor STILL resolves instead of being silently dropped as dangling (Task #4 #2,
+ * mirrors the Review-display fix). dependencies[] stays frozen name strings; _orig_name
+ * (frozen at adaptToLegacyShape) is the stable key; the LLM then reads the CURRENT name.
+ * Self-edges + genuinely-dangling edges (a deleted peer) are still dropped. Pure function,
+ * exported for the offline test. Returns (story) => {dependsOn, blocks}.
+ * @param {Array<object>} peerStories the FULL breakdown feature list (NOT a 1-Story regen batch)
+ */
+export function buildDependencyResolver(peerStories) {
+  const peers = Array.isArray(peerStories) ? peerStories : [];
+  const oneLineOf = (st) => String((st && (st.user_story || st.description)) || '').replace(/\s+/g, ' ').trim().slice(0, 160);
+  const keyOf = (st) => (st && ((typeof st._orig_name === 'string' && st._orig_name) || st.name)) || '';
+  const summaryByName = new Map();    // CURRENT name → one-line
+  const currentByOrig = new Map();    // FROZEN _orig_name → CURRENT name (resolve a frozen dep string)
+  const dependentsByOrig = new Map(); // FROZEN dep string → [CURRENT dependent names]
+  for (const st of peers) {
+    if (st && typeof st.name === 'string' && st.name) summaryByName.set(st.name, oneLineOf(st));
+    const k = keyOf(st);
+    if (k && !currentByOrig.has(k)) currentByOrig.set(k, (st && st.name) || k); // first-match on a duplicate _orig_name
+  }
+  for (const st of peers) {
+    const nm = st && st.name;
+    if (typeof nm !== 'string' || !nm) continue;
+    for (const dn of (Array.isArray(st.dependencies) ? st.dependencies : [])) {
+      if (typeof dn !== 'string' || !dn) continue;
+      if (!dependentsByOrig.has(dn)) dependentsByOrig.set(dn, []);
+      dependentsByOrig.get(dn).push(nm);
+    }
+  }
+  // Resolve names → {name: CURRENT, oneLine}. frozen=true first maps a FROZEN dep string to
+  // its current name (currentByOrig) so a renamed peer resolves; a paraphrase/deleted peer
+  // falls through summaryByName.has and is DROPPED (dangling). frozen=false = the names are
+  // already current (the reverse "blocks" dependents). A self-edge is dropped.
+  const resolve = (names, selfCurrentName, frozen) => {
+    const out = [];
+    for (const raw of (Array.isArray(names) ? names : [])) {
+      if (typeof raw !== 'string' || !raw) continue;
+      const cur = frozen ? (currentByOrig.get(raw) || raw) : raw;
+      if (!cur || cur === selfCurrentName || !summaryByName.has(cur)) continue;
+      out.push({ name: cur, oneLine: summaryByName.get(cur) || '' });
+    }
+    return out;
+  };
+  return (story) => ({
+    dependsOn: resolve(story && story.dependencies, (story && story.name) || '', true),
+    blocks: resolve(dependentsByOrig.get(keyOf(story)), (story && story.name) || '', false),
+  });
+}
+
+/**
  * Submit an N-request test-case batch. One request per Story; custom_id = String(index).
  * The system block is SHARED across all N requests (ephemeral cache → one cache-write
  * cost, N-1 cache-reads). Each request's user block is per-Story (not cached).
@@ -695,34 +747,10 @@ export async function submitTestCaseBatch({ stories, allStories, siblingNames, s
   // allStories (the FULL breakdown feature list) — NOT `stories`, which on the single-Story
   // regenerate path is a 1-element batch that would otherwise starve EVERY edge (§8 silent miss).
   const peerStories = (Array.isArray(allStories) && allStories.length) ? allStories : stories;
-  const oneLineOf = (st) => String((st && (st.user_story || st.description)) || '').replace(/\s+/g, ' ').trim().slice(0, 160);
-  const summaryByName = new Map();
-  const dependentsByName = new Map(); // name → [names that list `name` in their dependencies]; built ONCE
-  for (const st of peerStories) {
-    if (st && typeof st.name === 'string' && st.name) summaryByName.set(st.name, oneLineOf(st));
-  }
-  for (const st of peerStories) {
-    const nm = st && st.name;
-    if (typeof nm !== 'string' || !nm) continue;
-    for (const dn of (Array.isArray(st.dependencies) ? st.dependencies : [])) {
-      if (typeof dn !== 'string' || !dn) continue;
-      if (!dependentsByName.has(dn)) dependentsByName.set(dn, []);
-      dependentsByName.get(dn).push(nm);
-    }
-  }
-  // per-edge filter: drop a self-edge and a DANGLING edge (peer absent/deleted) — never the whole section.
-  const resolveEdges = (names, selfName) => {
-    const out = [];
-    for (const n of (Array.isArray(names) ? names : [])) {
-      if (typeof n !== 'string' || !n || n === selfName || !summaryByName.has(n)) continue;
-      out.push({ name: n, oneLine: summaryByName.get(n) || '' });
-    }
-    return out;
-  };
-  const dependencyContextFor = (story) => ({
-    dependsOn: resolveEdges(story && story.dependencies, story && story.name),
-    blocks: resolveEdges(dependentsByName.get(story && story.name), story && story.name),
-  });
+  // Resolve each Story's edges by the FROZEN _orig_name → CURRENT name, so a peer renamed in
+  // the editor is NOT dropped as dangling (Task #4 #2). Built ONCE for the batch; pure +
+  // offline-tested (prototype/test_dep_context.js).
+  const dependencyContextFor = buildDependencyResolver(peerStories);
 
   const requests = stories.map((story, index) => ({
     custom_id: String(index),
