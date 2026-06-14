@@ -354,6 +354,125 @@ package names de-scaffolded (→ `spec2tickets`). Build green (bundle ≈ −1.4
 
 ---
 
+## ⚡ HANDOVER NOTE (2026-06-14 — ⭐ LAYER-1 DIAGNOSTICS ARC CLOSED: Task #3 + #4#1 + #4#2 + #13 all §13-gated + committed; #13 TRIPLE-verified (gate → deep audit → 9/9/9 vote); build-green; DEV-only; SESSION CLOSED — next chapter = Monitoring + CI/CD strategy)
+
+The session that **closed the whole Layer-1 diagnostics backlog** the ledger was always pointing at (the
+root-cause layer beneath the client-side ledger of `ae0cdf3`). Four tasks, each full Analyze→Design→Solve +
+§13-gated, the two big ones deep-audited; the last one (#13) verified through **three escalating rounds**.
+**4 commits on `feature/product-improvements` (the partner PUSHES + deploys):** `a30da12` (#3) · `5507f21`
+(#4#1) · `80af1ed` (#4#2) · `c85ed5f` (#13). Still **DEV-only** (no `forge deploy -e production` until the
+v5.3.0 Marketplace verdict — a prod deploy auto-creates a Marketplace version + would entangle the in-flight review).
+
+**⭐ THE ARC — frozen stable-identity (`_orig_name`/`_uid`, POLICY §3.5) threaded through every layer a rename touches:**
+- **Task #3 — uid-bind dependency links (`a30da12`).** The live-S1 banner used to say *"source 'X' not created"*
+  when X was merely RENAMED (the story WAS created, under its new title) — a **misleading failure that reads
+  especially bad after we hand the BA a BreakdownEditor.** Fix (approach C): freeze `_orig_name`+`_uid` at adapt
+  time; push resolves links **uid-first, name-fallback** (`buildResolvableLinks`); `dependencies[]` is UNTOUCHED →
+  blast radius = push + diagnostics only. Deletes the rename-"not created" class; a renamed-AND-failed story now
+  honestly reads `story_failed`. ⭐ A partner-requested **5-lens DEEP audit AFTER the §13 gate SHIP'd** caught +
+  removed a **structurally-unreachable `endpoint_deleted` bucket** (write-time optimism; my own offline test had
+  masked it with an impossible input) — [[deep-audit-vs-per-change-gate]] again.
+- **Task #4 #1 — Review shows CURRENT dependency names after a rename (`5507f21`).** The partner **RE-CLASSIFIED
+  this from cosmetic → a REAL trust bug** ("the user's eyes in Review are exactly what Live-acceptance recreates;
+  a stale name breeds confusion → bad impression → it is our BUG"). Fix is **display-only**: `extractV3Signals`/
+  `DependencyStructure` resolve the SHOWN name via a `displayOf` map (`labelOf`), while the **mutation key stays the
+  frozen `target`** — the trap avoided was *re-keying the mutation → a silent no-op remove/restore*.
+- **Task #4 #2 — test-gen dependency context survives a rename (`80af1ed`).** Extracted an exported-pure
+  `buildDependencyResolver(peerStories)` keyed by the frozen `_orig_name` (both directions); **parity proven by a
+  17,328-resolution fuzz vs the old code = 0 mismatches**; `prompts.js` untouched; legacy data → name-fallback.
+- **Task #13 — never-pushed-orphan cleanup (`c85ed5f`) — THIS session's build.** See below.
+
+**⭐⭐ TASK #13 in full (the Analyze→Design→Brainstorm item from the 06-13 note):** a generated-but-never-PUSHED
+breakdown orphaned `pagesnap:` (~180KB) + `job:` (~240KB) in the customer's own KVS indefinitely. **Impact, measured
+first (5-lens vote): NOT a cost or stability problem** — Forge KVS bills **I/O only, no at-rest billing today** (reads
+$0.055/GB, writes $1.090/GB, 0.1GB/mo free each per-app, billed to the VENDOR), **no documented total-storage/entity
+cap** (only 240KiB/key), and orphans add **zero** I/O (never re-read). ⚠ But Atlassian announced KVS at-rest "Data
+Stored" pricing **"coming later in 2026"** → a future, modest, compounding cost — and the REAL driver was **privacy /
+DPA posture** (the orphan holds the customer's spec content forever; the DPA §7.1 had a live `[PARTNER: verify]`
+backstop placeholder). The partner chose the **stronger posture**: implement the cleanup + make the DPA/site/UI claim
+honest. **Design = access-renewed scheduled sweep, NEVER a native TTL** (a KVS TTL renews only on `set`, so a read-only
+review/reconnect/push would silently lose the deliverable — §11):
+- `src/sweep_util.js` (NEW, pure, fail-safe): `isOrphanStale(meta, now, inactivityMs)` — prefers `lastAccessedAt`,
+  falls back to `startedAt`, **KEEPS on any missing/garbage timestamp** (never delete on absent data). In its own
+  module because **index.js is NOT node-importable** (`@forge/resolver`'s `new Resolver()` throws under plain node).
+- `src/index.js`: `setJob` stamps `jobmeta.lastAccessedAt`; **`touchJobAccess(jobId)`** (1h-throttled, never throws)
+  renews it on **every meaningful access** (review/reconnect + the test-case sub-journey + push); `deleteJobKeys`
+  EXTRACTED from purgeJob (DRY, shared); **`sweepHandler`** (daily, `kvs.query` jobmeta-prefix, bounded
+  `SWEEP_MAX_DELETES=50`/run, **strict `kvs.get` re-read before the irreversible delete**, fail-open, asApp).
+  `ORPHAN_INACTIVITY_MS = 7 calendar days` (partner picked 7-cal over business-day math for simplicity).
+- `manifest.yml`: `scheduledTrigger` (key `orphan-sweep`, interval `day`) + the `orphan-sweep-fn → index.sweepHandler`
+  function. **PagePicker.jsx**: an honest 7-day-inactivity cleanup notice (only when tracked breakdowns exist).
+- **Honesty surface (claim==code, §7.1):** the SITE (`privacy`/`dpa`/`subprocessors`) + the forge
+  `docs/compliance/{DPA-managed-tier,atlassian-questionnaire-managed,subprocessors}.md` all updated to "removed after
+  7 days of inactivity"; the **inaccurate "removed when you regenerate" over-claim was REMOVED everywhere** (regenerate
+  ORPHANS the prior job — the sweep removes it later; it is NOT an immediate purge).
+
+**⭐ TASK #13 VERIFIED THROUGH THREE ESCALATING ROUNDS (the partner's "rigorous mode, колкото пъти е нужно") — each
+caught what the prior could not, the right bar for an irreversible-delete + privacy feature:**
+1. **§13 gate (4 lenses):** honesty lens was CHANGES_REQUIRED → I'd MISSED `subprocessors.html` + a dpa erasure line
+   still over-claiming → fixed.
+2. **5-lens DEEP audit + skeptic-verify (AFTER the gate passed) → 4 MORE real cross-layer defects, all fixed:**
+   **(A)** `deleteJobKeys` deleted `jobmeta` (the sweep's SOLE enumeration key) BEFORE `pagesnap` → a transient
+   pagesnap-delete failure orphaned the 180KB snapshot **un-refindably forever** → fix: jobmeta deleted **LAST + only
+   if `!degraded`** = self-healing (next sweep retries). **(B)** `touchJobAccess` was only on getResults/
+   getGenerationStatus → a BA editing TEST CASES (the project's core deliverable) for >7d never renewed the breakdown
+   timer → swept, destroying hand-edited cases ($1-3.67) + the §7 pagesnap → fix: added to all 6 TC resolvers +
+   unconditional in startTestCaseGeneration + startPush. **(C)** the sweep decided staleness from the
+   **eventually-consistent `kvs.query` index** → a renew-then-immediate-sweep race could delete a just-reopened
+   deliverable → fix: a strictly-consistent `kvs.get` re-read + re-check before deleting. **(D)** the SITE was updated
+   but 2 FORGE-repo compliance docs still carried the old claim → updated (the mirror-copies-not-in-the-diff blind spot).
+3. **Final assurance: 4 diverse personas + a 3-judge confidence vote → unanimous 9/9/9, ZERO blocking, SHIP.** Only LOW
+   accuracy nits, all applied (de-enumerated the renewal-site comments; documented the degraded-purge phantom-row
+   self-heal window).
+
+**⚠⚠ ROLLOUT FLAGS for the partner (HIGH — do NOT skip):**
+1. **`forge install --upgrade`** — NOT just `forge deploy`. The manifest changed (new `scheduledTrigger`); a code-only
+   deploy does NOT register the trigger → **the sweep never runs and the new 7-day DPA/site/UI claim is NOT actually
+   true.** Verify it registers/fires via `forge logs` (`[sweep] orphan sweep: scanned=…`) before relying on the claim.
+2. **Push the SEPARATE site repo** (`…\MVP-roll-out\spec2jira-site\spec2jira-site` — privacy/dpa/subprocessors; auto-
+   deploys via GitHub Pages). The forge `docs/compliance/*` mirrors are committed in `c85ed5f`.
+3. Partner Live-E2E: the UI notice is observable immediately; the 7-day sweep itself is not quickly observable → covered
+   by `prototype/test_orphan_sweep.js` (14 checks) + the 9/9/9 vote.
+
+**⭐ HARD-WON (fold into the Forge gotchas / lessons):**
+- **index.js is NOT node-importable** (`new Resolver()` throws under plain node) → put unit-testable pure logic in a
+  sibling module (`sweep_util.js`, like `graph.js`). This is now the pattern for any testable backend core.
+- **Forge KVS bills I/O, not at-rest (TODAY); at-rest "Data Stored" pricing is "coming later 2026."** A native KVS TTL
+  is **sliding-on-WRITE, fixed-on-read** → it belongs on TRANSIENT/reconstructible data, **NEVER on the user's
+  deliverable** (review/reconnect/push are READS and don't renew it). Access-renewed + scheduled sweep is the correct shape.
+- **A multi-key delete must order its keys so a partial failure self-heals** — delete the enumeration/index key LAST and
+  only on full success, so the next sweep retries rather than orphaning data un-refindably.
+- A **scheduledTrigger** runs system-context (no user) → KVS-only (asApp, `storage:app`); interval = `hour|day|week`;
+  manifest change → `forge install --upgrade`.
+- **The 3-escalating-rounds lesson, reinforced HARD ([[deep-audit-vs-per-change-gate]]):** per-change §13 gate → deep
+  multi-lens audit → persona panel + confidence vote. The deep audit found 4 real defects the gate passed; the vote
+  confirmed the fixes. **Audit the FIXES, not just the feature.** For irreversible/privacy/cross-key-invariant surfaces
+  this escalation is not ceremony — each layer is structurally blind to the next layer's defect class (write-time
+  optimism / ref-correlation breaks BETWEEN layers / eventual-consistency races / honesty-drift in un-diffed mirrors).
+
+**⭐ NEXT SESSION — NEW CHAPTER (partner-set): Monitoring + CI/CD STRATEGY for the MVP (`feature/product-improvements`).**
+**This is Analyze → Design ONLY — build a STRATEGY + trade-offs, do NOT jump to conclusions or implementation.** Full
+brief: [[mvp-monitoring-cicd]]. Survey how **enterprise** teams approach monitoring + CI/CD for a Forge app of this
+shape, what market options/patterns exist, and recommend a strategy scaled to a **solo vendor** (§3.5 — lightweight):
+- **CI/CD:** Forge CLI in GitHub Actions (env promotion dev→prod), automated gates = `npm run build` + `node --check
+  src/*.js` + the offline test suites (`prototype/test_*.js`), `forge lint`, the tunnel for local E2E.
+- **Observability within the no-egress constraint:** the **diagnostics ledger is the in-product half** (customer-side,
+  no egress); the GAP is **vendor-side deploy/health confidence** — `forge logs`/metrics, deploy verification, the
+  scheduledTrigger health (e.g. did the orphan sweep fire?), env-promotion safety. Recommend how to close it without a
+  backend.
+- Deliverable: a recommendation set + trade-offs, NOT code, until the partner picks a direction.
+
+**BACKLOG (partner's explicit call this session — NOT urgent, quality is good):** the broader **test-case validation on
+the ~9 real Confluence pages** (the pre-ship confidence sweep) is **parked in the backlog**, not done this cycle. Other
+parked items unchanged: the deferred test-gen quality levers ([[product-improvements]] — uid-keyed push-embed,
+directional-flag N+1, destructive negative-control, priority/ceiling/near-dup lints); UI/UX refresher + dead-code
+cleanup (orphan `getLastSelectedPage`/`LAST_SELECTED_KEY`). **⛔ BLOCKED until the Marketplace Approval signal:** Managed
+PRO edition (compute-budget cap) + custom prompts / house-style.
+
+С усмивка ✨ — Layer-1 диагностичната арка е затворена изцяло: четирите задачи са §13-gate-нати и committed, замразената стабилна идентичност (`_orig_name`/`_uid`) минава през всеки слой, който rename докосва (push → Review-дисплей → test-gen контекст), а #13 е тройно-верифициран (gate → deep audit с 4 fix-а → 9/9/9 единодушен vote). Подвеждащото "source X not created" при преименуване вече го няма — точно впечатлението, което не искаме BA-ят да получи след като му дадохме BreakdownEditor. Прозрачният orphan-cleanup прави DPA/site/UI claim-а честен (claim==code). Следваща глава: стратегия за Monitoring + CI/CD — чист Analyze→Design, без скачане към действия. Test-case validation-ът на 9-те реални страници остава в backlog (качеството е добро, не е спешно).
+
+---
+
 ## ⚡ HANDOVER NOTE (2026-06-13 cont. — Live-E2E ACCEPTANCE round (S1/S2/S3/S7/#6/distill/health/admin all GREEN) + 2 bug-fixes + polish + a binding POLICY rule; build-green; DEV-only; SESSION CLOSED)
 
 Continuation of the diagnostics-ledger arc below. The partner ran a **dev Live-E2E acceptance sweep**; I fixed what it surfaced, added one binding POLICY rule, and CLOSED the session. **5 commits ahead of origin — the partner PUSHES.** Still DEV-only (no `forge deploy -e production` until the v5.3.0 verdict).
