@@ -66,6 +66,18 @@ modules:
       # forge-lint error — verified 2026-06-03). Moot now: the app is licensed-only
       # (the in-app Free tier was removed 2026-06-03), so no surface declares
       # unlicensedAccess.
+  # ── Task #13: never-pushed-orphan cleanup (2026-06-14) ───────────────────────
+  # Daily sweep that deletes a generated-but-never-pushed breakdown 7 days after its
+  # last access — the privacy / data-minimization backstop for abandoned generations
+  # (purgeJob already removes a breakdown on push; this covers the never-pushed case).
+  # ACCESS-renewed (jobmeta.lastAccessedAt, bumped on every meaningful access — review/reconnect + TC/push),
+  # NOT a creation-anchored native TTL — a KVS TTL renews only on `set`, so a read-only
+  # review would silently lose the deliverable (§11). System trigger (no user context)
+  # → KVS only (asApp, storage:app). Per-installation. interval: day | hour | week.
+  scheduledTrigger:
+    - key: orphan-sweep
+      function: orphan-sweep-fn
+      interval: day
   function:
     # Single resolver handles ALL backend work in v3.0.1+:
     #   - Settings (BYOK API key), Confluence page fetch/search
@@ -79,6 +91,9 @@ modules:
     #     unavailable in async context (AUTH_TYPE_UNAVAILABLE); resolver-only.
     - key: resolver
       handler: index.handler
+    # Task #13 orphan sweep (scheduledTrigger above). System invocation, KVS-only.
+    - key: orphan-sweep-fn
+      handler: index.sweepHandler
 resources:
   - key: main
     path: static/hello-world/build

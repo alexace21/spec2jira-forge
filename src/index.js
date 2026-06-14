@@ -31,7 +31,7 @@
  */
 
 import Resolver from '@forge/resolver';
-import { kvs } from '@forge/kvs';
+import { kvs, WhereConditions } from '@forge/kvs';
 import api, { route } from '@forge/api';
 
 import {
@@ -57,6 +57,7 @@ import {
   fetchTestCaseResults,
 } from './anthropic_client.js';
 import { startPushSession, pushSessionStep, flattenBreakdown, lookupProject } from './push_handler.js';
+import { isOrphanStale } from './sweep_util.js'; // Task #13: pure staleness decision (unit-tested; index.js isn't node-importable)
 import { detectCycles } from './graph.js';
 import { renderGherkin, renderManualTable, parseTestCaseResult, normAC } from './testcases.js';
 import {
@@ -226,9 +227,11 @@ const JOB_KEY_PREFIX = 'job:';
 // the user's BREAKDOWN deliverable — review/reconnect/PUSH are READS and a native KVS TTL renews only
 // on `set`, so a completed-but-unpushed breakdown vanished at completion+30d (§11 silent-data-loss),
 // and pagesnap: expired out from under §7-aware test-gen. So job:/jobmeta:/pagesnap: carry NO TTL —
-// they persist until the explicit purgeJob (on push), restoring the pre-optimization durability.
-// Bounding STORAGE for never-pushed orphans is a SEPARATE follow-up that must be ACCESS-renewed
-// (re-set on getResults/getGenerationStatus) or scheduled, NOT creation-anchored.
+// they persist until the explicit purgeJob (on push) OR, for a NEVER-pushed job, until the Task #13
+// orphan sweep removes it 7 days after its last access. That orphan bound is now IMPLEMENTED (Task #13):
+// access-renewed (jobmeta.lastAccessedAt, re-set via touchJobAccess on every meaningful access — review/reconnect + the TC/push sub-journeys)
+// + a daily scheduled sweep (sweepHandler) — NOT a creation-anchored TTL, which would silently expire
+// a deliverable still under review (the trap above).
 const JOB_META_PREFIX = 'jobmeta:';
 async function setJob(jobId, value) {
   const jobKey = `${JOB_KEY_PREFIX}${jobId}`;
@@ -240,10 +243,122 @@ async function setJob(jobId, value) {
       status: value.status,
       pageTitle: value.pageTitle,
       startedAt: value.submittedAt || value.createdAt,
+      // Task #13: a setJob IS activity → stamp the inactivity timer. Renewed (leaner)
+      // on read-access via touchJobAccess so an actively-reviewed breakdown is never
+      // swept; the scheduled orphan sweep deletes a never-pushed job 7 days after this.
+      lastAccessedAt: Date.now(),
     });
   } catch (e) {
     console.warn(`[setJob] jobmeta mirror failed (non-fatal): ${String(e?.message || e)}`);
   }
+}
+
+// ── Task #13: never-pushed-orphan cleanup (access-renewed + scheduled sweep) ────────
+// The user-facing claim (DPA + the picker label) is "removed after 7 days of INACTIVITY
+// (or immediately on push)". INACTIVITY, not creation: the timer is renewed on every
+// meaningful access, so an actively-reviewed breakdown is NEVER deleted — which is exactly
+// why a creation-anchored native KVS TTL was rejected (KVS TTL renews only on `set`, so a
+// read-only review/push would silently lose the deliverable, §11). The sweep (a daily
+// scheduledTrigger → sweepHandler) deletes a never-pushed job 7 days after its last access.
+const ORPHAN_INACTIVITY_MS = 7 * 24 * 60 * 60 * 1000; // 7 calendar days — the working-week equivalent of "5 working days", chosen for simplicity over business-day math
+const ORPHAN_RENEW_THROTTLE_MS = 60 * 60 * 1000;      // 1h — skip re-writing jobmeta on a frequent poll (write-amplification guard)
+const SWEEP_PAGE_LIMIT = 50;                           // jobmeta keys per query page
+const SWEEP_MAX_DELETES = 50;                          // cap deletions per daily run; the daily cadence clears any backlog over a few days
+
+// Renew a job's inactivity timer (lean jobmeta write, throttled). Called on review /
+// reconnect access so an actively-used breakdown is preserved. Best-effort: a miss only
+// risks sweeping a still-active job, which is rare and recoverable (the user regenerates).
+async function touchJobAccess(jobId) {
+  if (!jobId) return;
+  try {
+    const meta = await kvs.get(`${JOB_META_PREFIX}${jobId}`);
+    if (!meta || typeof meta !== 'object') return; // no mirror (purged / legacy) → nothing to renew
+    const now = Date.now();
+    if (Number.isFinite(meta.lastAccessedAt) && now - meta.lastAccessedAt < ORPHAN_RENEW_THROTTLE_MS) return; // recently renewed → skip (no write-amplification)
+    await kvs.set(`${JOB_META_PREFIX}${jobId}`, { ...meta, lastAccessedAt: now });
+  } catch (_) { /* best-effort — never block the access path */ }
+}
+
+// isOrphanStale (the pure staleness decision used by sweepHandler) lives in ./sweep_util.js
+// (imported at the top) so it is unit-testable under plain node — index.js itself is not
+// node-importable (@forge/resolver's `new Resolver()` throws outside the Forge runtime).
+
+// Shared deletion of a generation job's stored content + ALL sibling keys (the pageJob:
+// reconnect index, job:, jobmeta:, pagesnap:, the per-user tracked-list entry, and the
+// tcjob:/testcases:/tcregenjob: test-case keys). Used by purgeJob (on push) AND the
+// scheduled orphan sweep (after inactivity). Faithful to the original purgeJob deletion:
+// core deletes (job/jobmeta/pagesnap) throw on failure (→ the caller's catch); the
+// tracked-list + tc sweeps fail-open into `degraded`. Records NO diagnostics — returns
+// { degraded, tcInFlight, tcOwner } so the CALLER owns the ledger write (purge-on-push
+// records tracking_degraded for an in-flight TC run; the sweep does not).
+async function deleteJobKeys(jobId, job, accountId) {
+  let degraded = false;
+  let tcInFlight = false;
+  let tcOwner = null;
+  if (job && job.pageId) {
+    // Clear the page→job reconnect index ONLY if it still points at THIS job (purging a
+    // SUPERSEDED job must NOT blow away a newer job's reconnect index).
+    const pageRef = await kvs.get(`${PAGE_JOB_PREFIX}${String(job.pageId)}`).catch(() => null);
+    if (pageRef && pageRef.jobId === jobId) {
+      await kvs.delete(`${PAGE_JOB_PREFIX}${String(job.pageId)}`);
+    }
+  }
+  await kvs.delete(`${JOB_KEY_PREFIX}${jobId}`);
+  // pagesnap: holds a full source-page copy (~180KB) — the privacy-critical item.
+  await kvs.delete(`${PAGE_SNAP_PREFIX}${jobId}`);
+  // drop from the per-user tracked list (best-effort; getDashboardJobs also prunes dead refs).
+  try {
+    if (accountId) {
+      const trackedKey = `${TRACKED_JOBS_PREFIX}${accountId}`;
+      const tj = await kvs.get(trackedKey);
+      if (Array.isArray(tj)) {
+        const next = tj.filter((j) => j.jobId !== jobId);
+        if (next.length !== tj.length) await kvs.set(trackedKey, next);
+      }
+    }
+  } catch (cjErr) {
+    degraded = true;
+    console.warn(`[deleteJobKeys] tracked-jobs filter failed (non-fatal): ${String(cjErr?.message || cjErr)} ref=${jobId}`);
+  }
+  // test-case KVS entries (control + per-story + per-story-regen), bounded by the HIGH-WATER total.
+  try {
+    const tcJob = await kvs.get(`${TC_JOB_KEY_PREFIX}${jobId}`);
+    if (tcJob) {
+      tcInFlight = tcJob.status === 'batched' || tcJob.status === 'pending';
+      tcOwner = tcJob.ownerAccountId || null;
+      const sweepTo = Math.max(
+        typeof tcJob.total === 'number' ? tcJob.total : 0,
+        Number.isFinite(tcJob.maxTotal) ? tcJob.maxTotal : 0,
+      );
+      if (sweepTo > 0) {
+        const perStoryKeys = Array.from({ length: sweepTo }, (_, i) => `${TC_STORY_KEY_PREFIX}${jobId}:${i}`);
+        await Promise.all(perStoryKeys.map((k) => kvs.delete(k).catch(() => { degraded = true; })));
+      }
+      const regenCount = Math.max(
+        Array.isArray(tcJob.stampedStories) ? tcJob.stampedStories.length : 0,
+        sweepTo, // old-tail regen control records too
+      );
+      if (regenCount > 0) {
+        const regenKeys = Array.from({ length: regenCount }, (_, i) => `${TC_REGEN_KEY_PREFIX}${jobId}:${i}`);
+        await Promise.all(regenKeys.map((k) => kvs.delete(k).catch(() => { degraded = true; })));
+      }
+    }
+    await kvs.delete(`${TC_JOB_KEY_PREFIX}${jobId}`);
+  } catch (tcErr) {
+    degraded = true;
+    console.warn(`[deleteJobKeys] tc KVS purge failed (non-fatal): ${String(tcErr?.message || tcErr)} ref=${jobId}`);
+  }
+  // ⭐ jobmeta: is the sweep's SOLE enumeration key → delete it LAST and ONLY if everything else
+  // succeeded (deep-audit fix). A throwing core delete above aborts before here, and any fail-open
+  // miss sets `degraded` → either way jobmeta SURVIVES, so the next daily sweep re-finds the job and
+  // retries (self-healing; KVS delete is idempotent). Deleting jobmeta early would orphan a
+  // failed-to-delete sibling (e.g. the 180KB pagesnap) un-refindably forever — the exact leak this
+  // ordering prevents. purgeJob keeps its diagnostics (purge_incomplete on degraded). NOTE: a degraded
+  // purge KEEPS jobmeta → getDashboardJobs (reads jobmeta first) may show a phantom "ready" row until
+  // the next sweep (≤7d) or tracked-list cap-eviction; clicking it → not_found → Ready (non-destructive).
+  // The bounded cosmetic phantom strictly dominates the un-refindable 180KB pagesnap leak.
+  if (!degraded) await kvs.delete(`${JOB_META_PREFIX}${jobId}`);
+  return { degraded, tcInFlight, tcOwner };
 }
 
 // Index: page id → latest generation jobId. Lets a reopened page reconnect to an
@@ -1840,10 +1955,16 @@ resolver.define('pollJobStatus', async ({ payload, context }) => {
     // 'batched' → the dashboard strands the row under "In progress" AND stop-idle never stops (the
     // read leak returns). Terminal states never re-transition, so this poll is the only re-sync point.
     try {
+      // Task #13: PRESERVE the inactivity timer (don't bump it — this re-assert can fire from a
+      // reconcile poll, which must NOT count as "access"). Keep the existing lastAccessedAt; fall
+      // back to now only if absent, so the setJob invariant (jobmeta always carries lastAccessedAt)
+      // holds at every write site and a swept-too-early silent loss can't sneak in via this path.
+      const prevMeta = await kvs.get(`${JOB_META_PREFIX}${jobId}`).catch(() => null);
       await kvs.set(`${JOB_META_PREFIX}${jobId}`, {
         status: job.status,
         pageTitle: job.pageTitle,
         startedAt: job.submittedAt || job.createdAt,
+        lastAccessedAt: prevMeta && Number.isFinite(prevMeta.lastAccessedAt) ? prevMeta.lastAccessedAt : Date.now(),
       });
     } catch (_) {}
     return job;
@@ -2255,6 +2376,7 @@ resolver.define('getResults', async ({ payload }) => {
   if (!jobId) return { error: 'No job ID' };
   const job = await kvs.get(`${JOB_KEY_PREFIX}${jobId}`);
   if (!job) return { error: 'not_found' };
+  await touchJobAccess(jobId); // Task #13: opening a breakdown for review renews its inactivity timer (never sweep an actively-used job)
   if (job.status === 'failed') {
     return { error: job.error || 'failed', detail: job.detail || 'Job failed' };
   }
@@ -2309,6 +2431,7 @@ resolver.define('getGenerationStatus', async ({ payload }) => {
 
   const job = await kvs.get(`${JOB_KEY_PREFIX}${ref.jobId}`);
   if (!job) return { status: 'idle' };
+  await touchJobAccess(ref.jobId); // Task #13: reconnecting/polling a page renews its inactivity timer
 
   if (job.status === 'completed') {
     // tcStatus: lets the reconnecting frontend know test cases exist without a 2nd round-trip.
@@ -2377,96 +2500,25 @@ resolver.define('purgeJob', async ({ payload, context }) => {
   const jobId = payload?.jobId;
   const diagJobRef = cleanClientRef(jobId); // [P5 LOW-2] payload id -> strict shape for LEDGER refs only
   if (!jobId) return { ok: false };
-  // [diag Phase 5, §7-deferred] ONE purge_incomplete record per invocation that hit ANY
-  // fail-open miss (a flag, not per-section spam): a partial purge leaves content behind,
-  // silently eroding the "removed when you push" privacy claim — support must see it.
-  let purgeDegraded = false;
   try {
     const job = await kvs.get(`${JOB_KEY_PREFIX}${jobId}`);
-    if (job && job.pageId) {
-      // Clear the page→job reconnect index ONLY if it still points at THIS job. Purging a
-      // SUPERSEDED job (a newer generation exists for the same page) must NOT blow away the
-      // newer job's reconnect index (deep-audit re-verify note — pre-existing, narrow window).
-      const pageRef = await kvs.get(`${PAGE_JOB_PREFIX}${String(job.pageId)}`).catch(() => null);
-      if (pageRef && pageRef.jobId === jobId) {
-        await kvs.delete(`${PAGE_JOB_PREFIX}${String(job.pageId)}`);
-      }
+    // Shared deletion (same set + fail-open contract as before — see deleteJobKeys).
+    const { degraded, tcInFlight, tcOwner } = await deleteJobKeys(jobId, job, (context && context.accountId) || 'unknown');
+    // [seams-audit HIGH (c)] honesty record: pushing while a TC batch is still in flight
+    // discards a BILLED run (the FE warns at the Create button; the background TC poll now
+    // stops quietly) — the ledger keeps the durable trace. Purge-on-PUSH only (the scheduled
+    // orphan sweep deletes abandoned jobs and does NOT record this — there was no push to bill against).
+    if (tcInFlight) {
+      await recordDiagnostic({
+        context,
+        owner: tcOwner,
+        record: { op: 'purge', error_class: 'tracking_degraded', level: 'warn', ref: jobId, counts: { tc_run_discarded: 1 }, surfaced: true },
+      });
     }
-    await kvs.delete(`${JOB_KEY_PREFIX}${jobId}`);
-    await kvs.delete(`${JOB_META_PREFIX}${jobId}`); // lean dashboard mirror (KVS-cost optimization)
-    // Delete the source-page snapshot (the §8 test-gen feed stores a full page-content copy in
-    // pagesnap:<jobId>). It IS the privacy-critical item this purge exists to remove — without
-    // this it would linger ~180KB/job indefinitely, falsifying the "page content removed after
-    // processing" privacy claim (deep-audit 2026-06-06). Fail-open like the rest.
-    await kvs.delete(`${PAGE_SNAP_PREFIX}${jobId}`);
-
-    // (multi-batch dashboard) drop this job from the per-user tracked list so a pushed
-    // breakdown stops appearing in the dashboard. Best-effort; getDashboardJobs also
-    // dereferences-and-prunes (job gone → dropped) as the real backstop, so a miss here
-    // self-heals on read — and covers the rare case where a different user pushes the job.
-    try {
-      const acct = (context && context.accountId) || 'unknown';
-      const trackedKey = `${TRACKED_JOBS_PREFIX}${acct}`;
-      const tj = await kvs.get(trackedKey);
-      if (Array.isArray(tj)) {
-        const next = tj.filter((j) => j.jobId !== jobId);
-        if (next.length !== tj.length) await kvs.set(trackedKey, next);
-      }
-    } catch (cjErr) {
-      purgeDegraded = true;
-      console.warn(`[purgeJob] tracked-jobs filter failed (non-fatal): ${String(cjErr?.message || cjErr)} ref=${jobId}`);
-    }
-
-    // P4 audit B/Finding-6: also purge test-case KVS entries so generated cases
-    // don't linger after the user's content has been pushed. Fail-open: a purge
-    // failure must never error the push completion (the page content is the
-    // privacy-critical item; test cases are derived data, bounded by the same
-    // instance's KVS).
-    try {
-      const tcJob = await kvs.get(`tcjob:${jobId}`);
-      if (tcJob) {
-        // [seams-audit HIGH (c)] honesty record: pushing while a TC batch is still
-        // in flight discards a BILLED run (the FE warns at the Create button; the
-        // background TC poll now stops quietly) — the ledger keeps the durable trace.
-        if (tcJob.status === 'batched' || tcJob.status === 'pending') {
-          await recordDiagnostic({
-            context,
-            owner: tcJob.ownerAccountId,
-            record: { op: 'purge', error_class: 'tracking_degraded', level: 'warn', ref: jobId, counts: { tc_run_discarded: 1 }, surfaced: true },
-          });
-        }
-        // [deep-audit P4 F5] sweep to the HIGH-WATER mark — a re-generate after an
-        // editor delete re-stamps a SHORTER total; purging only 0..total-1 orphaned
-        // the old tail's per-story keys (content-adjacent) forever.
-        const sweepTo = Math.max(
-          typeof tcJob.total === 'number' ? tcJob.total : 0,
-          Number.isFinite(tcJob.maxTotal) ? tcJob.maxTotal : 0,
-        );
-        if (sweepTo > 0) {
-          const perStoryKeys = Array.from({ length: sweepTo }, (_, i) => `testcases:${jobId}:${i}`);
-          await Promise.all(perStoryKeys.map((k) => kvs.delete(k).catch(() => { purgeDegraded = true; })));
-        }
-        // [diag Phase 5, §7-deferred] tcregenjob purge-leak FIX (closes the old TODO):
-        // per-story regen control records (tcregenjob:<jobId>:<i>) are bounded by the
-        // stamped story count, so enumerate 0..N-1 and delete BEFORE the tcjob record
-        // (it carries the count). Best-effort per key; KVS delete of a non-existent key
-        // is idempotent, so a job with few/no regens costs only cheap no-op deletes.
-        const regenCount = Math.max(
-          Array.isArray(tcJob.stampedStories) ? tcJob.stampedStories.length : 0,
-          sweepTo, // [P4 F5] old-tail regen control records too
-        );
-        if (regenCount > 0) {
-          const regenKeys = Array.from({ length: regenCount }, (_, i) => `${TC_REGEN_KEY_PREFIX}${jobId}:${i}`);
-          await Promise.all(regenKeys.map((k) => kvs.delete(k).catch(() => { purgeDegraded = true; })));
-        }
-      }
-      await kvs.delete(`tcjob:${jobId}`);
-    } catch (tcErr) {
-      purgeDegraded = true;
-      console.warn(`[purgeJob] tc KVS purge failed (non-fatal): ${String(tcErr?.message || tcErr)} ref=${jobId}`);
-    }
-
-    if (purgeDegraded) {
+    // [diag Phase 5, §7-deferred] ONE purge_incomplete per invocation that hit ANY fail-open
+    // miss (a flag, not per-section spam): a partial purge leaves content behind, silently
+    // eroding the "removed when you push" privacy claim — support must see it.
+    if (degraded) {
       await recordDiagnostic({
         context,
         record: { op: 'purge', error_class: 'purge_incomplete', level: 'warn', ref: diagJobRef, surfaced: false },
@@ -2534,6 +2586,7 @@ resolver.define('startPush', async ({ payload, context }) => {
   // mint-shape check (UUID / ts-base36): a crafted dotted-ASCII "jobId" must not
   // become pseudo-prose in the admin's view. Business logic keeps the raw jobId.
   const diagJobRef = cleanClientRef(jobId);
+  if (jobId) await touchJobAccess(jobId); // Task #13: a push attempt is activity on this breakdown — renew its inactivity timer so a near-stale push can't race the daily sweep
   if (!breakdown) {
     // (diag Phase 2) a missing breakdown payload is a FRONTEND bug, not a user
     // mistake — warn-level, but recorded so support sees it in the timeline.
@@ -2831,6 +2884,7 @@ resolver.define('pushStep', async ({ payload, context }) => {
 resolver.define('startTestCaseGeneration', async ({ payload, context }) => {
   const { jobId } = payload || {};
   if (!jobId) return { error: 'no_job_id', detail: 'jobId is required.' };
+  await touchJobAccess(jobId); // Task #13: starting test-case generation is activity on this breakdown — renew its inactivity timer UNCONDITIONALLY (the edited-breakdown branch alone misses the idempotent-return path)
 
   // Defensive license gate (mirrors startGeneration)
   try {
@@ -3152,6 +3206,7 @@ resolver.define('pollTestCaseStatus', async ({ payload, context }) => {
   // may be driven by another user's client.
   const { jobId } = payload || {};
   if (!jobId) return { error: 'no_job_id', detail: 'jobId is required.' };
+  await touchJobAccess(jobId); // Task #13: polling a live test-case batch is activity on this breakdown — renew its inactivity timer (cross-phase liveness)
 
   const tcJob = await kvs.get(`${TC_JOB_KEY_PREFIX}${jobId}`);
   if (!tcJob) return { error: 'not_found', detail: `tcjob ${jobId} not found.` };
@@ -3443,6 +3498,7 @@ resolver.define('pollTestCaseStatus', async ({ payload, context }) => {
 resolver.define('getTestCases', async ({ payload }) => {
   const { jobId } = payload || {};
   if (!jobId) return { error: 'no_job_id', detail: 'jobId is required.' };
+  await touchJobAccess(jobId); // Task #13: viewing test cases is activity on this breakdown — renew its inactivity timer (cross-phase liveness)
 
   const tcJob = await kvs.get(`${TC_JOB_KEY_PREFIX}${jobId}`);
   if (!tcJob) return { error: 'not_found', detail: `tcjob ${jobId} not found.` };
@@ -3518,6 +3574,7 @@ resolver.define('saveTestCases', async ({ payload, context }) => {
   const { jobId, storyIdx, result } = payload || {};
   const diagJobRef = cleanClientRef(jobId); // [P5 LOW-2]
   if (!jobId) return { error: 'no_job_id', detail: 'jobId is required.' };
+  await touchJobAccess(jobId); // Task #13: saving a test case is activity on this breakdown — renew its inactivity timer (cross-phase liveness)
   if (typeof storyIdx !== 'number' || !Number.isInteger(storyIdx) || storyIdx < 0) {
     return { error: 'bad_story_idx', detail: 'storyIdx must be a non-negative integer.' };
   }
@@ -3616,6 +3673,7 @@ resolver.define('saveTestCases', async ({ payload, context }) => {
 resolver.define('regenerateTestCase', async ({ payload, context }) => {
   const { jobId, storyIdx } = payload || {};
   if (!jobId) return { error: 'no_job_id', detail: 'jobId is required.' };
+  await touchJobAccess(jobId); // Task #13: regenerating a test case is activity on this breakdown — renew its inactivity timer (cross-phase liveness)
   if (typeof storyIdx !== 'number' || !Number.isInteger(storyIdx) || storyIdx < 0) {
     return { error: 'bad_story_idx', detail: 'storyIdx must be a non-negative integer.' };
   }
@@ -3868,6 +3926,7 @@ resolver.define('pollRegenerateTestCase', async ({ payload, context }) => {
   if (!jobId || typeof storyIdx !== 'number') {
     return { error: 'bad_args', detail: 'jobId and numeric storyIdx are required.' };
   }
+  await touchJobAccess(jobId); // Task #13: polling a live regen is activity on this breakdown — renew its inactivity timer (cross-phase liveness)
 
   const regenKey = `${TC_REGEN_KEY_PREFIX}${jobId}:${storyIdx}`;
   const regenJob = await kvs.get(regenKey);
@@ -4112,6 +4171,7 @@ resolver.define('getTestCaseExports', async ({ payload, context }) => {
   const { jobId, storyIdx, format = 'both' } = payload || {};
   const diagJobRef = cleanClientRef(jobId); // [P5 LOW-2]
   if (!jobId) return { error: 'no_job_id', detail: 'jobId is required.' };
+  await touchJobAccess(jobId); // Task #13: exporting test cases is activity on this breakdown — renew its inactivity timer (cross-phase liveness)
 
   const tcJob = await kvs.get(`${TC_JOB_KEY_PREFIX}${jobId}`).catch(() => null);
   if (!tcJob) return { error: 'not_found', detail: `tcjob ${jobId} not found.` };
@@ -4640,5 +4700,63 @@ resolver.define('clearDiagnostics', async ({ context }) => {
 });
 
 // ── Export handler bound к manifest function key "resolver" ──
+
+// ── Task #13: scheduled orphan sweep ───────────────────────────────────────────────
+// A daily scheduledTrigger (manifest: orphan-sweep → this handler) runs PER INSTALLATION
+// with NO user context (system trigger → KVS only, asApp via storage:app). It enumerates
+// the lean jobmeta: keys and, for any job INACTIVE longer than ORPHAN_INACTIVITY_MS (7 days)
+// — i.e. generated-but-never-pushed/-reopened — deletes the job + all siblings. A pushed job
+// was already purged; an actively-reviewed job had its timer renewed (touchJobAccess), so
+// neither is swept (this is the access-renewed alternative to a creation-anchored TTL, which
+// would silently lose a deliverable under review). Bounded (SWEEP_MAX_DELETES/run; the daily
+// cadence clears any backlog over a few days) + idempotent. Fail-open — never throws to the platform.
+export async function sweepHandler() {
+  const now = Date.now();
+  let scanned = 0;
+  let deleted = 0;
+  let degraded = 0;
+  let cursor;
+  try {
+    const maxPages = 500; // hard loop bound on the cursor pagination
+    for (let page = 0; page < maxPages && deleted < SWEEP_MAX_DELETES; page++) {
+      let q = kvs.query().where('key', WhereConditions.beginsWith(JOB_META_PREFIX)).limit(SWEEP_PAGE_LIMIT);
+      if (cursor) q = q.cursor(cursor);
+      const res = await q.getMany();
+      const results = res && Array.isArray(res.results) ? res.results : [];
+      for (const r of results) {
+        if (deleted >= SWEEP_MAX_DELETES) break;
+        if (!r || typeof r.key !== 'string' || !r.key.startsWith(JOB_META_PREFIX)) continue;
+        const jobId = r.key.slice(JOB_META_PREFIX.length);
+        if (!jobId) continue;
+        scanned++;
+        if (!isOrphanStale(r.value, now, ORPHAN_INACTIVITY_MS)) continue; // active per the (eventually-consistent) query index → keep (fail-safe)
+        // ⭐ kvs.query() is EVENTUALLY consistent — a just-written touchJobAccess renewal can lag in
+        // the query index. Before an IRREVERSIBLE delete, RE-CONFIRM staleness with a STRICTLY-
+        // consistent kvs.get (deep-audit fix): closes the renew-then-immediate-sweep race so a
+        // just-reopened deliverable is never swept, matching the codebase's re-read-before-
+        // destructive-write discipline. Only the few query-stale candidates pay this strict read.
+        const freshMeta = await kvs.get(`${JOB_META_PREFIX}${jobId}`).catch(() => null);
+        if (!isOrphanStale(freshMeta, now, ORPHAN_INACTIVITY_MS)) continue; // a fresh renewal (or a concurrent delete) won the race → keep/skip
+        // Stale (strictly confirmed). Read the heavy job: record ONLY now (for pageId + ownerAccountId).
+        const job = await kvs.get(`${JOB_KEY_PREFIX}${jobId}`).catch(() => null);
+        const acct = (job && job.ownerAccountId) || null; // null → deleteJobKeys skips the tracked-list filter (getDashboardJobs prunes the dead ref anyway)
+        try {
+          const { degraded: d } = await deleteJobKeys(jobId, job, acct);
+          deleted++;
+          if (d) degraded++;
+        } catch (delErr) {
+          degraded++;
+          console.warn(`[sweep] delete failed for ${jobId} (non-fatal): ${String(delErr?.message || delErr)}`);
+        }
+      }
+      cursor = res ? res.nextCursor : undefined;
+      if (!cursor || results.length === 0) break;
+    }
+    console.log(`[sweep] orphan sweep: scanned=${scanned} deleted=${deleted} degraded=${degraded}`);
+  } catch (e) {
+    console.error(`[sweep] orphan sweep failed (non-fatal): ${String(e?.message || e)}`);
+  }
+  return { scanned, deleted, degraded };
+}
 
 export const handler = resolver.getDefinitions();

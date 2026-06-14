@@ -412,6 +412,17 @@ function PagePickerScreen({ onSelect, onOpenSettings }) {
             )}
             {renderGroup("✓ Ready for review", "var(--s2j-blue)", ready, "r", () => "Completed — not yet pushed")}
             {renderGroup("⚠ Needs attention", "var(--s2j-red)", failed, "f", () => "Generation failed — reopen to retry")}
+            {(inProgress.length > 0 || ready.length > 0 || failed.length > 0) && (
+              <p
+                className="text-[11px] mb-4 px-1"
+                style={{ color: "var(--s2j-text-muted)" }}
+              >
+                {/* Task #13: honest cleanup notice — matches the scheduled orphan sweep
+                    (7-day inactivity) + the privacy/DPA disclosure (no over-claim). */}
+                ⓘ Generated breakdowns you don't push to Jira are automatically removed after
+                7 days of inactivity. Opening one resets its timer.
+              </p>
+            )}
           </>
         );
       })()}
