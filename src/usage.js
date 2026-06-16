@@ -19,7 +19,7 @@
  *                  liability for us; the subscription is pure app-value.
  *   - Managed Pro: "Advanced" edition, $13/user/mo (editions Phase 2 — not yet a
  *                  published edition) → CAPPED (we call Anthropic with OUR key, so usage = our
- *                  cost). Fair-use 10 breakdowns/user/mo (MANAGED_USER_CAP),
+ *                  cost). Fair-use 25 breakdowns/user/mo (MANAGED_USER_CAP),
  *                  metered PER USER, NOT pooled (no runtime seat count) —
  *                  loss-proof per seat. See below.
  *   - Unlicensed:  a minimal DEFENSIVE tier (limit 0, blocked) for the
@@ -56,19 +56,33 @@ import { kvs } from '@forge/kvs';
 import { getAppContext } from '@forge/api';
 
 // ── Managed Pro per-user fair-use cap ────────────────────────────────
-// Managed Pro meters PER USER per month (each seat its own allowance), NOT pooled
-// per instance — the Forge License object exposes NO seat count at runtime
-// (verified @forge/api runtime.d.ts 2026-06-03), so 10×seats is uncomputable, and
-// per-user is the loss-bounded shape that needs no seat count: 10 × worst-case
-// ~$0.50 = ~$5 < $13/seat revenue → ≥60% margin at the cap, any instance size;
-// and abuse is self-funding (each extra seat is paid revenue). Market research
-// (2026-06-03) confirmed 10 is GENEROUS — typical use 1-3/mo, power 5-8/mo — so it
-// rarely binds; heavy users → BYOK or a future Managed-Plus. Env-tunable for
-// signal-driven adaptation: `forge variables set ... MANAGED_USER_CAP <n>`.
+// Managed Pro meters PER USER per calendar month (each seat its own allowance),
+// NOT pooled per instance — the Forge License object exposes NO seat count at
+// runtime (verified @forge/api runtime.d.ts 2026-06-03), so N×seats is
+// uncomputable; per-user is the loss-bounded shape that needs no seat count.
+//
+// CAP = 25 (raised from 10, 2026-06-16). v5.4.0 Managed ships BREAKDOWN-ONLY
+// (test-case generation is a v5.5.0 feature, NOT in this build), and a breakdown
+// costs only ~$0.118 avg / $0.24 max on our key → 25 × $0.24 = $6.00 worst-case
+// vs $13/seat revenue ⇒ ~54% margin FLOOR (cap × max cost; typical use stays
+// well under the cap → ~90%+ margin). The cap is pure
+// cost-protection / abuse circuit-breaker, NOT a value gate, so it is set
+// GENEROUS: a real BA (typ. 1-3 specs/mo, power 5-8, PLUS each regeneration
+// consuming one) effectively never reaches 25, so Managed feels "unlimited" — its
+// value prop (no key to manage). Raising a cap is customer-friendly, lowering is
+// hostile, so 25 is committable: we will NOT lower it for breakdown-only. Abuse is
+// self-funding (each seat is paid revenue). Env-tunable for signal-driven
+// adaptation: `forge variables set ... MANAGED_USER_CAP <n>`.
+//
+// ⭐ v5.5.0 forward note: test-case generation costs $1-3.67 (8.6× a breakdown),
+// which would blow this cap's margin if folded in. The fix is NOT to lower this
+// cap — it is to give test-cases their OWN separate budget/meter (a surgical
+// compute-budget on the expensive driver), so breakdowns stay generously
+// count-capped at 25. Test cases must justify their price as a premium feature.
 export const MANAGED_USER_CAP =
   Number.parseInt(process.env.MANAGED_USER_CAP, 10) > 0
     ? Number.parseInt(process.env.MANAGED_USER_CAP, 10)
-    : 10;
+    : 25;
 
 // ── Tier model — single source of truth ─────────────────────────────
 // `limit`: breakdowns per calendar month. `null` = unlimited, `0` = blocked.
