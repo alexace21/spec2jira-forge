@@ -1,5 +1,5 @@
 /**
- * Spec2JIRA — Forge Custom UI
+ * Spec2Tickets — Forge Custom UI
  *
  * Flow: loading → ready → generating → reviewing → confirming → pushed
  * Includes: reconnect on mount, non-blocking generation, confirmation step.

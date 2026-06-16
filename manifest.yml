@@ -60,7 +60,7 @@ modules:
       resource: main
       resolver:
         function: resolver
-      title: Spec2JIRA Settings
+      title: Spec2Tickets Settings
       useAsConfig: true
       # NOTE: confluence:globalSettings does NOT support unlicensedAccess (a hard
       # forge-lint error — verified 2026-06-03). Moot now: the app is licensed-only
@@ -94,7 +94,7 @@ permissions:
       # Property name 'backend' е the Forge manifest schema's predefined
       # key for external fetch egress (не arbitrary). Despite the name,
       # this declares egress access TO https://api.anthropic.com — there
-      # е no Spec2JIRA-operated backend.
+      # е no Spec2Tickets-operated backend.
       backend:
         - address: https://api.anthropic.com
   scopes:
