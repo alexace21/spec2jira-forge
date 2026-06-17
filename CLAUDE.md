@@ -354,6 +354,33 @@ package names de-scaffolded (→ `spec2tickets`). Build green (bundle ≈ −1.4
 
 ---
 
+## ⚡ HANDOVER NOTE (2026-06-17 — ⭐⭐⭐ v5.4.0 SHIPPED + LIVE ON MARKETPLACE + editions submitted; agent-conducted)
+
+**THE MILESTONE: the app is officially live + publicly discoverable on the Atlassian Marketplace.**
+Live URL: **https://marketplace.atlassian.com/apps/1475765564/spec2tickets-for-confluence-and-jira** (App ID `e804f31f`). It now appears in Marketplace search on a customer site (no more manual `forge install` from console). The long arc closed: FIT rejection → v3 BYOK pivot → XCA/PvA blocker → v5.3.0 approval → **v5.4.0 + two editions, live.** Long agent-conducted session (§13 throughout), on branch **`release/v5.4.0`** (partner pushed/deployed).
+
+**The release strategy (central decision):** v5.4.0 = a MINIMAL release (branding + editions go-live), NOT the big delta. **Baseline = commit `7bb7159`** — the v5.3.0-era state (prod ≈ `main`; `7bb7159` = `main` + the 2 branding/error commits `f5b4fb0`+`7bb7159`). The big delta (test-cases / multi-batch dashboard / diagnostics ledger / Layer-1) stays on **`feature/product-improvements` = v5.5.0**. Proved prod≈main forensically (no tag; `main`'s UI still says "JIRA", `7bb7159` says "Jira" — `f5b4fb0` IS the reviewer's branding fix, so building from `7bb7159` ships it for free).
+
+**Shipped on `release/v5.4.0` (committed; partner pushed + deployed):**
+- `a7efff6` branding Spec2JIRA→Spec2Tickets (manifest Settings title + vendor-name headers; rendered UI already brand-correct via `f5b4fb0`). §13-SHIP.
+- `f979931` Managed fair-use cap 10→**25** (breakdown-only → margin-safe: 25 × $0.24 = $6 worst vs $13 = ~54% floor; v5.5.0 test-cases get a SEPARATE compute-budget cap, NOT a lowered count-cap). Env-tunable `MANAGED_USER_CAP`.
+- `9390034`+`8067336`+`5e139bc` compliance pack `docs/compliance/*-v5.4.0.md` (DPA/questionnaire/subprocessors/TIA/IR + PARTNER-CHECKLIST + privacy-security-tab-answers + privacy-policy-update + privacy-tab-CHANGES). claim==code reconciliation (honest no-sweep, 29-day non-ZDR, SCC Module 3) + NEW TIA + IR runbook. §13-SHIP (verified vs manifest/purgeJob/usage). ⚠ These forge-repo drafts keep `[PARTNER]` placeholders; the LIVE site has the PUBLISHED filled + lawyer-approved versions.
+- Deployed → **v5.4.0 Build 2000080, PUBLIC, 2026-06-17.** env confirmed (MANAGED_ANTHROPIC_KEY + ENFORCEMENT_MODE=block).
+
+**Editions Phase 2 — SUBMITTED 2026-06-17 12:10 UTC → PENDING (~10-15 business days):** Standard (DEFAULT, BYOK Pro) $6.70/user ($57 ≤10, declining, 1.5× multi) · Advanced (Managed Pro) **$13.40/user** (= 2× Standard, declining KEPT) — single unique feature "Managed AI — no setup, fair-use 25/user/mo." Editions are CUMULATIVE (single-select; Advanced inherits Standard; our inverted model → BYOK/unlimited goes in the edition DESCRIPTION, not a feature row). Mechanics: `memory/marketplace-publish-mechanics.md`.
+
+**Privacy & Security tab — BYOK→hybrid, submitted.** 4 flips: share=Yes→Anthropic PBC (US); data-processor=Yes; DPA=Yes+/dpa; EEA-transfer=SCC Module 3. ⭐ HARD-WON: the form NESTS "share with sub-processor" UNDER "store-outside-Atlassian=Yes" → you MUST answer store=Yes to declare Anthropic (Claude's first "store=No" advice was WRONG — corrected). Full store-vs-share logic in `marketplace-publish-mechanics`.
+
+**Site (separate repo `…/spec2jira-site/spec2jira-site`, partner pushed):** real Marketplace URL in all 14 CTAs; honest-disclosure via `<!-- v5.5.0 TOGGLE -->` HTML comments (live /privacy /dpa /subprocessors promised a 7-day orphan sweep that's v5.5.0-only → 7-day text hidden-but-preserved, honest v5.4.0 text shown; un-comment when the sweep ships). Lawyer review DONE (processor = Aleks Asenov Asenov, sole trader, Sofia).
+
+**⭐ POST-APPROVAL TODO (Atlassian notifies on approval):** (1) flip `src/usage.js` managedPro.price `null`→`"$13/user/mo"` + wire `PRO_UPGRADE_URL` (= the Marketplace URL) + `MARKETPLACE_REVIEW_URL` [Claude ~5-min]; (2) site /privacy + /pricing Managed "coming soon"→live; (3) test first Managed customer; (4) public listing Version-Info Summary still shows "Minor version update" — refresh/fix. Then **v5.5.0** (big delta + Managed compute-budget cap + un-hide the 7-day TOGGLEs).
+
+**Memory updated:** `marketplace-launch-state` (v5.4.0 LIVE) · `marketplace-publish-mechanics` (NEW) · `monetization-strategy` ($13.40/cap 25) · `mvp-monitoring-cicd` (launch pivot; chapter still pending).
+
+С усмивка ✨ — продуктът е жив на пазара. Дългият път (rejection → pivot → blocker → approval) е затворен; v5.4.0 е минимален, честен, и публично откриваем.
+
+---
+
 ## ⚡ HANDOVER NOTE (2026-06-04 EOD — spec2jira.com rebuilt to USD + in-app "spec"→"page" cleanup + DPA/SEO/a11y; agent-conducted)
 
 A long, agent-conducted session (§13 throughout) updating the **public site** + customer-facing app copy. The site lives in the **SEPARATE GitHub Pages repo** (`C:\Software Engineer\Success\AI-delivery\ai-delivery-platform\MVP-roll-out\spec2jira-site\spec2jira-site`; auto-deploys on `git push`). All §13 gates passed (incl. a 5-agent adversarial audit + per-wave reviews). **NOT committed/deployed — partner pushes the site + builds/deploys the forge app.**
