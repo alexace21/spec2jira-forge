@@ -1513,6 +1513,17 @@ function App() {
                 return { ...prev, perStory: updated, failedCount };
               });
               setRegenStates((prev) => ({ ...prev, [storyIdx]: "done" }));
+              // ⭐ v6 cost-transparency: the backend accumulated this regen's spend into the bulk run
+              // total; re-read the freshly batch-priced cost so the echo (SummaryBar / ConfirmScreen)
+              // stays honest in-session — the delta-patch above preserves the OLD cost. Best-effort,
+              // cheap, reuses the single pricing source (getTestCases). Cost-only patch keeps perStory.
+              invoke("getTestCases", { jobId })
+                .then((tc) => {
+                  if (tc && !tc.error) {
+                    setTestCaseResults((prev) => (prev ? { ...prev, cost: tc.cost, usage: tc.usage } : prev));
+                  }
+                })
+                .catch(() => {});
             } else if (st.status === "failed") {
               clearInterval(regenPollRefs.current[storyIdx]);
               setRegenStates((prev) => ({ ...prev, [storyIdx]: "error" }));
@@ -2134,6 +2145,7 @@ function App() {
           tcGenerating={tcGenerating}
           tcStale={tcStaleVsEdits}
           usage={usage}
+          jobId={jobId}
         />
       );
     case "pushing":
@@ -2797,12 +2809,31 @@ function ConfirmScreen({
   tcGenerating,
   tcStale,
   usage,
+  jobId,
 }) {
   // v6 value-split: test-case generation is an Advanced-edition feature. Gate the UI on the
   // capability the backend sends (usage.hasTestCases). Default-FALSE on an absent field
   // (back-compat: a cached pre-v6 getUsage payload has no hasTestCases → treat as no-access,
   // never leak the premium feature). The backend remains the authority (fail-closed gate).
   const hasTestCases = usage?.hasTestCases === true;
+  // v6 cost-transparency: pre-flight Anthropic-usage estimate for a test-case run. Fetched
+  // (read-only resolver, NO spend) only when test-cases are offered and not already fresh-generated;
+  // re-fetched when the breakdown goes stale (edited ACs → new estimate). Best-effort: on any error
+  // the UI falls back to the qualitative "uses compute" copy (no $), never blocks.
+  const [tcEstimate, setTcEstimate] = useState(null);
+  useEffect(() => {
+    let cancelled = false;
+    if (!hasTestCases || !jobId || (testCaseResults && !tcStale)) {
+      setTcEstimate(null);
+      return undefined;
+    }
+    invoke("estimateTestCaseCost", { jobId, breakdown })
+      .then((r) => { if (!cancelled && r && !r.error) setTcEstimate(r); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+    // `breakdown` is a stable state reference (pendingBreakdown) for the confirm screen's lifetime;
+    // it changes only on an edit, which is exactly when a re-estimate is warranted.
+  }, [hasTestCases, jobId, testCaseResults, tcStale, breakdown]);
   const total = dryRunResult?.total_items || 0;
   const epics = dryRunResult?.total_epics || 0;
   const stories = dryRunResult?.total_stories || 0;
@@ -3250,6 +3281,40 @@ function ConfirmScreen({
               ? "You edited the breakdown since generating these. Re-running re-generates ALL stories (takes a few minutes, uses compute) — or push as-is; the edited stories simply won't get a test-case summary. Your call."
               : "BA-grade Gherkin / CSV export + a summary embedded in each Jira Story."}
           </p>
+          {/* ⭐ v6 cost-transparency: POST-RUN actual echo (green, exact) takes priority; else the
+              PRE-RUN estimate (an honest upper-bound + typical). Both are framed "your own API key,
+              no markup" to disambiguate from the Marketplace subscription price. */}
+          {(() => {
+            const actual = testCaseResults?.cost?.total_usd;
+            // Show the EXACT post-run echo only when the cases are FRESH. On the stale path the BA is
+            // about to pay for a re-run, so the upcoming-run ESTIMATE is the relevant number — fall
+            // through to it (it is already fetched).
+            if (testCaseResults && !tcStaleNow && typeof actual === "number") {
+              return (
+                <p className="text-xs mt-1" style={{ color: "var(--s2j-green-dark)" }}>
+                  💲 This run used <strong>{fmtUsd(actual)}</strong> of Anthropic usage —
+                  billed to your own API key, no markup.
+                </p>
+              );
+            }
+            if (hasTestCases && tcEstimate && (!testCaseResults || tcStaleNow)) {
+              return (
+                <p className="text-xs mt-1" style={{ color: "var(--s2j-text-muted)" }}>
+                  💲 Estimated Anthropic usage:{" "}
+                  <strong>up to ~{fmtUsd(tcEstimate.upper_usd)}</strong>
+                  {tcEstimate.expected_usd
+                    ? ` (typically ~${fmtUsd(tcEstimate.expected_usd)})`
+                    : ""}{" "}
+                  — billed to your own API key, no markup. Rough estimate; you'll see the exact
+                  amount after the run.
+                  {tcEstimate.has_spec_source === false
+                    ? " (excludes source-spec context; actual may be lower)"
+                    : ""}
+                </p>
+              );
+            }
+            return null;
+          })()}
         </div>
         <div className="shrink-0 flex items-center gap-2">
           {/* Navigate to the Test Cases screen — available whenever test cases exist, INCLUDING the
@@ -3301,9 +3366,12 @@ function ConfirmScreen({
             <button
               type="button"
               onClick={() => {
-                // Stale re-run-all is expensive (every story re-billed) → arm a 2-step confirm so the BA
-                // consciously consents (Phase-1 cost fix). First click arms; second (within 4s) fires.
-                if (tcStaleNow && !regenArmed) {
+                // ⭐ v6: confirm-before-spend on BOTH bulk paths — first-time generate AND stale
+                // re-run-all are each a paid Anthropic run (the $ estimate sits right above). First
+                // click arms (the BA sees the estimate + a "confirm" label); second (within 4s) fires.
+                // (Previously only the stale re-run armed; first-time generate spent with no confirm —
+                // the main bill-shock vector.)
+                if (!regenArmed) {
                   setRegenArmed(true);
                   clearTimeout(regenArmTimer.current);
                   regenArmTimer.current = setTimeout(() => setRegenArmed(false), 4000);
@@ -3327,10 +3395,12 @@ function ConfirmScreen({
             >
               {tcGenerating
                 ? "⏳ Generating tests…"
+                : regenArmed
+                ? tcStaleNow
+                  ? `⚠ Confirm re-run (${stories} stories)`
+                  : "⚠ Confirm & generate"
                 : tcStaleNow
-                ? regenArmed
-                  ? `⚠ Re-runs all ${stories} stories — confirm?`
-                  : "🔄 Re-run all"
+                ? "🔄 Re-run all"
                 : "🧪 Generate Test Cases"}
             </button>
           )}
@@ -4370,6 +4440,15 @@ function SetupScreen({ message, onOpenSettings }) {
 }
 
 // ── Util ────────────────────────────────────────────────────────
+
+// v6 cost-transparency: format a COMPUTE-cost dollar amount (Anthropic usage on the customer's
+// own key — distinct from the Marketplace subscription price rendered via findPrice). Non-zero
+// amounts under a cent floor to $0.01 so a tiny figure still reads as a real (small) cost.
+function fmtUsd(usd) {
+  if (typeof usd !== "number" || !isFinite(usd) || usd <= 0) return "$0.00";
+  if (usd < 0.01) return "$0.01";
+  return `$${usd.toFixed(2)}`;
+}
 
 // Look up a tier's display price from a getUsage/quota pricing[] array. The
 // pricing table is the SINGLE source of USD prices (composed server-side) — the UI

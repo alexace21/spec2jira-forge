@@ -55,6 +55,9 @@ import {
   submitTestCaseBatch,
   pollTestCaseBatch,
   fetchTestCaseResults,
+  projectTestCaseCost, // v6 cost-transparency: pre-flight projector
+  sumUsage, // v6 cost-transparency: batch-wide usage aggregation for the post-run echo
+  TC_SPEC_SOURCE_MAX_CHARS, // v6: clamp the projector's spec-source input identically to submit
 } from './anthropic_client.js';
 import { startPushSession, pushSessionStep, flattenBreakdown, lookupProject } from './push_handler.js';
 import { isOrphanStale } from './sweep_util.js'; // Task #13: pure staleness decision (unit-tested; index.js isn't node-importable)
@@ -2160,8 +2163,12 @@ resolver.define('pollJobStatus', async ({ payload, context }) => {
         return failed;
       }
 
-      // Success — compute cost + persist completed state
-      const costEstimate = estimateCost(fetchResult.usage, fetchResult.model);
+      // Success — compute cost + persist completed state.
+      // ⭐ v6: breakdown ALSO runs via the Batches API (50% of sync rates), so price it
+      // batch-rate. This corrects the pre-existing ~2× over-statement of the cost_usd
+      // diagnostic below (it is a dev-internal breadcrumb, not user-facing — the value will
+      // step DOWN ~50% from this deploy onward; expected, documented in the release notes).
+      const costEstimate = estimateCost(fetchResult.usage, fetchResult.model, { batch: true });
       const elapsedMs =
         Date.now() - new Date(job.submittedAt || job.createdAt).getTime();
 
@@ -3408,12 +3415,19 @@ resolver.define('pollTestCaseStatus', async ({ payload, context }) => {
 
     const completedAt = new Date().toISOString();
     const failedCount = perStory.filter((e) => e.error).length;
+    // ⭐ v6 cost-transparency: sum the per-request usage across the batch (each perStory entry
+    // now carries message.usage) → store the raw token totals on the tcjob. The dollar cost is
+    // derived on READ (getTestCases), keeping ONE pricing source of truth. 4 integers — rides the
+    // existing tcjob write, no per-story KVS bloat. A regen later ACCUMULATES into this (see
+    // pollRegenerateTestCase) so the displayed run total stays honest as the BA re-runs stories.
+    const batchUsage = sumUsage(perStory.map((e) => e.usage));
     const completed = {
       ...tcJob,
       status: 'completed',
       completedAt,
       batchStatus: 'ended',
       failedCount,
+      usage: batchUsage,
     };
     // #10 — do NOT merge perStory payloads into tcjob (240KB KVS value-size guard)
     // [diag F1, (d) completed-flip wrap — same retry contract as (F)] the per-story results
@@ -3569,6 +3583,16 @@ resolver.define('getTestCases', async ({ payload }) => {
 
   const failedCount = perStory.filter((e) => e && e.error).length;
 
+  // ⭐ v6 cost-transparency: surface the EXACT post-run cost echo. The tcjob stores raw token
+  // totals (usage); price them batch-rate on READ so the stored record stays the single source of
+  // truth and re-pricing never drifts. null when usage is absent (legacy pre-v6 tcjobs) OR all-zero
+  // (a fully-errored run that billed nothing) → the FE hides the cost row rather than showing a
+  // misleading "$0.00 used". estimateCost is pure; no extra API call.
+  const rawUsage = tcJob.usage || null;
+  const usage = (rawUsage && (rawUsage.input_tokens || rawUsage.output_tokens
+    || rawUsage.cache_creation_input_tokens || rawUsage.cache_read_input_tokens)) ? rawUsage : null;
+  const cost = usage ? estimateCost(usage, MODEL_PRIMARY, { batch: true }) : null;
+
   return {
     perStory,
     total,
@@ -3576,7 +3600,56 @@ resolver.define('getTestCases', async ({ payload }) => {
     breakdownPageVersion,
     failedStories,
     failedCount,
+    usage,
+    cost, // { total_usd, breakdown, cache_hit, tokens } — batch-priced; the FE shows total_usd
   };
+});
+
+/**
+ * estimateTestCaseCost — v6 cost-transparency PRE-FLIGHT. Projects an HONEST batch-priced cost
+ * RANGE for a test-case run BEFORE spending, so the customer confirms against the worst realistic
+ * case. PURE read + projection: loads NO Anthropic key, submits NOTHING, consumes NO quota.
+ * Computed backend-side because only here can we read the cached source-spec size (pagesnap) that
+ * materially drives input cost. Accepts the SAME edited `breakdown` payload startTestCaseGeneration
+ * does (read-only — never persists), so the estimate tracks the ACs the run will actually use.
+ * No hasTestCases gate: it is a harmless number with no spend/output; the frontend only offers it
+ * to Advanced (the Generate button is gated), and the real spend gate is on startTestCaseGeneration.
+ */
+resolver.define('estimateTestCaseCost', async ({ payload }) => {
+  const { jobId } = payload || {};
+  if (!jobId) return { error: 'no_job_id', detail: 'jobId is required.' };
+  await touchJobAccess(jobId); // viewing the estimate is activity on this breakdown
+
+  const job = await kvs.get(`${JOB_KEY_PREFIX}${jobId}`);
+  if (!job || !job.breakdown) return { error: 'not_found', detail: `Breakdown job ${jobId} not found.` };
+
+  // Per-story AC counts from the EDITED breakdown (payload.breakdown) when sent — so the estimate
+  // matches the run — else the stored breakdown. Read-only: NEVER persists (unlike start's #1 fix).
+  let stories = [];
+  if (payload && payload.breakdown) {
+    try {
+      const { features } = flattenBreakdown(payload.breakdown);
+      if (Array.isArray(features) && features.length > 0) stories = features;
+    } catch (_) { /* fall through to the stored breakdown */ }
+  }
+  if (stories.length === 0 && Array.isArray(job.breakdown.features)) stories = job.breakdown.features;
+  if (stories.length === 0) return { error: 'no_stories', detail: 'No stories to estimate.' };
+
+  const storyACcounts = stories.map((s) =>
+    (Array.isArray(s && s.acceptance_criteria) ? s.acceptance_criteria.length : 0));
+
+  // Cached source-spec size (only the backend sees the pagesnap). Fail-soft → 0 (no source block),
+  // matching submitTestCaseBatch's no-source fallback so the estimate tracks reality.
+  let specSourceChars = 0;
+  try {
+    const src = await resolveSpecSourceText(jobId, job);
+    // .trim() before measuring — submitTestCaseBatch trims then slices, so this matches the bytes
+    // the run actually sends (the "identical clamp" invariant).
+    specSourceChars = typeof src === 'string' ? Math.min(src.trim().length, TC_SPEC_SOURCE_MAX_CHARS) : 0;
+  } catch (_) { /* no source → 0 */ }
+
+  const projection = projectTestCaseCost({ storyACcounts, specSourceChars, model: MODEL_PRIMARY });
+  return { ...projection, has_spec_source: specSourceChars > 0 };
 });
 
 /**
@@ -4158,16 +4231,33 @@ resolver.define('pollRegenerateTestCase', async ({ payload, context }) => {
     if (entry && !entry.error && editedStory) {
       try {
         const bulkTcJob = await kvs.get(`${TC_JOB_KEY_PREFIX}${jobId}`);
-        if (bulkTcJob && Array.isArray(bulkTcJob.stampedStories)) {
-          const pos = bulkTcJob.stampedStories.findIndex((s) => s && s.idx === storyIdx);
-          if (pos >= 0) {
-            bulkTcJob.stampedStories[pos] = {
-              ...bulkTcJob.stampedStories[pos],
-              name: editedStory.name || bulkTcJob.stampedStories[pos].name,
-              acceptance_criteria: Array.isArray(editedStory.acceptance_criteria) ? editedStory.acceptance_criteria : [],
-            };
-            await kvs.set(`${TC_JOB_KEY_PREFIX}${jobId}`, bulkTcJob);
+        if (bulkTcJob) {
+          let dirty = false;
+          // ⭐ v6 cost-transparency (CRITICAL): accumulate THIS regen's real usage into the bulk
+          // run total so the echo stays honest as the BA re-runs stories (a regen is additional
+          // real spend on the same run). Folded into the existing read-modify-write (free). Idempotent:
+          // a completed regen early-returns at the top (status guard), so this runs exactly once.
+          // ⚠ KNOWN RESIDUAL (accepted): a "Regenerate N failed" fan-out fires N parallel regens that
+          // each read-modify-write this one key — Forge KVS has no compare-and-set, so concurrent
+          // accumulations can lose-update and the echo under-counts slightly. Rare (only the bulk-retry
+          // fan-out), customer-favourable direction, and self-corrects on the next getTestCases that
+          // reads a settled tcjob. Not worth a per-regen-key + sum-on-read rework for the MVP.
+          if (entry.usage) {
+            bulkTcJob.usage = sumUsage([bulkTcJob.usage, entry.usage]);
+            dirty = true;
           }
+          if (Array.isArray(bulkTcJob.stampedStories)) {
+            const pos = bulkTcJob.stampedStories.findIndex((s) => s && s.idx === storyIdx);
+            if (pos >= 0) {
+              bulkTcJob.stampedStories[pos] = {
+                ...bulkTcJob.stampedStories[pos],
+                name: editedStory.name || bulkTcJob.stampedStories[pos].name,
+                acceptance_criteria: Array.isArray(editedStory.acceptance_criteria) ? editedStory.acceptance_criteria : [],
+              };
+              dirty = true;
+            }
+          }
+          if (dirty) await kvs.set(`${TC_JOB_KEY_PREFIX}${jobId}`, bulkTcJob);
         }
       } catch (e) {
         console.error(`[pollRegenTC] stampedStories sync failed (non-fatal): ${String(e?.message || e)} ref=${jobId}`);

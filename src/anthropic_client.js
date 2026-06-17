@@ -49,6 +49,11 @@ export const MODEL_FALLBACK = 'claude-haiku-4-5';
 // >50-dense-story follow-up.
 export const TC_MAX_OUTPUT_TOKENS = 24000;
 
+// Feed-side char cap for the shared SOURCE SPECIFICATION block injected into the test-case
+// batch (one cache-write + N-1 cache-reads). Exported so the v6 cost PROJECTOR clamps the
+// spec-source input identically to what submitTestCaseBatch actually sends — no estimate drift.
+export const TC_SPEC_SOURCE_MAX_CHARS = 80000;
+
 // Output cap. Sonnet 4.6's max output is 64K tokens — we use ALL of it for
 // maximum headroom (it is a CEILING, not a target: a small spec still emits a
 // small breakdown, so the larger cap costs nothing on normal specs). Sizing:
@@ -270,21 +275,35 @@ export async function testConnection(apiKey = null) {
 // ── Cost estimator ──────────────────────────────────────────
 
 /**
- * Estimate cost of a breakdown generation call в USD от its token usage.
- * Used by tier enforcement к decide когато customer hits subscription cap.
+ * Estimate cost of a Claude call в USD от its token usage.
+ * Used by tier enforcement + (v6) the customer-facing cost-transparency surface.
  *
- * Sonnet 4.6 pricing (verified 2026-05-27):
+ * Sonnet 4.6 pricing (verified 2026-05-27, standard/sync rates):
  *   Base input: $3.00 / MTok | Cache write 5m: $3.75 | Cache read: $0.30
  *   Output: $15.00
  *
  * Haiku 4.5 pricing:
  *   Base input: $1.00 / MTok | Cache write: $1.25 | Cache read: $0.10
  *   Output: $5.00
+ *
+ * ⭐ v6 — `opts.batch`: the Message Batches API is 50% of standard prices on ALL
+ * token usage (confirmed Anthropic API ref). BOTH breakdown AND test-case generation
+ * run via Batches, so their REAL cost is half what the sync rates above give. Pass
+ * `{ batch: true }` for any batch-submitted usage (default false preserves the default-rate
+ * math for any caller that omits the flag — byte-identical to pre-v6). Omitting it OVER-STATES
+ * the bill 2×, which on a customer-facing echo is its own trust failure.
  */
-export function estimateCost(usage, model = MODEL_PRIMARY) {
-  const rates = model.startsWith('claude-haiku')
+export function estimateCost(usage, model = MODEL_PRIMARY, { batch = false } = {}) {
+  const f = batch ? 0.5 : 1; // Batches API = 50% of standard prices, on every bucket
+  const base = model.startsWith('claude-haiku')
     ? { input: 1.0, cache_write: 1.25, cache_read: 0.1, output: 5.0 }
     : { input: 3.0, cache_write: 3.75, cache_read: 0.3, output: 15.0 };
+  const rates = {
+    input: base.input * f,
+    cache_write: base.cache_write * f,
+    cache_read: base.cache_read * f,
+    output: base.output * f,
+  };
 
   const inputTokens = usage?.input_tokens || 0;
   const cacheCreateTokens = usage?.cache_creation_input_tokens || 0;
@@ -310,6 +329,101 @@ export function estimateCost(usage, model = MODEL_PRIMARY) {
       cache_read: cacheReadTokens,
       output: outputTokens,
     },
+  };
+}
+
+/**
+ * Null-safe sum of N Anthropic usage blocks into one (for the batch-wide post-run echo).
+ * A test-case batch returns one usage block per Story (per request); the customer's bill
+ * is the SUM across the run. Pure.
+ */
+export function sumUsage(usages) {
+  const acc = { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 };
+  for (const u of usages || []) {
+    if (!u) continue;
+    acc.input_tokens += u.input_tokens || 0;
+    acc.output_tokens += u.output_tokens || 0;
+    acc.cache_creation_input_tokens += u.cache_creation_input_tokens || 0;
+    acc.cache_read_input_tokens += u.cache_read_input_tokens || 0;
+  }
+  return acc;
+}
+
+// ── v6 cost-transparency: pre-flight PROJECTOR for a test-case run ──────────────
+// PURE, deterministic (POLICY §4) — projects an HONEST batch-priced cost RANGE from the
+// breakdown shape BEFORE spending, so the customer consents against the worst realistic case.
+// It does NOT call count_tokens: the bill-driving axis is OUTPUT (16× variance) which is
+// UNCOUNTABLE ahead of time, so count_tokens would only make the cheap INPUT half precise
+// while charging an extra BYOK call + Confirm-step latency — false confidence. char/4 heuristic
+// on input + an AC-scaled output heuristic is the honest shape for a 16×-variance quantity.
+//
+// ⚠ The per-AC / per-story constants below are UNCALIBRATED heuristics (no production echo data
+// yet). They MUST be calibrated against a handful of REAL echoed runs before relying on the
+// EXPECTED figure — the post-run echo (sumUsage → estimateCost) is the ground truth that feeds
+// that calibration. Until then the UPPER bound is deliberately generous so the echo rarely
+// exceeds it (under-stating then echoing higher is a worse trust failure than over-stating).
+const CHARS_PER_TOKEN = 4; // standard rough English approximation; exact counts come from the echo
+const TC_USER_BASE_TOKENS = 500; // per-story user-prompt scaffold (buildTestCaseUserPrompt fixed parts)
+const TC_INPUT_TOKENS_PER_AC = 120; // per-AC input text in the user block
+const TC_OUTPUT_BASE_TOKENS = 400; // per-story output floor scaffold
+const TC_OUTPUT_TOKENS_PER_AC = 700; // ~one scenario cluster of output per AC
+const TC_OUTPUT_FLOOR_TOKENS = 600; // a story always emits at least this much
+const TC_UPPER_MULTIPLIER = 2.6; // high-side factor on OUTPUT (the variance axis) for the "up to ~$X" bound (raised from 2.2 — the upper must genuinely bracket the right tail of a 16× quantity)
+// Cap the EXPECTED per-story output strictly BELOW the ceiling so expected < upper ALWAYS holds
+// (even an extreme-AC story never quotes the 24K ceiling as its expected value). The UPPER bound
+// still reaches the full ceiling.
+const TC_EXPECTED_OUTPUT_CAP = Math.floor(TC_MAX_OUTPUT_TOKENS * 0.85);
+
+/**
+ * Project a test-case run's cost. The shared system + source-spec block is cache-amortized
+ * (1 cache-write + N-1 cache-reads — NOT N× full price, which would over-state ~10×). Output
+ * is heuristic, clamped to the per-story TC_MAX_OUTPUT_TOKENS ceiling but NEVER quoting the
+ * ceiling as the expected value. Returns batch-priced USD.
+ * @param {object} args
+ * @param {number[]} args.storyACcounts - per-story acceptance-criteria counts (length = story count)
+ * @param {number} [args.specSourceChars] - chars of the cached SOURCE SPECIFICATION block (0 if none)
+ * @param {string} [args.model]
+ * @returns {{expected_usd:number, upper_usd:number, story_count:number, ac_total:number}}
+ */
+export function projectTestCaseCost({ storyACcounts = [], specSourceChars = 0, model = MODEL_PRIMARY } = {}) {
+  const counts = Array.isArray(storyACcounts) ? storyACcounts : [];
+  const N = counts.length;
+  if (N === 0) return { expected_usd: 0, upper_usd: 0, story_count: 0, ac_total: 0 };
+
+  const clampedSourceChars = Math.min(Math.max(0, Number(specSourceChars) || 0), TC_SPEC_SOURCE_MAX_CHARS);
+  // Shared ephemeral block (system prompt + optional source spec): written ONCE, read N-1 times.
+  const sharedTokens = Math.ceil((TEST_CASE_SYSTEM_PROMPT.length + clampedSourceChars) / CHARS_PER_TOKEN);
+
+  let userInputTokens = 0;
+  let expectedOutputTokens = 0;
+  let upperOutputTokens = 0;
+  let acTotal = 0;
+  for (const raw of counts) {
+    const ac = Math.max(0, Number(raw) || 0);
+    acTotal += ac;
+    userInputTokens += TC_USER_BASE_TOKENS + ac * TC_INPUT_TOKENS_PER_AC;
+    const expOut = Math.min(
+      Math.max(TC_OUTPUT_BASE_TOKENS + ac * TC_OUTPUT_TOKENS_PER_AC, TC_OUTPUT_FLOOR_TOKENS),
+      TC_EXPECTED_OUTPUT_CAP, // expected stays below the ceiling so expected < upper always
+    );
+    expectedOutputTokens += expOut;
+    // Upper reaches the full per-story ceiling; based on the UNCAPPED expected to bracket the tail.
+    const uncappedExp = Math.max(TC_OUTPUT_BASE_TOKENS + ac * TC_OUTPUT_TOKENS_PER_AC, TC_OUTPUT_FLOOR_TOKENS);
+    upperOutputTokens += Math.min(Math.round(uncappedExp * TC_UPPER_MULTIPLIER), TC_MAX_OUTPUT_TOKENS);
+  }
+
+  const sharedUsage = {
+    cache_creation_input_tokens: sharedTokens, // written once (story 0)
+    cache_read_input_tokens: sharedTokens * (N - 1), // read by the other N-1
+    input_tokens: userInputTokens, // per-story user blocks, uncached
+  };
+  const expected = estimateCost({ ...sharedUsage, output_tokens: expectedOutputTokens }, model, { batch: true });
+  const upper = estimateCost({ ...sharedUsage, output_tokens: upperOutputTokens }, model, { batch: true });
+  return {
+    expected_usd: expected.total_usd,
+    upper_usd: upper.total_usd,
+    story_count: N,
+    ac_total: acTotal,
   };
 }
 
@@ -727,7 +841,7 @@ export async function submitTestCaseBatch({ stories, allStories, siblingNames, s
   // requests → the page is a single cache-write + N-1 cache-reads (~10%), not N× full price.
   // Feed-side char cap (a pathological page can't blow the input budget; the snapshot was already
   // byte-capped at capture). Absent snapshot → omit the block → today's behaviour (backward-compat).
-  const TC_SPEC_SOURCE_MAX_CHARS = 80000;
+  // (TC_SPEC_SOURCE_MAX_CHARS is module-level + exported so the cost projector clamps identically.)
   const specSource = typeof specSourceText === 'string' ? specSourceText.trim().slice(0, TC_SPEC_SOURCE_MAX_CHARS) : '';
   const hasSpecSource = specSource.length > 0;
   if (hasSpecSource) {
@@ -913,8 +1027,14 @@ export async function fetchTestCaseResults(resultsUrl, stampedStories, apiKey) {
       continue;
     }
 
+    // ⭐ v6 cost-transparency: a message-bearing row consumed tokens even when its OUTPUT is
+    // unusable (refusal / max_tokens truncation / parse failure / coverage reject). Capture usage
+    // ONCE here and attach it to EVERY downstream push — dropping it on the error branches
+    // under-counts the echo, and the costliest failure (max_tokens) is the one most worth counting.
+    const usage = message.usage || null;
+
     if (message.stop_reason === 'refusal') {
-      perStory.push({ storyIdx, error: 'refused', detail: 'Anthropic declined to process this story.' });
+      perStory.push({ storyIdx, error: 'refused', detail: 'Anthropic declined to process this story.', usage });
       continue;
     }
 
@@ -937,8 +1057,8 @@ export async function fetchTestCaseResults(resultsUrl, stampedStories, apiKey) {
       // persist it (this detail is written to KVS). Keep the failure signal generic.
       perStory.push(
         truncated
-          ? { storyIdx, error: 'truncated', detail: `Output for story index ${storyIdx} hit the ${TC_MAX_OUTPUT_TOKENS}-token cap mid-JSON and could not be recovered. Regenerate this story.` }
-          : { storyIdx, error: 'parse_failed', detail: `Invalid JSON returned for story index ${storyIdx} (raw output omitted for privacy).` },
+          ? { storyIdx, error: 'truncated', detail: `Output for story index ${storyIdx} hit the ${TC_MAX_OUTPUT_TOKENS}-token cap mid-JSON and could not be recovered. Regenerate this story.`, usage }
+          : { storyIdx, error: 'parse_failed', detail: `Invalid JSON returned for story index ${storyIdx} (raw output omitted for privacy).`, usage },
       );
       continue;
     }
@@ -950,11 +1070,13 @@ export async function fetchTestCaseResults(resultsUrl, stampedStories, apiKey) {
 
     const parseOutcome = parseTestCaseResult(parsed, storyRef);
     if (parseOutcome.error) {
-      perStory.push({ storyIdx, error: parseOutcome.error, detail: parseOutcome.detail });
+      perStory.push({ storyIdx, error: parseOutcome.error, detail: parseOutcome.detail, usage });
     } else {
       // [diag Phase 4, A5] truncated-but-parsed: the cases are KEPT (the pure coverage strip
       // stays authoritative) with an honest additive flag — never a silent clean success.
-      perStory.push({ storyIdx, result: parseOutcome.result, coverage: parseOutcome.coverage, ...(truncated ? { truncated: true } : {}) });
+      // ⭐ v6 cost-transparency: carry the per-request usage (input/output/cache tokens) so the
+      // poll resolver can sum a batch-wide total and price the EXACT post-run echo (captured once above).
+      perStory.push({ storyIdx, result: parseOutcome.result, coverage: parseOutcome.coverage, usage, ...(truncated ? { truncated: true } : {}) });
     }
   }
 

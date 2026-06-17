@@ -215,6 +215,14 @@ function GeneratePrompt({ storyCount, onGenerate }) {
 // "{N} stories · {total} cases · {failedCount} failed [↻ Regenerate N failed]"
 // Fix 7 (Audit-5): when failedCount > 0, offer a single "↻ Regenerate N failed" button
 // that loops onRegenerate(storyIdx) for every failed entry only — preserves good stories.
+// v6 cost-transparency: format the post-run Anthropic-usage cost (your own key, no markup —
+// distinct from the subscription price). Non-zero amounts under a cent floor to $0.01.
+function fmtUsd(usd) {
+  if (typeof usd !== "number" || !isFinite(usd) || usd <= 0) return "$0.00";
+  if (usd < 0.01) return "$0.01";
+  return `$${usd.toFixed(2)}`;
+}
+
 function SummaryBar({ testCaseResults, onRegenerate }) {
   if (!testCaseResults) return null;
   const { perStory = [], total = 0, failedCount = 0 } = testCaseResults;
@@ -274,6 +282,20 @@ function SummaryBar({ testCaseResults, onRegenerate }) {
           <strong style={{ color: "var(--s2j-text)" }}>{totalCases}</strong>{" "}
           test case{totalCases !== 1 ? "s" : ""}
         </span>
+        {/* ⭐ v6 cost-transparency: exact post-run Anthropic-usage echo for this run (your own key,
+            no markup) — disambiguated from the subscription price by the 💲 + "used" + the title. */}
+        {typeof testCaseResults?.cost?.total_usd === "number" && (
+          <>
+            <span>·</span>
+            <span title="Anthropic API usage for this run — billed to your own API key, no markup">
+              💲{" "}
+              <strong style={{ color: "var(--s2j-text)" }}>
+                {fmtUsd(testCaseResults.cost.total_usd)}
+              </strong>{" "}
+              used
+            </span>
+          </>
+        )}
         {failedCount > 0 && (
           <>
             <span>·</span>
