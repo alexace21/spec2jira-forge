@@ -227,13 +227,17 @@ retention at the Sub-processor; do not read it as a "zero-retention" guarantee.*
   breakdown to Jira (`purgeJob` deletes the job's content + breakdown and its page→job index;
   the push-session record is deleted when the push completes). This is best-effort and runs as
   part of the normal flow.
-- **[PARTNER: verify]** a backstop for abandoned jobs: confirm that breakdowns which are
-  generated but never pushed are also removed (e.g. via a Forge scheduled-trigger sweep or a
-  KVS TTL), so transient content does not linger if a user walks away. If no automatic backstop
-  exists yet, either (a) implement one before launch, or (b) state the honest current behaviour
-  here (content persists in the Customer's own Forge instance until overwritten by a new
-  generation, until the user pushes, or until the App is uninstalled). **Do not claim an
-  automatic time-boxed purge that the code does not perform.**
+- **Backstop for abandoned jobs (implemented 2026-06-14, Task #13):** a breakdown that is
+  generated but never pushed is removed automatically by a daily **Forge scheduled-trigger
+  sweep** (`sweepHandler` in `src/index.js`) **7 days after its last access**. This is an
+  INACTIVITY timer, not a fixed lifetime: it is renewed (`jobmeta.lastAccessedAt`, via
+  `touchJobAccess`) on every meaningful access — review/reconnect AND the test-case + push sub-journeys —
+  so a breakdown a user is actively working (incl. its test cases) is preserved. A creation-anchored native KVS TTL was
+  deliberately rejected — a KVS TTL renews only on `set`, so a read-only review/push would
+  silently delete the deliverable. The sweep also covers breakdowns regenerated away (each
+  regenerate orphans the prior job, which then ages out of access). So transient content does
+  not linger if a user walks away. The user is told this on the picker (a 7-day-inactivity
+  notice); the claim is exactly what the code performs (no over-claim).
 - Uninstalling the App removes its Forge-stored data for that instance.
 
 ### 7.2 At Anthropic (Sub-processor — the residual retention to disclose)

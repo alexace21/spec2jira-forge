@@ -59,7 +59,19 @@ export function parseConcernPrefix(raw) {
 export function adaptToLegacyShape(v3) {
   if (!v3 || typeof v3 !== 'object') return v3;
 
-  const features = Array.isArray(v3.features) ? v3.features : [];
+  // (POLICY §3.5 simplicity-over-complexity) mint a stable _uid on every feature once
+  // (frontend-first identity) so the test-case staleness + per-card regen bind to IT — surviving
+  // reorder / rename / restructure where index- or name-matching mis-targets. Idempotent: an
+  // already-uid'd feature (reloaded from a persisted breakdown) is left untouched → uid is stable.
+  // Task #3 (name→uid links): ALSO freeze _orig_name = the GENERATION name (canonical HERE —
+  // this runs at load, BEFORE any editor rename). Dependency strings stay frozen generation names
+  // too, so the push (flattenBreakdown) maps a frozen dep-name → _orig_name → _uid and a rename can
+  // never break the link. Both fields are captured in the SAME idempotent pass and ride edits via spread.
+  const features = (Array.isArray(v3.features) ? v3.features : []).map((f) => {
+    if (!f || typeof f !== 'object') return f;
+    if (f._uid && f._orig_name) return f; // both already minted → stable, untouched
+    return { ...f, _uid: f._uid || newStoryUid(), _orig_name: f._orig_name || f.name };
+  });
 
   // Group by category
   const categoryMap = new Map();
@@ -113,8 +125,20 @@ export function adaptToLegacyShape(v3) {
     shared_acceptance_criteria: sharedAC,
     metadata: v3.metadata,
     spec_concerns: v3.spec_concerns,
-    _v3_original: v3,
+    _v3_original: { ...v3, features },
   };
+}
+
+// Stable per-story identity (POLICY §3.5). Minted once on the frontend when a breakdown loads
+// (adaptToLegacyShape above) or a feature is added in the editor, then threaded through edits (the
+// editor spreads feature objects → _uid survives), test-case stamping, and the per-story staleness /
+// per-card regen binding — so identity is robust to reorder / rename / restructure. Function
+// declaration → hoisted, so adaptToLegacyShape may call it above. Prefixed 's_' for readable logs.
+export function newStoryUid() {
+  try {
+    if (typeof crypto !== 'undefined' && crypto.randomUUID) return 's_' + crypto.randomUUID();
+  } catch (_) {}
+  return 's_' + Math.random().toString(36).slice(2, 12) + Date.now().toString(36);
 }
 
 // ════════════════════════════════════════════════════════════
@@ -134,7 +158,7 @@ export function adaptToLegacyShape(v3) {
  *     parsedSpecConcerns: [{type, severity, text}],
  *     parsedFeatureConcerns: [{featureName, type, severity, text}],
  *     categories: [{name, featureCount}],
- *     dependencyEdges: [{source, target}],
+ *     dependencyEdges: [{source, target, targetDisplay}], // target = FROZEN dep string (mutation key); targetDisplay = current name (display)
  *     epicSummary: string | null,
  *     hasEpic: boolean,
  *   }
@@ -172,6 +196,16 @@ export function extractV3Signals(breakdown) {
   let scoreSum = 0;
   let scoreCount = 0;
 
+  // Task #4: frozen _orig_name → CURRENT name, so a dependency edge (whose target is
+  // the depended-on feature's FROZEN generation name) can DISPLAY the current name
+  // after a rename. Display-only — the frozen string stays the remove/restore mutation
+  // key. First-match on a duplicate _orig_name (rare; the mutation is unaffected).
+  const origToCurrent = new Map();
+  for (const f of features) {
+    const k = f && (f._orig_name || f.name);
+    if (k != null && !origToCurrent.has(k)) origToCurrent.set(k, f.name);
+  }
+
   for (const f of features) {
     totalTasks += (f.tasks || []).length;
     totalFeatureACs += (f.acceptance_criteria || []).length;
@@ -197,7 +231,9 @@ export function extractV3Signals(breakdown) {
     }
 
     for (const depTarget of f.dependencies || []) {
-      dependencyEdges.push({ source: f.name, target: depTarget });
+      // target = the FROZEN dep string (the remove/restore mutation key); targetDisplay
+      // = the depended-on feature's CURRENT name for the Review display (Task #4).
+      dependencyEdges.push({ source: f.name, target: depTarget, targetDisplay: origToCurrent.get(depTarget) || depTarget });
     }
 
     for (const concernRaw of f.concerns || []) {

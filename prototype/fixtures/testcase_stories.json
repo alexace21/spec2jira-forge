@@ -1,0 +1,117 @@
+{
+  "_note": "Validation fixtures for the per-Story TEST_CASE prompt (T2). Deliberately spans distinct domains (clinical / fintech / logistics) plus three behaviour probes (trivial=boundedness, no_acs=loud inference, rich=coverage-at-scale + the maxItems ceiling). Each story carries the full §8 contract (siblingNames + sharedAcceptanceCriteria + specSummary) so the harness exercises informational completeness, not a starved call. ACs are written with deliberate numeric boundaries and implied negative paths so falsifiability + edge/negative coverage can be judged rule-by-rule across runs.",
+  "stories": [
+    {
+      "id": "clinical-med-admin",
+      "domain": "clinical",
+      "probe": "boundaries + high-alert negative",
+      "story": {
+        "name": "Record a medication administration",
+        "category": "Medication Management",
+        "user_story": "As a ward nurse, I want to record that I gave a patient a medication dose, so that the medication-administration record is accurate and the next nurse can see what was given.",
+        "description": "Nurse scans the patient wristband and the medication, enters the dose, and confirms administration. The system records it against the active prescription.",
+        "acceptance_criteria": [
+          "AC1: A dose may only be recorded against an active prescription for that patient.",
+          "AC2: The recorded dose must be within the prescribed minimum and maximum for that prescription; a dose outside the range is blocked.",
+          "AC3: For a high-alert medication, a second nurse must co-sign within 5 minutes or the administration is not committed.",
+          "AC4: Each recorded administration stores the administering nurse, the timestamp, and the dose."
+        ]
+      },
+      "siblingNames": ["Record a medication administration", "Prescribe a medication", "Reconcile medications on discharge", "View the patient medication history"],
+      "sharedAcceptanceCriteria": ["Every clinical action is written to an immutable audit log.", "A user may only act on patients in a ward they are assigned to."],
+      "specSummary": "Inpatient electronic medication management: prescribing, administration with barcode verification, high-alert co-signing, and discharge reconciliation."
+    },
+    {
+      "id": "fintech-transfer",
+      "domain": "fintech",
+      "probe": "limits + multiple negative paths",
+      "story": {
+        "name": "Transfer funds between own accounts",
+        "category": "Money Movement",
+        "user_story": "As a retail banking customer, I want to move money between my own accounts, so that I can manage my balances instantly.",
+        "description": "Customer picks a source and destination account they own, enters an amount, and confirms. The transfer settles immediately.",
+        "acceptance_criteria": [
+          "AC1: The transfer is rejected if the amount exceeds the available balance of the source account.",
+          "AC2: A single transfer may not exceed 25,000 in the account currency.",
+          "AC3: The total transferred from one account in a calendar day may not exceed 50,000.",
+          "AC4: Source and destination must be different accounts both owned by the customer.",
+          "AC5: On success, both account balances reflect the transfer immediately and a reference number is returned."
+        ]
+      },
+      "siblingNames": ["Transfer funds between own accounts", "Pay a registered payee", "Set up a standing order", "View transaction history"],
+      "sharedAcceptanceCriteria": ["All monetary amounts are handled to two decimal places with no rounding loss.", "Every money movement is reversible only via an explicit reversal transaction, never by edit."],
+      "specSummary": "Retail banking money-movement module: internal transfers, external payees, standing orders, with per-transaction and daily limits."
+    },
+    {
+      "id": "logistics-van-assign",
+      "domain": "logistics",
+      "probe": "capacity boundaries + time window",
+      "story": {
+        "name": "Assign a parcel to a delivery van",
+        "user_story": "As a depot dispatcher, I want to assign a parcel to a van on a route, so that it is delivered within its promised window.",
+        "description": "Dispatcher selects a parcel and a van scheduled for a route; the system validates fit and adds the parcel to the van's manifest.",
+        "acceptance_criteria": [
+          "AC1: A parcel may only be assigned to a van whose remaining weight capacity is at least the parcel's weight.",
+          "AC2: A parcel may only be assigned to a van whose route covers the parcel's destination postcode.",
+          "AC3: The parcel's promised delivery window must fall within the van's route operating hours.",
+          "AC4: A parcel that is already on a manifest cannot be assigned to a second van."
+        ]
+      },
+      "siblingNames": ["Assign a parcel to a delivery van", "Plan a route", "Re-route a van mid-shift", "Mark a parcel delivered"],
+      "sharedAcceptanceCriteria": ["A parcel's chain of custody is recorded at every handover.", "Capacity figures are read from the van's current load, never a cached value."],
+      "specSummary": "Last-mile delivery operations: route planning, parcel-to-van assignment with capacity and service-area checks, live re-routing, and proof of delivery."
+    },
+    {
+      "id": "trivial-footer-version",
+      "domain": "saas-utility",
+      "probe": "boundedness — must NOT pad a trivial story",
+      "story": {
+        "name": "Show the application version in the footer",
+        "user_story": "As any user, I want to see the application version in the page footer, so that I can quote it when reporting an issue.",
+        "description": "The footer displays the current build version string.",
+        "acceptance_criteria": [
+          "AC1: The footer shows the current application version string on every page."
+        ]
+      },
+      "siblingNames": ["Show the application version in the footer", "Show a cookie banner", "Render the global navigation"],
+      "sharedAcceptanceCriteria": ["All pages share one footer component."],
+      "specSummary": "Global chrome for the web app: navigation, footer, cookie consent."
+    },
+    {
+      "id": "no-acs-export",
+      "domain": "saas-utility",
+      "probe": "no_acs — loud inference path",
+      "story": {
+        "name": "Export the report",
+        "user_story": "As an analyst, I want to export the report I am viewing, so that I can share it outside the tool.",
+        "description": "An export action on the report view produces a downloadable file.",
+        "acceptance_criteria": []
+      },
+      "siblingNames": ["Export the report", "Filter the report", "Schedule a report email"],
+      "sharedAcceptanceCriteria": ["Exported files never include data the requesting user is not entitled to see."],
+      "specSummary": "Reporting module: interactive reports with filtering, export, and scheduled email delivery."
+    },
+    {
+      "id": "rich-recurring-payments",
+      "domain": "fintech",
+      "probe": "coverage-at-scale (6 ACs) + maxItems ceiling pressure",
+      "story": {
+        "name": "Schedule a recurring payment",
+        "category": "Payments",
+        "user_story": "As a customer, I want to schedule a recurring payment to a payee, so that a fixed amount is paid automatically on a regular cadence.",
+        "description": "Customer chooses a payee, an amount, a frequency, a start date, and an optional end date; the system runs the payment on each due date.",
+        "acceptance_criteria": [
+          "AC1: A recurring payment requires a payee, an amount greater than zero, a frequency (weekly or monthly), and a start date not in the past.",
+          "AC2: If an end date is given, it must be on or after the start date.",
+          "AC3: On a due date with insufficient funds, the payment is skipped, the customer is notified, and the schedule continues to the next due date.",
+          "AC4: A monthly payment whose start day exceeds the days in a given month runs on that month's last day.",
+          "AC5: The customer may cancel a recurring payment at any time; no payment runs on or after the cancellation.",
+          "AC6: Each run records the run date, amount, and outcome (paid or skipped)."
+        ]
+      },
+      "siblingNames": ["Schedule a recurring payment", "Pay a registered payee", "Transfer funds between own accounts", "Manage payees"],
+      "sharedAcceptanceCriteria": ["All money movements post to the ledger exactly once (no double-charge on retry).", "Every monetary amount is handled to two decimal places."],
+      "specSummary": "Retail banking payments: one-off payee payments, internal transfers, and recurring payment schedules with retry and cancellation."
+    }
+  ]
+}

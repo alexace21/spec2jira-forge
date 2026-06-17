@@ -12,6 +12,7 @@ import BreakdownEditor from "./components/breakdown";
 import AdminSettings from "./components/AdminSettings";
 import PagePickerScreen from "./components/PagePicker";
 import BackButton from "./components/BackButton";
+import TestCasesScreen from "./components/TestCasesScreen";
 import {
   adaptToLegacyShape,
   extractV3Signals,
@@ -22,6 +23,7 @@ import {
   CONCERN_TYPE_LABEL,
   QUALITY_PALETTE,
 } from "./lib/v3Schema";
+import { classText } from "./lib/diagnosticsView";
 import "./index.css";
 
 // v3.0.0 result-loading helper. Resolver getResults returns either
@@ -170,6 +172,17 @@ function _classifyBackendError(errorShape, contextLabel = "") {
   // a raw HTTP body or an opaque token. They must come BEFORE Class 7 (the generic
   // pass-through, which would otherwise append the raw `detail` verbatim).
 
+  // Page trashed / archived (soft-deleted) — Confluence still serves it with HTTP 200,
+  // the backend rejects it (S7 fix). Drop the raw token; the detail is already clean.
+  if (/page_not_available/i.test(errorStr)) {
+    return {
+      message:
+        detail ||
+        "This page is no longer available — it may have been moved to the trash or archived in Confluence. Pick another page.",
+      routeToSetup: false,
+    };
+  }
+
   // Confluence permission / scope error — the app couldn't read the page or search
   // because of authorization (403 / missing scope / search/parse failure). Actionable:
   // re-authorize the app. Checked before the numeric confluence_<status> class below.
@@ -258,9 +271,27 @@ function _classifyBackendError(errorShape, contextLabel = "") {
 
 function App() {
   const [screen, setScreen] = useState("loading");
+  // screenRef mirrors screen state so poll callbacks always read the CURRENT value
+  // without a stale closure (fix 6: navigate to testcases only when generatingTests).
+  const screenRef = useRef("loading");
+  // (A deep-audit fix 2026-06-10) the job id each poll is CURRENTLY tracking. The poll
+  // guards must key on JOB IDENTITY, not just screen name: with one shared pollRef/tcPollRef
+  // and a closure-captured jid, a stale in-flight callback from an ABANDONED job (user hit
+  // Start over → Generate B while A's poll was awaiting) would otherwise pass a bare
+  // screen-name check and (1) hijack to the wrong job and (2) clearInterval the NEWER poll's
+  // interval, orphaning it. startPolling/startTcPolling set these; the guards compare
+  // `jid === current` before navigating, setting status, or clearing the shared ref.
+  const currentPollJobIdRef = useRef(null);
+  const currentTcJobIdRef = useRef(null);
   const [pageData, setPageData] = useState(null);
   const [pageId, setPageId] = useState(null);
   const [error, setError] = useState(null);
+  // [diag Phase 3, design §5] The diagnostic correlation id (jobId) for the CURRENT error
+  // screen, or null when the failure has no job in scope (page-fetch errors, submit
+  // errors whose response carries no job_id, init failures). Set EXPLICITLY at every
+  // setScreen("error") site — never inferred from possibly-stale jobId state — so the
+  // ErrorScreen ref can never point at an unrelated job's diagnostic record.
+  const [errorRefId, setErrorRefId] = useState(null);
   const [quotaInfo, setQuotaInfo] = useState(null);
 
   // Project Context profiles (P1+): the available named contexts + the one selected
@@ -364,6 +395,33 @@ function App() {
   // NEVER show a false "edited" banner).
   const [staleBreakdown, setStaleBreakdown] = useState(null);
 
+  // Persist-failed degraded mode (diagnostics Phase 0, design §3.1). TRUE when the
+  // completed breakdown could NOT be written to Forge storage (typically the ~240KB KVS
+  // value cap on very large pages) — pollJobStatus terminalized the job and handed the
+  // results forward INLINE (persistFailed: true on the poll response), so they exist ONLY
+  // in this tab's memory. Drives an additive amber banner on the reviewing + confirm
+  // screens ("review and push it now"). Cleared whenever results load normally from
+  // storage (poll getResults path + routeByPageStatus reconnect).
+  const [persistFailed, setPersistFailed] = useState(false);
+
+  // [diag Phase 3, S4] Failure notice for the Ready screen. The dashboard's ⚠ "Needs
+  // attention" click (and any reconnect to a failed job) used to fall through to a
+  // PRISTINE Ready screen — zero failure info, no ref. routeByPageStatus's failed branch
+  // sets { refId, code, detail }; ReadyScreen renders an additive failure card with the
+  // diagnostic ref, and the existing Generate button doubles as the retry. Cleared on
+  // ANY navigation away from Ready (new generation → "generating", different page →
+  // "picker"/"loading", Settings, …) so it can never leak onto another page's Ready.
+  const [genFailureNotice, setGenFailureNotice] = useState(null);
+  useEffect(() => {
+    if (screen !== "ready") setGenFailureNotice(null);
+  }, [screen]);
+
+  // Test-case results (P4). null = none generated / not loaded.
+  // Shape: the getTestCases resolver return ({ perStory, total, completedAt, ... }).
+  // Set on reconnect rehydration (routeByPageStatus completed branch) when
+  // tcStatus === 'completed'. Cleared on page change / regenerate / retry.
+  const [testCaseResults, setTestCaseResults] = useState(null);
+
   // In-app Settings access (2026-06-03). WHY this exists: the Forge
   // confluence:globalSettings "Configure" page (which renders AdminSettings) is
   // NOT reachable from Atlassian's centralized "Connected apps" admin — the classic
@@ -378,10 +436,41 @@ function App() {
   //     (standalone, no Back). handleOpenSettings is the ONLY place that sets it TRUE.
   const [reinitNonce, setReinitNonce] = useState(0);
   const [settingsFromApp, setSettingsFromApp] = useState(false);
+  // [diag Phase 5, design §5] Which AdminSettings tab to land on + an optional
+  // diagnostic-ref pre-filter for the Diagnostics tab. handleOpenSettings keeps its
+  // historical behavior (Settings tab, no filter); handleOpenDiagnostics — the
+  // [Open Diagnostics] click-nav on failure surfaces — sets both. Cleared when
+  // leaving the admin screen (handleCloseSettings) so a stale ref filter can never
+  // greet a later, unrelated Settings visit.
+  const [settingsInitialTab, setSettingsInitialTab] = useState("settings");
+  const [settingsDiagRefFilter, setSettingsDiagRefFilter] = useState(null);
+  // [P5 LOW-1] which screen [Open Diagnostics] left from — 'pushed' is restored on
+  // close (its purged-job summary is pure client state and unrecoverable otherwise).
+  const settingsReturnScreenRef = useRef(null);
 
   const pollRef = useRef(null);
   const timerRef = useRef(null);
   const pushPollRef = useRef(null);
+
+  // Test-case generation state (P5)
+  const [tcJobStatus, setTcJobStatus] = useState(null);
+  const [tcStartTime, setTcStartTime] = useState(null);
+  const [tcElapsed, setTcElapsed] = useState(0);
+  // Fix 6: tracks whether a TC generation is in-flight (persists across screen transitions
+  // so the reviewing-screen button can show "⏳ Generating…" even after the BA navigates back)
+  const [tcGenerating, setTcGenerating] = useState(false);
+  // [polish] captured at push time: was a test-case run in flight when the user
+  // pushed? (the push purges it). Drives a confirmation note on the success screen
+  // so the user doesn't have to open Diagnostics to learn the run was discarded.
+  const [tcDiscardedAtPush, setTcDiscardedAtPush] = useState(false);
+  const tcPollRef = useRef(null);
+  // Per-story regenerate: { [storyIdx]: 'idle'|'pending'|'polling'|'done'|'error' }
+  const [regenStates, setRegenStates] = useState({});
+  const regenPollRefs = useRef({});
+
+  // Keep screenRef in sync with screen state (fix 6: poll callbacks read the current screen
+  // without a stale closure — useEffect fires after every render where screen changed).
+  useEffect(() => { screenRef.current = screen; }, [screen]);
 
   // ── Init ──────────────────────────────────────────────────────
   // globalPage migration (2026-05-09): no longer auto-binds via
@@ -564,47 +653,25 @@ function App() {
           console.error("URL deep-link check failed:", urlErr);
         }
 
-        // ═══ Gate 5 — KVS lastSelected reconnect (active jobs only) ═══
-        // U4 part 33 (2026-05-09) — refined per partner UX directive
-        // 2026-05-08 part 18: "auto-load last breakdown на app return
-        // should route to picker, не resume". Reconnect ONLY когато
-        // last-selected page has ACTIVE job (running/pending) — те
-        // are time-sensitive (user wants monitoring); completed jobs
-        // wait for explicit pick от picker (still 1-click via recent
-        // list which shows last_selected at top). Idle status also
-        // falls through to picker (no work to monitor).
-        //
-        // Net UX change: after completing a run, returning to the app
-        // lands в picker → user picks deliberately whether to review
-        // the completed work, start fresh, or do something else. Active
-        // jobs still surface automatically (monitoring use case).
-        // Failures here are non-fatal — picker fallback covers uncertainty.
-        try {
-          const lastResp = await invoke("getLastSelectedPage");
-          const last = lastResp?.lastSelected;
-          if (last?.id) {
-            const [pageResult, statusResult] = await Promise.all([
-              invoke("fetchPage", { pageId: last.id }),
-              invoke("getGenerationStatus", { pageId: last.id }),
-            ]);
-            if (
-              !pageResult.error &&
-              (statusResult.status === "running" ||
-                statusResult.status === "pending" ||
-                statusResult.status === "batched")
-            ) {
-              await routeByPageStatus(last, pageResult, statusResult);
-              return;
-            }
-          }
-        } catch (reconErr) {
-          // Non-fatal — picker fallback handles uncertainty.
-          console.error("Reconnect attempt failed:", reconErr);
-        }
+        // ═══ Gate 5 — reopen ALWAYS lands on the picker (the dashboard) ═══
+        // (multi-batch dashboard, 2026-06-10 — partner live-acceptance UX finding) Reopening
+        // the app WITHOUT an explicit deep-link always lands on the picker. The picker IS the
+        // live multi-batch dashboard now: every in-flight job shows under "⏳ In progress" (10s
+        // reconcile), completed under "✓ Ready for review", failed under "⚠ Needs attention".
+        // So the OLD Gate-5 behavior — auto-resuming the SINGLE last-selected job's generating
+        // SCREEN when it had an active job — was RETIRED: it hid the other batched jobs behind
+        // one spinner, contradicting the whole "fire several → return → see them ALL" vision.
+        // The monitoring use case the old gate served is now covered better by the dashboard;
+        // from the picker the user clicks any "⏳ In progress" row to drop into that job's
+        // generating screen (route-by-jobId). Explicit deep-links (Gates 3/4 above) still open
+        // their specific page directly — that intent is unambiguous, so they are unchanged.
+        // (The 2026-05-08 "return → picker, не resume" directive is now fully honored — it had
+        // carved out active jobs; the dashboard makes that carve-out unnecessary.)
 
-        // Default entry: page picker.
+        // Default entry: page picker (the dashboard).
         setScreen("picker");
       } catch (err) {
+        setErrorRefId(null); // [diag Phase 3] init failure — no job in scope
         setError(err.message);
         setScreen("error");
       }
@@ -614,6 +681,8 @@ function App() {
       clearInterval(pollRef.current);
       clearInterval(timerRef.current);
       clearInterval(pushPollRef.current);
+      clearInterval(tcPollRef.current);
+      Object.values(regenPollRefs.current).forEach(clearInterval);
     };
     // reinitNonce: bumped by handleCloseSettings → re-runs the init/config gate after
     // closing in-app Settings (re-checks config → routes to picker if now configured).
@@ -631,6 +700,17 @@ function App() {
     }
     return () => clearInterval(timerRef.current);
   }, [screen, startTime]);
+
+  // TC timer — elapsed counter for the generatingTests screen
+  useEffect(() => {
+    if (screen === "generatingTests" && tcStartTime) {
+      const id = setInterval(
+        () => setTcElapsed(Math.floor((Date.now() - tcStartTime) / 1000)),
+        1000,
+      );
+      return () => clearInterval(id);
+    }
+  }, [screen, tcStartTime]);
 
   // ── Bug F1 fix (2026-05-10 part 44) — reviewing screen layout reflow ─
   // Symptom: in-flight generation→reviewing transition rendered breakdown
@@ -659,39 +739,160 @@ function App() {
   // ── Polling ───────────────────────────────────────────────────
   const startPolling = useCallback((jid) => {
     clearInterval(pollRef.current);
+    currentPollJobIdRef.current = jid; // this poll now owns pollRef
     pollRef.current = setInterval(async () => {
       try {
         const st = await invoke("pollJobStatus", { jobId: jid });
+        // (A deep-audit fix) Is this callback's job STILL the one this poll tracks? A stale
+        // tick from an abandoned job (a newer startPolling replaced pollRef) must not clear
+        // the newer poll's interval, overwrite its status, or drive the screen. isCurrent
+        // gates every side effect that touches the shared pollRef / current screen.
+        const isCurrent = jid === currentPollJobIdRef.current;
         if (st.error) {
-          clearInterval(pollRef.current);
-          setError(st.error);
-          setScreen("error");
+          if (isCurrent) clearInterval(pollRef.current); // only the owner clears the shared ref
+          // not_found / job-gone: route to error ONLY for the foreground job. Background or
+          // stale → quiet (a cue would point at nothing).
+          if (isCurrent && screenRef.current === "generating") {
+            setErrorRefId(jid); // [diag Phase 3] diagnostic ref for the error screen
+            setError(st.error);
+            setScreen("error");
+          }
           return;
         }
-        setJobStatus(st);
+        // Progress drives the generating screen — only for the tracked job, so a stale tick
+        // can't overwrite the new job's progress.
+        if (isCurrent) setJobStatus(st);
         if (st.status === "completed") {
-          clearInterval(pollRef.current);
-          const full = await invoke("getResults", { jobId: jid });
-          if (full.error) {
-            setError(full.error);
-            setScreen("error");
-          } else {
-            // A freshly-generated breakdown is current by definition — clear any
-            // stale flag lingering from a previous reconnect (e.g. after Regenerate).
-            setStaleBreakdown(null);
-            setResults(v3AdaptResultPayload(full));
-            setScreen("reviewing");
+          if (isCurrent) clearInterval(pollRef.current);
+          // Navigate to review ONLY for the foreground job (tracked AND its generating screen
+          // is up). A background/stale completion just stops polling — the per-user dashboard
+          // on the picker surfaces it durably (⏳→✓), so no screen-yank and no separate cue.
+          if (isCurrent && screenRef.current === "generating") {
+            if (st.persistFailed === true) {
+              // [diag Phase 0, §3.1 degraded path] The breakdown completed but could NOT be
+              // saved to Forge storage — the poll response carries the full results inline.
+              // SKIP getResults (the job record now holds only a small terminal 'failed'
+              // record — getResults would error and throw the breakdown away) and feed the
+              // inline payload through the SAME adapter the getResults path uses below.
+              // The results live only in this tab → persistFailed drives the amber
+              // review-and-push-now banner on the reviewing/confirm screens.
+              setStaleBreakdown(null);
+              setPersistFailed(true);
+              setResults(v3AdaptResultPayload(st));
+              setScreen("reviewing");
+            } else {
+              const full = await invoke("getResults", { jobId: jid });
+              if (full.error) {
+                setErrorRefId(jid); // [diag Phase 3] diagnostic ref for the error screen
+                setError(full.error);
+                setScreen("error");
+              } else {
+                // A freshly-generated breakdown is current by definition — clear any
+                // stale flag lingering from a previous reconnect (e.g. after Regenerate).
+                setStaleBreakdown(null);
+                setPersistFailed(false);
+                setResults(v3AdaptResultPayload(full));
+                setScreen("reviewing");
+              }
+            }
           }
         } else if (st.status === "failed") {
-          clearInterval(pollRef.current);
-          setError(st.error || "Generation failed");
-          setScreen("error");
+          if (isCurrent) clearInterval(pollRef.current);
+          // Foreground → error screen. A background/stale failure stops quietly — the
+          // dashboard's ⚠ Needs attention group surfaces it durably (§11: shown, not silent).
+          if (isCurrent && screenRef.current === "generating") {
+            // [diag P5 audit] humanize the terminal CODE via the single FE map — the
+            // raw `st.error` used to render literally ("anthropic_529") while the S4
+            // card and TC poll already humanized. st.detail stays deliberately
+            // unrendered (network_failure carries raw exception prose — the H rule);
+            // zone-2 keeps the verbatim detail for the consent export.
+            setErrorRefId(jid);
+            const t = classText(st.error);
+            setError(st.error ? `${t.title} (${st.error})` : "Generation failed");
+            setScreen("error");
+          }
         }
       } catch (e) {
         console.error("Poll error:", e);
       }
     }, POLL_MS);
   }, []);
+
+  // ── Test-case poll (P5) ─────────────────────────────────────
+  // ⚠ Declared BEFORE routeByPageStatus, which references startTcPolling in its
+  // reconnect path AND its dependency array. A `const` referenced before its own
+  // declaration line is a Temporal-Dead-Zone crash at render ("Cannot access … before
+  // initialization") — it blanks the whole app. Order matters; keep this above routeByPageStatus.
+  const startTcPolling = useCallback(
+    (jid) => {
+      clearInterval(tcPollRef.current);
+      currentTcJobIdRef.current = jid; // this poll now owns tcPollRef
+      tcPollRef.current = setInterval(async () => {
+        try {
+          const st = await invoke("pollTestCaseStatus", { jobId: jid });
+          // (A deep-audit fix, mirrored from the breakdown poll) ignore a stale tick from an
+          // abandoned TC job — a newer startTcPolling owns tcPollRef now; this callback must
+          // not clear its interval, overwrite its status, or drive the screen.
+          const isCurrent = jid === currentTcJobIdRef.current;
+          if (st.error) {
+            if (isCurrent) {
+              clearInterval(tcPollRef.current);
+              setTcGenerating(false); // Fix 6
+              // [seams-audit HIGH] navigate ONLY when the user is watching the TC
+              // generating screen — a BACKGROUND error must stop quietly. The
+              // reachable yank: push-while-TC-generating → push done → purgeJob
+              // deletes the batched tcjob → the next tick here got not_found and
+              // pulled the user OFF their SUCCESSFUL push summary onto a red error.
+              if (screenRef.current === "generatingTests") {
+                const friendly = _classifyBackendError(st, "Test case generation failed");
+                setErrorRefId(jid); // [diag Phase 3] tcjob: is keyed by the breakdown jobId
+                setError(friendly.message);
+                setScreen("error");
+              }
+            }
+            return;
+          }
+          if (isCurrent) setTcJobStatus(st);
+          if (st.status === "completed") {
+            if (!isCurrent) return; // stale — a newer TC poll owns tcPollRef
+            clearInterval(tcPollRef.current);
+            const tc = await invoke("getTestCases", { jobId: jid });
+            if (tc.error) {
+              setTcGenerating(false); // Fix 6
+              const friendly = _classifyBackendError(tc, "Failed to load test cases");
+              setErrorRefId(jid); // [diag Phase 3]
+              setError(friendly.message);
+              setScreen("error");
+            } else {
+              setTestCaseResults(tc);
+              setTcGenerating(false); // Fix 6
+              // Fix 6: navigate to testcases ONLY when the user is on the generating screen;
+              // if they backed to reviewing, update results silently — don't yank them away.
+              if (screenRef.current === "generatingTests") {
+                setScreen("testcases");
+              }
+            }
+          } else if (st.status === "failed") {
+            if (!isCurrent) return; // stale
+            clearInterval(tcPollRef.current);
+            setTcGenerating(false); // Fix 6
+            // [seams-audit HIGH] same background-gate as the error branch above — a
+            // legitimately failed background batch surfaces via the TC screen's own
+            // affordances on return, never by yanking an unrelated screen.
+            if (screenRef.current === "generatingTests") {
+              const friendly = _classifyBackendError(st, "Test case generation failed");
+              setErrorRefId(jid); // [diag Phase 3]
+              setError(friendly.message);
+              setScreen("error");
+            }
+          }
+        } catch (e) {
+          console.error("TC poll error:", e);
+        }
+      }, POLL_MS);
+    },
+    [],
+  );
 
   // ── Page selection routing (post globalPage migration) ───────
   // routeByPageStatus is shared между init's reconnect path AND
@@ -703,6 +904,9 @@ function App() {
     async (pageRef, pageResult, statusResult) => {
       setPageId(String(pageRef.id));
       setPageData(pageResult);
+      // Defensive: clear any test cases from a previously-routed page before this page's
+      // state loads — the completed branch below re-sets them when tcStatus==='completed'.
+      setTestCaseResults(null);
 
       if (
         statusResult.status === "running" ||
@@ -743,16 +947,74 @@ function App() {
           } else {
             setStaleBreakdown(null);
           }
+          // Results just loaded fine FROM storage → any persist-failed flag belongs to a
+          // previous tab-local breakdown (diagnostics Phase 0) — clear it so the banner
+          // never false-fires on a normally-stored breakdown.
+          setPersistFailed(false);
           setResults(v3AdaptResultPayload(full));
+          // P4 (§13 BUG-6): stamp jobId so a reconnect→push carries it to startPush —
+          // else the push reads tcjob:<null> and the embed is silently skipped.
+          setJobId(statusResult.job_id);
+          // P4 audit B3: transition to reviewing BEFORE the getTestCases await so the
+          // user sees the review screen immediately. Test cases feed the P5 screen, not
+          // the review screen — they must not block the transition. The rehydrate is
+          // still non-fatal: a failure here must never block the reviewing screen.
           setScreen("reviewing");
+          // P4 reconnect rehydration: if test cases were completed for this job,
+          // load them back into state so the Test Cases screen can restore without
+          // re-generating. Non-fatal. full.tcStatus forwarded by getResults.
+          if (full.tcStatus === 'completed') {
+            try {
+              const tc = await invoke("getTestCases", { jobId: statusResult.job_id });
+              if (!tc.error) setTestCaseResults(tc);
+            } catch (e) {
+              console.error("getTestCases rehydrate failed (non-fatal):", e);
+            }
+          }
+          // Fix 6 (Audit-6/7 reconnect): if TC generation was in-flight when the user
+          // reconnected (tcStatus batched/pending), resume polling so completion still lands.
+          // setTcGenerating(true) drives the "⏳ Generating tests…" state on the Review/Confirm
+          // screen's test-cases button (the in-flight state surfaces there post-#1-redesign).
+          if (full.tcStatus === 'batched' || full.tcStatus === 'pending') {
+            setTcGenerating(true);
+            startTcPolling(statusResult.job_id);
+          }
           return;
         }
+      }
+
+      // [diag Phase 3, S4 — design §5] FAILED branch. Before this, a ⚠ "Needs attention"
+      // dashboard click (or any reconnect to a failed job) fell through to the pristine
+      // Ready screen below — zero failure info, no ref: the exact confusion the diagnostics
+      // feature exists to prevent. Land on Ready WITH a failure card: fetch the stored
+      // user-facing detail (a failed job's getResults returns { error, detail }), stash the
+      // notice, and let the existing Generate button double as the retry. Best-effort — a
+      // getResults glitch still shows the card with the generic body + the diagnostic ref.
+      if (statusResult.status === "failed") {
+        let failCode = statusResult.error || null;
+        let failDetail = null;
+        try {
+          const failed = await invoke("getResults", { jobId: statusResult.job_id });
+          if (failed && failed.error) failCode = failed.error;
+          if (failed && typeof failed.detail === "string" && failed.detail) {
+            failDetail = failed.detail;
+          }
+        } catch (e) {
+          console.error("getResults (failed-job detail) failed (non-fatal):", e);
+        }
+        setGenFailureNotice({
+          refId: statusResult.job_id,
+          code: failCode,
+          detail: failDetail,
+        });
+        setScreen("ready");
+        return;
       }
 
       // Idle / no job → fresh start.
       setScreen("ready");
     },
-    [startPolling],
+    [startPolling, startTcPolling],
   );
 
   // handlePageSelected — picker hands off the chosen page (or manual
@@ -765,9 +1027,22 @@ function App() {
       setError(null);
 
       try {
+        // Dashboard rows carry their OWN jobId+status (the per-user identity) → route by THAT,
+        // not by getGenerationStatus → the shared per-install page→job index, which a co-worker
+        // generating the same page can overwrite (deep-audit MED: a dashboard click would then
+        // open the OTHER user's job). Recent-list / reconnect rows have no jobId → resolve by page.
+        const statusReq = pageRef.jobId
+          ? Promise.resolve({
+              status: pageRef.jobStatus,
+              job_id: pageRef.jobId,
+              elapsed_seconds: pageRef.startedAt
+                ? Math.max(0, Math.floor((Date.now() - new Date(pageRef.startedAt).getTime()) / 1000))
+                : 0,
+            })
+          : invoke("getGenerationStatus", { pageId: pageRef.id });
         const [pageResult, statusResult] = await Promise.all([
           invoke("fetchPage", { pageId: pageRef.id }),
-          invoke("getGenerationStatus", { pageId: pageRef.id }),
+          statusReq,
         ]);
 
         if (pageResult.error) {
@@ -783,6 +1058,11 @@ function App() {
             setScreen("setup");
             return;
           }
+          // [diag P3 audit NIT-8] a dashboard ⚠ row carries its OWN jobId — the
+          // generation-failure record lives under it; keep the one-click prefilter
+          // even when the PAGE no longer fetches (deleted/permission). Non-dashboard
+          // rows have no jobId → null as before.
+          setErrorRefId(pageRef?.jobId || null);
           setError(friendly.message);
           setScreen("error");
           return;
@@ -805,6 +1085,7 @@ function App() {
 
         await routeByPageStatus(pageRef, pageResult, statusResult);
       } catch (err) {
+        setErrorRefId(pageRef?.jobId || null); // [diag P3 audit NIT-8] keep a dashboard row's ref
         setError(err.message || "Failed to open page");
         setScreen("error");
       }
@@ -814,6 +1095,10 @@ function App() {
 
   // ── Start generation ─────────────────────────────────────────
   const handleGenerate = useCallback(async () => {
+    // [diag Phase 3, S4] A new run supersedes the failure notice (the card promises
+    // "Generating again will start a fresh run"). The screen-change effect also clears
+    // it; this is the explicit belt for the named lifecycle event.
+    setGenFailureNotice(null);
     setScreen("generating");
     setStartTime(Date.now());
     setElapsed(0);
@@ -824,11 +1109,27 @@ function App() {
     // cross-project selection could be submitted before getContextProfiles resolves.
     const effectiveProfileId =
       contextLoadedForPageId === pageData.page_id ? selectedContextProfileId : "none";
-    const result = await invoke("startGeneration", {
-      pageId: pageData.page_id,
-      modelMode: "primary",
-      contextProfileId: effectiveProfileId,
-    });
+    let result;
+    try {
+      result = await invoke("startGeneration", {
+        pageId: pageData.page_id,
+        modelMode: "primary",
+        contextProfileId: effectiveProfileId,
+      });
+    } catch (invokeErr) {
+      // [diag Phase 5, design §2] TERMINAL invoke failure — the resolver rejected or
+      // was killed before returning (25s kill leaves NO backend write), so file the
+      // client-side fallback record (fire-and-forget; the .catch keeps the fallback
+      // from ever cascading), then route to the error screen instead of stranding the
+      // user on the generating spinner. No jobId exists yet for this run
+      // (startGeneration is what mints it) → no ref. invoke_rejected for ALL shapes —
+      // @forge/bridge exposes no structural timeout discriminator.
+      invoke("recordClientDiagnostic", { error_class: "invoke_rejected" }).catch(() => {});
+      setErrorRefId(null);
+      setError(invokeErr?.message || "Generate failed");
+      setScreen("error");
+      return;
+    }
 
     if (result.error === "quota_exceeded") {
       // Managed Pro fair-use cap reached (we run Claude + pay compute, so the
@@ -851,6 +1152,7 @@ function App() {
       // Managed Pro selected but our server key isn't configured (rare/transient).
       // The backend composes an actionable detail (contact support OR switch to
       // BYOK) — show it directly rather than the generic classifier wrapping.
+      setErrorRefId(null); // [diag Phase 3] fails before a job record exists — no ref
       setError(
         result.detail ||
           "The Managed service is temporarily unavailable. Please contact support, or switch to your own Anthropic API key in Settings.",
@@ -866,6 +1168,11 @@ function App() {
         setScreen("setup");
         return;
       }
+      // [diag Phase 5, gate MED-1] submit failures carry job_id on the error response
+      // (a job + ledger record + zone-2 detail exist under it backend-side) — surface
+      // that ref so support can correlate. Other start errors carry none → null.
+      // Never reuse the stale jobId state for an unrelated error.
+      setErrorRefId(typeof result.job_id === "string" ? result.job_id : null);
       setError(friendly.message);
       setScreen("error");
       return;
@@ -932,6 +1239,10 @@ function App() {
   // UI calls startPush (lookup + Epic) then loops pushStep (one bounded JIRA
   // batch per call) until done, showing a progress bar on the "pushing" screen.
   const handleConfirmedPush = useCallback(async () => {
+    // [polish] snapshot whether a TC run is in flight NOW — the push will purge it
+    // (the Create-button warning already told the user; this drives the post-push
+    // confirmation note so they don't have to check Diagnostics to know it happened).
+    setTcDiscardedAtPush(tcGenerating);
     setIsPushing(true);
     setPushProgress(0);
     setPushPhase("starting");
@@ -949,13 +1260,21 @@ function App() {
         detail && friendly.message && !friendly.message.includes(detail)
           ? `${friendly.message} (${detail})`
           : friendly.message || fallback;
+      // [diag Phase 3] the push diagnostics record under ref jobId (startPush/pushStep
+      // pass it through) — thread it so the error screen's ref matches the record.
+      setErrorRefId(jobId || null);
       setError(message);
       setScreen(friendly.routeToSetup ? "setup" : "error");
       setIsPushing(false);
     };
 
+    // [diag Phase 5] Hoisted so the TERMINAL invoke-catch below can stamp the push
+    // session on the client-side fallback record (sessionId is otherwise block-scoped
+    // inside the try).
+    let pushSessionId = null;
+
     try {
-      const start = await invoke("startPush", { breakdown: pendingBreakdown });
+      const start = await invoke("startPush", { breakdown: pendingBreakdown, jobId });
       // No push gate: every app user is licensed (30-day Atlassian trial → paid;
       // unsubscribed users are blocked natively by Atlassian, never reaching here),
       // so push proceeds. Any startPush error is a genuine failure → normal path.
@@ -965,17 +1284,23 @@ function App() {
       }
       const sessionId = start.session_id;
       if (!sessionId) {
+        setErrorRefId(jobId || null); // [diag Phase 3]
         setError("Push did not start correctly (no session id).");
         setScreen("error");
         setIsPushing(false);
         return;
       }
+      pushSessionId = sessionId; // [diag Phase 5] for the terminal invoke-catch fallback record
       setPushPhase(start.phase || "stories");
 
       // Loop pushStep until done. Safety cap prevents runaway (huge specs
       // chunk in 15s → 2000 steps would be ~30000 items, far beyond any real spec).
       for (let i = 0; i < 2000; i++) {
-        const step = await invoke("pushStep", { sessionId });
+        // jobId rides the payload (deep-audit P2 ref-correlation): the pushStep
+        // CATCH classes (push_exception/session_not_found) have no session to read
+        // a jobId from — without it their records are ref:null and unfindable by
+        // the ref the error screen shows. The backend shape-checks it.
+        const step = await invoke("pushStep", { sessionId, jobId: jobId || undefined });
         if (step.error) {
           fail(step, "Push step failed");
           return;
@@ -993,17 +1318,252 @@ function App() {
         setPushPhase(step.phase || "");
       }
 
+      setErrorRefId(jobId || null); // [diag Phase 3]
       setError(
         "Push took an unexpectedly large number of steps. Check Jira for created items; contact support@spec2jira.com if items are missing.",
       );
       setScreen("error");
       setIsPushing(false);
     } catch (err) {
+      // [diag Phase 5, design §2] TERMINAL invoke failure — the startPush/pushStep
+      // resolver rejected or was killed (the 25s kill leaves NO backend write), and the
+      // push aborts to the error screen. File the client-side fallback record:
+      // fire-and-forget WITH .catch so the fallback can never cascade into this error
+      // path. invoke_rejected for ALL shapes — @forge/bridge exposes no structural
+      // timeout discriminator (BridgeAPIError is a bare Error subclass; only message
+      // prose differs, and prose matching is banned).
+      invoke("recordClientDiagnostic", {
+        error_class: "invoke_rejected",
+        ref: jobId || undefined,
+        session_ref: pushSessionId || undefined,
+      }).catch(() => {});
+      setErrorRefId(jobId || null); // [diag Phase 3]
       setError(err.message || "Push failed");
       setScreen("error");
       setIsPushing(false);
     }
-  }, [pendingBreakdown, jobId]);
+  }, [pendingBreakdown, jobId, tcGenerating]);
+
+  // ── Test-case generation (P5) ─────────────────────────────────
+
+  const handleGenerateTestCases = useCallback(async () => {
+    if (!jobId) return;
+    // [diag §3.1 / gate M1] persistFailed = the breakdown lives ONLY in this tab (its job
+    // record is a small terminal 'failed' stub). Test-gen reads job.breakdown from storage →
+    // it would return breakdown_not_ready, route to the Error screen, and STRAND the unsaved
+    // breakdown (the one thing the degraded path protects). The Confirm-screen affordance is
+    // hidden in this mode; this guard is defense-in-depth for any other entry point.
+    if (persistFailed) return;
+    setScreen("generatingTests");
+    setTcGenerating(true); // Fix 6: mark in-flight before the invoke
+    setTcStartTime(Date.now());
+    setTcElapsed(0);
+    setTcJobStatus({ progress: 0, phase: "Starting…" });
+
+    // #1 fix (edited-state): send the BA's edited breakdown (lifted into pendingBreakdown on the
+    // Review→TestCases nav) so the backend generates test cases for the EDITED stories/ACs, not
+    // the pristine generated ones. Mirrors the push (handleConfirmedPush sends the same shape).
+    let result;
+    try {
+      result = await invoke("startTestCaseGeneration", {
+        jobId,
+        breakdown: pendingBreakdown || results?.breakdown,
+      });
+    } catch (invokeErr) {
+      // [diag Phase 5, design §2] TERMINAL invoke failure — mirrors handleGenerate's
+      // catch (resolver rejected/killed → no backend write possible → client-side
+      // fallback record, fire-and-forget with .catch), then the error screen.
+      invoke("recordClientDiagnostic", {
+        error_class: "invoke_rejected",
+        ref: jobId || undefined,
+      }).catch(() => {});
+      setTcGenerating(false); // Fix 6
+      setErrorRefId(jobId || null);
+      setError(invokeErr?.message || "Test case generation failed");
+      setScreen("error");
+      return;
+    }
+
+    if (result.error === "quota_exceeded") {
+      setTcGenerating(false); // Fix 6
+      setQuotaInfo(result);
+      setScreen("limit_reached");
+      return;
+    }
+    if (result.error === "license_required") {
+      setTcGenerating(false); // Fix 6
+      setQuotaInfo(result);
+      setScreen("limit_reached");
+      return;
+    }
+    if (result.error === "managed_unavailable") {
+      setTcGenerating(false); // Fix 6
+      setErrorRefId(jobId || null); // [diag Phase 3] TC-gen failure for THIS job
+      setError(
+        result.detail ||
+          "The Managed service is temporarily unavailable. Please contact support, or switch to your own Anthropic API key in Settings.",
+      );
+      setScreen("error");
+      return;
+    }
+    if (result.error) {
+      setTcGenerating(false); // Fix 6
+      const friendly = _classifyBackendError(result, "Test case generation failed");
+      if (friendly.routeToSetup) {
+        setError(friendly.message);
+        setScreen("setup");
+        return;
+      }
+      setErrorRefId(jobId || null); // [diag Phase 3]
+      setError(friendly.message);
+      setScreen("error");
+      return;
+    }
+
+    // Idempotency: if the resolver returned already-completed, load results directly.
+    // Fix 5: if getTestCases returns an error on the fast-path, do NOT silently return
+    // (leaves user stuck on generatingTests) — fall through to startTcPolling to re-poll.
+    if (result.status === "completed") {
+      const tc = await invoke("getTestCases", { jobId });
+      if (!tc.error) {
+        setTcGenerating(false); // Fix 6
+        setTestCaseResults(tc);
+        setScreen("testcases");
+        return;
+      }
+      // tc.error → fall through: re-poll picks up the completed status and retries the fetch
+    }
+
+    startTcPolling(jobId);
+  }, [jobId, startTcPolling, pendingBreakdown, results, persistFailed]);
+
+  const handleRegenerateTestCase = useCallback(
+    (storyIdx) => {
+      // [deep-audit F7] symmetry with handleGenerateTestCases' M1 guard: a
+      // persistFailed breakdown lives only in this tab — the backend would read
+      // the small terminal stub. Provably unreachable today (testCaseResults is
+      // nulled on every path into persistFailed mode), kept as defense-in-depth.
+      if (persistFailed) return;
+      setRegenStates((prev) => ({ ...prev, [storyIdx]: "pending" }));
+      (async () => {
+        let submitResult;
+        try {
+          // (b) send the EDITED breakdown so the backend regen reads the BA's edited ACs (not the
+          // generation-time snapshot). The resolver persists it to job.breakdown (mirrors #1).
+          submitResult = await invoke("regenerateTestCase", { jobId, storyIdx, breakdown: pendingBreakdown || results?.breakdown });
+        } catch (_invokeErr) {
+          setRegenStates((prev) => ({ ...prev, [storyIdx]: "error" }));
+          return;
+        }
+        if (submitResult.error) {
+          setRegenStates((prev) => ({ ...prev, [storyIdx]: "error" }));
+          return;
+        }
+        setRegenStates((prev) => ({ ...prev, [storyIdx]: "polling" }));
+
+        // Poll this story's regen until done
+        clearInterval(regenPollRefs.current[storyIdx]);
+        regenPollRefs.current[storyIdx] = setInterval(async () => {
+          try {
+            const st = await invoke("pollRegenerateTestCase", { jobId, storyIdx });
+            if (!st || st.error) {
+              clearInterval(regenPollRefs.current[storyIdx]);
+              setRegenStates((prev) => ({ ...prev, [storyIdx]: "error" }));
+              return;
+            }
+            if (st.status === "completed") {
+              clearInterval(regenPollRefs.current[storyIdx]);
+              // Delta-patch: only update the one entry in testCaseResults.perStory
+              setTestCaseResults((prev) => {
+                if (!prev) return prev;
+                const updated = prev.perStory.map((entry) => {
+                  if (entry.storyIdx !== storyIdx) return entry;
+                  return {
+                    ...entry,
+                    result: st.result !== undefined ? st.result : entry.result,
+                    coverage: st.coverage !== undefined ? st.coverage : entry.coverage,
+                    // (c) adopt the EDITED story the regen used → the per-story staleness clears for this card.
+                    story: st.story !== undefined ? st.story : entry.story,
+                    error: st.error,
+                    // [deep-audit P4 F1] the A5 flag rides the live response — spread-only
+                    // kept a STALE chip after a clean regen and showed NO chip after a
+                    // still-truncated one (both self-corrected only on remount).
+                    truncated: st.truncated === true ? true : undefined,
+                  };
+                });
+                const failedCount = updated.filter((e) => e && e.error).length;
+                return { ...prev, perStory: updated, failedCount };
+              });
+              setRegenStates((prev) => ({ ...prev, [storyIdx]: "done" }));
+            } else if (st.status === "failed") {
+              clearInterval(regenPollRefs.current[storyIdx]);
+              setRegenStates((prev) => ({ ...prev, [storyIdx]: "error" }));
+            }
+          } catch (e) {
+            console.error("Regen poll error:", e);
+          }
+        }, POLL_MS);
+      })();
+    },
+    [jobId, pendingBreakdown, results, persistFailed],
+  );
+
+  // handleSaveTestCase — persist ONE story's hand-edits to KVS via saveTestCases, then delta-patch
+  // testCaseResults from the SAVED + sanitized result/coverage (the resolver returns the authoritative
+  // shape: cap-20, dropped empties, recomputed coverage — never the raw edit buffer). Returns the
+  // resolver response so TestCasesScreen drives its per-story Save UI (saved / fail-loud-keep-buffer).
+  // Mirrors the regenerate delta-patch above. Editing CASES doesn't change ACs → the push-embed
+  // AC-hash is unchanged → the embed reads the edited entry for free (no push change needed).
+  const handleSaveTestCase = useCallback(
+    async (storyIdx, result) => {
+      let resp;
+      try {
+        resp = await invoke("saveTestCases", { jobId, storyIdx, result });
+      } catch (e) {
+        return { error: "save_failed", detail: String(e?.message || e) || "Save failed (network)." };
+      }
+      if (resp && resp.ok) {
+        setTestCaseResults((prev) => {
+          if (!prev) return prev;
+          const updated = prev.perStory.map((entry) => {
+            if (entry.storyIdx !== storyIdx) return entry;
+            return {
+              ...entry,
+              result: resp.result !== undefined ? resp.result : entry.result,
+              coverage: resp.coverage !== undefined ? resp.coverage : entry.coverage,
+              error: undefined, // a hand-authored valid story drops any prior error sentinel
+              // [deep-audit P4 F3] clear-on-save semantics, ALIGNED with storage: the
+              // saved entry is the BA's reviewed content — the stored rebuild drops the
+              // A5 flag, so the chip must clear here too (it used to linger till remount).
+              truncated: undefined,
+            };
+          });
+          const failedCount = updated.filter((e) => e && e.error).length;
+          return { ...prev, perStory: updated, failedCount };
+        });
+      }
+      return resp;
+    },
+    [jobId],
+  );
+
+  const handleOpenTestCases = useCallback((edited) => {
+    // Navigate to the Test Cases screen. After the #1 flow redesign this is reached from the
+    // Review/Confirm screen, where pendingBreakdown was ALREADY lifted (handlePush on the
+    // editor→Review step) — so test-gen consumes the EDITED breakdown. The optional `edited` arg
+    // + `.capabilities` guard remain a defensive lift: only a real legacy-shaped breakdown lifts,
+    // never a stray truthy value (e.g. a SyntheticEvent) that would corrupt pendingBreakdown.
+    if (edited && edited.capabilities) setPendingBreakdown(edited);
+    setScreen("testcases");
+  }, []);
+
+  const handleBackFromTestCases = useCallback(() => {
+    // #1 fix (flow redesign): Test Cases is now reached FROM the Review/Confirm screen (the single
+    // lift point), so Back returns there — not to the editor. (dryRunResult + pendingBreakdown were
+    // set by handlePush on the editor→Review step, so the Review screen re-renders cleanly.)
+    setScreen("confirming");
+    // Intentionally does NOT clear testCaseResults — they persist until page change / regenerate
+  }, []);
 
   // ── Navigation ────────────────────────────────────────────────
   // handleRetry — same page, fresh attempt. Used by ErrorScreen
@@ -1018,13 +1578,23 @@ function App() {
   const handleRetry = useCallback(() => {
     clearInterval(pollRef.current);
     clearInterval(pushPollRef.current);
+    // Fix 4: stop in-flight TC + regen polls (interval-leak on SPA navigation)
+    clearInterval(tcPollRef.current);
+    Object.values(regenPollRefs.current).forEach(clearInterval);
+    // Fix 6: reset TC UI state so the reviewing screen doesn't show a stuck "⏳ Generating…"
+    setTcGenerating(false);
+    setRegenStates({});
+    setTcJobStatus(null);
     setError(null);
+    setErrorRefId(null); // [diag Phase 3] leaving the error screen — drop its ref
     setJobId(null);
     setJobStatus(null);
     setResults(null);
+    setTestCaseResults(null);
     setPushResult(null);
     setDryRunResult(null);
     setPendingBreakdown(null);
+    setPersistFailed(false); // [deep-audit F6] clear wherever results is nulled (defensive invariant)
     setIsPushing(false);
     setScreen(pageData ? "ready" : "picker");
   }, [pageData]);
@@ -1041,16 +1611,44 @@ function App() {
   const handleRegenerate = useCallback(() => {
     clearInterval(pollRef.current);
     clearInterval(pushPollRef.current);
+    // Fix 4: stop in-flight TC + regen polls (interval-leak on SPA navigation)
+    clearInterval(tcPollRef.current);
+    Object.values(regenPollRefs.current).forEach(clearInterval);
+    // Fix 6: reset TC UI state so the reviewing screen doesn't show a stuck "⏳ Generating…"
+    setTcGenerating(false);
+    setRegenStates({});
+    setTcJobStatus(null);
     setResults(null);
+    setTestCaseResults(null);
     setPendingBreakdown(null);
     setJobId(null);
     setJobStatus(null);
     setDryRunResult(null);
     setPushResult(null);
     setStaleBreakdown(null);
+    setPersistFailed(false); // [deep-audit F6] clear wherever results is nulled
     setIsPushing(false);
     setScreen("ready");
   }, []);
+
+  // handleStartOver (multi-batch, 2026-06-10) — "Start over" on the GENERATING screen. The user
+  // edited the page after starting, so this in-flight run is on a STALE version → ABANDON it.
+  // Reuses handleRegenerate (clears polls + state, routes to Ready) THEN best-effort purges the
+  // job so it disappears from the dashboard immediately — otherwise it lingered as "⏳ In
+  // progress" (pre-dashboard this side effect was invisible; the run keeps going on Anthropic's
+  // side and expires ~24h orphaned — we just stop tracking/surfacing it; partner chose this over
+  // a cancel-batch API). Capture jobId BEFORE handleRegenerate nulls it. (Reviewing's
+  // "Regenerate" deliberately KEEPS its completed job — that breakdown is still useful + resumable;
+  // only the in-flight Start-over abandons.)
+  const handleStartOver = useCallback(() => {
+    const abandonedJobId = jobId;
+    handleRegenerate();
+    if (abandonedJobId) {
+      invoke("purgeJob", { jobId: abandonedJobId }).catch((e) =>
+        console.error("Start-over purge failed (non-fatal):", e),
+      );
+    }
+  }, [jobId, handleRegenerate]);
 
   // handleNewPage — clear page binding, return to picker. Used от
   // PushedScreen "Generate Another" (post-push, user wants different
@@ -1058,15 +1656,25 @@ function App() {
   const handleNewPage = useCallback(() => {
     clearInterval(pollRef.current);
     clearInterval(pushPollRef.current);
+    // Fix 4: stop in-flight TC + regen polls (interval-leak on SPA navigation)
+    clearInterval(tcPollRef.current);
+    Object.values(regenPollRefs.current).forEach(clearInterval);
+    // Fix 6: reset TC UI state so the reviewing screen doesn't show a stuck "⏳ Generating…"
+    setTcGenerating(false);
+    setRegenStates({});
+    setTcJobStatus(null);
     setError(null);
+    setErrorRefId(null); // [diag Phase 3] page unbound — drop any error ref
     setPageId(null);
     setPageData(null);
     setJobId(null);
     setJobStatus(null);
     setResults(null);
+    setTestCaseResults(null);
     setPushResult(null);
     setDryRunResult(null);
     setPendingBreakdown(null);
+    setPersistFailed(false); // [deep-audit F6] clear wherever results is nulled
     setIsPushing(false);
     setSelectedContextProfileId("none");
     setContextLoadedForPageId(null);
@@ -1085,14 +1693,40 @@ function App() {
   // (standalone, no Back). handleCloseSettings re-runs the init/config gate (reinitNonce)
   // so a just-configured app routes straight to the picker instead of back to Setup.
   const handleOpenSettings = useCallback(() => {
+    setSettingsInitialTab("settings"); // [diag Phase 5] the Settings entry keeps its historical behavior
+    setSettingsDiagRefFilter(null);
+    setSettingsFromApp(true);
+    setScreen("admin");
+  }, []);
+  // [diag Phase 5, design §5] In-app click-nav to Settings → Diagnostics, pre-filtered
+  // by the failure's diagnostic ref (≤2 clicks from any failure). Used by
+  // DiagnosticRefLine's [Open Diagnostics] on BOTH render sites (ErrorScreen + the
+  // Ready failure card). A null/absent ref opens the tab unfiltered.
+  const handleOpenDiagnostics = useCallback((ref) => {
+    // [deep-audit P5 LOW-1] snapshot the screen we leave — closing Diagnostics used to
+    // reinit to the picker, and for 'pushed' that DESTROYED the (purged-job) push
+    // summary the banner annotates: the partial-failure list + created-issue links
+    // were unrecoverable. 'pushed' is pure client state → restore it on close.
+    settingsReturnScreenRef.current = screenRef.current === "pushed" ? "pushed" : null;
+    setSettingsInitialTab("diagnostics");
+    setSettingsDiagRefFilter(typeof ref === "string" && ref ? ref : null);
     setSettingsFromApp(true);
     setScreen("admin");
   }, []);
   const handleCloseSettings = useCallback(() => {
     setSettingsFromApp(false);
+    setSettingsInitialTab("settings"); // [diag Phase 5] leaving admin — reset the entry tab + ref filter
+    setSettingsDiagRefFilter(null);
+    if (settingsReturnScreenRef.current === "pushed" && pushResult) {
+      // [P5 LOW-1] return to the still-in-state push summary instead of reinit.
+      settingsReturnScreenRef.current = null;
+      setScreen("pushed");
+      return;
+    }
+    settingsReturnScreenRef.current = null;
     setScreen("loading");
     setReinitNonce((n) => n + 1);
-  }, []);
+  }, [pushResult]);
 
   // ── Render ────────────────────────────────────────────────────
   // Admin page has its own full-screen component.
@@ -1102,7 +1736,13 @@ function App() {
   //   • The globalSettings admin module (settingsFromApp === false) renders standalone,
   //     no Back button — it IS the dedicated settings surface.
   if (screen === "admin") {
-    if (!settingsFromApp) return <AdminSettings />;
+    if (!settingsFromApp)
+      return (
+        <AdminSettings
+          initialTab={settingsInitialTab}
+          diagRefFilter={settingsDiagRefFilter}
+        />
+      );
     // Opened from within the app: AdminSettings is maxWidth:640 + p-8 but NOT
     // centered, so on the wide globalPage it floated left ("flies in the air") and
     // the Back button sat detached. Wrap both in a centered 640px frame (matching
@@ -1126,7 +1766,10 @@ function App() {
             ← Back
           </button>
         </div>
-        <AdminSettings />
+        <AdminSettings
+          initialTab={settingsInitialTab}
+          diagRefFilter={settingsDiagRefFilter}
+        />
       </div>
     );
   }
@@ -1195,6 +1838,7 @@ function App() {
           >
             {pageData?.title || "(reviewing)"}
           </span>
+          {/* Test-case entry moved to the Review screen (ConfirmScreen) — single lift point (#1 fix). */}
           {/* Regenerate (2026-06-02) — the must-have path back to generation. A
               reopened completed page lands here on the OLD breakdown (routeByPageStatus
               bypasses Ready), so without this a user who edited the spec page had no
@@ -1202,7 +1846,7 @@ function App() {
               auto-generate — so the user can re-pick the Project Context profile + see
               their usage first. Always present; the stale banner below just makes it
               salient when the page changed. Mirrors BackButton's muted-with-hover style;
-              ml-auto pins it to the far end of this flex-row top-bar. */}
+              marginRight: -8px pins it to the far end of this flex-row top-bar. */}
           <button
             onClick={handleRegenerate}
             className="text-xs flex items-center gap-1.5 ml-auto"
@@ -1264,6 +1908,31 @@ function App() {
               </button>
             </div>
           )}
+          {/* Persist-failed banner (diagnostics Phase 0, §3.1) — the completed breakdown
+              could not be written to Forge storage (typically the ~240KB KVS value cap on
+              very large pages); pollJobStatus handed the results forward inline and they
+              exist ONLY in this tab. ADDITIVE sibling of the stale-page banner (same amber
+              style); no existing copy changed. */}
+          {persistFailed && (
+            <div
+              className="shrink-0 mx-3 mt-3 rounded-lg p-3 flex items-start gap-2"
+              style={{
+                background: "var(--s2j-orange-bg)",
+                border: "1px solid var(--s2j-orange-border)",
+              }}
+            >
+              <span aria-hidden="true" style={{ flexShrink: 0 }}>⚠</span>
+              <div style={{ flex: 1 }}>
+                <p className="text-sm font-medium" style={{ color: "var(--s2j-text)" }}>
+                  This breakdown could not be saved to storage (too large).
+                </p>
+                <p className="text-xs mt-0.5" style={{ color: "var(--s2j-text-light)" }}>
+                  It is loaded in this tab only — review and push it now, or it will be
+                  lost when you leave. Consider splitting very large pages.
+                </p>
+              </div>
+            </div>
+          )}
           <BreakdownEditor
             initialBreakdown={pendingBreakdown || results.breakdown}
             onPush={handlePush}
@@ -1273,6 +1942,67 @@ function App() {
       </div>
     );
   }
+
+  // Edit-after-generate staleness (#1 honest-signal): the BA edited the breakdown AFTER generating
+  // test cases → the cases (stamped against the OLD ACs) are outdated. Compare the current breakdown's
+  // AC-signature to what the LOADED cases were generated against (perStory[].story.acceptance_criteria =
+  // the stamped ACs the push will hash). Frontend-only; surfaces a WARNING — NO auto-regen (the BA's
+  // call whether to push as-is or regenerate, per the cost/agency decision). Normalized EXACTLY like the
+  // backend normAC (curly quotes / NBSP / "AC1:" prefix / backslash folds) so the warning fires precisely
+  // when the push would skip the embed — and the matching idempotency check re-generates on the same
+  // signal. Order-independent across stories + ACs.
+  const tcStaleInfo = (() => {
+    if (!testCaseResults || !Array.isArray(testCaseResults.perStory)) return { any: false, staleIdxs: [], removedIdxs: [] };
+    const sig = (stories) => {
+      const acs = [];
+      for (const s of Array.isArray(stories) ? stories : []) {
+        for (const ac of Array.isArray(s && s.acceptance_criteria) ? s.acceptance_criteria : []) {
+          const n = String(ac == null ? "" : ac)
+            .replace(/^\s*AC\s*\d+\s*[:.]\s*/i, "").replace(/\\/g, "")
+            .replace(/[‘’‛′]/g, "'").replace(/[“”‟″]/g, '"')
+            .replace(/ /g, " ").replace(/\s+/g, " ").trim().toLowerCase();
+          if (n) acs.push(n);
+        }
+      }
+      return acs.sort().join("|");
+    };
+    const cur = pendingBreakdown || results?.breakdown;
+    const currentStories = cur && Array.isArray(cur.capabilities) ? cur.capabilities.flatMap((c) => c.features || []) : [];
+    if (!currentStories.length) return { any: false, staleIdxs: [], removedIdxs: [] }; // no current breakdown to compare → never false-warn
+    // (a) per-story staleness bound to the STABLE _uid (POLICY §3.5) → robust to reorder / rename /
+    // restructure in the editor, where index- or name-matching mis-targets. Falls back to unique-name,
+    // then positional index, for old breakdowns/regens that predate _uid (backward-compatible).
+    // findCur returns the matching current story, or undefined if the stamped story is GONE from the
+    // breakdown (uid + unique-name both absent = removed in the editor).
+    const findCur = (p) => {
+      const s = p.story || {};
+      if (s._uid) { const byUid = currentStories.find((c) => c && c._uid === s._uid); if (byUid) return byUid; }
+      if (s.name) { const named = currentStories.filter((c) => c && c.name === s.name); if (named.length === 1) return named[0]; }
+      return undefined;
+    };
+    const staleIdxs = [];
+    const removedIdxs = [];
+    for (const p of testCaseResults.perStory) {
+      if (!p || !p.story) continue;
+      const cur = findCur(p);
+      if (cur === undefined) {
+        // a uid-bearing stamp with no current match → the story was REMOVED → an ORPHAN card (not "stale").
+        // Legacy stamps (no _uid) keep the old positional comparison rather than false-flagging removed.
+        if (p.story._uid) { removedIdxs.push(p.storyIdx); continue; }
+        if (sig([currentStories[p.storyIdx]]) !== sig([p.story])) staleIdxs.push(p.storyIdx);
+        continue;
+      }
+      if (sig([cur]) !== sig([p.story])) staleIdxs.push(p.storyIdx);
+    }
+    // (#2 fix, Attack 8) drive the GLOBAL banner/ConfirmScreen-amber from the per-story result — ONE
+    // identity model. Prevents a green "✓ generated" while stories are actually stale (e.g. an AC moved
+    // between two stories leaves the global AC multiset unchanged but both stories drifted).
+    const any = staleIdxs.length > 0 || removedIdxs.length > 0;
+    return { any, staleIdxs, removedIdxs };
+  })();
+  const tcStaleVsEdits = tcStaleInfo.any;
+  const tcStaleStoryIdxs = tcStaleInfo.staleIdxs;
+  const tcRemovedStoryIdxs = tcStaleInfo.removedIdxs;
 
   switch (screen) {
     case "loading":
@@ -1318,6 +2048,8 @@ function App() {
           onGenerate={handleGenerate}
           onBack={handleNewPage}
           onOpenSettings={handleOpenSettings}
+          onOpenDiagnostics={handleOpenDiagnostics}
+          genFailureNotice={genFailureNotice}
         />
       );
     case "generating":
@@ -1327,7 +2059,34 @@ function App() {
           jobStatus={jobStatus}
           elapsed={elapsed}
           onBack={handleNewPage}
-          onStartOver={handleRegenerate}
+          onStartOver={handleStartOver}
+        />
+      );
+    case "generatingTests":
+      return (
+        <GeneratingTestsScreen
+          pageTitle={pageData?.title}
+          tcElapsed={tcElapsed}
+          onBack={handleBackFromTestCases}
+        />
+      );
+    case "testcases":
+      return (
+        <TestCasesScreen
+          testCaseResults={testCaseResults}
+          breakdown={pendingBreakdown || results?.breakdown}
+          pageTitle={pageData?.title}
+          jobId={jobId}
+          currentVersion={pageData?.version}
+          onBack={handleBackFromTestCases}
+          onPush={handlePush}
+          onGenerate={handleGenerateTestCases}
+          tcStale={tcStaleVsEdits}
+          tcStaleStoryIdxs={tcStaleStoryIdxs}
+          tcRemovedStoryIdxs={tcRemovedStoryIdxs}
+          onRegenerate={handleRegenerateTestCase}
+          onSaveTestCase={handleSaveTestCase}
+          regenStates={regenStates}
         />
       );
     case "confirming":
@@ -1336,12 +2095,18 @@ function App() {
           dryRunResult={dryRunResult}
           breakdown={pendingBreakdown}
           truncationNote={results?.truncation_note}
+          persistFailed={persistFailed}
           isPushing={isPushing}
           onConfirm={handleConfirmedPush}
           onBack={handleBackToReview}
           onBackToPicker={handleNewPage}
           onRemoveDependency={handleRemoveDependency}
           onRestoreDependency={handleRestoreDependency}
+          testCaseResults={testCaseResults}
+          onGenerateTestCases={handleGenerateTestCases}
+          onOpenTestCases={handleOpenTestCases}
+          tcGenerating={tcGenerating}
+          tcStale={tcStaleVsEdits}
         />
       );
     case "pushing":
@@ -1352,6 +2117,9 @@ function App() {
           result={pushResult}
           onBack={handleBackToReview}
           onNew={handleNewPage}
+          jobId={jobId}
+          onOpenDiagnostics={handleOpenDiagnostics}
+          tcDiscarded={tcDiscardedAtPush}
         />
       );
     case "limit_reached":
@@ -1360,8 +2128,10 @@ function App() {
       return (
         <ErrorScreen
           error={error}
+          jobId={errorRefId}
           onRetry={handleRetry}
           onBackToPicker={pageData ? handleNewPage : null}
+          onOpenDiagnostics={handleOpenDiagnostics}
         />
       );
     default:
@@ -1406,6 +2176,110 @@ function Spinner({ size = 16 }) {
   );
 }
 
+// [diag Phase 3+5, design §5] Diagnostic-ref line — "Diagnostic ref: <ref> [Copy]" + the
+// "Full report" pointer, now with a LIVE [Open Diagnostics] link-button (Phase 5) that
+// navigates in-app to Settings → Diagnostics pre-filtered by this ref (onOpenDiagnostics
+// → App's handleOpenDiagnostics).
+// Shared by the Ready failure card and ErrorScreen — BOTH render sites get the click-nav
+// through this one component. Renders NOTHING when refId is absent
+// (never an "undefined" ref). Copy mirrors the app's existing clipboard pattern
+// (StoryTestCaseCard/TestCasesScreen): navigator.clipboard + discriminated
+// "✓ Copied"/"Copy failed" feedback with a timed reset — no data-URI download fallback
+// for a short ref string (that fallback exists for large export payloads).
+function DiagnosticRefLine({ refId, onOpenDiagnostics }) {
+  const [copyState, setCopyState] = useState("idle"); // 'idle' | 'copied' | 'failed'
+  // [diag Phase 5, gate fix — null-ref affordance] failures without a correlation id
+  // (page-fetch, managed-unavailable…) still WRITE null-ref ledger records — give them
+  // a path to Diagnostics too: "Recorded in Diagnostics" + an unfiltered open. Render
+  // nothing only when there is neither a ref NOR a navigation handler.
+  if (!refId && !onOpenDiagnostics) return null;
+  if (!refId) {
+    return (
+      <div className="mt-2 text-xs" style={{ color: "var(--s2j-text-muted)" }}>
+        Recorded in Diagnostics
+        <button
+          type="button"
+          onClick={() => onOpenDiagnostics(null)}
+          className="text-xs"
+          style={{
+            background: "none",
+            border: "none",
+            color: "var(--s2j-blue)",
+            textDecoration: "underline",
+            cursor: "pointer",
+            padding: 0,
+            marginLeft: "8px",
+          }}
+          title="Open the Diagnostics tab"
+        >
+          Open Diagnostics
+        </button>
+      </div>
+    );
+  }
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(String(refId));
+      setCopyState("copied");
+      setTimeout(() => setCopyState("idle"), 1500);
+    } catch (_) {
+      setCopyState("failed");
+      setTimeout(() => setCopyState("idle"), 2500);
+    }
+  };
+  return (
+    <div className="mt-2 text-xs" style={{ color: "var(--s2j-text-light)" }}>
+      <span style={{ fontFamily: "monospace" }}>Diagnostic ref: {refId}</span>
+      <button
+        type="button"
+        onClick={handleCopy}
+        className="text-xs"
+        style={{
+          background: "var(--s2j-bg)",
+          border: "1px solid var(--s2j-border)",
+          color: "var(--s2j-text)",
+          cursor: "pointer",
+          padding: "1px 8px",
+          borderRadius: "4px",
+          marginLeft: "8px",
+        }}
+        title="Copy the diagnostic reference (include it when contacting support)"
+      >
+        {copyState === "copied"
+          ? "✓ Copied"
+          : copyState === "failed"
+            ? "Copy failed — check browser permissions"
+            : "Copy"}
+      </button>
+      <div className="mt-1" style={{ color: "var(--s2j-text-muted)" }}>
+        Full report: Settings → Diagnostics
+        {/* [diag Phase 5] live in-app navigation — lands on the Diagnostics tab
+            pre-filtered by this ref (the pointer text above stays as the fallback
+            wayfinding when the handler isn't threaded). */}
+        {onOpenDiagnostics && (
+          <button
+            type="button"
+            onClick={() => onOpenDiagnostics(refId)}
+            className="text-xs"
+            style={{
+              background: "none",
+              border: "none",
+              color: "var(--s2j-blue)",
+              textDecoration: "underline",
+              cursor: "pointer",
+              padding: 0,
+              marginLeft: "8px",
+            }}
+            title="Open the Diagnostics tab filtered to this reference"
+          >
+            Open Diagnostics
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ── Ready ───────────────────────────────────────────────────────
 
 function ReadyScreen({
@@ -1417,6 +2291,8 @@ function ReadyScreen({
   onGenerate,
   onBack,
   onOpenSettings,
+  onOpenDiagnostics,
+  genFailureNotice = null,
 }) {
   // Prices come from getUsage's pricing[] (single source of truth — no hardcoded
   // USD prices in the UI). The hybrid has two paid editions: byokPro (unlimited, own
@@ -1465,6 +2341,43 @@ function ReadyScreen({
       <p className="text-sm mb-4" style={{ color: "var(--s2j-text-light)" }}>
         {(pageData.body_length || 0).toLocaleString()} characters
       </p>
+
+      {/* [diag Phase 3, S4] Last-generation-failed card — the dashboard ⚠ "Needs
+          attention" click / failed-job reconnect lands HERE instead of a context-free
+          Ready screen. ADDITIVE: everything below (usage badge, context picker,
+          Generate) is unchanged; the Generate button doubles as the retry. */}
+      {genFailureNotice && (
+        <div
+          className="rounded-lg p-4 mb-4"
+          style={{
+            background: "var(--s2j-red-bg)",
+            border: "1px solid var(--s2j-red-border)",
+          }}
+        >
+          <p
+            className="text-sm font-medium mb-1"
+            style={{ color: "var(--s2j-red)" }}
+          >
+            ⚠ The last generation for this page failed
+          </p>
+          <p className="text-xs" style={{ color: "var(--s2j-text)" }}>
+            {/* [diag Phase 5] When the stored user-facing detail is absent, humanize the
+                stored error CODE via the diagnosticsView map (Phase-3 stored it un-rendered);
+                the original generic sentence remains the final fallback when neither exists. */}
+            {genFailureNotice.detail ||
+              (genFailureNotice.code
+                ? classText(genFailureNotice.code).title
+                : "The generation could not complete. You can generate again below.")}
+          </p>
+          <p className="text-xs mt-1" style={{ color: "var(--s2j-text-light)" }}>
+            Generating again will start a fresh run.
+          </p>
+          <DiagnosticRefLine
+            refId={genFailureNotice.refId}
+            onOpenDiagnostics={onOpenDiagnostics}
+          />
+        </div>
+      )}
 
       {usage && (
         <div
@@ -1715,6 +2628,111 @@ function GeneratingScreen({ pageTitle, elapsed, onBack, onStartOver }) {
   );
 }
 
+// ── GeneratingTestsScreen (P5) ──────────────────────────────────
+// Clones GeneratingScreen for test-case bulk generation.
+// Generation runs on Anthropic's async Batch API (same as the breakdown
+// batch); the same "you can leave" and "taking longer" UX applies.
+function GeneratingTestsScreen({ pageTitle, tcElapsed, onBack }) {
+  // #3 (2026-06-07): NO determinate "% complete". Test-case generation is one async Anthropic BATCH
+  // (N per-story requests that all finish together at the end), so progress sits at 0 the whole run
+  // then jumps to 100 — the old "0% complete" read as BROKEN, most acutely right after a user-clicked
+  // regenerate. An honest INDETERMINATE spinner + the live timer conveys "working, here's how long"
+  // without faking a percentage (mirrors the breakdown GeneratingScreen fix).
+  return (
+    <div className="p-6" style={SCREEN_MAX_WIDTH_STYLE}>
+      {onBack && (
+        <BackButton
+          onClick={onBack}
+          label="Back to Review"
+          title="Return to the breakdown editor. Test-case generation continues in the background — return to this breakdown to see progress."
+        />
+      )}
+      <div className="flex flex-col items-center text-center py-6">
+        <div className="relative mb-5" style={{ width: 96, height: 96 }}>
+          <div
+            className="absolute inset-0 rounded-full animate-spin"
+            style={{
+              border: "3px solid var(--s2j-border)",
+              borderTopColor: "var(--s2j-blue)",
+              animationDuration: "1.1s",
+            }}
+          />
+          <div className="absolute inset-0 flex items-center justify-center">
+            <span
+              className="text-xl font-mono font-semibold"
+              style={{ color: "var(--s2j-text)" }}
+            >
+              {fmtTime(tcElapsed)}
+            </span>
+          </div>
+        </div>
+        <h2
+          className="text-base font-semibold"
+          style={{ color: "var(--s2j-text)" }}
+        >
+          Generating test cases…
+        </h2>
+        {pageTitle && (
+          <p className="text-sm mt-0.5" style={{ color: "var(--s2j-text-light)" }}>
+            {pageTitle}
+          </p>
+        )}
+        <p
+          className="text-xs mt-2.5"
+          style={{ color: "var(--s2j-text-muted)", maxWidth: "26rem" }}
+        >
+          Building BA-grade acceptance scenarios for every story — Gherkin and CSV
+          export included. Typically a few minutes; large breakdowns take longer.
+        </p>
+      </div>
+
+      {tcElapsed >= 600 && (
+        <div
+          className="rounded-lg p-3 mb-4 flex items-start gap-2"
+          style={{
+            background: "var(--s2j-orange-bg)",
+            border: "1px solid var(--s2j-orange-border)",
+          }}
+        >
+          <span aria-hidden="true">⏳</span>
+          <div>
+            <p
+              className="text-xs font-medium mb-1"
+              style={{ color: "var(--s2j-text)" }}
+            >
+              Taking longer than usual — this is normal, nothing is broken
+            </p>
+            <p className="text-xs" style={{ color: "var(--s2j-text-light)" }}>
+              Test-case generation runs on Anthropic's Batch API; it can slow down under
+              heavy load. Your request is still processing.
+            </p>
+          </div>
+        </div>
+      )}
+
+      <div
+        className="rounded-lg p-3"
+        style={{
+          background: "var(--s2j-blue-bg)",
+          border: "1px solid var(--s2j-blue-border)",
+        }}
+      >
+        <p
+          className="text-xs font-medium mb-1"
+          style={{ color: "var(--s2j-text)" }}
+        >
+          ☕ You can safely leave — we'll keep working
+        </p>
+        <p className="text-xs" style={{ color: "var(--s2j-text-light)" }}>
+          Close this tab or switch tasks — test-case generation continues in the
+          background. Reopen the breakdown (Apps → Spec2Tickets) and the results
+          will be waiting for you.
+        </p>
+      </div>
+    </div>
+  );
+}
+
 // ── Confirm Push ────────────────────────────────────────────────
 // v3.0.0 ConfirmScreen — embeds Dashboard signals at the push decision point.
 //
@@ -1736,12 +2754,18 @@ function ConfirmScreen({
   dryRunResult,
   breakdown,
   truncationNote,
+  persistFailed,
   isPushing,
   onConfirm,
   onBack,
   onBackToPicker,
   onRemoveDependency,
   onRestoreDependency,
+  testCaseResults,
+  onGenerateTestCases,
+  onOpenTestCases,
+  tcGenerating,
+  tcStale,
 }) {
   const total = dryRunResult?.total_items || 0;
   const epics = dryRunResult?.total_epics || 0;
@@ -1749,6 +2773,15 @@ function ConfirmScreen({
   const tasks = dryRunResult?.total_subtasks || 0;
   const links = dryRunResult?.dependency_links || 0;
   const project = dryRunResult?.project_key || "(Settings)";
+  const tcStaleNow = !!testCaseResults && !!tcStale; // edited-since-generation → amber warning (not green ✓)
+  // 2-step armed confirm for the EXPENSIVE re-run-all (Phase-1 cost fix): a stale re-generate re-runs
+  // ALL stories (full Anthropic cost), so the BA must click twice + see the scope — never a surprise
+  // spend. (Targeted per-story / per-case regeneration is the separate follow-up feature.)
+  const [regenArmed, setRegenArmed] = useState(false);
+  const regenArmTimer = useRef(null);
+  // Clear the arm timer on unmount so a pending setRegenArmed(false) never fires on an unmounted
+  // ConfirmScreen (e.g. the BA arms Re-run then clicks "View / edit →" within the 4s window).
+  useEffect(() => () => clearTimeout(regenArmTimer.current), []);
 
   // Extract v3 native signals от breakdown's _v3_original (preserved by
   // v3AdaptResultPayload at result-load time). Falls back gracefully когато
@@ -1801,6 +2834,31 @@ function ConfirmScreen({
             </p>
             <p className="text-xs mt-0.5" style={{ color: "var(--s2j-text-light)" }}>
               {truncationNote}
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* Persist-failed warning (diagnostics Phase 0, §3.1) — the breakdown exists ONLY in
+          this tab (it could not be written to Forge storage); repeated at the push decision
+          point because pushing now is the way to keep it. ADDITIVE sibling of the truncation
+          banner above (same pattern); no existing copy changed. */}
+      {persistFailed && (
+        <div
+          className="rounded-lg p-3 mb-4 flex items-start gap-2"
+          style={{
+            background: "var(--s2j-orange-bg)",
+            border: "1px solid var(--s2j-orange-border)",
+          }}
+        >
+          <span aria-hidden="true" style={{ flexShrink: 0 }}>⚠</span>
+          <div>
+            <p className="text-sm font-medium" style={{ color: "var(--s2j-text)" }}>
+              This breakdown could not be saved to storage (too large).
+            </p>
+            <p className="text-xs mt-0.5" style={{ color: "var(--s2j-text-light)" }}>
+              It is loaded in this tab only — review and push it now, or it will be
+              lost when you leave. Consider splitting very large pages.
             </p>
           </div>
         </div>
@@ -2019,6 +3077,23 @@ function ConfirmScreen({
         </div>
       </div>
 
+      {/* Test-case summary line — shown when test cases have been generated */}
+      {testCaseResults && typeof testCaseResults.total === "number" && (
+        <div
+          className="rounded-lg p-3 mb-4 text-xs"
+          style={{
+            background: "var(--s2j-bg-section)",
+            border: "1px solid var(--s2j-border)",
+            color: "var(--s2j-text-muted)",
+          }}
+        >
+          <strong style={{ color: "var(--s2j-text)" }}>
+            Test cases: {testCaseResults.total} generated
+          </strong>{" "}
+          — a summary will be added to each Story.
+        </div>
+      )}
+
       {/* Cross-feature dependency structure — shows WHICH feature depends on
           WHICH and lets the reviewer remove an over-inferred edge before push
           (partner request 2026-05-31). Always rendered: it self-guards (returns
@@ -2112,6 +3187,112 @@ function ConfirmScreen({
         </details>
       )}
 
+      {/* Optional pre-push step (P5) — generate acceptance test cases for these stories. This is
+          THE single entry point to test-case generation (moved here from the editor + top-bar so
+          the BA's edits are always lifted into pendingBreakdown before generating — #1 fix). */}
+      <div
+        className="rounded-lg p-3 mb-3 flex items-center justify-between gap-3"
+        style={{
+          background: tcStaleNow ? "var(--s2j-orange-bg)" : testCaseResults ? "var(--s2j-green-bg)" : "var(--s2j-blue-bg)",
+          border: `1px solid ${tcStaleNow ? "var(--s2j-orange-border)" : testCaseResults ? "var(--s2j-green-border)" : "var(--s2j-blue-border)"}`,
+        }}
+      >
+        <div>
+          <p className="text-xs font-medium" style={{ color: "var(--s2j-text)" }}>
+            {tcStaleNow
+              ? "⚠ Test cases may be outdated"
+              : testCaseResults
+              ? "✓ Acceptance test cases generated"
+              : "Optional: acceptance test cases"}
+          </p>
+          <p className="text-xs" style={{ color: "var(--s2j-text-muted)" }}>
+            {tcStaleNow
+              ? "You edited the breakdown since generating these. Re-running re-generates ALL stories (takes a few minutes, uses compute) — or push as-is; the edited stories simply won't get a test-case summary. Your call."
+              : "BA-grade Gherkin / CSV export + a summary embedded in each Jira Story."}
+          </p>
+        </div>
+        <div className="shrink-0 flex items-center gap-2">
+          {/* Navigate to the Test Cases screen — available whenever test cases exist, INCLUDING the
+              stale state (the screen carries its own stale banner). This is the always-free view/edit
+              path; it NEVER regenerates. Fixes the trap where editing the breakdown left "Re-run all"
+              as the ONLY affordance, blocking access to the existing cases + targeted per-story regen. */}
+          {testCaseResults && (
+            <button
+              type="button"
+              onClick={() => onOpenTestCases?.()}
+              disabled={isPushing || tcGenerating}
+              style={{
+                background: "var(--s2j-green-bg)",
+                border: "1px solid var(--s2j-green-border)",
+                color: "var(--s2j-green-dark)",
+                padding: "6px 12px",
+                borderRadius: "6px",
+                fontSize: "13px",
+                fontWeight: 500,
+                cursor: isPushing || tcGenerating ? "not-allowed" : "pointer",
+                whiteSpace: "nowrap",
+              }}
+            >
+              View / edit →
+            </button>
+          )}
+          {/* Generate (no cases yet, blue) OR Re-run-all (stale → expensive; 2-step armed confirm,
+              orange). NOT shown when fresh — the cases already match the breakdown, so re-running
+              would be a pointless re-spend. NOT shown when persistFailed (gate M1): test-gen reads
+              the stored job.breakdown, which in degraded mode is a small 'failed' stub → the call
+              can only dead-end on the Error screen and strand the unsaved breakdown. */}
+          {persistFailed && !testCaseResults && (
+            <span
+              style={{
+                fontSize: "12px",
+                color: "var(--s2j-text-muted)",
+                whiteSpace: "nowrap",
+              }}
+              title="This breakdown could not be saved to Forge storage, so test-case generation (which reads the saved copy) is unavailable. Push to Jira now to keep your work."
+            >
+              🧪 Test cases unavailable — breakdown not saved
+            </span>
+          )}
+          {!persistFailed && (!testCaseResults || tcStaleNow) && (
+            <button
+              type="button"
+              onClick={() => {
+                // Stale re-run-all is expensive (every story re-billed) → arm a 2-step confirm so the BA
+                // consciously consents (Phase-1 cost fix). First click arms; second (within 4s) fires.
+                if (tcStaleNow && !regenArmed) {
+                  setRegenArmed(true);
+                  clearTimeout(regenArmTimer.current);
+                  regenArmTimer.current = setTimeout(() => setRegenArmed(false), 4000);
+                  return;
+                }
+                setRegenArmed(false);
+                onGenerateTestCases?.();
+              }}
+              disabled={isPushing || tcGenerating}
+              style={{
+                background: tcStaleNow ? "var(--s2j-orange-bg)" : "var(--s2j-blue-bg)",
+                border: `1px solid ${tcStaleNow ? "var(--s2j-orange-border)" : "var(--s2j-blue-border)"}`,
+                color: tcStaleNow ? "var(--s2j-text)" : "var(--s2j-blue)",
+                padding: "6px 12px",
+                borderRadius: "6px",
+                fontSize: "13px",
+                fontWeight: 500,
+                cursor: isPushing || tcGenerating ? "not-allowed" : "pointer",
+                whiteSpace: "nowrap",
+              }}
+            >
+              {tcGenerating
+                ? "⏳ Generating tests…"
+                : tcStaleNow
+                ? regenArmed
+                  ? `⚠ Re-runs all ${stories} stories — confirm?`
+                  : "🔄 Re-run all"
+                : "🧪 Generate Test Cases"}
+            </button>
+          )}
+        </div>
+      </div>
+
       {/* Final action */}
       <div
         className="rounded-lg p-3 mb-4"
@@ -2125,6 +3306,15 @@ function ConfirmScreen({
         </p>
       </div>
 
+      {/* [seams-audit HIGH (b)] honest consent: pushing now PURGES the in-flight
+          TC batch (post-push purge deletes the tcjob) — the user must know the
+          generating test cases will be discarded and not embedded. */}
+      {tcGenerating && (
+        <p className="text-xs mb-2" style={{ color: "var(--s2j-orange)" }}>
+          ⚠ Test cases are still generating — pushing now discards that run (they
+          will not be embedded in the Jira stories).
+        </p>
+      )}
       <div className="flex gap-3">
         <button onClick={onBack} className="btn-secondary" disabled={isPushing}>
           ← Back to Editor
@@ -2155,7 +3345,7 @@ function ConfirmScreen({
 // source feature, AND lets the reviewer remove an edge that doesn't belong (e.g.
 // an over-inferred dependency) before pushing.
 //
-// Data: edges = signals.dependencyEdges = [{source, target}] where `source` is
+// Data: edges = signals.dependencyEdges = [{source, target, targetDisplay}] where `source` is
 // the feature that depends on `target` (v3Schema.extractV3Signals; mirrors
 // prompts.js rule 11 — feature.dependencies lists what THIS feature needs). In
 // JIRA each edge becomes a Story-blocks-Story link — `target` blocks `source`
@@ -2168,12 +3358,23 @@ function ConfirmScreen({
 function DependencyStructure({ edges, onRemove, onRestore }) {
   const [removed, setRemoved] = useState([]);
 
+  // Task #4: the target string is the FROZEN dep name (the depended-on feature's
+  // generation name) — it stays the mutation/tracking key everywhere (remove/restore
+  // filter dependencies[] by it). labelOf resolves it to that feature's CURRENT name
+  // for DISPLAY only, so after a rename the Review shows the current name, not the
+  // stale original. Fallback to the raw string (legacy / paraphrase / deleted dep).
+  const displayOf = new Map();
+  for (const e of edges || []) {
+    if (e && e.target != null) displayOf.set(e.target, e.targetDisplay || e.target);
+  }
+  const labelOf = (t) => displayOf.get(t) || t;
+
   const handleRemove = (source, target) => {
     onRemove?.(source, target);
     setRemoved((prev) =>
       prev.some((r) => r.source === source && r.target === target)
         ? prev
-        : [...prev, { source, target }],
+        : [...prev, { source, target, display: labelOf(target) }],
     );
   };
   const handleRestore = (source, target) => {
@@ -2262,13 +3463,13 @@ function DependencyStructure({ edges, onRemove, onRestore }) {
                           <span style={{ color: "var(--s2j-blue)", flexShrink: 0 }}>
                             depends on →
                           </span>
-                          <span style={{ color: "var(--s2j-text-light)" }}>{t}</span>
+                          <span style={{ color: "var(--s2j-text-light)" }}>{labelOf(t)}</span>
                         </span>
                         <button
                           type="button"
                           onClick={() => handleRemove(source, t)}
-                          title={`Remove this dependency — "${source}" will no longer be blocked by "${t}" in Jira`}
-                          aria-label={`Remove dependency: ${source} depends on ${t}`}
+                          title={`Remove this dependency — "${source}" will no longer be blocked by "${labelOf(t)}" in Jira`}
+                          aria-label={`Remove dependency: ${source} depends on ${labelOf(t)}`}
                           style={{
                             background: "transparent",
                             border: "none",
@@ -2322,7 +3523,7 @@ function DependencyStructure({ edges, onRemove, onRestore }) {
                     minWidth: 0,
                   }}
                 >
-                  {r.source} → {r.target}
+                  {r.source} → {r.display || r.target}
                 </span>
                 <button
                   type="button"
@@ -2471,7 +3672,7 @@ function PushingScreen({ progress, phase }) {
 
 // ── Pushed (Success) ────────────────────────────────────────────
 
-function PushedScreen({ result, onBack, onNew }) {
+function PushedScreen({ result, onBack, onNew, jobId = null, onOpenDiagnostics, tcDiscarded = false }) {
   const total = result?.total_items || result?.created_issues?.length || 0;
   const stories = result?.created_issues || [];
   const browseUrl = (key) =>
@@ -2523,6 +3724,25 @@ function PushedScreen({ result, onBack, onNew }) {
             ? ` · ${result.dependency_links_created} links`
             : ""}
         </p>
+        {(result?.tc_embedded > 0 || result?.tc_skipped > 0) && (
+          <p className="text-xs mt-1" style={{ color: "var(--s2j-text-light)" }}>
+            {result.tc_embedded > 0
+              ? `Test cases summarized in ${result.tc_embedded} Stor${result.tc_embedded === 1 ? "y" : "ies"}`
+              : "Test cases were not attached to any Story"}
+            {result.tc_skipped > 0
+              ? ` (${result.tc_skipped} skipped — ACs changed since generation; regenerate on the Test Cases screen)`
+              : ""}
+          </p>
+        )}
+        {/* [polish] a test-case run was in flight when the user pushed → it was
+            discarded (the Create-button warning consented to this). Confirm it here
+            so they don't have to open Diagnostics to learn what happened. */}
+        {tcDiscarded && (
+          <p className="text-xs mt-1" style={{ color: "var(--s2j-orange)" }}>
+            ℹ The in-progress test-case generation was discarded — regenerate from the
+            editor after the push if you want them embedded.
+          </p>
+        )}
       </div>
 
       {(result?.epic_key || stories.length > 0) && (
@@ -2643,6 +3863,16 @@ function PushedScreen({ result, onBack, onNew }) {
               }`
             : null) ||
           null;
+        // Truncate the banner reason at a WORD boundary + ellipsis (it was a hard
+        // mid-word substring(0,200) → "…Required custom fie"); the full reason is
+        // always in Settings → Diagnostics (Copy report).
+        const reasonText = (() => {
+          const full = String(firstDetail || "");
+          if (full.length <= 220) return full;
+          const cut = full.slice(0, 220);
+          const sp = cut.lastIndexOf(" ");
+          return (sp > 160 ? cut.slice(0, sp) : cut) + "…";
+        })();
         return (
           <div
             className="rounded-lg p-3 mb-4"
@@ -2659,7 +3889,7 @@ function PushedScreen({ result, onBack, onNew }) {
             </p>
             {firstDetail && (
               <p className="text-xs mb-1" style={{ color: "var(--s2j-text-muted)" }}>
-                Reason: {String(firstDetail).substring(0, 200)}
+                Reason: {reasonText}
               </p>
             )}
             <p className="text-xs" style={{ color: "var(--s2j-text-muted)" }}>
@@ -2671,6 +3901,10 @@ function PushedScreen({ result, onBack, onNew }) {
                 support@spec2jira.com
               </a>
             </p>
+            {/* [diag Phase 5, gate MED-3] the partial-push class (the S1 paraphrased-link
+                case) is the feature's highest-value diagnostics class — give the banner
+                the ref + the in-app path to the pre-filtered Diagnostics tab. */}
+            <DiagnosticRefLine refId={jobId} onOpenDiagnostics={onOpenDiagnostics} />
           </div>
         );
       })()}
@@ -2870,7 +4104,7 @@ function LimitReachedScreen({ quota, onBack }) {
   );
 }
 
-function ErrorScreen({ error, onRetry, onBackToPicker }) {
+function ErrorScreen({ error, jobId = null, onRetry, onBackToPicker, onOpenDiagnostics }) {
   // EH1 polish part 27 (2026-05-09) — last-resort defensive HTML strip.
   // Most error paths now route through `_classifyBackendError` which
   // discards HTML detail bodies, but legacy paths (mid-pipeline polling
@@ -2912,6 +4146,10 @@ function ErrorScreen({ error, onRetry, onBackToPicker }) {
         <p className="text-xs" style={{ color: "var(--s2j-text)" }}>
           {displayError}
         </p>
+        {/* [diag Phase 3, design §5] ADDITIVE diagnostic ref under the verbatim error
+            text — the existing message above is never shortened or replaced. Renders
+            nothing when no jobId is in scope for this failure (jobId null). */}
+        <DiagnosticRefLine refId={jobId} onOpenDiagnostics={onOpenDiagnostics} />
       </div>
 
       <button onClick={onRetry} className="btn-secondary">

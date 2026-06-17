@@ -31,6 +31,7 @@
 
 import api, { route } from '@forge/api';
 import { kvs } from '@forge/kvs';
+import { renderTestCasesAdf, normAC } from './testcases.js';
 
 const BULK_MAX = 50;
 // Concurrency cap для parallel issueLink creation. 6 concurrent stays well
@@ -67,7 +68,7 @@ function plainADF(text) {
   };
 }
 
-function richADF({ userStory, description, acceptanceCriteria, sourceHeading, embeddedTasks }) {
+function richADF({ userStory, description, acceptanceCriteria, sourceHeading, embeddedTasks, tcEntry = null }) {
   const content = [];
 
   if (userStory) {
@@ -162,6 +163,25 @@ function richADF({ userStory, description, acceptanceCriteria, sourceHeading, em
     });
   }
 
+  // Embed compact test-case summary when available (P4). Passes coverage so the
+  // summary paragraph shows "{covered}/{total} ACs covered". Wrapped in try/catch:
+  // a render failure must never block the Story create (a test-case embed is bonus
+  // content, not a required field — gotcha #11). renderTestCasesAdf returns [] when
+  // absent, so the spread is always safe. ONLY safe ADF node types used (gotcha #11).
+  if (
+    tcEntry &&
+    !tcEntry.error &&
+    tcEntry.result &&
+    Array.isArray(tcEntry.result.test_cases) &&
+    tcEntry.result.test_cases.length > 0
+  ) {
+    try {
+      content.push(...renderTestCasesAdf(tcEntry.result, tcEntry.coverage));
+    } catch (e) {
+      console.warn('[push] tc embed render failed (non-fatal, skipping):', String(e?.message || e));
+    }
+  }
+
   return { type: 'doc', version: 1, content };
 }
 
@@ -177,7 +197,7 @@ function richADF({ userStory, description, acceptanceCriteria, sourceHeading, em
  *                acceptance_criteria, dependencies, tasks }]
  *   links: [{ source: <featureName>, target: <featureName> }]
  */
-function flattenBreakdown(breakdown) {
+export function flattenBreakdown(breakdown) {
   if (!breakdown) return { epic: null, features: [], links: [] };
 
   const epic =
@@ -202,11 +222,30 @@ function flattenBreakdown(breakdown) {
   // Build dependency edges. feature.dependencies[] contains names of features
   // that THIS feature depends на. JIRA semantics: outwardIssue blocks
   // inwardIssue. So if B depends on A: outwardIssue=A, inwardIssue=B.
+  // Task #3 (name→uid): bind each edge to the endpoints' stable _uid so a rename
+  // in the editor never breaks the link. Dependency STRINGS are frozen generation
+  // names; each feature's _orig_name (frozen at adaptToLegacyShape, when names were
+  // canonical) maps a frozen dep-name → that feature's _uid. A rename changes f.name
+  // but neither the dep string nor _orig_name → the frozen-to-frozen match still
+  // resolves to the right _uid at push. Names ride along for display, the unresolved
+  // reason, and the legacy name-fallback. PURE FUNCTION (§4): deterministic identity,
+  // no LLM; dependencies[] stays name-canonical so every OTHER consumer is untouched.
+  const nameToUids = {}; // _orig_name → [uid…]; an array so an ambiguous duplicate name stays UNBOUND
+  for (const f of features) {
+    const key = f && (f._orig_name || f.name);
+    if (key == null) continue;
+    (nameToUids[key] || (nameToUids[key] = [])).push((f && f._uid) || null);
+  }
   const links = [];
   for (const f of features) {
     const deps = f.dependencies || [];
-    for (const depTarget of deps) {
-      links.push({ source: depTarget, target: f.name });
+    for (const depName of deps) {
+      const cand = nameToUids[depName];
+      // Bind ONLY on a unique name match. A duplicate name (cand.length > 1) is an
+      // ambiguous reference the LLM itself created → leave it name-bound (resolves
+      // last-wins at push = no worse than today); a missing name → null (paraphrase).
+      const sourceUid = cand && cand.length === 1 ? cand[0] : null;
+      links.push({ source: depName, target: f.name, sourceUid, targetUid: (f && f._uid) || null });
     }
   }
 
@@ -220,8 +259,10 @@ function flattenBreakdown(breakdown) {
  * resolves the subtask issue type dynamically (naming-independent).
  * Returns { ok, project, subtaskTypeId, subtaskTypeName, issueTypesAvailable }
  * OR { ok: false, error, detail }. Fail fast before any creates.
+ * Exported (diag Phase 5): runHealthCheck's 'jira_project' probe REUSES this
+ * exact push preflight (project access + subtask type + SP/priority fields).
  */
-async function lookupProject(projectKey) {
+export async function lookupProject(projectKey) {
   let response;
   try {
     // expand=issueTypes guarantees the issueTypes array е present (needed to
@@ -345,22 +386,66 @@ async function createSingleIssue(payload) {
  * body is logged separately (console.error) — it never reaches the user.
  * Parses defensively: any malformed body falls back to a generic HTTP-status line.
  */
+/**
+ * Walk a Jira error body of ANY shape and pull out human reasons + the rejected
+ * FIELD IDs (content-free keys only — never numeric element indices). Jira's
+ * bulk endpoint returns at least three shapes, all handled here (Live-E2E found
+ * shape (b) on the all-stories-rejected case — the old code did
+ * `String(<detail-object>)` → "[object Object]" and captured zero field names):
+ *   (a) flat field map:        { errors: { customfield_X: "reason" }, errorMessages: [] }
+ *   (b) indexed whole-bulk 400: { errors: { "0": <detail-obj>, "1": <detail-obj> } }
+ *   (c) nested per-element:     { elementErrors: { errors: {…}, errorMessages: [] } }
+ * Returns { reasons, fieldNames } (deduped, capped). VALUES are content (a field
+ * reason can echo a submitted value) → they ride `reasons` (zone-2/consent-gated
+ * + the user-facing message), NEVER `fieldNames` (the content-free ledger key).
+ */
+export function parseJiraErrorDetail(body) {
+  const reasons = [];
+  const fieldNames = [];
+  const seenReason = new Set();
+  const seenField = new Set();
+  const isIndexKey = (k) => /^\d+$/.test(k); // element-index, NOT a field id
+  const addReason = (s) => {
+    const c = String(s == null ? '' : s).trim();
+    if (c && !seenReason.has(c) && reasons.length < 20) { seenReason.add(c); reasons.push(c); }
+  };
+  const addField = (f) => {
+    if (typeof f !== 'string' || isIndexKey(f)) return;
+    if (!seenField.has(f) && fieldNames.length < 20) { seenField.add(f); fieldNames.push(f); }
+  };
+  const walk = (node, depth) => {
+    if (!node || typeof node !== 'object' || depth > 5) return;
+    if (Array.isArray(node)) { for (const el of node) walk(el, depth + 1); return; }
+    // errorMessages members are strings in every Jira shape; a non-string member
+    // (hostile/odd input) must NOT become "[object Object]" — skip it (P5-review LOW).
+    if (Array.isArray(node.errorMessages)) for (const m of node.errorMessages) if (typeof m === 'string') addReason(m);
+    if (node.errors && typeof node.errors === 'object') {
+      // (P5-review MED) the DOCUMENTED /issue/bulk failure body returns `errors` as a
+      // top-level ARRAY [{status, elementErrors, failedElementNumber}] — descend it too;
+      // only-object-map was the original 'shape-agnostic' gap.
+      if (Array.isArray(node.errors)) {
+        for (const el of node.errors) walk(el, depth + 1);
+      } else {
+        for (const [key, val] of Object.entries(node.errors)) {
+          if (typeof val === 'string') { addField(key); addReason(`${key}: ${val.trim()}`); }
+          else if (val && typeof val === 'object') walk(val, depth + 1); // indexed/nested detail
+        }
+      }
+    }
+    if (node.elementErrors && typeof node.elementErrors === 'object') walk(node.elementErrors, depth + 1);
+  };
+  walk(body, 0);
+  return { reasons, fieldNames };
+}
+
+/**
+ * Build a CLEAN, customer-facing message from a Jira error body (any shape, via
+ * parseJiraErrorDetail). The raw body is logged separately; it never reaches the
+ * user. Malformed/unparseable → a generic HTTP-status line.
+ */
 function jiraErrorMessage(status, rawText) {
   try {
-    const body = JSON.parse(rawText);
-    const reasons = [];
-    if (Array.isArray(body?.errorMessages)) {
-      for (const m of body.errorMessages) {
-        const clean = String(m || '').trim();
-        if (clean) reasons.push(clean);
-      }
-    }
-    if (body?.errors && typeof body.errors === 'object') {
-      for (const [field, msg] of Object.entries(body.errors)) {
-        const clean = String(msg || '').trim();
-        if (clean) reasons.push(`${field}: ${clean}`);
-      }
-    }
+    const { reasons } = parseJiraErrorDetail(JSON.parse(rawText));
     if (reasons.length > 0) {
       return `Jira rejected this item: ${reasons.join('; ')}. If a required field is missing, add it under Advanced → Required custom fields in Settings (or set a default in Jira), then retry.`;
     }
@@ -403,10 +488,17 @@ async function bulkCreateIssues(issuesArray) {
     const text = await response.text();
     // Log the raw Jira body (technical detail stays in the logs); surface a clean,
     // parsed customer message (raw HTTP bodies must never reach the success screen).
+    // `status` is additive (diag Phase 2): the whole-call HTTP status would
+    // otherwise be invisible to the ledger; the UI reads only `.message`.
     console.error(`[push] bulk create HTTP ${response.status}: ${text.substring(0, 300)}`);
+    // Extract the content-free field IDs so the ledger's jira[] carries them on
+    // the WHOLE-CALL rejection too (Live-E2E gap: this path used to hand the diag
+    // only {status} — the all-stories-rejected case lost the field names entirely).
+    let wholeCallFields = [];
+    try { wholeCallFields = parseJiraErrorDetail(JSON.parse(text)).fieldNames; } catch (_) { /* non-JSON */ }
     return {
       issues: new Array(issuesArray.length).fill(null),
-      errors: [{ message: jiraErrorMessage(response.status, text) }],
+      errors: [{ status: response.status, field_names: wholeCallFields, message: jiraErrorMessage(response.status, text) }],
     };
   }
 
@@ -423,6 +515,9 @@ async function bulkCreateIssues(issuesArray) {
     errors.push({
       index: err.failedElementNumber,
       ...elErr,
+      // Content-free rejected field IDs for the ledger (shape-agnostic — survives
+      // the nested per-element shape too); the diag prefers this over re-walking.
+      field_names: parseJiraErrorDetail(elErr).fieldNames,
       // Clean, customer-facing reason for the success screen (this 200-OK
       // per-element path is the common partial-failure case; raw body never shown).
       message: jiraErrorMessage(elErr.status || response.status, JSON.stringify(elErr)),
@@ -515,6 +610,7 @@ function buildStoryPayload(projectKey, feature, parentEpicKey, opts = {}) {
     customFields = null,
     storyPointsFieldId = null,
     validPriorities = null,
+    tcEntry = null,
   } = opts;
   const fields = {
     project: { key: projectKey },
@@ -527,6 +623,7 @@ function buildStoryPayload(projectKey, feature, parentEpicKey, opts = {}) {
       sourceHeading: feature.source_heading,
       // Embed task checklist directly into the Story когато no subtask type.
       embeddedTasks: embedTasks ? feature.tasks || [] : null,
+      tcEntry,
     }),
   };
   if (parentEpicKey) {
@@ -605,7 +702,7 @@ function buildSubtaskPayload(projectKey, task, parentStoryKey, subtaskTypeId, cu
  * @param {object|null} customFields
  * @returns {Promise<{ok, sessionId?, phase?, epicKey?, totals?, error?, detail?}>}
  */
-export async function startPushSession(breakdown, projectKey, customFields = null) {
+export async function startPushSession(breakdown, projectKey, customFields = null, jobId = null) {
   if (!breakdown) return { ok: false, error: 'no_breakdown', detail: 'No breakdown provided.' };
   if (!projectKey) return { ok: false, error: 'no_project_key', detail: 'No Jira project key.' };
 
@@ -629,6 +726,47 @@ export async function startPushSession(breakdown, projectKey, customFields = nul
   );
 
   const { epic, features, links } = flattenBreakdown(breakdown);
+
+  // Read the test-case job record (fail-open: a missing/failed tcjob → no embed,
+  // which is the pre-P4 behaviour; never block push on a test-case absence).
+  // Build a compact hash map (C2 audit): {[storyIdx]: acSetHash} instead of the
+  // full stampedStories array (~40 KB). The map's presence gates the embed.
+  let tcHashToIdx = null;
+  let tcTotal = 0;
+  if (jobId) {
+    try {
+      const tcJob = await kvs.get(`tcjob:${jobId}`);
+      if (tcJob && tcJob.status === 'completed' && Array.isArray(tcJob.stampedStories)) {
+        // ⭐ Key by AC-content HASH → the generation storyIdx, so the push MATCHES each pushed
+        // feature to its test cases by CONTENT, not by position. The push order (flattenBreakdown
+        // — capability-grouped from the edited breakdown) differs from the generation order
+        // (job.breakdown.features, flat); position-keying embedded only the coincidentally-first
+        // story (live-smoke bug 2026-06-06). The hash lookup is ALSO the staleness check.
+        // Collision guard (deep-audit 2026-06-06): two stories with the SAME AC set — including
+        // MULTIPLE no-AC stories, which all hash the empty set — would otherwise collapse to one
+        // idx (last writer wins) → the WRONG story's cases embed on a Jira Story (silent
+        // mis-attribution, the exact failure this feature prevents). A genuinely ambiguous hash is
+        // DROPPED → those features get no embed (counted as tc_skipped — honest) instead of a wrong
+        // embed. A SINGLE no-AC story has a unique (empty-set) hash → still embeds correctly (no
+        // regression). The real long-term fix is a stable story_uid minted at generation.
+        tcHashToIdx = {};
+        const tcHashSeen = new Set();
+        const tcHashCollided = new Set();
+        for (const st of tcJob.stampedStories) {
+          if (st && typeof st.idx === 'number') {
+            const h = acSetHash(st.acceptance_criteria);
+            if (tcHashSeen.has(h)) tcHashCollided.add(h);
+            else tcHashSeen.add(h);
+            tcHashToIdx[h] = st.idx;
+          }
+        }
+        for (const h of tcHashCollided) delete tcHashToIdx[h];
+        tcTotal = typeof tcJob.total === 'number' ? tcJob.total : tcJob.stampedStories.length;
+      }
+    } catch (e) {
+      console.warn(`[push] tcjob read failed (non-fatal, no embed): ${String(e?.message || e)}`);
+    }
+  }
 
   // Create the Epic (one fast call) up front.
   let epicKey = null;
@@ -672,17 +810,29 @@ export async function startPushSession(breakdown, projectKey, customFields = nul
     features,
     links,
     storyKeyMap: {},
+    uidKeyMap: {}, // Task #3: stable _uid → Jira key (rename-proof resolution, dual-keyed with storyKeyMap)
     createdStories: [],
     phase: features.length > 0 ? 'stories' : links.length > 0 ? 'links' : 'done',
     cursor: 0,
     counts: {
       stories_created: 0, story_failures: 0,
       subtasks_created: 0, subtask_failures: 0,
+      subtasks_orphaned: 0, // parent Story failed → its subtasks skipped (recomputed in buildFlatTasks)
       links_created: 0, link_failures: 0,
       tasks_embedded: 0,
+      tc_embedded: 0, tc_skipped: 0,
     },
     totals: { stories: features.length, tasks: totalTasks, links: links.length },
     failureDetails: { stories: [], subtasks: [], links: [] },
+    // Diagnostic accumulation (ledger Phase 2) — identifiers/counts only; the
+    // pushStep resolver turns result.diag into the ONE coalesced ledger record.
+    diag: newPushDiag(),
+    // Test-case embed metadata (P4). jobId null → no embed; tcHashToIdx null → no embed.
+    // tcHashToIdx maps AC-content hash → generation storyIdx, so each pushed feature finds its
+    // cases by CONTENT (the push order differs from the generation order); presence gates the embed.
+    jobId: jobId || null,
+    tcHashToIdx,
+    tcTotal,
   };
   await kvs.set(PUSH_SESSION_PREFIX + sessionId, session);
 
@@ -712,7 +862,10 @@ export async function pushSessionStep(sessionId) {
   if (s.phase === 'done') {
     const r = buildFinalResult(s);
     try { await kvs.delete(key); } catch (_) {}
-    return { ok: true, done: true, phase: 'done', progress: 1, ...r };
+    // job_id rides every session-loaded return (diag Phase 2, additive) so the
+    // pushStep resolver can stamp the ledger record's ref without re-reading
+    // the session — which is already deleted by the time `done` returns.
+    return { ok: true, done: true, phase: 'done', progress: 1, job_id: s.jobId || null, ...r };
   }
 
   try {
@@ -720,14 +873,17 @@ export async function pushSessionStep(sessionId) {
     else if (s.phase === 'subtasks') await stepSubtasks(s);
     else if (s.phase === 'links') await stepLinks(s);
   } catch (e) {
-    console.error(`[push] step exception (phase=${s.phase}): ${String(e?.message || e)}`);
-    return { ok: false, error: 'step_exception', detail: String(e?.message || e) };
+    console.error(`[push] step exception (phase=${s.phase}): ${String(e?.message || e)} ref=${s.jobId || '-'}`);
+    return { ok: false, error: 'step_exception', detail: String(e?.message || e), job_id: s.jobId || null };
   }
 
   if (s.phase === 'done') {
     const r = buildFinalResult(s);
     try { await kvs.delete(key); } catch (_) {}
-    return { ok: true, done: true, phase: 'done', progress: 1, ...r };
+    // job_id rides every session-loaded return (diag Phase 2, additive) so the
+    // pushStep resolver can stamp the ledger record's ref without re-reading
+    // the session — which is already deleted by the time `done` returns.
+    return { ok: true, done: true, phase: 'done', progress: 1, job_id: s.jobId || null, ...r };
   }
 
   await kvs.set(key, s);
@@ -740,34 +896,207 @@ export async function pushSessionStep(sessionId) {
   };
 }
 
+// ── AC-set hash (P4 audit C2) ─────────────────────────────────────────────────
+// Replaces the full tcStampedStories array (up to ~40 KB of raw AC text) with a
+// compact hash map. Zero external dependencies — the Forge sandbox has no crypto.
+// djb2 over the sorted, normalised AC set is collision-resistant enough for a
+// staleness fingerprint (same as normAC, order-insensitive).
+
+/**
+ * Compute a compact djb2 hash of an AC set. Normalises via normAC, sorts
+ * (order-insensitive), joins with '|', then hashes. Returns a base-36 string.
+ * @param {string[]} acs acceptance_criteria array (may be null/undefined)
+ * @returns {string}
+ */
+function acSetHash(acs) {
+  const s = (Array.isArray(acs) ? acs : []).map(normAC).sort().join('|');
+  let h = 5381;
+  for (const ch of s) h = ((((h << 5) + h) ^ ch.charCodeAt(0)) >>> 0); // djb2-xor: (h*33) ^ c
+  return h.toString(36);
+}
+
+// ── Diagnostic accumulation (ledger Phase 2) ──────────────────────────────────
+// Plain-DATA accumulators on the push session. NO recordDiagnostic here —
+// push_handler has no resolver context; the index.js resolvers own the ledger
+// writes and consume result.diag (SOLID split, design §2.9/§4). Everything
+// below is identifiers/counts only — names/messages stay in failureDetails
+// (the UI/zone-2 surface), never in this struct.
+
+function newPushDiag() {
+  return {
+    jira: [], // [{status, field_names}] from bulk per-element errors — deduped, cap 5
+    failedStoryIdxs: [], // GLOBAL feature indices of failed Stories, cap 20
+    failedSubtaskFeatureIdxs: [], // parent feature idx per failed subtask — deduped, cap 20
+    failedKeys: [], // Jira issue keys connected to failures — key-shape only, deduped, cap 20
+    links_unresolved_story_failed: 0, // preflight: endpoint is a real feature whose Story failed
+    links_unresolved_name_unknown: 0, // preflight: endpoint name matches NO surviving feature (model paraphrase or a user-deleted endpoint)
+    links_api_failed: 0, // link-create API failures — distinct from preflight-unresolved
+  };
+}
+
+// An in-flight session written by a PRE-deploy startPushSession has no s.diag —
+// default it lazily so a deploy mid-push can never crash a step.
+function ensureDiag(s) {
+  if (!s.diag) s.diag = newPushDiag();
+  return s.diag;
+}
+
+// Lazily default the uid→key map (Task #3). A session created by a PRE-deploy
+// startPushSession has no s.uidKeyMap → default it so a deploy mid-push can't
+// crash the write below (and every read guards with `s.uidKeyMap || {}`).
+function ensureUidKeyMap(s) {
+  if (!s.uidKeyMap) s.uidKeyMap = {};
+  return s.uidKeyMap;
+}
+
+// Jira issue-key shape (the ledger validates the same way; pre-filter here so
+// only durable, key-shaped handles accumulate — never a name).
+const ISSUE_KEY_SHAPE = /^[A-Z][A-Z0-9_]*-\d+$/;
+
+function diagAddFailedKey(s, key) {
+  const diag = ensureDiag(s);
+  if (typeof key !== 'string' || !ISSUE_KEY_SHAPE.test(key)) return;
+  if (diag.failedKeys.includes(key) || diag.failedKeys.length >= 20) return;
+  diag.failedKeys.push(key);
+}
+
+// Accumulate content-free Jira failure signatures from bulk per-element errors:
+// HTTP status + rejected field KEYS only (the same Object.keys(...errors) safe
+// pattern as the subtask-failure console.warn below) — NEVER message text
+// (ledger §1 privacy wall). Covers both element shapes: the nested
+// {elementErrors:{errors,status}} that console.warn reads AND the spread shape
+// bulkCreateIssues actually builds ({...elementErrors} lifts errors/status to
+// the top level). Deduped by (status + sorted field names) — one push usually
+// fails for ONE repeated cause — cap 5.
+function diagAddJiraErrors(s, batchErrors) {
+  const diag = ensureDiag(s);
+  if (!Array.isArray(batchErrors)) return;
+  const sigOf = (status, names) => `${status}|${names.slice().sort().join(',')}`;
+  for (const be of batchErrors) {
+    if (!be || typeof be !== 'object') continue;
+    // Prefer the pre-extracted, shape-agnostic field IDs (bulkCreateIssues now
+    // attaches them for both the whole-call AND per-element paths); the raw-shape
+    // walk is the legacy fallback. Either way drop numeric element-index keys —
+    // the indexed whole-bulk shape would otherwise store "0".."4" as field names.
+    const fieldNames = (
+      Array.isArray(be.field_names) && be.field_names.length
+        ? be.field_names
+        : Object.keys(be?.elementErrors?.errors || be?.errors || {})
+    ).filter((n) => typeof n === 'string' && !/^\d+$/.test(n)).slice(0, 20);
+    const rawStatus = be?.status ?? be?.elementErrors?.status;
+    const status = Number.isInteger(rawStatus) ? rawStatus : null;
+    if (status === null && fieldNames.length === 0) continue; // nothing diagnostic to keep
+    const sig = sigOf(status, fieldNames);
+    if (diag.jira.some((e) => sigOf(Number.isInteger(e.status) ? e.status : null, e.field_names || []) === sig)) continue;
+    const entry = {};
+    if (status !== null) entry.status = status;
+    if (fieldNames.length > 0) entry.field_names = fieldNames;
+    if (diag.jira.length < 5) {
+      diag.jira.push(entry);
+    } else {
+      // (deep-audit P2 #4) cap eviction policy: first-5-wins used to DROP a later
+      // UNSEEN status — e.g. a mid-push 401 (auth revoked, the decisive evidence)
+      // after five 400-variants. When full and the incoming STATUS is new, replace
+      // the LAST entry whose status is already represented more than once; else
+      // the last entry. A new shape of an already-seen status still drops (the
+      // status signal is what support routes on).
+      const seenStatus = new Set(diag.jira.map((e) => e.status));
+      if (status !== null && !seenStatus.has(status)) {
+        let victim = diag.jira.length - 1;
+        const statusCounts = {};
+        for (const e of diag.jira) statusCounts[e.status] = (statusCounts[e.status] || 0) + 1;
+        for (let i = diag.jira.length - 1; i >= 0; i--) {
+          if (statusCounts[diag.jira[i].status] > 1) { victim = i; break; }
+        }
+        diag.jira[victim] = entry;
+      }
+    }
+  }
+}
+
 async function stepStories(s) {
   const start = s.cursor;
   const end = Math.min(start + STORY_CHUNK, s.features.length);
   const slice = s.features.slice(start, end);
-  const payloads = slice.map((f) =>
-    buildStoryPayload(s.projectKey, f, s.epicKey, {
+
+  // Fetch per-story test-case entries in parallel when the tc hash map is present.
+  // Each entry lives at testcases:<jobId>:<globalIdx> (global index = start + j).
+  // Fail-open: a KVS read error → null → no embed for that story (never blocks push).
+  // ⭐ Match each pushed feature to its test cases by AC-CONTENT, not position. The push order
+  // (flattenBreakdown — capability-grouped from the edited breakdown) differs from the generation
+  // order (job.breakdown.features, flat), so position-keying mis-aligned all but the first story.
+  // Look up the generation storyIdx by the feature's AC-hash; the lookup IS the staleness check
+  // (a feature whose ACs match no generated story → no idx → no embed). Fail-open on KVS error.
+  let tcEntries = null;
+  if (s.jobId && s.tcHashToIdx) {
+    try {
+      tcEntries = await Promise.all(
+        slice.map((f) => {
+          const idx = s.tcHashToIdx[acSetHash(f && f.acceptance_criteria)];
+          return idx != null ? kvs.get(`testcases:${s.jobId}:${idx}`).catch(() => null) : Promise.resolve(null);
+        }),
+      );
+    } catch (e) {
+      console.warn(`[push] tc entries fetch failed (non-fatal, no embed): ${String(e?.message || e)}`);
+      tcEntries = null;
+    }
+  }
+
+  const tcEmbeddedIdx = new Set(); // slice idxs whose payload carries a tc embed (counted on SUCCESS below)
+  const payloads = slice.map((f, j) => {
+    // The content-match above bound the right entry (or null when the feature's ACs match no
+    // generated story → edited/new → correctly no embed). tc_skipped is computed at the end
+    // (tcTotal − tc_embedded) so it reflects generated stories that did not land an embed.
+    let tcEntry = null;
+    const tcCand = tcEntries && tcEntries[j];
+    // Embed only when the entry actually has cases — a valid-but-empty entry would
+    // embed nothing. The tc_embedded COUNT moves to the bulk SUCCESS branch below
+    // (deep-audit P2 #3): counting at payload-BUILD measured INTENT, not OUTCOME —
+    // a story whose create then failed kept its increment, so the partial_push
+    // record + PushedScreen over-reported embeds exactly when stories failed.
+    if (tcCand && !tcCand.error && tcCand.result && Array.isArray(tcCand.result.test_cases) && tcCand.result.test_cases.length > 0) {
+      tcEntry = tcCand;
+      tcEmbeddedIdx.add(j);
+    }
+    return buildStoryPayload(s.projectKey, f, s.epicKey, {
       embedTasks: !s.hasSubtasks,
       customFields: s.customFields,
       storyPointsFieldId: s.storyPointsFieldId,
       validPriorities: s.validPriorities,
-    }),
-  );
+      tcEntry,
+    });
+  });
   const bulk = await bulkCreateIssues(payloads);
   for (let j = 0; j < bulk.issues.length; j++) {
     if (bulk.issues[j]) {
       s.storyKeyMap[slice[j].name] = bulk.issues[j].key;
+      // Task #3: dual-key by stable _uid alongside name so dependency links AND
+      // subtask-parent lookups resolve uid-first (rename-proof), name-fallback.
+      if (slice[j]._uid) ensureUidKeyMap(s)[slice[j]._uid] = bulk.issues[j].key;
       // Append-only list (preserves duplicate-named stories, unlike the
       // name-keyed storyKeyMap) so the success screen can deep-link every
       // created Story, not just the last one per name.
       s.createdStories.push({ name: slice[j].name, key: bulk.issues[j].key });
       s.counts.stories_created++;
+      // tc_embedded counts OUTCOME (the embed actually landed in a created
+      // Story), not intent — see the payload-build note above.
+      if (tcEmbeddedIdx.has(j)) s.counts.tc_embedded++;
     } else {
       s.counts.story_failures++;
+      // (diag Phase 2) capture the GLOBAL feature index at the source — the
+      // failureDetails struct carries names only, which the ledger bans (§1).
+      const diag = ensureDiag(s);
+      if (diag.failedStoryIdxs.length < 20) diag.failedStoryIdxs.push(start + j);
       if (s.failureDetails.stories.length < 10) {
-        s.failureDetails.stories.push({ name: slice[j].name, batchError: bulk.errors });
+        // (deep-audit P2 #7) pair THIS story with ITS per-element error where one
+        // exists — batchError used to carry the whole chunk's array, so story #2's
+        // zone-2 line showed story #1's verbatim reason in multi-cause chunks.
+        const own = Array.isArray(bulk.errors) ? bulk.errors.find((e) => e && e.index === j) : null;
+        s.failureDetails.stories.push({ name: slice[j].name, batchError: own ? [own] : bulk.errors });
       }
     }
   }
+  if (Array.isArray(bulk.errors) && bulk.errors.length > 0) diagAddJiraErrors(s, bulk.errors);
   s.cursor = end;
   console.log(`[push] stories chunk ${start}-${end}/${s.features.length}: ${s.counts.stories_created} ok, ${s.counts.story_failures} failed`);
 
@@ -778,7 +1107,8 @@ async function stepStories(s) {
     } else {
       if (!s.hasSubtasks) {
         for (const f of s.features) {
-          if (s.storyKeyMap[f.name]) {
+          // uid-first / name-fallback (Task #3) — match the parent-key lookup below.
+          if ((f._uid && (s.uidKeyMap || {})[f._uid]) || s.storyKeyMap[f.name]) {
             s.counts.tasks_embedded += (f.tasks || []).filter((t) => t && (t.summary || '').trim()).length;
           }
         }
@@ -790,14 +1120,31 @@ async function stepStories(s) {
 
 function buildFlatTasks(s) {
   const flat = [];
-  for (const f of s.features) {
-    const parentKey = s.storyKeyMap[f.name];
-    if (!parentKey) continue;
+  let orphaned = 0;
+  for (let fi = 0; fi < s.features.length; fi++) {
+    const f = s.features[fi];
+    // uid-first / name-fallback (Task #3) so a renamed Story still parents its subtasks.
+    const parentKey = (f._uid && (s.uidKeyMap || {})[f._uid]) || s.storyKeyMap[f.name];
+    if (!parentKey) {
+      // (diag Phase 2) the parent Story failed to create → its subtasks are
+      // skipped here. Previously a silent drop with zero trace (§2.3 worst
+      // offender #4). Orphans only exist when a Story failed, so `partial` is
+      // already true in every orphan scenario — counting changes NO behaviour.
+      orphaned += (f.tasks || []).filter((t) => t && (t.summary || '').trim()).length;
+      continue;
+    }
     for (const task of f.tasks || []) {
       if (!task || !(task.summary || '').trim()) continue;
-      flat.push({ task, parentKey, featureName: f.name });
+      // featureIdx threads the parent feature's GLOBAL index to the failure
+      // branch (the ledger speaks idxs/keys, never names).
+      flat.push({ task, parentKey, featureName: f.name, featureIdx: fi });
     }
   }
+  // SET, never += — buildFlatTasks is recomputed fresh on EVERY subtasks step
+  // (and at the stories→subtasks transition), so incrementing would multiply
+  // the count across steps. storyKeyMap is frozen once the stories phase ends,
+  // so the recomputed value is stable → the set is idempotent.
+  s.counts.subtasks_orphaned = orphaned;
   return flat;
 }
 
@@ -814,15 +1161,31 @@ async function stepSubtasks(s) {
     if (bulk.issues[j]) s.counts.subtasks_created++;
     else {
       s.counts.subtask_failures++;
+      // (diag Phase 2) durable handles at the source: the parent feature's
+      // global idx (threaded via buildFlatTasks) + the parent Story's Jira key
+      // (survives purge — design §4 capture corrections).
+      const diag = ensureDiag(s);
+      const fi = slice[j].featureIdx;
+      if (
+        Number.isInteger(fi) &&
+        diag.failedSubtaskFeatureIdxs.length < 20 &&
+        !diag.failedSubtaskFeatureIdxs.includes(fi)
+      ) {
+        diag.failedSubtaskFeatureIdxs.push(fi);
+      }
+      diagAddFailedKey(s, slice[j].parentKey);
       if (s.failureDetails.subtasks.length < 10) {
+        // (deep-audit P2 #7) same per-element pairing as the stories capture.
+        const own = Array.isArray(bulk.errors) ? bulk.errors.find((e) => e && e.index === j) : null;
         s.failureDetails.subtasks.push({
           parentFeature: slice[j].featureName,
           taskSummary: slice[j].task.summary,
-          batchError: bulk.errors,
+          batchError: own ? [own] : bulk.errors,
         });
       }
     }
   }
+  if (Array.isArray(bulk.errors) && bulk.errors.length > 0) diagAddJiraErrors(s, bulk.errors);
   s.cursor = end;
   console.log(`[push] subtasks chunk ${start}-${end}/${flat.length}: ${s.counts.subtasks_created} ok, ${s.counts.subtask_failures} failed`);
   if (s.counts.subtask_failures > 0 && s.failureDetails.subtasks[0]) {
@@ -836,15 +1199,19 @@ async function stepSubtasks(s) {
   }
 }
 
-function buildResolvableLinks(s) {
+export function buildResolvableLinks(s) {
   const resolvable = [];
   const unresolved = [];
-  for (const { source, target } of s.links) {
-    const sourceKey = s.storyKeyMap[source];
-    const targetKey = s.storyKeyMap[target];
+  const uidKeyMap = s.uidKeyMap || {};
+  for (const { source, target, sourceUid, targetUid } of s.links) {
+    // Task #3: resolve by stable _uid FIRST (rename-proof), fall back to NAME
+    // (legacy / pre-uid breakdowns + ambiguous duplicate names). The rename case
+    // that used to lie "source X not created" now resolves and never reaches here.
+    const sourceKey = (sourceUid && uidKeyMap[sourceUid]) || s.storyKeyMap[source];
+    const targetKey = (targetUid && uidKeyMap[targetUid]) || s.storyKeyMap[target];
     if (!sourceKey || !targetKey) {
       unresolved.push({
-        source, target,
+        source, target, sourceUid, targetUid,
         reason: !sourceKey ? `source "${source}" not created` : `target "${target}" not created`,
       });
       continue;
@@ -854,14 +1221,73 @@ function buildResolvableLinks(s) {
   return { resolvable, unresolved };
 }
 
+// Classify each genuinely-unresolved link into ONE honest cause (Task #3). With
+// uid-binding a RENAME resolves (never reaches here) — INCLUDING a renamed source
+// whose Story merely FAILED, which now correctly reads story_failed (its _uid is
+// still a live feature) where the old name-only split mislabeled it name_unknown.
+// ONE cause per link (precedence name_unknown > story_failed, preserving the
+// pre-Task-#3 ordering) → the counts sum to unresolved.length. Pure function,
+// exported for the offline test.
+// NOTE: a user-DELETED endpoint reads name_unknown (its dep string maps to no
+// surviving feature → sourceUid:null), same as before Task #3. Distinguishing a
+// delete from a model paraphrase would need a frozen generation-name→uid roster
+// carried from adaptToLegacyShape (a deleted feature's _uid is already gone from
+// s.features, so it can't be derived at push); deliberately DEFERRED — a hollow
+// always-zero "endpoint_deleted" bucket was removed here as unreachable dead code
+// (deep-audit catch — it could only fire on an input the pipeline can't produce).
+export function classifyUnresolvedLinks(unresolved, ctx) {
+  const featureUids = (ctx && ctx.featureUids) || new Set();
+  const featureNames = (ctx && ctx.featureNames) || new Set();
+  const storyKeyMap = (ctx && ctx.storyKeyMap) || {};
+  const uidKeyMap = (ctx && ctx.uidKeyMap) || {};
+  const classify = (uid, name) => {
+    if (uid && featureUids.has(uid)) return 'story_failed'; // _uid is a live feature → its Story create failed (cascade)
+    if (featureNames.has(name)) return 'story_failed';      // legacy name-only: name IS a feature → its Story failed
+    return 'name_unknown';                                  // matches no feature → model paraphrase (or a deleted endpoint)
+  };
+  let story_failed = 0, name_unknown = 0;
+  for (const u of unresolved || []) {
+    const causes = [];
+    if (!(u.sourceUid && uidKeyMap[u.sourceUid]) && !storyKeyMap[u.source]) causes.push(classify(u.sourceUid, u.source));
+    if (!(u.targetUid && uidKeyMap[u.targetUid]) && !storyKeyMap[u.target]) causes.push(classify(u.targetUid, u.target));
+    if (causes.includes('name_unknown')) name_unknown++;
+    else story_failed++;
+  }
+  return { story_failed, name_unknown };
+}
+
 async function stepLinks(s) {
   const { resolvable, unresolved } = buildResolvableLinks(s);
+  const diag = ensureDiag(s);
   // Account unresolved links once, at the start of the link phase.
   if (s.cursor === 0 && unresolved.length > 0) {
     s.counts.link_failures += unresolved.length;
+    // (diag Phase 2) deterministic cause-split. A missing endpoint whose name
+    // IS a real feature → that Story failed to create (cascade); a name that
+    // matches NO feature → the model paraphrased the dependency (the S1 class
+    // behind the misleading "not created" reason). SET (=), not += — a
+    // step_exception retry re-enters with cursor 0 and must not double-count.
+    const uidKeyMap = s.uidKeyMap || {};
+    const split = classifyUnresolvedLinks(unresolved, {
+      featureUids: new Set(s.features.map((f) => f && f._uid).filter(Boolean)),
+      featureNames: new Set(s.features.map((f) => f && f.name)),
+      storyKeyMap: s.storyKeyMap,
+      uidKeyMap,
+    });
     for (const u of unresolved) {
+      // The endpoint that DID create is a durable support anchor (key-shaped only) —
+      // uid-first / name-fallback, mirroring buildResolvableLinks.
+      const srcKey = (u.sourceUid && uidKeyMap[u.sourceUid]) || s.storyKeyMap[u.source];
+      const tgtKey = (u.targetUid && uidKeyMap[u.targetUid]) || s.storyKeyMap[u.target];
+      if (srcKey) diagAddFailedKey(s, srcKey);
+      if (tgtKey) diagAddFailedKey(s, tgtKey);
       if (s.failureDetails.links.length < 10) s.failureDetails.links.push(u);
     }
+    diag.links_unresolved_story_failed = split.story_failed;
+    diag.links_unresolved_name_unknown = split.name_unknown;
+    // (A2 fix, half 1) preflight unresolved are logged ONCE here — they are not
+    // chunk API outcomes, so they no longer inflate the chunk log below.
+    console.log(`[push] links preflight: ${unresolved.length} unresolved (story_failed=${split.story_failed}, name_unknown=${split.name_unknown}) ref=${s.jobId || '-'}`);
   }
   const start = s.cursor;
   const end = Math.min(start + LINK_CHUNK, resolvable.length);
@@ -873,6 +1299,12 @@ async function stepLinks(s) {
       if (results[j].ok) s.counts.links_created++;
       else {
         s.counts.link_failures++;
+        // (diag Phase 2 + A2) chunk-level API failure — tracked separately from
+        // the preflight unresolved so the chunk log reconciles. link_failures
+        // (the UI total) keeps its semantics: preflight + API combined.
+        diag.links_api_failed++;
+        diagAddFailedKey(s, batch[j].sourceKey);
+        diagAddFailedKey(s, batch[j].targetKey);
         if (s.failureDetails.links.length < 10) {
           s.failureDetails.links.push({
             source: batch[j].source, target: batch[j].target,
@@ -883,7 +1315,10 @@ async function stepLinks(s) {
     }
   }
   s.cursor = end;
-  console.log(`[push] links chunk ${start}-${end}/${resolvable.length}: ${s.counts.links_created} ok, ${s.counts.link_failures} failed`);
+  // (A2 fix, half 2) count only chunk-level API failures against the resolvable
+  // denominator — link_failures was pre-inflated by preflight unresolved, so
+  // "ok + failed" never reconciled with the chunk size (the one debug log lied).
+  console.log(`[push] links chunk ${start}-${end}/${resolvable.length}: ${s.counts.links_created} ok, ${diag.links_api_failed} failed`);
   if (s.cursor >= resolvable.length) {
     s.phase = 'done';
   }
@@ -903,8 +1338,13 @@ function computeProgress(s) {
 
 function buildFinalResult(s) {
   const c = s.counts;
+  const diag = ensureDiag(s);
   const allSuccess = c.story_failures === 0 && c.subtask_failures === 0 && c.link_failures === 0;
-  console.log(`[push] DONE session=${s.sessionId} - stories=${c.stories_created} subtasks=${c.subtasks_created} links=${c.links_created} embedded=${c.tasks_embedded} (partial=${!allSuccess})`);
+  // tc_skipped = generated stories that did not land an embed (ACs edited since generation, or a
+  // story dropped from the push). Computed from the total (content-match makes a per-story skip
+  // count ambiguous). 0 on a clean push where every generated story was pushed unchanged.
+  const tcSkipped = Math.max(0, (s.tcTotal || 0) - c.tc_embedded);
+  console.log(`[push] DONE session=${s.sessionId} - stories=${c.stories_created} subtasks=${c.subtasks_created} links=${c.links_created} embedded=${c.tasks_embedded} tc_embedded=${c.tc_embedded} tc_skipped=${tcSkipped} (partial=${!allSuccess}) ref=${s.jobId || '-'}`);
   return {
     partial: !allSuccess,
     result: {
@@ -917,6 +1357,8 @@ function buildFinalResult(s) {
       dependency_links_created: c.links_created,
       subtasks_embedded: !s.hasSubtasks,
       tasks_embedded: c.tasks_embedded,
+      tc_embedded: c.tc_embedded,
+      tc_skipped: tcSkipped,
       epic_key: s.epicKey,
       browse_base: s.browseBase || null,
       created_issues: s.createdStories || [],
@@ -925,6 +1367,20 @@ function buildFinalResult(s) {
         subtasks: c.subtask_failures,
         links: c.link_failures,
         details: s.failureDetails,
+      },
+      // (diag Phase 2) plain diagnostic material for the ledger — the pushStep
+      // resolver (which owns `context`) turns this into the ONE coalesced
+      // recordDiagnostic per push (design §4). ADDITIVE: every pre-existing
+      // field above is unchanged — the UI reads them verbatim.
+      diag: {
+        jira: diag.jira,
+        failedStoryIdxs: diag.failedStoryIdxs,
+        failedSubtaskFeatureIdxs: diag.failedSubtaskFeatureIdxs,
+        failedKeys: diag.failedKeys,
+        links_unresolved_story_failed: diag.links_unresolved_story_failed || 0,
+        links_unresolved_name_unknown: diag.links_unresolved_name_unknown || 0,
+        links_api_failed: diag.links_api_failed || 0,
+        subtasks_orphaned: c.subtasks_orphaned || 0,
       },
     },
   };

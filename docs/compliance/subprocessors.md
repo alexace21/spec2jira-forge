@@ -48,8 +48,11 @@
   **Atlassian Forge storage within the customer's own instance**, only to drive the
   review-and-push workflow.
 - It is **purged after the customer pushes the breakdown to Jira** (`purgeJob`); uninstalling
-  the app removes the app's stored data. **[PARTNER: verify]** the backstop for breakdowns that
-  are generated but never pushed (TTL / scheduled sweep) — or state the honest current behaviour.
+  the app removes the app's stored data. A breakdown that is **never pushed** — including one the
+  customer regenerated away or left unattended — is **automatically removed after 7 days of
+  inactivity** by a daily Forge scheduled sweep (opening it for review resets the timer). [Backstop
+  IMPLEMENTED 2026-06-14, Task #13: access-renewed `jobmeta.lastAccessedAt` + a scheduled
+  `sweepHandler`; NOT a creation-anchored TTL — that would silently expire a deliverable under review.]
 - The **only** external destination for content is **Anthropic** (the sub-processor above). The
   app runs no separate vendor backend or database.
 
