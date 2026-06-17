@@ -354,6 +354,26 @@ package names de-scaffolded (→ `spec2tickets`). Build green (bundle ≈ −1.4
 
 ---
 
+## ⚡ HANDOVER NOTE (2026-06-17 — ⭐⭐⭐ v5.4.0 LIVE on Marketplace + ⭐ v6.0.0 EDITION-STRATEGY PIVOT to value-split BYOK; agent-conducted)
+
+> ⚠ **This note is on `release/v6.0.0`. The FULL v5.4.0-launch handover lives on `release/v5.4.0` (commit `a056b4d`); the branch-independent record is in `memory/` (marketplace-launch-state + v6-value-split-editions + marketplace-publish-mechanics + monetization-strategy + product-improvements — ALL updated this session, always-loaded).**
+
+### Part 1 — v5.4.0 SHIPPED + LIVE (brief; full detail on release/v5.4.0 + memory)
+The app is **officially live + publicly discoverable on the Atlassian Marketplace** — **https://marketplace.atlassian.com/apps/1475765564/spec2tickets-for-confluence-and-jira** (App ID `e804f31f`). v5.4.0 (Build 2000080, PUBLIC, 2026-06-17): branding Spec2JIRA→Spec2Tickets + Managed cap 10→25. **Editions SUBMITTED 2026-06-17 → PENDING** (Standard BYOK $6.70 / Advanced Managed $13.40). Privacy&Security tab BYOK→hybrid submitted; site updated (real Marketplace URL + honest 7-day-sweep `<!-- v5.5.0 TOGGLE -->` comments) + lawyer-approved. POST-APPROVAL TODO + the HARD-WON publish mechanics (editions cumulative; Privacy-tab nests share-with-sub-processor UNDER store-outside=Yes) → `memory/marketplace-launch-state` + `memory/marketplace-publish-mechanics`.
+
+### Part 2 — ⭐ v6.0.0 EDITION-STRATEGY PIVOT (the new decision; north star = `memory/v6-value-split-editions`)
+Partner flagged: Managed (no-key) is a weak differentiator + test-cases are too expensive to cap. An 11-agent §13 stress-test + 3-judge confidence vote (**8/7/7, unanimous PROCEED_WITH_CHANGES**) validated the pivot. **Editions pivot from KEY-SOURCE → VALUE; both BYOK. Standard (BYOK $6.70) = core breakdown+push + Project Context · Advanced (BYOK $13.40) = + test-case generation + custom prompts + future-expensive.** Managed DROPPED as a Marketplace edition (off-Marketplace fallback; deletes the cap/metering/COGS/Managed-DPA burden). Market-validated (no rival splits on key-source; the Bake "Unlimited vs Metered" natural experiment; ChatPRD/$13.40 pricing). **6 binding execution requirements** (Phase-2-timing · NEW `hasTestCases` capability not overloading `advanced`=Managed · cost-transparency launch-blocker · BYOK onboarding wizard · single-anchor on test-cases · honest no-key-segment framing) — all in `memory/v6-value-split-editions`. **Future vision: Capacity Sheet → planning** (PO/BA capacity → breakdown+complexity → sprint PLAN, Kanban/Scrum).
+
+### Part 3 — ⚠⚠ BRANCH RECONCILIATION (v6.0.0 prep — do this FIRST)
+**Current branch `release/v6.0.0` = `7bb7159` + branding (`a7efff6`) + cap-25 (`f979931`) ONLY.** It is MISSING:
+- From **`release/v5.4.0`**: the compliance docs (`9390034` + `8067336` + `5e139bc`) + the v5.4.0 launch handover (`a056b4d`).
+- From **`feature/product-improvements`**: the WHOLE delta (test-cases / dashboard / diagnostics / Layer-1; +~38 commits) — and feature LACKS the cap-25 + v5.4.0 compliance.
+→ **v6.0.0 prep step 1 = reconcile: merge `release/v5.4.0` AND `feature/product-improvements` into `release/v6.0.0`** (conflicts: usage.js cap 10-vs-25 → keep 25; the original vs `-v5.4.0` compliance docs; CLAUDE.md). THEN the 4 v6.0.0 ADDs (hasTestCases gating · cost-transparency · BYOK onboarding · keep Project Context in Standard). Edition re-config (Advanced: Managed→test-cases) = Phase 2 post-approval. DON'T touch the pending v5.4.0 editions.
+
+С усмивка ✨ — продуктът е жив; стратегията е заострена и stress-test-ната; v6.0.0 е голямата delta под value-split editions.
+
+---
+
 ## ⚡ HANDOVER NOTE (2026-06-04 EOD — spec2jira.com rebuilt to USD + in-app "spec"→"page" cleanup + DPA/SEO/a11y; agent-conducted)
 
 A long, agent-conducted session (§13 throughout) updating the **public site** + customer-facing app copy. The site lives in the **SEPARATE GitHub Pages repo** (`C:\Software Engineer\Success\AI-delivery\ai-delivery-platform\MVP-roll-out\spec2jira-site\spec2jira-site`; auto-deploys on `git push`). All §13 gates passed (incl. a 5-agent adversarial audit + per-wave reviews). **NOT committed/deployed — partner pushes the site + builds/deploys the forge app.**
