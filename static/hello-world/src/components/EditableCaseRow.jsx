@@ -89,6 +89,7 @@ export default function EditableCaseRow({
   saveError = null,
   onSaveStory,
   onRevertCase,
+  readOnly = false,
 }) {
   const c = tc || {};
   const type = c.type || "happy-path";
@@ -119,9 +120,14 @@ export default function EditableCaseRow({
   }, [armed, onDelete]);
 
   return (
-    <div
+    // [deep-audit E-#6] read-only (downgraded user): a disabled fieldset NATIVELY disables every
+    // nested input/select/button (edit fields, add/delete, the per-case Save/Revert footer) → a true
+    // read-only card matching the banner, with no dead/clickable controls. minInlineSize resets the
+    // fieldset's default min-content sizing so layout is unchanged.
+    <fieldset
+      disabled={readOnly}
       className="rounded-lg border p-3 mb-2 text-xs"
-      style={{ background: "var(--s2j-bg)", border: `1px solid ${invalid ? "var(--s2j-orange-border)" : "var(--s2j-border)"}` }}
+      style={{ background: "var(--s2j-bg)", border: `1px solid ${invalid ? "var(--s2j-orange-border)" : "var(--s2j-border)"}`, minInlineSize: "auto" }}
     >
       {/* Header: # · type · priority · title · delete */}
       <div className="flex items-start gap-2 mb-2 flex-wrap">
@@ -269,6 +275,6 @@ export default function EditableCaseRow({
           </button>
         </div>
       )}
-    </div>
+    </fieldset>
   );
 }

@@ -2175,6 +2175,7 @@ function App() {
               ? () => setScreen("confirming")
               : handleNewPage
           }
+          backToReview={quotaInfo?.error === "edition_required" && !!pendingBreakdown}
         />
       );
     case "error":
@@ -4126,7 +4127,12 @@ function EditionRow({ name, price, blurb }) {
   );
 }
 
-function LimitReachedScreen({ quota, onBack }) {
+function LimitReachedScreen({ quota, onBack, backToReview = false }) {
+  // ⭐ [deep-audit fix] when onBack returns to the in-flight breakdown (edition_required mid-flow),
+  // the back affordances must say so — not the default "page picker" (which would be misleading copy
+  // for a non-destructive return-to-Review).
+  const backTitle = backToReview ? "Return to your breakdown" : "Return to the page picker";
+  const backLabel = backToReview ? "← Back to your breakdown" : "← Back to pages";
   // v6 value-split modes from the routing payload:
   //   edition_required → a Standard user reached an Advanced-only feature (test-cases) → upsell Advanced.
   //   license_required (defensive) → no active license → subscribe (both editions).
@@ -4173,7 +4179,7 @@ function LimitReachedScreen({ quota, onBack }) {
   return (
     <div className="p-6" style={SCREEN_MAX_WIDTH_STYLE}>
       {onBack && (
-        <BackButton onClick={onBack} title="Return to the page picker" />
+        <BackButton onClick={onBack} title={backTitle} />
       )}
 
       <div
@@ -4260,7 +4266,7 @@ function LimitReachedScreen({ quota, onBack }) {
       )}
 
       <button onClick={onBack} className="btn-secondary">
-        ← Back to pages
+        {backLabel}
       </button>
     </div>
   );

@@ -491,6 +491,7 @@ function StoryTestCaseCard({
             saving={isSaving || isPolling}
             saveState={saveState}
             saveError={saveError}
+            readOnly={readOnly}
             onSaveStory={readOnly ? undefined : onSave}
             onRevertCase={() =>
               caseIsNew(i)
