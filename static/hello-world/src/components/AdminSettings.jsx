@@ -520,6 +520,20 @@ export default function AdminSettings({ initialTab = "settings", diagRefFilter =
           </a>{" "}
           (sign up free; billed pay-as-you-go to your own Anthropic account).
         </p>
+        <p className="mb-2">
+          <strong>New to this?</strong> Follow our plain-English, step-by-step
+          walkthrough (no technical background needed — it covers the easy-to-miss
+          billing step):{" "}
+          <a
+            href="https://spec2jira.com/get-api-key"
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{ color: "var(--s2j-blue)", textDecoration: "underline" }}
+          >
+            spec2jira.com/get-api-key
+          </a>
+          .
+        </p>
         <p>
           <strong>Privacy:</strong> your page content flows directly from Forge to the
           Anthropic API using your key. Data falls under{" "}

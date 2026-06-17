@@ -4412,6 +4412,18 @@ function SetupScreen({ message, onOpenSettings }) {
           ; billed pay-as-you-go to your own Anthropic account)
           <br />• A Jira project key where the breakdown will be created
         </p>
+        <p className="text-sm mb-3" style={{ color: "var(--s2j-text-light)" }}>
+          New to API keys? Our plain-English walkthrough (no technical background
+          needed) covers it step by step:{" "}
+          <a
+            href="https://spec2jira.com/get-api-key"
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{ color: "var(--s2j-blue)", textDecoration: "underline" }}
+          >
+            spec2jira.com/get-api-key
+          </a>
+        </p>
 
         {/* Primary call-to-action — open the app's OWN in-app Settings. This is the
             reliable path: the globalSettings "Configure" page is unreachable in the
