@@ -364,13 +364,14 @@ The app is **officially live + publicly discoverable on the Atlassian Marketplac
 ### Part 2 — ⭐ v6.0.0 EDITION-STRATEGY PIVOT (the new decision; north star = `memory/v6-value-split-editions`)
 Partner flagged: Managed (no-key) is a weak differentiator + test-cases are too expensive to cap. An 11-agent §13 stress-test + 3-judge confidence vote (**8/7/7, unanimous PROCEED_WITH_CHANGES**) validated the pivot. **Editions pivot from KEY-SOURCE → VALUE; both BYOK. Standard (BYOK $6.70) = core breakdown+push + Project Context · Advanced (BYOK $13.40) = + test-case generation + custom prompts + future-expensive.** Managed DROPPED as a Marketplace edition (off-Marketplace fallback; deletes the cap/metering/COGS/Managed-DPA burden). Market-validated (no rival splits on key-source; the Bake "Unlimited vs Metered" natural experiment; ChatPRD/$13.40 pricing). **6 binding execution requirements** (Phase-2-timing · NEW `hasTestCases` capability not overloading `advanced`=Managed · cost-transparency launch-blocker · BYOK onboarding wizard · single-anchor on test-cases · honest no-key-segment framing) — all in `memory/v6-value-split-editions`. **Future vision: Capacity Sheet → planning** (PO/BA capacity → breakdown+complexity → sprint PLAN, Kanban/Scrum).
 
-### Part 3 — ⚠⚠ BRANCH RECONCILIATION (v6.0.0 prep — do this FIRST)
-**Current branch `release/v6.0.0` = `7bb7159` + branding (`a7efff6`) + cap-25 (`f979931`) ONLY.** It is MISSING:
-- From **`release/v5.4.0`**: the compliance docs (`9390034` + `8067336` + `5e139bc`) + the v5.4.0 launch handover (`a056b4d`).
-- From **`feature/product-improvements`**: the WHOLE delta (test-cases / dashboard / diagnostics / Layer-1; +~38 commits) — and feature LACKS the cap-25 + v5.4.0 compliance.
-→ **v6.0.0 prep step 1 = reconcile: merge `release/v5.4.0` AND `feature/product-improvements` into `release/v6.0.0`** (conflicts: usage.js cap 10-vs-25 → keep 25; the original vs `-v5.4.0` compliance docs; CLAUDE.md). THEN the 4 v6.0.0 ADDs (hasTestCases gating · cost-transparency · BYOK onboarding · keep Project Context in Standard). Edition re-config (Advanced: Managed→test-cases) = Phase 2 post-approval. DON'T touch the pending v5.4.0 editions.
+### Part 3 — ✅ BRANCH RECONCILIATION (v6.0.0 prep) — DONE 2026-06-17 (commits `35a56b5` + `3c7d503`; local, partner pushes)
+**`release/v6.0.0` is now reconciled** (was `7bb7159` + branding + cap-25 only). Merged in:
+- **`release/v5.4.0`** (`35a56b5`): the compliance pack (`docs/compliance/*-v5.4.0.md` — DPA/questionnaire/subprocessors/TIA/IR/privacy-tab + partner checklist). v5.4.0 differed from v6.0.0 in docs ONLY.
+- **`feature/product-improvements`** (`3c7d503`): the WHOLE v5.5.0 delta (38 commits — test-cases P1-P5 + §7 injection + editable screen/export, diagnostics ledger `src/diagnostics.js`, Layer-1 #3/#4/#13 orphan-sweep `src/sweep_util.js`, live dashboard, distill/cycle-fix hardening).
+- **Conflict resolution (verified):** usage.js → cap-25 KEPT; manifest.yml auto-merged with BOTH branding AND the orphan-sweep `scheduledTrigger`; App.js clean (0 residual user-facing "Spec2JIRA"); ONLY CLAUDE.md conflicted (kept v6.0.0's superset handover). **Verified GREEN:** `node --check` all 9 `src/*.js` + `npm run build` "Compiled successfully" (`spec2tickets-ui@0.1.70`).
+→ **NEXT — the v6.0.0 ADDs (north star = `memory/v6-value-split-editions`):** (2) `hasTestCases` gating + DECOUPLE Managed (don't overload `advanced`=Managed across the ~6 verified sites) · (3) cost-transparency (pre-flight + post-run echo — launch-blocker) · (4) BYOK onboarding wizard (in-app + site) · (5) keep Project Context in Standard, single-anchor Advanced on test-cases. Edition re-config (Advanced: Managed→test-cases) = Phase 2 post-approval. **DON'T touch the pending v5.4.0 editions.**
 
-С усмивка ✨ — продуктът е жив; стратегията е заострена и stress-test-ната; v6.0.0 е голямата delta под value-split editions.
+С усмивка ✨ — продуктът е жив; стратегията е заострена и stress-test-ната; branch-овете са reconciled + build-green; следват трите v6.0.0 ADD-а под value-split editions.
 
 ---
 
