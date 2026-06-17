@@ -133,7 +133,13 @@ function StoryTestCaseCard({
   onDeleteCase,
   onSave,
   onRevert,
+  hasTestCases = true,
 }) {
+  // ⭐ [deep-audit E-#6] read-only mode for a DOWNGRADED (Advanced→Standard) user viewing retained
+  // cases: edit/regenerate/save are Advanced-only (backend fail-closed). Disable the write controls
+  // so the card matches the screen's "Viewing your existing test cases" banner (no reactive
+  // click→reject→bounce). View + Export stay available (retained paid output).
+  const readOnly = !hasTestCases;
   // 'idle' | 'clipboard' | 'download' | 'failed'
   const [copyGherkinState, setCopyGherkinState] = useState("idle");
   const [copyCsvState, setCopyCsvState] = useState("idle");
@@ -335,24 +341,24 @@ function StoryTestCaseCard({
           onClick={(e) => {
             e.preventDefault();
             e.stopPropagation();
-            if (isPolling || isSaving || isRemoved) return;
+            if (isPolling || isSaving || isRemoved || readOnly) return; // [deep-audit E-#6] regen is Advanced-only
             if (confirmArmed === "armed") {
               fireRegen();
             } else {
               armConfirm();
             }
           }}
-          disabled={isPolling || isSaving || isRemoved}
+          disabled={isPolling || isSaving || isRemoved || readOnly}
           className="text-[10px] px-2 py-0.5 rounded"
           style={{
             background: confirmArmed === "armed" ? "var(--s2j-red-bg)" : "none",
             border: `1px solid ${confirmArmed === "armed" ? "var(--s2j-red-border)" : "var(--s2j-border)"}`,
-            color: (isPolling || isSaving || isRemoved)
+            color: (isPolling || isSaving || isRemoved || readOnly)
               ? "var(--s2j-text-muted)"
               : confirmArmed === "armed"
               ? "var(--s2j-red)"
               : "var(--s2j-blue)",
-            cursor: (isPolling || isSaving || isRemoved) ? "not-allowed" : "pointer",
+            cursor: (isPolling || isSaving || isRemoved || readOnly) ? "not-allowed" : "pointer",
             transition: "all 0.15s",
           }}
           title={
@@ -485,7 +491,7 @@ function StoryTestCaseCard({
             saving={isSaving || isPolling}
             saveState={saveState}
             saveError={saveError}
-            onSaveStory={onSave}
+            onSaveStory={readOnly ? undefined : onSave}
             onRevertCase={() =>
               caseIsNew(i)
                 ? onDeleteCase && onDeleteCase(i)
@@ -501,8 +507,9 @@ function StoryTestCaseCard({
         )}
 
         {/* + Add test case — disabled at the 20-case ceiling (the parse caps at 20 — testcases.js
-            parseTestCaseResult; adding a 21st would be silently dropped). Hidden while regenerating. */}
-        {!hasError && !isPolling && (cases.length < 20 ? (
+            parseTestCaseResult; adding a 21st would be silently dropped). Hidden while regenerating.
+            [deep-audit E-#6] hidden in read-only (downgraded) mode — adding a case is an edit. */}
+        {!hasError && !isPolling && !readOnly && (cases.length < 20 ? (
           <button
             type="button"
             onClick={() => onAddCase && onAddCase()}
@@ -522,7 +529,7 @@ function StoryTestCaseCard({
             common edit/append flow the per-case footers above handle Save/Revert (Work B).
             WHY explicit save (unlike the breakdown editor's in-memory edits): test cases are re-read
             from KVS by BOTH export and the Jira push, so edits must be persisted there. */}
-        {!hasError && isDirty && !anyCaseFooter && (
+        {!hasError && isDirty && !anyCaseFooter && !readOnly && (
           <div
             className="mt-2 flex items-center gap-2 rounded-md px-3 py-2 flex-wrap"
             style={{

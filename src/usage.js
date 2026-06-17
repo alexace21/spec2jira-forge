@@ -17,9 +17,10 @@
  *                 + push + Project Context. The customer's own Anthropic key pays
  *                 compute, so unlimited is no cost liability for us.
  *   - Advanced:   "Advanced" edition, $13.40/user/mo, BYOK → UNLIMITED + TEST-CASE
- *                 GENERATION (the headline value anchor; + custom prompts + future
- *                 expensive features). Still BYOK → still $0 compute cost to us, so
- *                 still no cap. The ONLY differentiator vs Standard is the feature set.
+ *                 GENERATION (the SINGLE headline anchor TODAY; custom prompts + the
+ *                 Capacity-Sheet vision are FUTURE — do NOT advertise them until built).
+ *                 Still BYOK → still $0 compute cost to us, so still no cap. The ONLY
+ *                 differentiator vs Standard is the feature set (test-cases today).
  *   - Unlicensed: a minimal DEFENSIVE tier (limit 0, blocked) for the no-active-license
  *                 case. Not a product offering — the resolvers turn it into a clean
  *                 "subscribe or start a trial" prompt, never a raw error.

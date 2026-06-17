@@ -74,5 +74,16 @@ check('high-AC story costs more than a tiny one (scales with ACs)', huge.expecte
 const projBatch = projectTestCaseCost({ storyACcounts: [10, 10], specSourceChars: 20000 });
 check('projection uses batch rates (sanity: a 2-story run is a few cents to <$1, not dollars)', projBatch.expected_usd < 1.5);
 
+// ⭐ deep-audit fix #1: UPPER must be a GENUINE per-story ceiling (N × TC_MAX_OUTPUT_TOKENS=24K),
+// not a multiplier on expected that sits far below the real cap. A 2-story upper output = 48K tokens
+// × $7.5/MTok (Sonnet $15 output × 0.5 batch) = $0.36 output alone — so upper ≥ that, and well above
+// the (capped) expected. This is what makes "up to ~$X" a true bound the echo can never exceed.
+const up = projectTestCaseCost({ storyACcounts: [3, 5], specSourceChars: 0, model: 'claude-sonnet-4-6' });
+check('upper reflects the true N×24K ceiling output (≥ ~$0.36 for 2 stories)', up.upper_usd >= 0.36);
+check('upper is well above the capped expected (genuine ceiling, not multiplier-on-expected)', up.upper_usd > up.expected_usd * 1.8);
+// A low-AC story used to under-bound badly (AC=1 upper≈$0.04 vs ceiling≈$0.18); now it = the ceiling.
+const lowAc = projectTestCaseCost({ storyACcounts: [1], specSourceChars: 0, model: 'claude-sonnet-4-6' });
+check('low-AC single story: upper = full ceiling (~$0.18 output), not a tiny multiplier figure', lowAc.upper_usd >= 0.17);
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

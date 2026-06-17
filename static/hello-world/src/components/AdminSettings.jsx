@@ -464,7 +464,7 @@ export default function AdminSettings({ initialTab = "settings", diagRefFilter =
           {account.unlimited && (
             <p className="text-xs mt-3" style={{ color: "var(--s2j-text-muted)" }}>
               {hasTestCases
-                ? "Your Advanced plan includes unlimited breakdowns + test-case generation + custom prompts, all on your own Anthropic key."
+                ? "Your Advanced plan includes unlimited breakdowns + test-case generation, all on your own Anthropic key."
                 : `Your Standard plan includes unlimited breakdowns on your own Anthropic key.${
                     accountPriceFor(account, "byokAdvanced")
                       ? ` Upgrade to Advanced (${accountPriceFor(account, "byokAdvanced")}) for test-case generation.`
@@ -505,7 +505,7 @@ export default function AdminSettings({ initialTab = "settings", diagRefFilter =
             {accountPriceFor(account, "byokAdvanced")
               ? ` (${accountPriceFor(account, "byokAdvanced")})`
               : ""}{" "}
-            — everything in Standard, plus test-case generation and custom prompts.
+            — everything in Standard, plus test-case generation.
           </li>
         </ul>
         <p className="mb-2">

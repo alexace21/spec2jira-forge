@@ -2162,7 +2162,21 @@ function App() {
         />
       );
     case "limit_reached":
-      return <LimitReachedScreen quota={quotaInfo} onBack={handleNewPage} />;
+      // ⭐ [deep-audit B/E-#5] edition_required can fire MID-FLOW (a Standard/downgraded user
+      // attempted a test-case action on an in-flight breakdown). Returning via handleNewPage would
+      // DISCARD the breakdown + edits under review. For that case Back returns to the Review/Confirm
+      // screen (the breakdown lives in pendingBreakdown) — non-destructive. Other modes
+      // (license_required / fair-use, no work in flight) keep the page-picker return.
+      return (
+        <LimitReachedScreen
+          quota={quotaInfo}
+          onBack={
+            quotaInfo?.error === "edition_required" && pendingBreakdown
+              ? () => setScreen("confirming")
+              : handleNewPage
+          }
+        />
+      );
     case "error":
       return (
         <ErrorScreen
@@ -4206,7 +4220,7 @@ function LimitReachedScreen({ quota, onBack }) {
             <EditionRow
               name="Advanced"
               price={advancedPrice}
-              blurb="+ test-case generation + custom prompts"
+              blurb="+ test-case generation"
             />
           ) : isFairUse ? (
             <EditionRow
@@ -4224,7 +4238,7 @@ function LimitReachedScreen({ quota, onBack }) {
               <EditionRow
                 name="Advanced"
                 price={advancedPrice}
-                blurb="+ test-case generation + custom prompts"
+                blurb="+ test-case generation"
               />
             </>
           )}

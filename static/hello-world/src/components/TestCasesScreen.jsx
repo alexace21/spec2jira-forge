@@ -223,7 +223,7 @@ function fmtUsd(usd) {
   return `$${usd.toFixed(2)}`;
 }
 
-function SummaryBar({ testCaseResults, onRegenerate }) {
+function SummaryBar({ testCaseResults, onRegenerate, hasTestCases = true }) {
   if (!testCaseResults) return null;
   const { perStory = [], total = 0, failedCount = 0 } = testCaseResults;
   const storyCount = perStory.length;
@@ -302,7 +302,8 @@ function SummaryBar({ testCaseResults, onRegenerate }) {
             <span style={{ color: "var(--s2j-red)" }}>
               <strong>{failedCount}</strong> failed
             </span>
-            {onRegenerate && (
+            {/* ⭐ [deep-audit E-#6] "Regenerate N failed" is a paid action — gated on hasTestCases. */}
+            {hasTestCases && onRegenerate && (
               <button
                 type="button"
                 onClick={handleRetryFailed}
@@ -696,7 +697,9 @@ function TestCasesScreen({
             )}
             {isStale && <StaleBanner />}
             {tcStale && <EditStaleBanner count={tcStaleStoryIdxs.length} />}
-            {tcStale && tcStaleStoryIdxs.length >= 2 && (() => {
+            {/* ⭐ [deep-audit E-#6] the bulk "Refresh N affected" is a paid regenerate → gate it on
+                hasTestCases so a downgraded user gets the read-only experience the banner promises. */}
+            {hasTestCases && tcStale && tcStaleStoryIdxs.length >= 2 && (() => {
               // T2 fix: while any affected story is regenerating, DISABLE + show progress (the button used
               // to stay live + give no feedback while the cards quietly flipped to "Generating…").
               const bulkBusy = tcStaleStoryIdxs.some((idx) => regenStates[idx] === "pending" || regenStates[idx] === "polling");
@@ -723,13 +726,14 @@ function TestCasesScreen({
                 </button>
               );
             })()}
-            <SummaryBar testCaseResults={testCaseResults} onRegenerate={handleRegenerate} />
+            <SummaryBar testCaseResults={testCaseResults} onRegenerate={handleRegenerate} hasTestCases={hasTestCases} />
             <div>
               {perStory.map((entry) => (
                 <StoryTestCaseCard
                   key={entry.storyIdx}
                   entry={entry}
                   jobId={jobId}
+                  hasTestCases={hasTestCases}
                   isStale={tcStaleStoryIdxs.includes(entry.storyIdx)}
                   isRemoved={tcRemovedStoryIdxs.includes(entry.storyIdx)}
                   regenState={regenStates[entry.storyIdx] || "idle"}

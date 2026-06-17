@@ -368,10 +368,10 @@ const TC_INPUT_TOKENS_PER_AC = 120; // per-AC input text in the user block
 const TC_OUTPUT_BASE_TOKENS = 400; // per-story output floor scaffold
 const TC_OUTPUT_TOKENS_PER_AC = 700; // ~one scenario cluster of output per AC
 const TC_OUTPUT_FLOOR_TOKENS = 600; // a story always emits at least this much
-const TC_UPPER_MULTIPLIER = 2.6; // high-side factor on OUTPUT (the variance axis) for the "up to ~$X" bound (raised from 2.2 — the upper must genuinely bracket the right tail of a 16× quantity)
-// Cap the EXPECTED per-story output strictly BELOW the ceiling so expected < upper ALWAYS holds
-// (even an extreme-AC story never quotes the 24K ceiling as its expected value). The UPPER bound
-// still reaches the full ceiling.
+// Cap the EXPECTED per-story output strictly BELOW the per-story output ceiling so expected < upper
+// ALWAYS holds (even an extreme-AC story never quotes the 24K ceiling as its EXPECTED value). The
+// UPPER bound is the full ceiling (TC_MAX_OUTPUT_TOKENS), so it is a genuine worst-case the echo
+// can never exceed (see the upper-output assignment below).
 const TC_EXPECTED_OUTPUT_CAP = Math.floor(TC_MAX_OUTPUT_TOKENS * 0.85);
 
 /**
@@ -407,9 +407,12 @@ export function projectTestCaseCost({ storyACcounts = [], specSourceChars = 0, m
       TC_EXPECTED_OUTPUT_CAP, // expected stays below the ceiling so expected < upper always
     );
     expectedOutputTokens += expOut;
-    // Upper reaches the full per-story ceiling; based on the UNCAPPED expected to bracket the tail.
-    const uncappedExp = Math.max(TC_OUTPUT_BASE_TOKENS + ac * TC_OUTPUT_TOKENS_PER_AC, TC_OUTPUT_FLOOR_TOKENS);
-    upperOutputTokens += Math.min(Math.round(uncappedExp * TC_UPPER_MULTIPLIER), TC_MAX_OUTPUT_TOKENS);
+    // ⭐ UPPER = the TRUE per-story output ceiling (TC_MAX_OUTPUT_TOKENS = the real max_tokens cap a
+    // single request can emit). "up to ~$X" must be a GENUINE ceiling the echo can NEVER exceed — the
+    // deep audit (3 personas) caught that a multiplier-on-expected upper sat 1.5–8× below the real
+    // per-story cap for typical low-AC stories, so a verbose run could blow past "up to". BYOK means
+    // over-stating the ceiling costs the vendor nothing; the "(typically ~$Y)" anchor prevents scare.
+    upperOutputTokens += TC_MAX_OUTPUT_TOKENS;
   }
 
   const sharedUsage = {

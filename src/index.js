@@ -4211,6 +4211,18 @@ resolver.define('pollRegenerateTestCase', async ({ payload, context }) => {
     // degraded inline path — a regen is re-runnable. (A throw re-fires the (G)/per-cause
     // records next tick — the (ref, op, class) dedupe absorbs them into occurrences,
     // the accepted (F) pattern.)
+    // [deep-audit D-#3] Idempotency guard against a CONCURRENT re-poll: the FE polls on a fixed
+    // interval with no in-flight guard, and the ended-batch download+parse above can outlast one
+    // tick — so two ticks can both reach here while the regen is still 'batched'. If another tick
+    // already flipped this regen to a terminal state, BAIL: re-doing the writes + the bulk-usage
+    // accumulate below would DOUBLE-COUNT the cost echo (over-state the bill). Mirrors freshRg2 on
+    // the fetch-error path. (Narrows the window to ~ms between this read and the regenKey write;
+    // Forge KVS has no compare-and-set, so it is a strong mitigation, not a hard lock.)
+    const freshRg3 = await kvs.get(regenKey).catch(() => null);
+    if (freshRg3 && (freshRg3.status === 'completed' || freshRg3.status === 'failed')) {
+      return freshRg3;
+    }
+
     const completed = { ...regenJob, status: 'completed', completedAt: new Date().toISOString(), batchStatus: 'ended' };
     try {
       await kvs.set(`${TC_STORY_KEY_PREFIX}${jobId}:${storyIdx}`, storyKvsValue);
@@ -4228,25 +4240,29 @@ resolver.define('pollRegenerateTestCase', async ({ payload, context }) => {
     // (c) Sync the bulk tcjob's stamped story for this idx to the EDITED ACs (= what this regen used)
     // so the push-embed AC-hash (it hashes tcjob.stampedStories) matches the regenerated story AND the
     // frontend per-story staleness clears. Non-fatal: the per-story result write above is authoritative.
-    if (entry && !entry.error && editedStory) {
+    // Bulk-tcjob read-modify-write: (1) ACCUMULATE this regen's real usage into the run total —
+    // regardless of success/failure; (2) on SUCCESS, sync the stamped story's edited ACs.
+    if (entry && (entry.usage || (!entry.error && editedStory))) {
       try {
         const bulkTcJob = await kvs.get(`${TC_JOB_KEY_PREFIX}${jobId}`);
         if (bulkTcJob) {
           let dirty = false;
-          // ⭐ v6 cost-transparency (CRITICAL): accumulate THIS regen's real usage into the bulk
-          // run total so the echo stays honest as the BA re-runs stories (a regen is additional
-          // real spend on the same run). Folded into the existing read-modify-write (free). Idempotent:
-          // a completed regen early-returns at the top (status guard), so this runs exactly once.
-          // ⚠ KNOWN RESIDUAL (accepted): a "Regenerate N failed" fan-out fires N parallel regens that
-          // each read-modify-write this one key — Forge KVS has no compare-and-set, so concurrent
-          // accumulations can lose-update and the echo under-counts slightly. Rare (only the bulk-retry
-          // fan-out), customer-favourable direction, and self-corrects on the next getTestCases that
-          // reads a settled tcjob. Not worth a per-regen-key + sum-on-read rework for the MVP.
+          // ⭐ v6 cost-transparency (CRITICAL): accumulate THIS regen's real usage into the bulk run
+          // total so the echo stays honest as the BA re-runs stories (a regen is additional real spend).
+          // ⭐ [deep-audit D-#2] accumulate even on a FAILED regen (entry.error): a max_tokens regen still
+          // burned the full output budget, and the BULK poll counts errored rows too (sumUsage over ALL
+          // perStory) — so the regen path MUST match or the echo UNDER-counts the costliest failure.
+          // Idempotency: the terminal status-guard at the top + the freshRg3 re-read above keep this to
+          // exactly once per regen.
+          // ⚠ KNOWN RESIDUAL (accepted): a "Regenerate N failed" fan-out fires N PARALLEL regens for
+          // DIFFERENT stories that each read-modify-write this one key — Forge KVS has no compare-and-set,
+          // so concurrent accumulations can lose-update and the echo under-counts slightly. Customer-
+          // favourable direction; self-corrects on the next getTestCases that reads a settled tcjob.
           if (entry.usage) {
             bulkTcJob.usage = sumUsage([bulkTcJob.usage, entry.usage]);
             dirty = true;
           }
-          if (Array.isArray(bulkTcJob.stampedStories)) {
+          if (!entry.error && editedStory && Array.isArray(bulkTcJob.stampedStories)) {
             const pos = bulkTcJob.stampedStories.findIndex((s) => s && s.idx === storyIdx);
             if (pos >= 0) {
               bulkTcJob.stampedStories[pos] = {
