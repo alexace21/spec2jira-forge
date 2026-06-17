@@ -419,6 +419,7 @@ function TestCasesScreen({
   onRegenerate,
   onSaveTestCase,
   regenStates = {},
+  hasTestCases = true, // v6: false ⇒ a downgraded user viewing RETAINED cases (edit/regen need Advanced). Default true = back-compat / entitled.
 }) {
   // Stale detection: testCaseResults.breakdownPageVersion < currentVersion
   const tcPageVersion = testCaseResults?.breakdownPageVersion;
@@ -653,6 +654,24 @@ function TestCasesScreen({
           <GeneratePrompt storyCount={storyCount} onGenerate={onGenerate} />
         ) : (
           <>
+            {/* v6 value-split: a downgraded user (Advanced→Standard) keeps READ/EXPORT of
+                retained cases, but edit/regenerate are Advanced-only (backend fail-closed →
+                routed to the upgrade screen if attempted). Tell them so up front. */}
+            {!hasTestCases && (
+              <div
+                className="rounded-lg p-3 mb-4 text-xs"
+                style={{
+                  background: "var(--s2j-blue-bg)",
+                  border: "1px solid var(--s2j-blue-border)",
+                  color: "var(--s2j-text)",
+                }}
+              >
+                <strong>Viewing your existing test cases.</strong> Editing and
+                regenerating test cases is an Advanced-edition feature — your saved
+                cases stay viewable and exportable here. Upgrade to Advanced to edit
+                or regenerate.
+              </div>
+            )}
             {isStale && <StaleBanner />}
             {tcStale && <EditStaleBanner count={tcStaleStoryIdxs.length} />}
             {tcStale && tcStaleStoryIdxs.length >= 2 && (() => {

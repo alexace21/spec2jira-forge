@@ -160,11 +160,17 @@ app:
       required: false
   # ── Paid-via-Atlassian + TWO editions (Standard/Advanced) ────────────
   # The platform cap is EXACTLY two editions. editionsEnabled is MANDATORY for
-  # the two-price hybrid (licensing.enabled alone → a SINGLE price):
-  #   Standard = BYOK Pro    (customer's own key, UNLIMITED) — portal price (set 2026-06-04):
-  #                            100% of Confluence ($6.70/user, $57 ≤10, declining, 1.5x multi)
-  #   Advanced = Managed Pro (our key; capped 10/USER/mo) — editions are a POST-PUBLISH phase,
-  #                            so Advanced is ADDED AFTER the app is live (Phase 2; price $13/user planned)
+  # the two-price model (licensing.enabled alone → a SINGLE price).
+  # ⭐ v6 VALUE-SPLIT (2026-06-17): BOTH editions are BYOK (customer's own key); they
+  # differ by VALUE (feature set), NOT key-source:
+  #   Standard = core breakdown + push + Project Context (UNLIMITED, BYOK) — portal price
+  #              (set 2026-06-04): 100% of Confluence ($6.70/user, $57 ≤10, declining, 1.5x multi)
+  #   Advanced = Standard + test-case generation + custom prompts (UNLIMITED, BYOK; $13.40/user)
+  # ⚠ DEPLOY-TIMING: the portal Advanced edition is currently still the v5 "Managed" edition
+  #   (pending). Re-config it to the BYOK test-cases value at editions Phase 2 (POST-PUBLISH),
+  #   and deploy the v6 code only in lockstep with that re-config (portal copy FIRST, code
+  #   SECOND) so a new Advanced subscriber promised "no key" is never handed a must-bring-key
+  #   product. See the handover deploy-timing note.
   # Runtime tells them apart via context.license.capabilitySet
   # (capabilitystandard / capabilityadvanced) — see src/usage.js resolveTier.
   # Prices/edition names are set in the vendor portal, NOT here. Evaluation is the

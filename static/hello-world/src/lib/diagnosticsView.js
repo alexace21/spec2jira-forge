@@ -186,13 +186,16 @@ const CLASS_TEXT = {
     title: "A required setting is missing",
     hint: "A needed setting (for example the Anthropic API key) is not set. Open Settings and complete the configuration.",
   },
+  // v6 value-split: both live editions are BYOK (no managed key, no cap), so these two
+  // classes are DORMANT for Marketplace customers — they only fire on the off-Marketplace
+  // Managed fallback / legacy jobs. Copy kept generic so it never misleads a BYOK user.
   managed_unavailable: {
-    title: "The Managed service was unavailable",
-    hint: "The Managed (we-run-Claude) server key was not available. Contact support, or switch to BYOK with your own key in Settings.",
+    title: "The AI service was unavailable",
+    hint: "An Anthropic key was not available. Both editions use your own Anthropic key — open Settings and add it if it is missing, or contact support.",
   },
   quota_exceeded: {
     title: "The monthly allowance was reached",
-    hint: "The Managed plan's fair-use allowance ran out — an intended block, recorded for the timeline. It resets monthly; BYOK Pro is unlimited.",
+    hint: "A metered fair-use allowance ran out — an intended block, recorded for the timeline. It resets monthly. Both Marketplace editions are unlimited on your own Anthropic key.",
   },
   license_required: {
     title: "No active license was found",

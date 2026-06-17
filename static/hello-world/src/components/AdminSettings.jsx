@@ -160,12 +160,11 @@ export default function AdminSettings({ initialTab = "settings", diagRefFilter =
       return;
     }
 
-    // Block save ako neither а key nor а pre-configured key exist — UNLESS this is a
-    // Managed Pro (Advanced) install, where we run Claude with our key and the
-    // customer is not expected to provide one (they're only saving the project key
-    // + context here). isManaged is derived from getUsage's edition.
-    const isManaged = account?.edition === "advanced";
-    if (!isManaged && !trimmedKey && !apiKeyConfigured) {
+    // v6 value-split: BOTH editions are BYOK → a key is always required. The old Managed
+    // (edition==='advanced') "no key needed" exemption is GONE — under v6 'advanced' is a
+    // BYOK edition (byokAdvanced), so exempting it would let a paying Advanced customer save
+    // with no key and then dead-end at generate-time.
+    if (!trimmedKey && !apiKeyConfigured) {
       setMessage({
         type: "error",
         text: "Please paste your Anthropic API key. Get one from console.anthropic.com → API Keys.",
@@ -378,12 +377,13 @@ export default function AdminSettings({ initialTab = "settings", diagRefFilter =
     );
   }
 
-  // Managed Pro (Advanced edition) ⇒ WE run Claude with our key, so the customer
-  // needs NO Anthropic key. Hide the BYOK key input in that case + show a Managed
-  // notice. Only true when getUsage explicitly resolved 'advanced' — if account is
-  // null (best-effort load failed/unlicensed) we default to showing the BYOK input
-  // (the safe, today's behaviour). Distill also routes through the managed key then.
-  const isManaged = account?.edition === "advanced";
+  // v6 value-split: BOTH editions are BYOK → the key field shows for everyone and there
+  // is no "Managed / no key needed" mode. (The old `isManaged = account?.edition ===
+  // 'advanced'` was REMOVED: under v6 'advanced' is the BYOK Advanced edition, so deriving
+  // "no key" from it would HIDE the key field from a paying Advanced customer — the exact
+  // dead-end this decouple fixes.) Feature access is gated separately on usage.hasTestCases,
+  // never on the edition label.
+  const hasTestCases = account?.hasTestCases === true;
 
   return (
     <div>
@@ -420,7 +420,7 @@ export default function AdminSettings({ initialTab = "settings", diagRefFilter =
               <span className="font-medium" style={{ color: "var(--s2j-text)" }}>
                 {account.tierLabel || "—"}
                 {/* Price for the active PAID edition (from pricing[] — single source).
-                    Both BYOK Pro and Managed Pro show their price. */}
+                    Both Standard and Advanced show their price. */}
                 {accountPrice(account) ? (
                   <span
                     className="font-normal ml-1"
@@ -458,132 +458,88 @@ export default function AdminSettings({ initialTab = "settings", diagRefFilter =
               </div>
             )}
           </div>
-          {/* Tier-aware footnote. Managed Pro: the cap is fair-use, and BYOK Pro is
-              the unlimited option. BYOK Pro (unlimited): nothing to add. */}
-          {account.tier === "managedPro" && (
+          {/* v6 value-split footnote — both editions are BYOK + unlimited; the differentiator
+              is the feature set. Advanced includes test-cases; Standard gets a gentle upsell.
+              (The old managedPro fair-use footnote is dormant — both live editions are unlimited.) */}
+          {account.unlimited && (
             <p className="text-xs mt-3" style={{ color: "var(--s2j-text-muted)" }}>
-              Managed Pro runs Claude for you (no API key needed). Your plan includes a monthly
-              breakdown allowance{account.resetsAtLabel ? ` that resets on ${account.resetsAtLabel}` : ""}.{" "}
-              {accountPriceFor(account, "byokPro")
-                ? `For unlimited breakdowns, switch to BYOK Pro (${accountPriceFor(account, "byokPro")}) and use your own Anthropic key.`
-                : "For unlimited breakdowns, switch to BYOK Pro and use your own Anthropic key."}
+              {hasTestCases
+                ? "Your Advanced plan includes unlimited breakdowns + test-case generation + custom prompts, all on your own Anthropic key."
+                : `Your Standard plan includes unlimited breakdowns on your own Anthropic key.${
+                    accountPriceFor(account, "byokAdvanced")
+                      ? ` Upgrade to Advanced (${accountPriceFor(account, "byokAdvanced")}) for test-case generation.`
+                      : " Upgrade to Advanced for test-case generation."
+                  }`}
             </p>
           )}
         </div>
       )}
 
-      {/* Info callout — edition-aware. Managed Pro: we run Claude (no key needed).
-          Otherwise (BYOK Pro): the BYOK explainer + the two ways to use the app, so
-          an admin choosing how to run it understands both paths. */}
-      {isManaged ? (
-        <div
-          className="rounded-lg p-4 mb-6 text-sm"
-          style={{
-            background: "var(--s2j-green-bg)",
-            border: "1px solid var(--s2j-green-border)",
-            color: "var(--s2j-text)",
-          }}
-        >
-          <p className="mb-2">
-            <strong>Managed Pro — we run Claude for you.</strong> Your{" "}
-            {accountPriceFor(account, "managedPro") || "Managed Pro"} subscription
-            runs every breakdown on our Anthropic key, so there is{" "}
-            <strong>no API key to configure</strong>. Just set your default Jira
-            project below and you're ready to generate.
-          </p>
-          <p>
-            Your plan includes a generous monthly breakdown allowance. Want unlimited breakdowns and
-            to use your own Anthropic agreement? Switch to BYOK Pro
+      {/* Info callout (v6 value framing). BOTH editions are BYOK (your own Anthropic
+          key); the difference is the feature set — Standard = core, Advanced = + test
+          cases. The old "Managed — no key needed" path was removed (false under v6). */}
+      <div
+        className="rounded-lg p-4 mb-6 text-sm"
+        style={{
+          background: "var(--s2j-blue-bg)",
+          border: "1px solid var(--s2j-blue-border)",
+          color: "var(--s2j-text)",
+        }}
+      >
+        <p className="mb-2">
+          <strong>Powered by Claude:</strong> Spec2Tickets uses Anthropic's Claude
+          Sonnet 4.6 to analyze your Confluence pages. Both editions run on your own
+          Anthropic API key (BYOK):
+        </p>
+        <ul className="mb-2" style={{ marginLeft: "16px", listStyle: "disc" }}>
+          <li className="mb-1">
+            <strong>Standard</strong>
             {accountPriceFor(account, "byokPro")
               ? ` (${accountPriceFor(account, "byokPro")})`
               : ""}{" "}
-            and paste your own key here.
-          </p>
-        </div>
-      ) : (
-        <div
-          className="rounded-lg p-4 mb-6 text-sm"
-          style={{
-            background: "var(--s2j-blue-bg)",
-            border: "1px solid var(--s2j-blue-border)",
-            color: "var(--s2j-text)",
-          }}
-        >
-          <p className="mb-2">
-            <strong>Powered by Claude:</strong> Spec2Tickets uses Anthropic's Claude
-            Sonnet 4.6 to analyze your Confluence pages. There are two ways to run it:
-          </p>
-          <ul className="mb-2" style={{ marginLeft: "16px", listStyle: "disc" }}>
-            <li className="mb-1">
-              <strong>Bring your own key (BYOK)</strong> — paste your Anthropic API
-              key below. BYOK Pro
-              {accountPriceFor(account, "byokPro")
-                ? ` (${accountPriceFor(account, "byokPro")})`
-                : ""}{" "}
-              gives unlimited breakdowns. Breakdowns run on your own Anthropic
-              account, never on Spec2Tickets servers.
-            </li>
-            <li>
-              <strong>Managed</strong> — no key needed; we run Claude for you.
-              Subscribe to Managed Pro
-              {accountPriceFor(account, "managedPro")
-                ? ` (${accountPriceFor(account, "managedPro")})`
-                : ""}{" "}
-              (the Advanced edition) from your Atlassian site admin.
-            </li>
-          </ul>
-          <p className="mb-2">
-            <strong>Get an API key:</strong>{" "}
-            <a
-              href="https://console.anthropic.com/settings/keys"
-              target="_blank"
-              rel="noopener noreferrer"
-              style={{ color: "var(--s2j-blue)", textDecoration: "underline" }}
-            >
-              console.anthropic.com → Settings → API Keys
-            </a>{" "}
-            (sign up free; billed pay-as-you-go to your own Anthropic account).
-          </p>
-          <p>
-            <strong>Privacy:</strong> Under BYOK, your page content flows directly
-            from Forge to the Anthropic API using your key. Data falls under{" "}
-            <a
-              href="https://www.anthropic.com/legal/aup"
-              target="_blank"
-              rel="noopener noreferrer"
-              style={{ color: "var(--s2j-blue)", textDecoration: "underline" }}
-            >
-              Anthropic's Usage Policy
-            </a>
-            {" "}+ your own data processing agreement with Anthropic.
-          </p>
-        </div>
-      )}
+            — unlimited breakdowns: Confluence page → structured Jira backlog + push,
+            with Project Context profiles.
+          </li>
+          <li>
+            <strong>Advanced</strong>
+            {accountPriceFor(account, "byokAdvanced")
+              ? ` (${accountPriceFor(account, "byokAdvanced")})`
+              : ""}{" "}
+            — everything in Standard, plus test-case generation and custom prompts.
+          </li>
+        </ul>
+        <p className="mb-2">
+          <strong>Get an API key:</strong>{" "}
+          <a
+            href="https://console.anthropic.com/settings/keys"
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{ color: "var(--s2j-blue)", textDecoration: "underline" }}
+          >
+            console.anthropic.com → Settings → API Keys
+          </a>{" "}
+          (sign up free; billed pay-as-you-go to your own Anthropic account).
+        </p>
+        <p>
+          <strong>Privacy:</strong> your page content flows directly from Forge to the
+          Anthropic API using your key. Data falls under{" "}
+          <a
+            href="https://www.anthropic.com/legal/aup"
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{ color: "var(--s2j-blue)", textDecoration: "underline" }}
+          >
+            Anthropic's Usage Policy
+          </a>
+          {" "}+ your own data processing agreement with Anthropic.
+        </p>
+      </div>
 
       {/* Form */}
       <div className="space-y-5">
-        {/* BYOK key input — shown for BYOK Pro. HIDDEN for Managed Pro (we run Claude
-            with our key; the customer has no key to enter). A Managed admin still
-            configures the JIRA project below. */}
-        {isManaged ? (
-          <div
-            className="rounded-lg p-3 text-sm"
-            style={{
-              background: "var(--s2j-bg-section)",
-              border: "1px solid var(--s2j-border)",
-              color: "var(--s2j-text-muted)",
-            }}
-          >
-            <p style={{ color: "var(--s2j-text)" }} className="font-medium mb-1">
-              No Anthropic API key needed
-            </p>
-            <p>
-              On Managed Pro we run Claude for you, so there is no key to configure.
-              To use your own key (and unlimited breakdowns) instead, switch to BYOK
-              Pro and this field will appear.
-            </p>
-          </div>
-        ) : (
+        {/* BYOK key input — shown for EVERY edition (v6: both editions are BYOK). The
+            old "No Anthropic API key needed" Managed branch was REMOVED: it would have
+            hidden this field from a paying Advanced customer who must enter their own key. */}
           <Field
             label="Anthropic API Key"
             description={
@@ -635,7 +591,6 @@ export default function AdminSettings({ initialTab = "settings", diagRefFilter =
               </button>
             )}
           </Field>
-        )}
 
         <Field
           label="Default Jira Project Key"
@@ -663,7 +618,7 @@ export default function AdminSettings({ initialTab = "settings", diagRefFilter =
         <ContextProfilesEditor
           profiles={contextProfiles}
           setProfiles={setContextProfiles}
-          apiKeyConfigured={apiKeyConfigured || isManaged}
+          apiKeyConfigured={apiKeyConfigured}
           onMessage={setMessage}
         />
 
@@ -1354,10 +1309,9 @@ function DiagnosticsTab({ refFilter = "", onRefFilterChange }) {
 // row: name + context textarea + "Distill with Claude" (condense a long paste) + live
 // counter + remove. The user later picks which profile applies per generation
 // (ReadyScreen), so a multi-project workspace never gets the wrong project's context.
-// NOTE: `apiKeyConfigured` here is overloaded to mean "MAY DISTILL" — the parent
-// passes `apiKeyConfigured || isManaged`, because a Managed install has no BYOK key
-// but CAN distill (the backend calls Claude with our key). Every distill gate below
-// honours that. (§13 review fix — a future cleanup may rename the prop to canDistill.)
+// NOTE: `apiKeyConfigured` here means "MAY DISTILL". v6 value-split: both editions are
+// BYOK, so distill needs the customer's own key for everyone — the parent passes plain
+// `apiKeyConfigured` (the old `|| isManaged` term was removed; there is no managed key now).
 function ContextProfilesEditor({ profiles, setProfiles, apiKeyConfigured, onMessage }) {
   const [distillingId, setDistillingId] = useState(null);
   const [distillProgress, setDistillProgress] = useState(null); // { label, current, total } while a 6-step distill runs

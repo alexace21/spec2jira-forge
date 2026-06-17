@@ -529,31 +529,26 @@ function App() {
           }
         }
 
-        // ═══ Gate 1 — Settings (tier-aware, hybrid 2026-06-03) ═══
-        // v3.0.0 required a BYOK Anthropic key + a default JIRA project key. The
-        // hybrid makes the KEY requirement TIER-AWARE: Managed Pro (the Advanced
-        // edition) runs Claude on OUR key, so a Managed user has NO BYOK key by
-        // design — requiring one wrongly trapped them on the BYOK setup screen
-        // (the bug this fixes). BYOK Pro (Standard) still needs the customer's own
-        // key. Both editions still need a default JIRA project key (used by push).
-        // getUsage carries the license-resolved edition; fetched in PARALLEL with
-        // getSettings (no added latency) and fail-soft — on a metering glitch it is
-        // null, so we fall back to the BYOK key requirement (safe: at worst a
-        // Managed user is asked to open Settings; the key SOURCE is backend-resolved
-        // from the license regardless, so the wrong key is never actually used).
-        // Anthropic-health staleness stays deferred to generate-time (no re-test on
-        // every mount).
+        // ═══ Gate 1 — Settings (v6 value-split: both editions BYOK) ═══
+        // v6 (2026-06-17): BOTH Marketplace editions are BYOK → every user needs their
+        // own Anthropic key + a default JIRA project key. The old tier-aware exemption
+        // (Managed/Advanced skipped the key requirement because we ran Claude on our key)
+        // was REMOVED — under v6 'advanced' is the BYOK Advanced edition, so exempting it
+        // would strand a paying customer keyless and dead-end them at generate-time.
+        // getUsage is still fetched in PARALLEL with getSettings (no added latency) for the
+        // usage badge + feature capability (hasTestCases); the setup gate no longer branches
+        // on edition. Anthropic-health staleness stays deferred to generate-time.
         const [settings, mountUsage] = await Promise.all([
           invoke("getSettings"),
           invoke("getUsage").catch(() => null),
         ]);
         if (mountUsage && !mountUsage.error) setUsage(mountUsage);
-        const isManaged = mountUsage?.edition === "advanced";
 
-        if (
-          (!isManaged && !settings?.apiKeyConfigured) ||
-          !settings?.defaultProjectKey
-        ) {
+        // v6 value-split: BOTH editions are BYOK → every user needs an Anthropic key. The
+        // old `isManaged` (edition==='advanced') exemption that let Managed users past setup
+        // with no key is GONE — it would now strand a paying Advanced (BYOK) user keyless and
+        // dead-end them at generate-time. Require the key + the default project for everyone.
+        if (!settings?.apiKeyConfigured || !settings?.defaultProjectKey) {
           setScreen("setup");
           return;
         }
@@ -1396,6 +1391,16 @@ function App() {
       setScreen("limit_reached");
       return;
     }
+    if (result.error === "edition_required") {
+      // v6 value-split: test-cases are an Advanced feature; the user is licensed but on
+      // Standard. Route to the upgrade screen (NOT the generic Error screen — that reads as
+      // "broken" rather than "upgrade"). Defense-in-depth: the ConfirmScreen button is gated
+      // on usage.hasTestCases, so a Standard user normally never reaches this.
+      setTcGenerating(false); // Fix 6
+      setQuotaInfo(result);
+      setScreen("limit_reached");
+      return;
+    }
     if (result.error === "managed_unavailable") {
       setTcGenerating(false); // Fix 6
       setErrorRefId(jobId || null); // [diag Phase 3] TC-gen failure for THIS job
@@ -1456,6 +1461,19 @@ function App() {
           return;
         }
         if (submitResult.error) {
+          if (submitResult.error === "edition_required") {
+            // v6 value-split: regen is an Advanced feature; route a Standard user to the
+            // upgrade screen, NOT an opaque red error card (pitfall #4). Normally
+            // unreachable — the test-case UI is hidden for Standard.
+            setRegenStates((prev) => {
+              const next = { ...prev };
+              delete next[storyIdx];
+              return next;
+            });
+            setQuotaInfo(submitResult);
+            setScreen("limit_reached");
+            return;
+          }
           setRegenStates((prev) => ({ ...prev, [storyIdx]: "error" }));
           return;
         }
@@ -1521,6 +1539,14 @@ function App() {
         resp = await invoke("saveTestCases", { jobId, storyIdx, result });
       } catch (e) {
         return { error: "save_failed", detail: String(e?.message || e) || "Save failed (network)." };
+      }
+      if (resp && resp.error === "edition_required") {
+        // v6 value-split: editing test cases is an Advanced action (fail-closed backend gate).
+        // Route a downgraded user to the upgrade screen — parity with generate/regenerate —
+        // instead of surfacing a generic red "save failed" on the card.
+        setQuotaInfo(resp);
+        setScreen("limit_reached");
+        return resp;
       }
       if (resp && resp.ok) {
         setTestCaseResults((prev) => {
@@ -1777,7 +1803,6 @@ function App() {
     return (
       <SetupScreen
         message={error}
-        isManaged={usage?.edition === "advanced"}
         onOpenSettings={handleOpenSettings}
       />
     );
@@ -2087,6 +2112,7 @@ function App() {
           onRegenerate={handleRegenerateTestCase}
           onSaveTestCase={handleSaveTestCase}
           regenStates={regenStates}
+          hasTestCases={usage?.hasTestCases === true}
         />
       );
     case "confirming":
@@ -2107,6 +2133,7 @@ function App() {
           onOpenTestCases={handleOpenTestCases}
           tcGenerating={tcGenerating}
           tcStale={tcStaleVsEdits}
+          usage={usage}
         />
       );
     case "pushing":
@@ -2295,9 +2322,10 @@ function ReadyScreen({
   genFailureNotice = null,
 }) {
   // Prices come from getUsage's pricing[] (single source of truth — no hardcoded
-  // USD prices in the UI). The hybrid has two paid editions: byokPro (unlimited, own
-  // key) + managedPro (we run it). Only byokProPrice is surfaced on this badge (the
-  // Managed → unlimited upsell); there is no Free tier to upsell from.
+  // USD prices in the UI). v6 value-split: both paid editions (Standard + Advanced)
+  // are BYOK + unlimited, so the badge shows "<edition> plan · unlimited" for both,
+  // plus a "includes test cases" value-signal for Advanced. The managedPro branch
+  // below is DORMANT (off-Marketplace only; both live editions are unlimited).
   const byokProPrice = findPrice(usage, "byokPro");
   return (
     <div className="p-6" style={SCREEN_MAX_WIDTH_STYLE}>
@@ -2394,10 +2422,12 @@ function ReadyScreen({
                 {usage.tierLabel} plan
               </strong>{" "}
               · unlimited breakdowns
+              {usage.hasTestCases && " · includes test cases"}
             </span>
           ) : usage.tier === "managedPro" ? (
-            // Managed Pro is CAPPED fair-use (we run Claude), not a free trial —
-            // describe it as the monthly fair-use allowance, not a raw cap number.
+            // DORMANT under v6 — resolveTier never returns managedPro for a live customer
+            // (both editions are BYOK + unlimited → the `usage.unlimited` branch above always
+            // wins). Kept only for the off-Marketplace Managed fallback. Capped fair-use copy.
             <span>
               <strong style={{ color: "var(--s2j-text)" }}>
                 {usage.tierLabel} plan
@@ -2407,7 +2437,7 @@ function ReadyScreen({
               {usage.remaining === 0 && byokProPrice && (
                 <span style={{ color: "var(--s2j-text)" }}>
                   {" "}
-                  · for unlimited, switch to BYOK Pro — bring your own Anthropic key
+                  · for unlimited, switch to a BYOK edition — bring your own Anthropic key
                   ({byokProPrice})
                 </span>
               )}
@@ -2766,7 +2796,13 @@ function ConfirmScreen({
   onOpenTestCases,
   tcGenerating,
   tcStale,
+  usage,
 }) {
+  // v6 value-split: test-case generation is an Advanced-edition feature. Gate the UI on the
+  // capability the backend sends (usage.hasTestCases). Default-FALSE on an absent field
+  // (back-compat: a cached pre-v6 getUsage payload has no hasTestCases → treat as no-access,
+  // never leak the premium feature). The backend remains the authority (fail-closed gate).
+  const hasTestCases = usage?.hasTestCases === true;
   const total = dryRunResult?.total_items || 0;
   const epics = dryRunResult?.total_epics || 0;
   const stories = dryRunResult?.total_stories || 0;
@@ -3199,14 +3235,18 @@ function ConfirmScreen({
       >
         <div>
           <p className="text-xs font-medium" style={{ color: "var(--s2j-text)" }}>
-            {tcStaleNow
+            {!hasTestCases && !testCaseResults
+              ? "Acceptance test cases — Advanced"
+              : tcStaleNow
               ? "⚠ Test cases may be outdated"
               : testCaseResults
               ? "✓ Acceptance test cases generated"
               : "Optional: acceptance test cases"}
           </p>
           <p className="text-xs" style={{ color: "var(--s2j-text-muted)" }}>
-            {tcStaleNow
+            {!hasTestCases && !testCaseResults
+              ? "Generate BA-grade Gherkin / CSV acceptance scenarios for every story — available on the Advanced edition."
+              : tcStaleNow
               ? "You edited the breakdown since generating these. Re-running re-generates ALL stories (takes a few minutes, uses compute) — or push as-is; the edited stories simply won't get a test-case summary. Your call."
               : "BA-grade Gherkin / CSV export + a summary embedded in each Jira Story."}
           </p>
@@ -3253,7 +3293,11 @@ function ConfirmScreen({
               🧪 Test cases unavailable — breakdown not saved
             </span>
           )}
-          {!persistFailed && (!testCaseResults || tcStaleNow) && (
+          {/* v6 value-split: Generate / Re-run is gated on the Advanced capability (hasTestCases).
+              Standard users get the upsell chip below instead (no spend). The backend gate is the
+              authority (fail-closed); this is UX. View/edit of EXISTING cases stays available
+              (retained paid output). */}
+          {!persistFailed && hasTestCases && (!testCaseResults || tcStaleNow) && (
             <button
               type="button"
               onClick={() => {
@@ -3289,6 +3333,28 @@ function ConfirmScreen({
                   : "🔄 Re-run all"
                 : "🧪 Generate Test Cases"}
             </button>
+          )}
+          {/* v6 value-split: Standard edition → an upsell chip instead of the Generate button
+              (no spend, no dead-end click). Shown when there are no cases yet OR when cases
+              exist but are stale (Re-run is gated, so the chip is the actionable affordance —
+              avoids a stale warning with no button). A downgraded user with FRESH cases still
+              gets the View/edit button above. */}
+          {!persistFailed && !hasTestCases && (!testCaseResults || tcStaleNow) && (
+            <span
+              title="Test-case generation is included in the Advanced edition. Upgrade in your Atlassian site admin to generate BA-grade acceptance test cases for every story."
+              style={{
+                fontSize: "12px",
+                color: "var(--s2j-blue)",
+                background: "var(--s2j-blue-bg)",
+                border: "1px solid var(--s2j-blue-border)",
+                padding: "6px 12px",
+                borderRadius: "6px",
+                fontWeight: 500,
+                whiteSpace: "nowrap",
+              }}
+            >
+              🧪 Advanced feature
+            </span>
           )}
         </div>
       </div>
@@ -3977,33 +4043,39 @@ function EditionRow({ name, price, blurb }) {
 }
 
 function LimitReachedScreen({ quota, onBack }) {
-  // Mode from the routing payload. license_required (defensive) → no active license;
-  // otherwise a quota_exceeded payload, which can only be the Managed Pro fair-use
-  // cap (there is no Free tier). Default to the fair-use framing.
+  // v6 value-split modes from the routing payload:
+  //   edition_required → a Standard user reached an Advanced-only feature (test-cases) → upsell Advanced.
+  //   license_required (defensive) → no active license → subscribe (both editions).
+  //   quota_exceeded/fairUse → the DORMANT Managed per-user cap (off-Marketplace only; both
+  //     LIVE editions are BYOK + unlimited, so this never fires for a Marketplace customer).
+  const isEditionRequired = quota?.error === "edition_required";
   const isLicenseRequired = quota?.error === "license_required";
-  const isFairUse = !isLicenseRequired;
+  const isFairUse = !isEditionRequired && !isLicenseRequired;
 
   const limit = quota?.limit;
   const resetsAt =
     quota?.resetsAtLabel ||
     (quota?.resetsAt ? String(quota.resetsAt).slice(0, 10) : null);
-  const byokProPrice = findPrice(quota, "byokPro");
-  // Only surfaced in the license_required (no-plan) branch — fair-use already has a plan.
-  const managedProPrice = findPrice(quota, "managedPro");
+  const standardPrice = findPrice(quota, "byokPro"); // Standard edition
+  const advancedPrice = findPrice(quota, "byokAdvanced"); // v6: Advanced (was 'managedPro' → that key is dormant → blank-price bug)
 
   // Headline + intro. Prefer the backend-composed `detail` for the body (it is
   // already tier-correct and mentions the reset date / prices); fall back to a
   // mode-specific sentence if it is ever absent.
-  const heading = isLicenseRequired
-    ? "Subscription required"
-    : "You've used this month's breakdowns";
-  const fallbackBody = isLicenseRequired
-    ? "An active subscription is required to use Spec2Tickets. Manage your subscription from your Atlassian site admin."
-    : limit
-      ? `You've used all ${limit} breakdowns included this month${
-          resetsAt ? ` — they reset on ${resetsAt}.` : "."
-        }`
-      : "You've used this month's breakdowns.";
+  const heading = isEditionRequired
+    ? "Advanced feature"
+    : isLicenseRequired
+      ? "Subscription required"
+      : "You've used this month's breakdowns";
+  const fallbackBody = isEditionRequired
+    ? "Test-case generation is included in the Advanced edition. Upgrade to generate BA-grade acceptance test cases for every story."
+    : isLicenseRequired
+      ? "An active subscription is required to use Spec2Tickets. Manage your subscription from your Atlassian site admin."
+      : limit
+        ? `You've used all ${limit} breakdowns included this month${
+            resetsAt ? ` — they reset on ${resetsAt}.` : "."
+          }`
+        : "You've used this month's breakdowns.";
 
   const openUpgrade = () => {
     if (!UPGRADE_URL) return;
@@ -4043,9 +4115,9 @@ function LimitReachedScreen({ quota, onBack }) {
         )}
       </div>
 
-      {/* Subscription card. Fair-use (Managed) routes to BYOK Pro ONLY (unlimited);
-          license_required (no plan) offers both editions to choose from. */}
-      {(byokProPrice || (isLicenseRequired && managedProPrice)) && (
+      {/* Subscription card (v6 value framing). edition_required → upsell Advanced;
+          license_required (no plan) → both editions; fair-use (dormant Managed) → Standard. */}
+      {(standardPrice || advancedPrice) && (
         <div
           className="rounded-lg p-4 mb-4"
           style={{
@@ -4057,26 +4129,32 @@ function LimitReachedScreen({ quota, onBack }) {
             className="text-xs font-medium uppercase tracking-wider mb-2"
             style={{ color: "var(--s2j-text-muted)" }}
           >
-            {isFairUse ? "For unlimited" : "Choose a plan"}
+            {isEditionRequired ? "Upgrade" : isFairUse ? "For unlimited" : "Choose a plan"}
           </p>
 
-          {isFairUse ? (
+          {isEditionRequired ? (
             <EditionRow
-              name="BYOK Pro"
-              price={byokProPrice}
+              name="Advanced"
+              price={advancedPrice}
+              blurb="+ test-case generation + custom prompts"
+            />
+          ) : isFairUse ? (
+            <EditionRow
+              name="Standard"
+              price={standardPrice}
               blurb="unlimited — use your own Anthropic key"
             />
           ) : (
             <>
               <EditionRow
-                name="BYOK Pro"
-                price={byokProPrice}
-                blurb="unlimited — bring your own Anthropic key"
+                name="Standard"
+                price={standardPrice}
+                blurb="core breakdown + push + Project Context"
               />
               <EditionRow
-                name="Managed Pro"
-                price={managedProPrice}
-                blurb="we run Claude for you — no API key needed"
+                name="Advanced"
+                price={advancedPrice}
+                blurb="+ test-case generation + custom prompts"
               />
             </>
           )}
@@ -4084,7 +4162,7 @@ function LimitReachedScreen({ quota, onBack }) {
           {UPGRADE_URL && (
             <>
               <button onClick={openUpgrade} className="btn-primary mt-3">
-                {isFairUse ? "Switch to BYOK Pro" : "Subscribe"}
+                {isEditionRequired ? "Upgrade to Advanced" : isFairUse ? "Switch to Standard" : "Subscribe"}
               </button>
               <p
                 className="text-xs"
@@ -4180,14 +4258,16 @@ function ErrorScreen({ error, jobId = null, onRetry, onBackToPicker, onOpenDiagn
 /**
  * SetupScreen — shown when Spec2Tickets is not yet configured. Complements
  * AdminSettings (does not repeat its content). TIER-AWARE (hybrid 2026-06-03):
- * Managed Pro (Advanced) runs Claude on our key, so it asks ONLY for a JIRA
- * project key; BYOK Pro (Standard) also needs the customer's own Anthropic key.
+ * v6 value-split: BOTH editions are BYOK → every user needs their own Anthropic key.
+ * The old Managed/Advanced "no key needed" branch was REMOVED (it would mis-onboard a
+ * paying Advanced BYOK customer who DOES need a key). Setup asks for the Anthropic key
+ * + a JIRA project key for everyone.
  *
  * Surfaces to customer:
- *   - Prerequisite: a JIRA project key (+ an Anthropic API key for BYOK only)
+ *   - Prerequisite: an Anthropic API key + a JIRA project key
  *   - Navigation path: how to reach Settings to configure them
  */
-function SetupScreen({ message, isManaged = false, onOpenSettings }) {
+function SetupScreen({ message, onOpenSettings }) {
   return (
     <div className="p-6" style={SCREEN_MAX_WIDTH_STYLE}>
       <div
@@ -4225,35 +4305,23 @@ function SetupScreen({ message, isManaged = false, onOpenSettings }) {
           Spec2Tickets needs to be configured before first use.
         </p>
 
-        {/* Prerequisite — TIER-AWARE (hybrid 2026-06-03). Managed Pro (Advanced)
-            runs Claude on OUR key → only the JIRA project key is needed; BYOK Pro
-            (Standard) also needs the customer's own Anthropic key. */}
-        {isManaged ? (
-          <p className="text-sm mb-3" style={{ color: "var(--s2j-text)" }}>
-            <strong>You will need:</strong>
-            <br />• A Jira project key where the breakdown will be created
-            <br />
-            <span style={{ color: "var(--s2j-text-light)" }}>
-              No Anthropic API key needed — Managed Pro runs Claude with our key.
-            </span>
-          </p>
-        ) : (
-          <p className="text-sm mb-3" style={{ color: "var(--s2j-text)" }}>
-            <strong>You will need:</strong>
-            <br />
-            • An Anthropic API key (sign up at{" "}
-            <a
-              href="https://console.anthropic.com/settings/keys"
-              target="_blank"
-              rel="noopener noreferrer"
-              style={{ color: "var(--s2j-blue)", textDecoration: "underline" }}
-            >
-              console.anthropic.com → API Keys
-            </a>
-            ; billed pay-as-you-go to your own Anthropic account)
-            <br />• A Jira project key where the breakdown will be created
-          </p>
-        )}
+        {/* v6 value-split: both editions are BYOK → always show the Anthropic-key
+            prerequisite (the old "no key needed" Managed branch was removed). */}
+        <p className="text-sm mb-3" style={{ color: "var(--s2j-text)" }}>
+          <strong>You will need:</strong>
+          <br />
+          • An Anthropic API key (sign up at{" "}
+          <a
+            href="https://console.anthropic.com/settings/keys"
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{ color: "var(--s2j-blue)", textDecoration: "underline" }}
+          >
+            console.anthropic.com → API Keys
+          </a>
+          ; billed pay-as-you-go to your own Anthropic account)
+          <br />• A Jira project key where the breakdown will be created
+        </p>
 
         {/* Primary call-to-action — open the app's OWN in-app Settings. This is the
             reliable path: the globalSettings "Configure" page is unreachable in the
@@ -4288,15 +4356,12 @@ function SetupScreen({ message, isManaged = false, onOpenSettings }) {
             3. Find <strong>Spec2Tickets Settings</strong> in the left sidebar
           </p>
           <p>
-            4.{" "}
-            {isManaged
-              ? "Set your Jira Project Key, then Save"
-              : "Paste your Anthropic API key + Jira Project Key, then Test & Save"}
+            4. Paste your Anthropic API key + Jira Project Key, then Test & Save
           </p>
           <p style={{ marginTop: "6px", fontStyle: "italic" }}>
-            {isManaged
-              ? "Powered by Claude Sonnet 4.6 — Managed Pro runs it for you (no API key needed). Your page content flows from Forge to the Anthropic API; nothing is stored on Spec2Tickets servers."
-              : "Powered by Claude Sonnet 4.6 — your page content flows directly from Forge to the Anthropic API using your own key. No data on Spec2Tickets servers."}
+            Powered by Claude Sonnet 4.6 — your page content flows directly from
+            Forge to the Anthropic API using your own key. No data on Spec2Tickets
+            servers.
           </p>
         </div>
       </div>

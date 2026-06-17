@@ -89,13 +89,14 @@ import {
   DIAG_APP_VERSION,
 } from './diagnostics.js';
 
-// ── Managed-vs-BYOK Anthropic key resolution (hybrid tiers, 2026-06-03) ──
-// Managed Pro (Advanced edition) ⇒ WE call Anthropic with OUR key, stored as an
-// ENCRYPTED Forge env var (`forge variables set --encrypt MANAGED_ANTHROPIC_KEY ...`).
-// BYOK Pro ⇒ the customer's own stored key. An Anthropic batch is bound to
-// the key that created it, so the SOURCE ('managed'|'byok') is recorded on the job
-// at submit and reused at poll — never re-resolved from a license that may have
-// changed (e.g. a trial expiring) mid-batch.
+// ── Anthropic key resolution (v6 value-split: both editions BYOK) ──
+// v6 (2026-06-17): keySource is driven by the EXPLICIT tier.keySource field (see
+// resolveAnthropicKey), NOT the edition label. Both live Marketplace editions resolve to
+// 'byok' (the customer's own stored key). 'managed' (our MANAGED_ANTHROPIC_KEY, an ENCRYPTED
+// Forge env var) is the DORMANT off-Marketplace fallback + legacy pre-v6 stamped jobs only.
+// An Anthropic batch is bound to the key that created it, so the SOURCE ('managed'|'byok') is
+// recorded on the job at submit and reused at poll — never re-resolved from a license that may
+// have changed (e.g. a trial expiring) mid-batch.
 // [diag Phase 4, A4 — worst offender #2] fault-aware variant: { key, fault } where
 // fault=true ONLY when the BYOK secret READ threw (a Forge storage fault — the key may
 // still be saved). The managed env-var read cannot fault. Gate sites check fault FIRST
@@ -114,17 +115,18 @@ async function anthropicKeyForSource(source) {
 
 /**
  * Resolve { apiKey, keySource, keyFault, tier } for THIS invocation from the license.
- * keySource is purely tier-driven: Advanced edition (Managed Pro) ⇒ our key,
- * everything else ⇒ the customer's BYOK key. The license is backend-trusted, and
- * every accessing user is now licensed (the in-app Free / guest-access path was
- * removed 2026-06-03), so the old best-effort guest-guard on the spoofable
- * client-supplied accountType is gone — Managed exposure is bounded by the
- * backend-trusted per-user accountId cap (MANAGED_USER_CAP) in checkQuota.
+ * ⭐ v6 value-split: key-source is read from the EXPLICIT tier.keySource field, no longer
+ * INFERRED from edition. BOTH live Marketplace editions (Standard + Advanced) are BYOK →
+ * keySource 'byok' (the customer's stored key); 'managed' (our MANAGED_ANTHROPIC_KEY) is
+ * the DORMANT off-Marketplace fallback only (resolveTier never returns a managed tier).
+ * This is THE decoupling cut: once keySource is data-driven, the whole stamp/reuse chain
+ * (job record → anthropicKeyForSource at every poll/fetch/cycle/test-gen leg) follows
+ * automatically. The license is backend-trusted; every accessing user is licensed.
  * [diag Phase 4, A4] keyFault (additive): true ONLY when the stored-key read THREW.
  */
 async function resolveAnthropicKey(context) {
   const tier = getActiveTier(context);
-  const keySource = tier.edition === 'advanced' ? 'managed' : 'byok';
+  const keySource = tier.keySource || 'byok'; // v6: explicit field, default BYOK (was: edition==='advanced'?'managed':'byok')
   const { key: apiKey, fault: keyFault } = await anthropicKeyInfoForSource(keySource);
   return { apiKey, keySource, keyFault, tier };
 }
@@ -162,7 +164,24 @@ function buildLicenseRequired() {
   return {
     error: 'license_required',
     detail:
-      'This app requires an active subscription or trial. Subscribe to BYOK Pro or Managed Pro.',
+      'This app requires an active subscription or trial. Subscribe to the Standard or Advanced edition.',
+    pricing: pricingTable(),
+  };
+}
+
+/**
+ * v6 value-split: edition_required payload — returned when a user WITHOUT the test-case
+ * capability (Standard edition) reaches a test-case WRITE path (generate / regenerate /
+ * save). This is an UPGRADE prompt (the user IS licensed, just on the wrong edition), so
+ * the frontend routes it to the upgrade screen, NOT the generic error screen. Carries the
+ * pricing table so the UI can present the Advanced edition. `feature` lets the UI tailor copy.
+ */
+function buildUpgradeRequired(feature = 'test_cases') {
+  return {
+    error: 'edition_required',
+    feature,
+    detail:
+      'Test-case generation is an Advanced feature. Upgrade to the Advanced edition to generate acceptance test cases for your stories.',
     pricing: pricingTable(),
   };
 }
@@ -2900,6 +2919,18 @@ resolver.define('startTestCaseGeneration', async ({ payload, context }) => {
     });
   }
 
+  // v6 value-split FEATURE GATE — test-case generation is an Advanced-edition feature.
+  // FAIL-CLOSED (deny on a license-read fault) — the OPPOSITE polarity of the unlicensed
+  // gate above (which fails OPEN). Cost asymmetry (POLICY §3): silently leaking the
+  // Advanced-only feature to a Standard user is a value leak; a transient denial is merely
+  // retriable. Do NOT normalise this to the surrounding fail-open pattern.
+  try {
+    if (!getActiveTier(context).hasTestCases) return buildUpgradeRequired();
+  } catch (e) {
+    console.error(`[startTCGen] edition gate read failed (failing CLOSED — deny premium feature) ref=${jobId}: ${String(e?.message || e)}`);
+    return buildUpgradeRequired();
+  }
+
   // Resolve the Anthropic key by tier (#5: keySource-stamp enables same-key reuse at poll)
   const { apiKey, keySource, keyFault } = await resolveAnthropicKey(context);
   if (!apiKey) {
@@ -3589,6 +3620,16 @@ resolver.define('saveTestCases', async ({ payload, context }) => {
     console.error(`[saveTC] license check failed (failing open): ${String(e?.message || e)}`);
   }
 
+  // v6 value-split FEATURE GATE (fail-CLOSED) — editing test cases is an active use of the
+  // Advanced feature (a downgraded user may still READ/EXPORT prior output, but EDITING
+  // requires the entitlement). Fail CLOSED on a license-read fault (see startTestCaseGeneration).
+  try {
+    if (!getActiveTier(context).hasTestCases) return buildUpgradeRequired();
+  } catch (e) {
+    console.error(`[saveTC] edition gate read failed (failing CLOSED): ${String(e?.message || e)}`);
+    return buildUpgradeRequired();
+  }
+
   const tcJob = await kvs.get(`${TC_JOB_KEY_PREFIX}${jobId}`);
   if (!tcJob) return { error: 'not_found', detail: `Test-case set ${jobId} not found — it may have expired. Regenerate test cases.` };
   if (tcJob.status !== 'completed') {
@@ -3683,6 +3724,16 @@ resolver.define('regenerateTestCase', async ({ payload, context }) => {
     if (getActiveTier(context).key === 'unlicensed') return buildLicenseRequired();
   } catch (e) {
     console.error(`[regenTC] license check failed (failing open): ${String(e?.message || e)}`);
+  }
+
+  // v6 value-split FEATURE GATE (fail-CLOSED) — regenerating a test case is a test-case
+  // WRITE/spend path, so it requires the Advanced capability just like the bulk generate.
+  // Fail CLOSED on a license-read fault (deny the premium feature; see startTestCaseGeneration).
+  try {
+    if (!getActiveTier(context).hasTestCases) return buildUpgradeRequired();
+  } catch (e) {
+    console.error(`[regenTC] edition gate read failed (failing CLOSED): ${String(e?.message || e)}`);
+    return buildUpgradeRequired();
   }
 
   // Resolve the key (#5: regen key must match the bulk batch's keySource for cost/auth consistency)
