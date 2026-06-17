@@ -48,6 +48,59 @@ Configure a **BYOK Anthropic key + a Jira project key** in Settings before gener
 
 ---
 
+## ⭐ Edition Rendering Matrix — the one-glance "what shows per edition"
+
+The v6 model: **both editions are BYOK** (the customer's own Anthropic key). The ONLY
+difference is the **value/feature set** — and on screen that means *which options render*.
+Run each screen on `--license Standard`, then `--license Advanced`, and tick that the
+rendered UI matches this column. (Exact on-screen strings quoted so you can match verbatim.)
+
+| Screen → element | **Standard** (CORE, BYOK) | **Advanced** (CORE + test-cases, BYOK) |
+|---|---|---|
+| **Setup** (no key yet) | Asks for **Anthropic API key + Jira project key** | **Same** — both BYOK need a key |
+| **Settings → API key field** | **VISIBLE** (paste / Test Connection / Clear) | **VISIBLE** — identical (⭐ the dead-end fix: NOT hidden) |
+| **Settings → info callout** | "Powered by Claude… Standard *core breakdown + push + Project Context*; Advanced *+ test-case generation*. Both run on your own Anthropic key" | **Same** callout (both editions described) |
+| **Settings → Account panel footnote** | "Your **Standard** plan includes unlimited breakdowns on your own Anthropic key. Upgrade to Advanced…" | "Your **Advanced** plan includes unlimited breakdowns **+ test-case generation**…" |
+| **Settings → Project Context editor** | **Available** (Distill needs the BYOK key) | **Available** (identical) |
+| **Ready screen → plan badge** | "**Standard** plan · unlimited breakdowns" | "**Advanced** plan · unlimited breakdowns **· includes test cases**" |
+| **Review/Confirm → test-case card header** | "**Acceptance test cases — Advanced**" | "Optional: acceptance test cases" (or "✓ …generated") |
+| **Review → test-case action** | **🧪 Advanced feature** chip (no Generate button, no spend) | **🧪 Generate Test Cases** button |
+| **Review → cost-estimate line** | **NOT shown** (no run possible) | **"💲 Estimated Anthropic usage: up to ~$X (typically ~$Y)…"** |
+| **Generate → confirm** | n/a | **2-step armed** → "⚠ Confirm & generate" (1st click arms, no spend) |
+| **Test Cases screen** | reachable ONLY if downgraded-with-retained-cases → **read-only** (banner + disabled controls; View/Export still work) | **full** generate / edit / regenerate / export |
+| **Post-run echo** | n/a | **"💲 $Z used"** on the SummaryBar + Review card |
+| **Hit test-gen anyway** (stale client) | backend **fail-closed** → **LimitReachedScreen "Advanced feature"** upsell (non-destructive Back) | n/a |
+| **CORE: generate → review → push** | ✅ works (on the BYOK key) | ✅ works (on the BYOK key) |
+
+> The rows in **bold** are the v6 load-bearing differences. Everything else is identical by
+> design (both editions are the same BYOK core).
+
+---
+
+## ⭐ Cost-Estimation Walkthrough (Advanced) — "explain the cost BEFORE the action"
+
+The customer must see what a paid action will cost **before** spending, and the exact amount
+**after**. Walk this end-to-end on `--license Advanced`:
+
+1. **Generate a breakdown** (core flow) → open the **Review/Confirm** screen.
+2. **Pre-flight estimate (before any spend):** the test-case card shows
+   **"💲 Estimated Anthropic usage: up to ~$X (typically ~$Y) — billed to your own API key,
+   no markup. Rough estimate; you'll see the exact amount after the run."**
+   - ✅ `~$X` (upper) ≥ `~$Y` (typical); both look sane for the story/AC count.
+   - ✅ If the breakdown has no cached source spec, it appends "(excludes source-spec context; actual may be lower)".
+   - ✅ The figure is clearly **Anthropic usage on your key** — NOT the subscription price ("$…/user/mo").
+3. **Confirm-before-spend:** click **🧪 Generate Test Cases** → it ARMS to **"⚠ Confirm & generate"**
+   and does **NOT** spend on the first click. ✅ Only the second click (within ~4 s) starts the run.
+4. **Run completes** → the **Test Cases** screen SummaryBar shows the EXACT actual:
+   **"💲 $Z used"**, and returning to Review shows **"💲 This run used $Z of Anthropic usage — your own API key, no markup."**
+   - ✅ `$Z` is at/under the earlier `up to ~$X` upper bound (it can never exceed it — that's the fix). If it ever does, note it (the heuristic needs calibration; the echo is authoritative).
+5. **Regenerate one story** (per-card ↻ — it has its own 2-step armed confirm) → after it completes
+   the SummaryBar cost **increases** to reflect the extra spend (not stuck at the old `$Z`). ✅
+6. **Stale re-run:** edit an AC on Review, return → the card shows **🔄 Re-run all** with its own
+   armed confirm and a fresh estimate (the upcoming run, not the prior actual). ✅
+
+---
+
 ## Epic A — Reconciliation sanity (the 38-commit merge didn't break the core)
 
 ### US-A1 — Core breakdown still works end-to-end
