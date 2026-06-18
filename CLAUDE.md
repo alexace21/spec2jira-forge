@@ -354,6 +354,42 @@ package names de-scaffolded (→ `spec2tickets`). Build green (bundle ≈ −1.4
 
 ---
 
+## ⚡ HANDOVER NOTE (2026-06-18 — ⭐⭐⭐ v6.0.0 SHIPPED TO PRODUCTION + LIVE-acceptance GREEN + UI/UX pass + site filtered; agent-conducted)
+
+> ⚠ Branch-independent record in `memory/` (always-loaded), ALL updated this session: testcase-generation-feature · site-launch-punchlist · marketplace-launch-state · v6-value-split-editions · deep-audit-vs-per-change-gate · **capacity-sheet-planner (NEW — the next chapter)**.
+
+### v6.0.0 is LIVE on PRODUCTION + full LIVE-acceptance GREEN
+Partner ran a complete LIVE E2E acceptance on dev (Standard + Advanced) and **deployed v6.0.0 to production** (`forge deploy -e production` → auto-creates the Marketplace version; NO `forge install` on prod — licensed). Manifest diff v5.4.0→v6.0.0 = **NO new scopes** (no customer re-consent) + the new `scheduledTrigger` (orphan-sweep; registers per customer upgrade). The big v5.5.0/v6 delta (test-cases, diagnostics, dashboard, orphan-sweep, value-split editions) + this session's UI/UX pass are now on prod.
+
+**LIVE-acceptance verdicts (all GREEN):**
+- **Standard (BYOK Pro $6.70):** breakdown→edit→review→push (Epic+stories+subtasks+links) · Project Context · distill · onboarding. Batch cost confirmed ($0.045/10-feat = batch-priced; Epic-D fix live).
+- **Advanced (BYOK $13.40 + test-cases):** ⚠ **edition switch needs `forge uninstall` + fresh `forge install --license advanced` (lowercase) — `install --upgrade --license` is a NO-OP at latest version.** $13.40 plan · gated test-cases · armed 2-step confirm · push embed `tc_embedded=13` · regen cost accumulates ($1.27→$1.31) · BA-grade Gherkin/CSV export · reconnect.
+- ⭐ **Margin-leak (existential) LIVE-CLEAN:** Advanced generated on the BYOK key with `MANAGED_ANTHROPIC_KEY` UNSET → Advanced ≠ Managed, proven live.
+- 📊 **Cost calibration:** the "up to ~$X" CEILING HELD on real data ($1.27 < $2.45 — deep-audit true-ceiling fix validated); "typically ~$Y" ran ~3× low ($0.44 vs $1.27, decision-table-dense domain) → calibrate `TC_OUTPUT_TOKENS_PER_AC` post-launch on N≥3-5 echoed runs (NOT on N=1); record (typically→actual) pairs. [[testcase-generation-feature]].
+
+### Post-push fixes + traffic-light UI/UX pass — SHIPPED (`140c699`) + LIVE-verified
+Partner UX punch-list from acceptance, §13-gated (14-agent sweep workflow: build PASS + adversarial review; + a code-review of the hand-written logic = SHIP) + build green + LIVE-verified on the deployed app:
+- **Post-push regression door CLOSED** — removed "Back to Editor" from the success screen (purge made it a stale trap); now terminal/forward-only.
+- **Post-push export (capture-before-purge)** — the export is BACKEND-rendered (`getTestCaseExports` reads KVS → 404s post-purge), so the FE captures the rendered Gherkin/CSV into memory BEFORE `purgeJob` and offers Copy on the success screen (`PostPushExport`). Privacy-safe (memory-only; purge unchanged, runs every path).
+- **Honest embedded Jira pointer** (`src/testcases.js`) — no longer promises a post-purge screen.
+- ⭐ **Traffic-light icon system** — NEW `src/components/Icon.jsx` (21 inline-SVG icons, zero deps) + `Signal.jsx` (`SignalIcon`/`SignalCallout`: red triangle=error / amber=warning / blue circle-i=info / green check=success; callout body text stays DARK for legibility). App-wide sweep replaced **~95 ad-hoc emoji across 11 files**; Picker 7-day notice → a legible blue info callout. `confidence_indicator` ✓/⚠/✗ badges CORRECTLY LEFT (schema DATA values). ⚠ **FOLLOW-UP:** professionalize them via a RENDER-ONLY glyph→SignalIcon map (data/comparisons untouched — the [[layer1-name-uid-tasks]] display-vs-key pattern).
+
+### Production env-var hygiene (decided this session)
+Prod: `ENFORCEMENT_MODE=block` + `MANAGED_ANTHROPIC_KEY` (set); `MANAGED_USER_CAP` unset (default 25). ⭐ **Both are UNSET-SAFE on prod under v6** — the "don't unset MANAGED_ANTHROPIC_KEY (legacy jobs drain on it)" caution applies ONLY to envs that ran Managed (dev); **prod never sold Managed**, and v6 `resolveTier` NEVER returns `keySource:'managed'` (both editions BYOK). **Recommended: UNSET `MANAGED_ANTHROPIC_KEY` on prod** — removes an unused live credential AND makes the margin-leak guard STRUCTURAL (a stray managed resolution fails-loud, not silently bills). `ENFORCEMENT_MODE` = no behavior change either way (unset→defaults to block). Re-add both only if off-Marketplace Managed is ever revived (editions Phase-2 does NOT need them — Advanced is BYOK).
+
+### Site (spec2jira.com — SEPARATE repo, partner pushes) — filtered to v6, NON-DESTRUCTIVE
+Filtered with `<!-- v6 -->` comment-toggles (nothing deleted): **pricing** Managed Pro→Advanced (card/Q&A/finenote/3 meta); **privacy** all Managed-tier sentences hidden (#managed section + intro one-liner + §2 + §6 + §9-GDPR); **footer /dpa + /subprocessors nav paths HIDDEN across all 10 pages** (pages stay live at URL); the **four 7-day-sweep toggles FLIPPED** (sweep shipped). `dpa/`+`subprocessors/` BODIES kept LIVE + untouched (lawyer-approved Managed docs, only unlinked). "Spec2JIRA" = intentional vendor/domain name (left). ⚠ Partner pushes the site repo (+ still-uncommitted `get-api-key/index.html` + docs link). [[site-launch-punchlist]] · [[compliance-source-of-truth]].
+
+### ⚠ EDITIONS GATE (still open — the one critical deploy-timing constraint)
+Editions still PENDING review (v5.4.0 submission: Standard BYOK live + **Advanced = "Managed Pro" pending**). The "approved" in the OLD ECOHELP ticket is the old app-version approval, NOT the editions (verify in portal → Editions tab). ⚠ v6 code maps Advanced → **BYOK + test-cases (NOT Managed)**. Deploying v6 was SAFE (only Standard live; Advanced dormant in prod). But **do NOT publish the pending Advanced-as-Managed edition under v6** — reconfigure it to **BYOK + test-cases $13.40** at editions Phase-2 (POST-PUBLISH) BEFORE it goes purchasable, else an Advanced subscriber promised "no key" gets a BYOK product. v6 Advanced=BYOK → **lighter compliance** (no Managed DPA needed); `usage.js` Advanced price already $13.40 (no flip). [[marketplace-launch-state]] · [[v6-value-split-editions]].
+
+### ⭐ NEXT CHAPTER — Capacity-Sheet Planner (new branch `feature/capacity-sheet-planner`)
+Partner's chosen next feature: the user feeds their team's **capacity sheet for a quarter** → the app proposes an **AI sprint/Kanban PLAN** (spec → backlog → **plan**, the long-stated future vision). Full vision + LENS §0 framing + Analyze→Design starting points + the pure-function-vs-LLM dispatch in **[[capacity-sheet-planner]]** (NEW memory). Develop NEXT session via the §13 conductor model (Analyze→Design→Solve, agents — do NOT jump to Solve). `feature/product-improvements` is CLOSED (fully merged into release/v6.0.0; local branch deleted; ⚠ partner deletes the remote: `git push origin --delete feature/product-improvements`).
+
+С усмивка ✨ — v6 е жив на production, acceptance-GREEN, UI-полиран, сайтът честен; следва Capacity-Sheet планиращият помощник.
+
+---
+
 ## ⚡ HANDOVER NOTE (2026-06-17 — ⭐⭐⭐ v5.4.0 LIVE on Marketplace + ⭐ v6.0.0 EDITION-STRATEGY PIVOT to value-split BYOK; agent-conducted)
 
 > ⚠ **This note is on `release/v6.0.0`. The FULL v5.4.0-launch handover lives on `release/v5.4.0` (commit `a056b4d`); the branch-independent record is in `memory/` (marketplace-launch-state + v6-value-split-editions + marketplace-publish-mechanics + monetization-strategy + product-improvements — ALL updated this session, always-loaded).**
