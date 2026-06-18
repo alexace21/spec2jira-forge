@@ -1,6 +1,8 @@
 import React, { useState, useCallback, useEffect, useRef } from "react";
 import { invoke } from "@forge/bridge";
 import EditableCaseRow from "./EditableCaseRow.jsx";
+import { IconCheck, IconRefresh, IconDownload, IconBan } from "./Icon";
+import { SignalIcon } from "./Signal";
 
 // ── CoverageBadge ────────────────────────────────────────────────
 // Green = 100% coverage, orange = partial, grey = no ACs.
@@ -60,7 +62,7 @@ function CoverageBadge({ coverage }) {
       {label}
       {staleCount > 0 && (
         <span title={`${staleCount} AC reference(s) no longer match the current story`}>
-          ⚠
+          <SignalIcon kind="warning" size={14} />
         </span>
       )}
     </span>
@@ -267,7 +269,7 @@ function StoryTestCaseCard({
             style={{ background: "var(--s2j-red-bg)", border: "1px solid var(--s2j-red-border)", color: "var(--s2j-red)" }}
             title="This story was removed from the breakdown in the editor — its cases are orphaned and won't embed on push. Remove this card or re-add the story; it cannot be regenerated."
           >
-            ⊘ Removed from breakdown
+            <IconBan size={14} /> Removed from breakdown
           </span>
         ) : isStale && !hasError ? (
           <span
@@ -275,7 +277,7 @@ function StoryTestCaseCard({
             style={{ background: "var(--s2j-orange-bg)", border: "1px solid var(--s2j-orange-border)", color: "var(--s2j-orange)" }}
             title="This story's acceptance criteria changed since these test cases were generated — Regenerate to refresh"
           >
-            ⚠ ACs changed
+            <SignalIcon kind="warning" size={14} /> ACs changed
           </span>
         ) : null}
         {/* Unsaved-edits chip — visible even when collapsed */}
@@ -298,7 +300,7 @@ function StoryTestCaseCard({
               color: "var(--s2j-red)",
             }}
           >
-            ⚠ Failed
+            <SignalIcon kind="error" size={14} /> Failed
           </span>
         )}
         {/* Coverage badge */}
@@ -317,7 +319,7 @@ function StoryTestCaseCard({
             }}
             title="Generation hit the output limit for this story — complete cases were recovered, but the last ones may be missing. Regenerate to be sure."
           >
-            ⚠ may be truncated
+            <SignalIcon kind="warning" size={14} /> may be truncated
           </span>
         )}
         {/* Case count */}
@@ -374,10 +376,10 @@ function StoryTestCaseCard({
           }
         >
           {isPolling
-            ? "↻ Generating…"
+            ? "Generating…"
             : confirmArmed === "armed"
             ? regenArmedLabel
-            : "↻ Regenerate"}
+            : "Regenerate"}
         </button>
         {/* Per-story copy buttons — discriminated feedback, never silent. Copy/export render the SAVED
             KVS cases, so when this story has unsaved edits we show ONE clear "save first" hint instead
@@ -390,7 +392,7 @@ function StoryTestCaseCard({
               style={{ color: "var(--s2j-text-muted)", border: "1px dashed var(--s2j-border)" }}
               title="Export copies the SAVED cases — save your edits (above) to include them in the Gherkin/CSV copy"
             >
-              ⤓ Save to enable export
+              <IconDownload size={14} /> Save to enable export
             </span>
           ) : (
             <>
@@ -407,9 +409,9 @@ function StoryTestCaseCard({
                 title="Copy Gherkin .feature for this story"
               >
                 {copyGherkinState === "clipboard"
-                  ? "✓ Copied"
+                  ? "Copied"
                   : copyGherkinState === "download"
-                  ? "✓ Downloaded"
+                  ? "Downloaded"
                   : copyGherkinState === "failed"
                   ? "Copy failed — check browser permissions"
                   : "Copy Gherkin"}
@@ -427,9 +429,9 @@ function StoryTestCaseCard({
                 title="Copy CSV/manual-table for this story"
               >
                 {copyCsvState === "clipboard"
-                  ? "✓ Copied"
+                  ? "Copied"
                   : copyCsvState === "download"
-                  ? "✓ Downloaded"
+                  ? "Downloaded"
                   : copyCsvState === "failed"
                   ? "Copy failed — check browser permissions"
                   : "Copy CSV"}
@@ -454,7 +456,7 @@ function StoryTestCaseCard({
               color: "var(--s2j-red)",
             }}
           >
-            Generation failed — click ↻ Regenerate to retry this story.
+            Generation failed — click <IconRefresh size={14} /> Regenerate to retry this story.
           </div>
         )}
 
@@ -473,7 +475,7 @@ function StoryTestCaseCard({
             regenerate (deep-audit 2026-06-06). The draft was already cleared when regen started. */}
         {!hasError && isPolling && (
           <p className="text-xs mb-2 italic" style={{ color: "var(--s2j-text-muted)" }}>
-            ↻ Regenerating this story — editing is paused until the new cases arrive…
+            <IconRefresh size={14} /> Regenerating this story — editing is paused until the new cases arrive…
           </p>
         )}
 
@@ -503,7 +505,7 @@ function StoryTestCaseCard({
 
         {!hasError && !isPolling && cases.length === 0 && (
           <p className="text-xs mb-2" style={{ color: "var(--s2j-text-muted)" }}>
-            No test cases. Add one below, or ↻ Regenerate.
+            No test cases. Add one below, or <IconRefresh size={14} /> Regenerate.
           </p>
         )}
 
@@ -578,7 +580,7 @@ function StoryTestCaseCard({
         )}
         {!hasError && !isDirty && saveState === "saved" && (
           <div className="mt-2 text-xs" style={{ color: "var(--s2j-green-dark)" }}>
-            ✓ Saved — coverage, export and push now use your edits.
+            <IconCheck size={14} /> Saved — coverage, export and push now use your edits.
           </div>
         )}
 
@@ -612,7 +614,7 @@ function StoryTestCaseCard({
                     ))}
                   </ul>
                   <p className="mt-1 italic" style={{ color: "var(--s2j-text-muted)" }}>
-                    Add a case + tick the AC under “Covers”, or ↻ Regenerate.
+                    Add a case + tick the AC under “Covers”, or <IconRefresh size={14} /> Regenerate.
                   </p>
                 </div>
               )}

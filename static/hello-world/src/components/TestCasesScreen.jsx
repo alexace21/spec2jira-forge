@@ -2,6 +2,8 @@ import React, { useState, useCallback, useEffect, useRef } from "react";
 import { invoke } from "@forge/bridge";
 import BackButton from "./BackButton";
 import StoryTestCaseCard from "./StoryTestCaseCard";
+import { IconCheck, IconRefresh, IconCost } from "./Icon";
+import { SignalIcon } from "./Signal";
 
 // Blank case template for "+ Add test case" (mirrors the schema; ac_trace empty → the parse
 // repairs to a single inferred entry until the BA ticks an AC in the AcTraceEditor checklist).
@@ -104,14 +106,14 @@ function ExportBar({ jobId, hasUnsavedEdits }) {
   );
 
   const gherkinLabel =
-    gherkinState === "clipboard" ? "✓ Copied" :
-    gherkinState === "download" ? "✓ Downloaded" :
+    gherkinState === "clipboard" ? "Copied" :
+    gherkinState === "download" ? "Downloaded" :
     gherkinState === "failed" ? "Copy failed — check browser permissions" :
     "Copy All — Gherkin";
 
   const csvLabel =
-    csvState === "clipboard" ? "✓ Copied" :
-    csvState === "download" ? "✓ Downloaded" :
+    csvState === "clipboard" ? "Copied" :
+    csvState === "download" ? "Downloaded" :
     csvState === "failed" ? "Copy failed — check browser permissions" :
     "Copy All — CSV";
 
@@ -123,7 +125,7 @@ function ExportBar({ jobId, hasUnsavedEdits }) {
           style={{ color: "var(--s2j-orange)" }}
           title="These stories have no test cases to export (generation failed or data missing) — see Settings → Diagnostics"
         >
-          ⚠ {exportSkipped} {exportSkipped === 1 ? "story" : "stories"} not included
+          <SignalIcon kind="warning" size={14} /> {exportSkipped} {exportSkipped === 1 ? "story" : "stories"} not included
         </span>
       )}
       {exportTruncated > 0 && (
@@ -132,7 +134,7 @@ function ExportBar({ jobId, hasUnsavedEdits }) {
           style={{ color: "var(--s2j-orange)" }}
           title="These stories hit the generation output limit — their case lists may be incomplete. Regenerate them to be sure."
         >
-          ⚠ {exportTruncated} may be truncated
+          <SignalIcon kind="warning" size={14} /> {exportTruncated} may be truncated
         </span>
       )}
       {hasUnsavedEdits && (
@@ -141,7 +143,7 @@ function ExportBar({ jobId, hasUnsavedEdits }) {
           style={{ color: "var(--s2j-orange)" }}
           title="Stories with unsaved edits export their SAVED version — Save them to include your edits"
         >
-          ⚠ unsaved edits excluded
+          <SignalIcon kind="warning" size={14} /> unsaved edits excluded
         </span>
       )}
       <button
@@ -282,13 +284,13 @@ function SummaryBar({ testCaseResults, onRegenerate, hasTestCases = true }) {
           <strong style={{ color: "var(--s2j-text)" }}>{totalCases}</strong>{" "}
           test case{totalCases !== 1 ? "s" : ""}
         </span>
-        {/* ⭐ v6 cost-transparency: exact post-run Anthropic-usage echo for this run (your own key,
-            no markup) — disambiguated from the subscription price by the 💲 + "used" + the title. */}
+        {/* v6 cost-transparency: exact post-run Anthropic-usage echo for this run (your own key,
+            no markup) — disambiguated from the subscription price by the cost icon + "used" + the title. */}
         {typeof testCaseResults?.cost?.total_usd === "number" && (
           <>
             <span>·</span>
             <span title="Anthropic API usage for this run — billed to your own API key, no markup">
-              💲{" "}
+              <IconCost size={14} />{" "}
               <strong style={{ color: "var(--s2j-text)" }}>
                 {fmtUsd(testCaseResults.cost.total_usd)}
               </strong>{" "}
@@ -316,7 +318,7 @@ function SummaryBar({ testCaseResults, onRegenerate, hasTestCases = true }) {
                 }}
                 title={`Regenerate the ${failedCount} failed stor${failedCount === 1 ? "y" : "ies"}`}
               >
-                ↻ Regenerate {failedCount} failed {failedCount === 1 ? "story" : "stories"}
+                <IconRefresh size={14} style={{ color: "var(--s2j-red)" }} /> Regenerate {failedCount} failed {failedCount === 1 ? "story" : "stories"}
               </button>
             )}
           </>
@@ -328,14 +330,14 @@ function SummaryBar({ testCaseResults, onRegenerate, hasTestCases = true }) {
         <div className="flex items-center gap-2 flex-wrap">
           {fullyCovered > 0 && (
             <span style={{ color: "var(--s2j-green-dark)" }}>
-              ✓ <strong>{fullyCovered}</strong> fully covered
+              <IconCheck size={14} style={{ color: "var(--s2j-green-dark)" }} /> <strong>{fullyCovered}</strong> fully covered
             </span>
           )}
           {partial > 0 && (
             <>
               {fullyCovered > 0 && <span>·</span>}
               <span style={{ color: "var(--s2j-orange)" }}>
-                ⚠ <strong>{partial}</strong> partial
+                <SignalIcon kind="warning" size={14} /> <strong>{partial}</strong> partial
               </span>
             </>
           )}
@@ -365,13 +367,13 @@ function StaleBanner() {
         border: "1px solid var(--s2j-orange-border)",
       }}
     >
-      <span aria-hidden="true" style={{ flexShrink: 0 }}>⚠</span>
+      <span style={{ flexShrink: 0 }}><SignalIcon kind="warning" size={16} /></span>
       <div>
         <p className="text-sm font-medium" style={{ color: "var(--s2j-text)" }}>
           The page was edited since these test cases were generated
         </p>
         <p className="text-xs mt-0.5" style={{ color: "var(--s2j-text-light)" }}>
-          Regenerate individual stories (↻ Regenerate per card) or go back and regenerate the breakdown first.
+          Regenerate individual stories (Regenerate per card) or go back and regenerate the breakdown first.
         </p>
       </div>
     </div>
@@ -391,7 +393,7 @@ function EditStaleBanner({ count = 0 }) {
         border: "1px solid var(--s2j-orange-border)",
       }}
     >
-      <span aria-hidden="true" style={{ flexShrink: 0 }}>⚠</span>
+      <span style={{ flexShrink: 0 }}><SignalIcon kind="warning" size={16} /></span>
       <div>
         <p className="text-sm font-medium" style={{ color: "var(--s2j-text)" }}>
           The breakdown was edited since these test cases were generated
@@ -402,7 +404,7 @@ function EditStaleBanner({ count = 0 }) {
           </p>
         )}
         <p className="text-xs mt-0.5" style={{ color: "var(--s2j-text-light)" }}>
-          These cases (and the summary that embeds in each Jira Story) rest on the earlier acceptance criteria. Regenerate the affected stories (↻ Regenerate per card) to refresh — or push as-is; it's your call.
+          These cases (and the summary that embeds in each Jira Story) rest on the earlier acceptance criteria. Regenerate the affected stories (Regenerate per card) to refresh — or push as-is; it's your call.
         </p>
       </div>
     </div>
@@ -621,7 +623,7 @@ function TestCasesScreen({
         <BackButton
           onClick={handleBackClick}
           className=""
-          label={dirtyCount > 0 && backArmed ? `⚠ ${dirtyCount} unsaved — leave anyway?` : "Back to Review"}
+          label={dirtyCount > 0 && backArmed ? `${dirtyCount} unsaved — leave anyway?` : "Back to Review"}
           title={dirtyCount > 0 ? "Some stories have unsaved test-case edits — Save them first or they'll be discarded" : undefined}
         />
         <span
@@ -653,7 +655,7 @@ function TestCasesScreen({
           title={dirtyCount > 0 ? "Some stories have unsaved test-case edits — Save them first to include them in the push" : "Continue to push"}
         >
           {dirtyCount > 0 && pushArmed
-            ? `⚠ ${dirtyCount} unsaved — push anyway?`
+            ? `${dirtyCount} unsaved — push anyway?`
             : "Continue to Push →"}
         </button>
       </div>
@@ -719,10 +721,10 @@ function TestCasesScreen({
                   title="Regenerate every story whose acceptance criteria changed — each is a paid generation (a few minutes each)"
                 >
                   {bulkBusy
-                    ? `⏳ Regenerating ${tcStaleStoryIdxs.length} stories…`
+                    ? `Regenerating ${tcStaleStoryIdxs.length} stories…`
                     : refreshArmed
-                    ? `⚠ Re-runs ${tcStaleStoryIdxs.length} affected stories (uses compute) — confirm?`
-                    : `↻ Refresh ${tcStaleStoryIdxs.length} affected stories`}
+                    ? `Re-runs ${tcStaleStoryIdxs.length} affected stories (uses compute) — confirm?`
+                    : `Refresh ${tcStaleStoryIdxs.length} affected stories`}
                 </button>
               );
             })()}

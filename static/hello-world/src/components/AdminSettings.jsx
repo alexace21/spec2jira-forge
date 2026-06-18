@@ -1,6 +1,8 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@forge/bridge";
 import { classText, opLabel, levelColor, relTime } from "../lib/diagnosticsView";
+import { IconCheck, IconX, IconMaximize, IconChevronRight } from "./Icon";
+import { SignalIcon } from "./Signal";
 
 /**
  * AdminSettings — v3.0.0 BYOK configuration page.
@@ -649,7 +651,7 @@ export default function AdminSettings({ initialTab = "settings", diagRefFilter =
               padding: 0,
             }}
           >
-            <span style={{ display: "inline-block", transform: showAdvanced ? "rotate(90deg)" : "none", transition: "transform 0.15s" }}>▶</span>
+            <span style={{ display: "inline-flex", transform: showAdvanced ? "rotate(90deg)" : "none", transition: "transform 0.15s" }}><IconChevronRight size={12} /></span>
             Advanced — Required custom fields (optional)
           </button>
 
@@ -1207,7 +1209,7 @@ function DiagnosticsTab({ refFilter = "", onRefFilterChange }) {
             title="Copy the diagnostic report to your clipboard (paste it into an email to support@spec2jira.com)"
           >
             {copyState === "copied"
-              ? "✓ Copied"
+              ? "Copied"
               : copyState === "failed"
                 ? "Copy failed — check browser permissions"
                 : "Copy full report"}
@@ -1240,7 +1242,7 @@ function DiagnosticsTab({ refFilter = "", onRefFilterChange }) {
             {clearing
               ? "Clearing…"
               : clearArmed
-                ? "⚠ Click again to confirm"
+                ? "Click again to confirm"
                 : "Clear diagnostics"}
           </button>
         </div>
@@ -1283,7 +1285,11 @@ function DiagnosticsTab({ refFilter = "", onRefFilterChange }) {
                         color: p?.ok ? "var(--s2j-green-dark)" : "var(--s2j-red)",
                       }}
                     >
-                      {p?.ok ? "✓" : "✗"}
+                      {p?.ok ? (
+                        <IconCheck size={14} />
+                      ) : (
+                        <SignalIcon kind="error" size={14} />
+                      )}
                     </span>
                     <span style={{ color: "var(--s2j-text)", minWidth: 0 }}>
                       {p?.name || "probe"}
@@ -1488,7 +1494,7 @@ function ContextProfilesEditor({ profiles, setProfiles, apiKeyConfigured, onMess
   // Distill button label — shows live "{Category} (k/6)" progress while the 6-step
   // pipeline runs (shared by the inline card + the focus-mode modal so they stay in sync).
   const renderDistillLabel = (busy) => {
-    if (!busy) return "✨ Summarize with Claude";
+    if (!busy) return "Summarize with Claude";
     const p = distillProgress;
     const text =
       p && p.label
@@ -1640,7 +1646,7 @@ function ContextProfilesEditor({ profiles, setProfiles, apiKeyConfigured, onMess
                     }}
                     title="Open a larger editor"
                   >
-                    ⤢ Expand
+                    <IconMaximize size={12} /> Expand
                   </button>
                   <span
                     className="text-xs"
@@ -1753,7 +1759,7 @@ function ContextProfilesEditor({ profiles, setProfiles, apiKeyConfigured, onMess
                       padding: "2px 6px",
                     }}
                   >
-                    ✕
+                    <IconX size={18} />
                   </button>
                 </div>
                 <textarea

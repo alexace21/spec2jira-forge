@@ -1,4 +1,6 @@
 import React from "react";
+import { IconX } from "./Icon";
+import { SignalIcon } from "./Signal";
 
 // Checkbox-matching normalizer — kept IN SYNC with normAC in src/testcases.js (the authoritative
 // backend coverage normalizer). Ticking an AC stores the VERBATIM live AC string, so the box-tick →
@@ -136,7 +138,7 @@ export default function AcTraceEditor({ acTrace, acceptanceCriteria, onChange })
             >
               [shared] {t.ac_text || ""}
               <button type="button" onClick={() => removeShared(i)} style={{ color: "var(--s2j-red)" }} title="Remove">
-                ✕
+                <IconX size={12} />
               </button>
             </span>
           ))}
@@ -158,13 +160,13 @@ export default function AcTraceEditor({ acTrace, acceptanceCriteria, onChange })
           style={{ background: "var(--s2j-orange-bg)", border: "1px solid var(--s2j-orange-border)", color: "var(--s2j-text)" }}
         >
           <p className="font-semibold mb-0.5">
-            ⚠ {staleEntries.length} reference{staleEntries.length > 1 ? "s" : ""} no longer match an AC (will be dropped on save)
+            <SignalIcon kind="warning" size={14} /> {staleEntries.length} reference{staleEntries.length > 1 ? "s" : ""} no longer match an AC (will be dropped on save)
           </p>
           {staleEntries.map((t, i) => (
             <div key={i} className="flex items-start gap-1">
               <span style={{ color: "var(--s2j-text-light)" }}>{t.ac_text}</span>
               <button type="button" onClick={() => removeStale(t.ac_text)} style={{ color: "var(--s2j-red)" }} title="Remove now">
-                ✕
+                <IconX size={12} />
               </button>
             </div>
           ))}

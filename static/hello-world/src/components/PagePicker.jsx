@@ -21,6 +21,8 @@
  */
 import React, { useEffect, useState, useCallback, useRef } from "react";
 import { invoke } from "@forge/bridge";
+import { SignalCallout } from "./Signal";
+import { IconSettings } from "./Icon";
 
 const SEARCH_DEBOUNCE_MS = 350;
 const SEARCH_MIN_QUERY_LEN = 2;
@@ -268,7 +270,7 @@ function PagePickerScreen({ onSelect, onOpenSettings }) {
             }}
             title="Open Spec2Tickets settings"
           >
-            ⚙ Settings
+            <IconSettings size={14} /> Settings
           </button>
         )}
       </div>
@@ -404,24 +406,23 @@ function PagePickerScreen({ onSelect, onOpenSettings }) {
         return (
           <>
             {renderGroup(
-              `⏳ In progress${reconciling ? " · checking…" : ""}`,
+              `In progress${reconciling ? " · checking…" : ""}`,
               "var(--s2j-text-muted)",
               inProgress,
               "p",
               (j) => `Generating · started ${relAge(j.startedAt) || "moments ago"}`,
             )}
-            {renderGroup("✓ Ready for review", "var(--s2j-blue)", ready, "r", () => "Completed — not yet pushed")}
-            {renderGroup("⚠ Needs attention", "var(--s2j-red)", failed, "f", () => "Generation failed — reopen to retry")}
+            {renderGroup("Ready for review", "var(--s2j-blue)", ready, "r", () => "Completed — not yet pushed")}
+            {renderGroup("Needs attention", "var(--s2j-red)", failed, "f", () => "Generation failed — reopen to retry")}
             {(inProgress.length > 0 || ready.length > 0 || failed.length > 0) && (
-              <p
-                className="text-[11px] mb-4 px-1"
-                style={{ color: "var(--s2j-text-muted)" }}
-              >
+              <SignalCallout kind="info" fontSize={11} style={{ marginBottom: 16 }}>
                 {/* Task #13: honest cleanup notice — matches the scheduled orphan sweep
-                    (7-day inactivity) + the privacy/DPA disclosure (no over-claim). */}
-                ⓘ Generated breakdowns you don't push to Jira are automatically removed after
+                    (7-day inactivity) + the privacy/DPA disclosure (no over-claim). v6: a
+                    SignalCallout (info) so it reads as a proper legible notice — the bare
+                    ⓘ + muted gray was easy to miss (partner UX note 2026-06-18). */}
+                Generated breakdowns you don't push to Jira are automatically removed after
                 7 days of inactivity. Opening one resets its timer.
-              </p>
+              </SignalCallout>
             )}
           </>
         );
@@ -553,7 +554,7 @@ function PagePickerScreen({ onSelect, onOpenSettings }) {
           Leave a quick review
         </a>{" "}
         on the Atlassian Marketplace — it takes a minute and helps other teams find
-        us. 🙏
+        us.
       </div>
     </div>
   );

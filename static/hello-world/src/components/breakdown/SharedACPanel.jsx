@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { IconCheck } from '../Icon';
 
 /**
  * SharedACPanel — displays shared (cross-cutting) acceptance criteria from the
@@ -321,7 +322,7 @@ function SharedACItem({
         </select>
 
         {isAssigned && (
-          <span className="shrink-0 text-xs" style={{ color: 'var(--s2j-green)' }}>✓</span>
+          <span className="shrink-0 text-xs inline-flex items-center" style={{ color: 'var(--s2j-green)' }}><IconCheck size={14} /></span>
         )}
       </div>
     </div>

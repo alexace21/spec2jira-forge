@@ -13,6 +13,18 @@ import AdminSettings from "./components/AdminSettings";
 import PagePickerScreen from "./components/PagePicker";
 import BackButton from "./components/BackButton";
 import TestCasesScreen from "./components/TestCasesScreen";
+import { SignalCallout, SignalIcon } from "./components/Signal";
+import {
+  IconRefresh,
+  IconClock,
+  IconCost,
+  IconBeaker,
+  IconX,
+  IconUndo,
+  IconExternalLink,
+  IconSettings,
+  IconLink,
+} from "./components/Icon";
 import {
   adaptToLegacyShape,
   extractV3Signals,
@@ -421,6 +433,10 @@ function App() {
   // Set on reconnect rehydration (routeByPageStatus completed branch) when
   // tcStatus === 'completed'. Cleared on page change / regenerate / retry.
   const [testCaseResults, setTestCaseResults] = useState(null);
+  // ⭐ v6 (2026-06-18): Gherkin/CSV export strings captured into memory BEFORE the
+  // post-push purge so the terminal success screen can still offer Copy (the KVS copy is
+  // gone post-purge). Null until a push WITH test cases captures them; cleared per push.
+  const [capturedExports, setCapturedExports] = useState(null);
 
   // In-app Settings access (2026-06-03). WHY this exists: the Forge
   // confluence:globalSettings "Configure" page (which renders AdminSettings) is
@@ -1238,6 +1254,7 @@ function App() {
     // (the Create-button warning already told the user; this drives the post-push
     // confirmation note so they don't have to check Diagnostics to know it happened).
     setTcDiscardedAtPush(tcGenerating);
+    setCapturedExports(null); // v6: clear any prior capture; this push re-captures if it has test cases
     setIsPushing(true);
     setPushProgress(0);
     setPushPhase("starting");
@@ -1306,7 +1323,36 @@ function App() {
           setIsPushing(false);
           // Data minimization: page content + breakdown in KVS aren't needed
           // after the push — purge them (best-effort). See privacy policy §5.
-          if (jobId) invoke("purgeJob", { jobId }).catch(() => {});
+          // ⭐ v6: if this run produced test cases, CAPTURE the rendered Gherkin/CSV into
+          // FE memory FIRST (getTestCaseExports reads KVS → 404s post-purge), so the terminal
+          // success screen can still offer Copy. Privacy-safe: nothing is kept in KVS — just
+          // two strings in memory, gone on reload. THEN purge. A capture failure degrades
+          // silently to "no Copy on the success screen"; it never blocks the purge.
+          if (jobId) {
+            if (testCaseResults && testCaseResults.total > 0) {
+              (async () => {
+                let exp = null;
+                try {
+                  const [g, c] = await Promise.all([
+                    invoke("getTestCaseExports", { jobId, format: "gherkin" }),
+                    invoke("getTestCaseExports", { jobId, format: "csv" }),
+                  ]);
+                  exp = {
+                    gherkin: g && !g.error ? g.gherkin : null,
+                    csv: c && !c.error ? c.csv : null,
+                    skipped: g && Number.isFinite(g.skipped) ? g.skipped : 0,
+                  };
+                } catch (_) {
+                  exp = null;
+                } finally {
+                  invoke("purgeJob", { jobId }).catch(() => {});
+                }
+                if (exp && (exp.gherkin || exp.csv)) setCapturedExports(exp);
+              })();
+            } else {
+              invoke("purgeJob", { jobId }).catch(() => {});
+            }
+          }
           return;
         }
         setPushProgress(typeof step.progress === "number" ? step.progress : 0);
@@ -1337,7 +1383,7 @@ function App() {
       setScreen("error");
       setIsPushing(false);
     }
-  }, [pendingBreakdown, jobId, tcGenerating]);
+  }, [pendingBreakdown, jobId, tcGenerating, testCaseResults]);
 
   // ── Test-case generation (P5) ─────────────────────────────────
 
@@ -1906,7 +1952,7 @@ function App() {
             }}
             title="Re-run generation from the current page (picks up any edits you've made)"
           >
-            ↻ Regenerate
+            <IconRefresh size={14} /> Regenerate
           </button>
         </div>
         <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
@@ -1924,7 +1970,7 @@ function App() {
                 border: "1px solid var(--s2j-orange-border)",
               }}
             >
-              <span aria-hidden="true" style={{ flexShrink: 0 }}>⚠</span>
+              <SignalIcon kind="warning" size={16} style={{ marginTop: 1 }} />
               <div style={{ flex: 1 }}>
                 <p className="text-sm font-medium" style={{ color: "var(--s2j-text)" }}>
                   This page was edited since this breakdown was generated
@@ -1940,7 +1986,7 @@ function App() {
                 style={{ whiteSpace: "nowrap" }}
                 title="Re-run generation from the current page (picks up any edits you've made)"
               >
-                ↻ Regenerate
+                <IconRefresh size={14} /> Regenerate
               </button>
             </div>
           )}
@@ -1957,7 +2003,7 @@ function App() {
                 border: "1px solid var(--s2j-orange-border)",
               }}
             >
-              <span aria-hidden="true" style={{ flexShrink: 0 }}>⚠</span>
+              <SignalIcon kind="warning" size={16} style={{ marginTop: 1 }} />
               <div style={{ flex: 1 }}>
                 <p className="text-sm font-medium" style={{ color: "var(--s2j-text)" }}>
                   This breakdown could not be saved to storage (too large).
@@ -2154,11 +2200,11 @@ function App() {
       return (
         <PushedScreen
           result={pushResult}
-          onBack={handleBackToReview}
           onNew={handleNewPage}
           jobId={jobId}
           onOpenDiagnostics={handleOpenDiagnostics}
           tcDiscarded={tcDiscardedAtPush}
+          capturedExports={capturedExports}
         />
       );
     case "limit_reached":
@@ -2300,7 +2346,7 @@ function DiagnosticRefLine({ refId, onOpenDiagnostics }) {
         title="Copy the diagnostic reference (include it when contacting support)"
       >
         {copyState === "copied"
-          ? "✓ Copied"
+          ? "Copied"
           : copyState === "failed"
             ? "Copy failed — check browser permissions"
             : "Copy"}
@@ -2383,7 +2429,7 @@ function ReadyScreen({
             }}
             title="Open Spec2Tickets settings"
           >
-            ⚙ Settings
+            <IconSettings size={14} /> Settings
           </button>
         )}
       </div>
@@ -2413,7 +2459,7 @@ function ReadyScreen({
             className="text-sm font-medium mb-1"
             style={{ color: "var(--s2j-red)" }}
           >
-            ⚠ The last generation for this page failed
+            <SignalIcon kind="error" size={14} /> The last generation for this page failed
           </p>
           <p className="text-xs" style={{ color: "var(--s2j-text)" }}>
             {/* [diag Phase 5] When the stored user-facing detail is absent, humanize the
@@ -2627,7 +2673,7 @@ function GeneratingScreen({ pageTitle, elapsed, onBack, onStartOver }) {
             border: "1px solid var(--s2j-orange-border)",
           }}
         >
-          <span aria-hidden="true">⏳</span>
+          <IconClock size={16} style={{ marginTop: 1 }} />
           <div>
             <p
               className="text-xs font-medium mb-1"
@@ -2655,7 +2701,7 @@ function GeneratingScreen({ pageTitle, elapsed, onBack, onStartOver }) {
           className="text-xs font-medium mb-1"
           style={{ color: "var(--s2j-text)" }}
         >
-          ☕ You can safely leave — we'll keep working
+          You can safely leave — we'll keep working
         </p>
         <p className="text-xs" style={{ color: "var(--s2j-text-light)" }}>
           Close this tab, switch tasks, or come back tomorrow — your breakdown keeps
@@ -2751,7 +2797,7 @@ function GeneratingTestsScreen({ pageTitle, tcElapsed, onBack }) {
             border: "1px solid var(--s2j-orange-border)",
           }}
         >
-          <span aria-hidden="true">⏳</span>
+          <IconClock size={16} style={{ marginTop: 1 }} />
           <div>
             <p
               className="text-xs font-medium mb-1"
@@ -2778,7 +2824,7 @@ function GeneratingTestsScreen({ pageTitle, tcElapsed, onBack }) {
           className="text-xs font-medium mb-1"
           style={{ color: "var(--s2j-text)" }}
         >
-          ☕ You can safely leave — we'll keep working
+          You can safely leave — we'll keep working
         </p>
         <p className="text-xs" style={{ color: "var(--s2j-text-light)" }}>
           Close this tab or switch tasks — test-case generation continues in the
@@ -2909,7 +2955,7 @@ function ConfirmScreen({
             border: "1px solid var(--s2j-orange-border)",
           }}
         >
-          <span aria-hidden="true" style={{ flexShrink: 0 }}>⚠</span>
+          <SignalIcon kind="warning" size={16} style={{ marginTop: 1 }} />
           <div>
             <p className="text-sm font-medium" style={{ color: "var(--s2j-text)" }}>
               Partial breakdown — some features may be missing
@@ -2933,7 +2979,7 @@ function ConfirmScreen({
             border: "1px solid var(--s2j-orange-border)",
           }}
         >
-          <span aria-hidden="true" style={{ flexShrink: 0 }}>⚠</span>
+          <SignalIcon kind="warning" size={16} style={{ marginTop: 1 }} />
           <div>
             <p className="text-sm font-medium" style={{ color: "var(--s2j-text)" }}>
               This breakdown could not be saved to storage (too large).
@@ -3194,7 +3240,7 @@ function ConfirmScreen({
             className="text-sm font-semibold mb-2 flex items-center gap-2"
             style={{ color: "var(--s2j-text)" }}
           >
-            <span>⚠</span>
+            <SignalIcon kind="warning" size={14} />
             <span>Review before push ({sortedSpecConcerns.length})</span>
           </h3>
           <p
@@ -3284,9 +3330,9 @@ function ConfirmScreen({
             {!hasTestCases && !testCaseResults
               ? "Acceptance test cases — Advanced"
               : tcStaleNow
-              ? "⚠ Test cases may be outdated"
+              ? "Test cases may be outdated"
               : testCaseResults
-              ? "✓ Acceptance test cases generated"
+              ? "Acceptance test cases generated"
               : "Optional: acceptance test cases"}
           </p>
           <p className="text-xs" style={{ color: "var(--s2j-text-muted)" }}>
@@ -3307,7 +3353,7 @@ function ConfirmScreen({
             if (testCaseResults && !tcStaleNow && typeof actual === "number") {
               return (
                 <p className="text-xs mt-1" style={{ color: "var(--s2j-green-dark)" }}>
-                  💲 This run used <strong>{fmtUsd(actual)}</strong> of Anthropic usage —
+                  <IconCost size={12} /> This run used <strong>{fmtUsd(actual)}</strong> of Anthropic usage —
                   billed to your own API key, no markup.
                 </p>
               );
@@ -3315,7 +3361,7 @@ function ConfirmScreen({
             if (hasTestCases && tcEstimate && (!testCaseResults || tcStaleNow)) {
               return (
                 <p className="text-xs mt-1" style={{ color: "var(--s2j-text-muted)" }}>
-                  💲 Estimated Anthropic usage:{" "}
+                  <IconCost size={12} /> Estimated Anthropic usage:{" "}
                   <strong>up to ~{fmtUsd(tcEstimate.upper_usd)}</strong>
                   {tcEstimate.expected_usd
                     ? ` (typically ~${fmtUsd(tcEstimate.expected_usd)})`
@@ -3370,7 +3416,7 @@ function ConfirmScreen({
               }}
               title="This breakdown could not be saved to Forge storage, so test-case generation (which reads the saved copy) is unavailable. Push to Jira now to keep your work."
             >
-              🧪 Test cases unavailable — breakdown not saved
+              <IconBeaker size={12} /> Test cases unavailable — breakdown not saved
             </span>
           )}
           {/* v6 value-split: Generate / Re-run is gated on the Advanced capability (hasTestCases).
@@ -3409,14 +3455,14 @@ function ConfirmScreen({
               }}
             >
               {tcGenerating
-                ? "⏳ Generating tests…"
+                ? "Generating tests…"
                 : regenArmed
                 ? tcStaleNow
-                  ? `⚠ Confirm re-run (${stories} stories)`
-                  : "⚠ Confirm & generate"
+                  ? `Confirm re-run (${stories} stories)`
+                  : "Confirm & generate"
                 : tcStaleNow
-                ? "🔄 Re-run all"
-                : "🧪 Generate Test Cases"}
+                ? "Re-run all"
+                : "Generate Test Cases"}
             </button>
           )}
           {/* v6 value-split: Standard edition → an upsell chip instead of the Generate button
@@ -3438,7 +3484,7 @@ function ConfirmScreen({
                 whiteSpace: "nowrap",
               }}
             >
-              🧪 Advanced feature
+              <IconBeaker size={12} /> Advanced feature
             </span>
           )}
         </div>
@@ -3462,7 +3508,7 @@ function ConfirmScreen({
           generating test cases will be discarded and not embedded. */}
       {tcGenerating && (
         <p className="text-xs mb-2" style={{ color: "var(--s2j-orange)" }}>
-          ⚠ Test cases are still generating — pushing now discards that run (they
+          <SignalIcon kind="warning" size={12} /> Test cases are still generating — pushing now discards that run (they
           will not be embedded in the Jira stories).
         </p>
       )}
@@ -3558,7 +3604,7 @@ function DependencyStructure({ edges, onRemove, onRestore }) {
             className="text-sm font-semibold mb-1 flex items-center gap-2"
             style={{ color: "var(--s2j-text)" }}
           >
-            <span aria-hidden="true">🔗</span>
+            <IconLink size={16} style={{ marginRight: 6 }} />
             <span>Cross-feature dependencies ({edges.length})</span>
           </h3>
           <p className="text-xs mb-3" style={{ color: "var(--s2j-text-muted)" }}>
@@ -3632,7 +3678,7 @@ function DependencyStructure({ edges, onRemove, onRestore }) {
                             fontSize: "13px",
                           }}
                         >
-                          ✕
+                          <IconX size={14} />
                         </button>
                       </li>
                     ))}
@@ -3690,7 +3736,7 @@ function DependencyStructure({ edges, onRemove, onRestore }) {
                     fontWeight: 500,
                   }}
                 >
-                  ↩ Restore
+                  <IconUndo size={12} /> Restore
                 </button>
               </li>
             ))}
@@ -3823,7 +3869,81 @@ function PushingScreen({ progress, phase }) {
 
 // ── Pushed (Success) ────────────────────────────────────────────
 
-function PushedScreen({ result, onBack, onNew, jobId = null, onOpenDiagnostics, tcDiscarded = false }) {
+// ── post-push export (v6, 2026-06-18) ───────────────────────────────
+// The success screen is terminal (no Back-to-Editor). If the run had test cases, App
+// captured the rendered Gherkin/CSV into memory BEFORE the purge — this is the last place
+// the BA can grab the full export (the KVS copy is gone). Tiny local clipboard helper
+// (mirrors TestCasesScreen's — duplicated to avoid a shared-module dep in this CRA app;
+// both are tiny). Never a silent no-op (clipboard → data-URI download fallback).
+async function copyTextToClipboard(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch (_) {
+    try {
+      const a = document.createElement("a");
+      a.href = "data:text/plain;charset=utf-8," + encodeURIComponent(text);
+      a.download = "testcases.txt";
+      a.style.display = "none";
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      return true;
+    } catch (_2) {
+      return false;
+    }
+  }
+}
+
+function PostPushExport({ captured }) {
+  const [gState, setGState] = useState("idle"); // idle | ok | fail
+  const [cState, setCState] = useState("idle");
+  if (!captured || (!captured.gherkin && !captured.csv)) return null;
+  const doCopy = async (text, set) => {
+    const ok = await copyTextToClipboard(text || "");
+    set(ok ? "ok" : "fail");
+    setTimeout(() => set("idle"), 1800);
+  };
+  const label = (state, base) =>
+    state === "ok"
+      ? "Copied"
+      : state === "fail"
+        ? "Copy failed — check browser permissions"
+        : base;
+  return (
+    <SignalCallout
+      kind="info"
+      style={{ marginBottom: 16 }}
+      iconTitle="Export your test cases now — the working copy is cleared on push"
+    >
+      <div style={{ fontWeight: 500, marginBottom: 4 }}>Acceptance test cases — export now</div>
+      <div style={{ marginBottom: 8 }}>
+        The working copy is cleared when you push (for privacy), so this is the last place to grab
+        the full Gherkin / CSV.
+      </div>
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+        {captured.gherkin && (
+          <button className="btn-secondary" onClick={() => doCopy(captured.gherkin, setGState)}>
+            {label(gState, "Copy all — Gherkin")}
+          </button>
+        )}
+        {captured.csv && (
+          <button className="btn-secondary" onClick={() => doCopy(captured.csv, setCState)}>
+            {label(cState, "Copy all — CSV")}
+          </button>
+        )}
+      </div>
+      {captured.skipped > 0 && (
+        <div style={{ fontSize: 11, color: "var(--s2j-orange)", marginTop: 6 }}>
+          {captured.skipped} {captured.skipped === 1 ? "story" : "stories"} not included (no cases or
+          generation failed).
+        </div>
+      )}
+    </SignalCallout>
+  );
+}
+
+function PushedScreen({ result, onNew, jobId = null, onOpenDiagnostics, tcDiscarded = false, capturedExports = null }) {
   const total = result?.total_items || result?.created_issues?.length || 0;
   const stories = result?.created_issues || [];
   const browseUrl = (key) =>
@@ -3890,7 +4010,7 @@ function PushedScreen({ result, onBack, onNew, jobId = null, onOpenDiagnostics, 
             so they don't have to open Diagnostics to learn what happened. */}
         {tcDiscarded && (
           <p className="text-xs mt-1" style={{ color: "var(--s2j-orange)" }}>
-            ℹ The in-progress test-case generation was discarded — regenerate from the
+            <SignalIcon kind="warning" size={12} /> The in-progress test-case generation was discarded — regenerate from the
             editor after the push if you want them embedded.
           </p>
         )}
@@ -3915,7 +4035,7 @@ function PushedScreen({ result, onBack, onNew, jobId = null, onOpenDiagnostics, 
               onClick={() => openIssue(result.epic_key)}
               className="btn-secondary mb-3"
             >
-              Open Epic {result.epic_key} ↗
+              Open Epic {result.epic_key} <IconExternalLink size={14} />
             </button>
           )}
           {stories.length > 0 && (
@@ -4060,16 +4180,19 @@ function PushedScreen({ result, onBack, onNew, jobId = null, onOpenDiagnostics, 
         );
       })()}
 
+      <PostPushExport captured={capturedExports} />
+
       {/* F3 misplacement fix part 32 (2026-05-09) — "Run again on this
           page" was removed because re-running на same page POST-PUSH
           would create duplicate JIRA tickets (semantically wrong post-
           push context). "Generate Another" renamed → "Generate on new
           page" для clarity (explicitly indicates picker-route to a
-          different page, avoiding "another what?" ambiguity). */}
+          different page, avoiding "another what?" ambiguity).
+          ⭐ v6 (2026-06-18): "Back to Editor" REMOVED — post-push the breakdown
+          is purged (purgeJob), so returning to the editor showed a stale/empty
+          state = a regression door. The success screen is now terminal:
+          forward-only (Open in Jira · export the captured test cases · new page). */}
       <div className="flex gap-3">
-        <button onClick={onBack} className="btn-secondary">
-          Back to Editor
-        </button>
         <button onClick={onNew} className="btn-secondary">
           Generate on new page
         </button>

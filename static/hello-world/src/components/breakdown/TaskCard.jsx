@@ -2,6 +2,7 @@ import { useState, useRef, useLayoutEffect, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import EditableField from './EditableField.jsx';
 import { TASK_TYPES, TASK_TYPE_COLORS } from './constants.js';
+import { IconCheck } from '../Icon';
 
 /**
  * SelectBadge — Badge that doubles as a dropdown selector.
@@ -106,7 +107,7 @@ function SelectBadge({ value, options, colorMap, labelMap, onChange }) {
                 >
                   <span className={`inline-block h-2 w-2 rounded-full ring-1 ring-inset ${optColor}`} />
                   {optLabel}
-                  {isSelected && <span className="ml-auto" style={{ color: 'var(--s2j-green)' }}>✓</span>}
+                  {isSelected && <span className="ml-auto inline-flex" style={{ color: 'var(--s2j-green)' }}><IconCheck size={14} /></span>}
                 </button>
               );
             })}

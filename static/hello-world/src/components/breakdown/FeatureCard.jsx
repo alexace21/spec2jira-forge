@@ -3,6 +3,7 @@ import EditableField from './EditableField.jsx';
 import TaskCard from './TaskCard.jsx';
 import LabelsEditor from './LabelsEditor.jsx';
 import { parseConcernPrefix, SEVERITY_PALETTE, CONCERN_TYPE_LABEL } from '../../lib/v3Schema.js';
+import { IconX } from '../Icon';
 
 /**
  * FeatureCard — Editor for a single Feature (→ JIRA Story).
@@ -376,7 +377,7 @@ export default function FeatureCard({ feature, index, onUpdate, onDelete }) {
                 {(feature.acceptance_criteria || []).length > 1 && (
                   <button onClick={() => deleteAC(i)}
                     className="mt-0.5 opacity-0 group-hover/ac:opacity-100 transition-all text-xs px-1"
-                    style={{ color: 'var(--s2j-red)' }}>✕</button>
+                    style={{ color: 'var(--s2j-red)' }}><IconX size={14} /></button>
                 )}
               </div>
             ))}

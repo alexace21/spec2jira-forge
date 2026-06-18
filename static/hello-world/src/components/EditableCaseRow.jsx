@@ -1,6 +1,8 @@
 import React, { useState, useRef, useEffect, useCallback } from "react";
 import EditableField from "./breakdown/EditableField.jsx";
 import AcTraceEditor from "./AcTraceEditor.jsx";
+import { IconX } from "./Icon";
+import { SignalIcon } from "./Signal";
 
 // Canon (src/prompts.js TEST_CASE_SCHEMA): type ∈ 3, priority ∈ 4 (optional).
 const TYPE_OPTIONS = ["happy-path", "edge", "negative"];
@@ -50,7 +52,7 @@ function StringListEditor({ label, items, onChange, addLabel = "+ Add", placehol
             style={{ color: "var(--s2j-red)" }}
             title="Remove"
           >
-            ✕
+            <IconX size={11} title="Remove" />
           </button>
         </div>
       ))}
@@ -169,13 +171,13 @@ export default function EditableCaseRow({
           }}
           title={armed ? "Click again to confirm — delete this case" : "Delete this case"}
         >
-          {armed ? "Confirm — delete?" : "✕"}
+          {armed ? "Confirm — delete?" : <IconX size={11} title="Delete this case" />}
         </button>
       </div>
 
       {invalid && (
         <div className="text-[10px] mb-2" style={{ color: "var(--s2j-orange)" }}>
-          ⚠ A case needs at least one When and one Then, or it is dropped on save.
+          <SignalIcon kind="warning" size={14} /> A case needs at least one When and one Then, or it is dropped on save.
         </div>
       )}
 
@@ -255,7 +257,7 @@ export default function EditableCaseRow({
             }}
             title={isNewCase ? "Remove this unsaved case" : "Discard your edits to this case"}
           >
-            {isNewCase ? "↩ Remove" : "↩ Revert this case"}
+            {isNewCase ? "Remove" : "Revert this case"}
           </button>
           <button
             type="button"
