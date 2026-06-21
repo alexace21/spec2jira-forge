@@ -61,7 +61,7 @@ import {
   submitPlanRankingBatch, // Capacity-Sheet Planner: the advisory ranking call via the Batches API (async)
   fetchPlanRankingResults,
 } from './anthropic_client.js';
-import { startPushSession, pushSessionStep, flattenBreakdown, lookupProject, startPlanPushSession, planPushSessionStep } from './push_handler.js';
+import { startPushSession, pushSessionStep, flattenBreakdown, lookupProject, startPlanPushSession, planPushSessionStep, startKanbanRankSession, kanbanRankSessionStep } from './push_handler.js';
 import { isOrphanStale } from './sweep_util.js'; // Task #13: pure staleness decision (unit-tested; index.js isn't node-importable)
 import { detectCycles } from './graph.js';
 // Capacity-Sheet Planner pure-fn core (src/planner.js — node-testable; prototype/test_planner.mjs).
@@ -3390,7 +3390,11 @@ resolver.define('startPlanPush', async ({ payload, context }) => {
   // permissions (NOT to "only the pushed backlog" — that earlier claim was write-time optimism; a tampered
   // client can only touch issues the user can already reach, no cross-user escalation). We additionally scope
   // moves to `projectKey` below so a mismatched/crafted projectKey+keys can't sprint issues in another project.
-  let plan = payloadPlan && Array.isArray(payloadPlan.sprints) ? payloadPlan : null;
+  // Accept BOTH plan shapes from the payload (capture-before-purge): a Scrum plan (.sprints) OR a Kanban plan
+  // (.methodology==='kanban' with now/next/later). The methodology branch below picks the push path; the Scrum
+  // .sprints guard stays the gate for the sprint path, so neither methodology can cross into the other's path.
+  const isKanbanPayload = payloadPlan && payloadPlan.methodology === 'kanban' && (Array.isArray(payloadPlan.now) || Array.isArray(payloadPlan.next) || Array.isArray(payloadPlan.later));
+  let plan = (payloadPlan && Array.isArray(payloadPlan.sprints)) ? payloadPlan : (isKanbanPayload ? payloadPlan : null);
   let form = payloadForm || null;
   if (!plan) {
     let record;
@@ -3399,7 +3403,8 @@ resolver.define('startPlanPush', async ({ payload, context }) => {
   }
   if (!plan) return { ok: false, error: 'no_plan', detail: 'Generate a plan first.' };
   // §13 gate: defensive size bound on the FE-supplied payload (DoS / accidental-giant guard).
-  if ((Array.isArray(plan.sprints) && plan.sprints.length > 100) || (Array.isArray(createdIssues) && createdIssues.length > PLAN_FEATURE_CAP)) {
+  const kanbanBodySize = (Array.isArray(plan.now) ? plan.now.length : 0) + (Array.isArray(plan.next) ? plan.next.length : 0) + (Array.isArray(plan.later) ? plan.later.length : 0); // gate C2: bound the kanban plan body too
+  if ((Array.isArray(plan.sprints) && plan.sprints.length > 100) || kanbanBodySize > PLAN_FEATURE_CAP || (Array.isArray(createdIssues) && createdIssues.length > PLAN_FEATURE_CAP)) {
     return { ok: false, error: 'payload_too_large', detail: 'The plan or issue list is unexpectedly large — regenerate the plan and retry.' };
   }
   const projectKey = await getProjectKey(payloadProjectKey);
@@ -3412,17 +3417,22 @@ resolver.define('startPlanPush', async ({ payload, context }) => {
     ? createdIssues.filter((ci) => ci && typeof ci.key === 'string' && ci.key.toUpperCase().startsWith(keyPrefix))
     : [];
   form = form || {};
+  // METHODOLOGY FORK (mirrors the planner's assemblePlan fork): a kanban plan ranks the backlog; a scrum plan
+  // creates sprints. EXPLICIT branch on plan.methodology — never a relaxed guard that could mis-route a shape.
+  const isKanban = plan && plan.methodology === 'kanban';
   let outcome;
   try {
-    outcome = await startPlanPushSession({
-      jobId, plan, createdIssues: scopedIssues, projectKey, boardId,
-      sprintStartDate: form.sprintStartDate, sprintLengthDays: form.sprintLengthDays, namePrefix,
-    });
+    outcome = isKanban
+      ? await startKanbanRankSession({ jobId, plan, createdIssues: scopedIssues, projectKey, boardId })
+      : await startPlanPushSession({
+          jobId, plan, createdIssues: scopedIssues, projectKey, boardId,
+          sprintStartDate: form.sprintStartDate, sprintLengthDays: form.sprintLengthDays, namePrefix,
+        });
   } catch (e) {
     console.error(`[startPlanPush] threw (non-fatal): ${String(e?.message || e)} ref=${jobId}`);
-    return { ok: false, error: 'plan_push_failed', detail: 'Could not start the sprint push — please try again.' };
+    return { ok: false, error: 'plan_push_failed', detail: 'Could not start the push — please try again.' };
   }
-  if (outcome.ok) await touchJobAccess(jobId);
+  if (outcome.ok) { outcome.kind = isKanban ? 'rank' : 'sprints'; await touchJobAccess(jobId); }
   return outcome;
 });
 
@@ -3434,6 +3444,20 @@ resolver.define('planPushStep', async ({ payload, context }) => {
     return await planPushSessionStep(sessionId);
   } catch (e) {
     console.error(`[planPushStep] threw: ${String(e?.message || e)}`);
+    return { ok: false, error: 'step_exception', detail: String(e?.message || e) };
+  }
+});
+
+// kanbanRankStep — the UI loops this for a KANBAN plan (kind:'rank' from startPlanPush). Sibling of planPushStep;
+// advances the chunked rank→labels→done session. Same never-hard-fail discipline.
+resolver.define('kanbanRankStep', async ({ payload, context }) => {
+  if (getActiveTier(context).key === 'unlicensed') return buildLicenseRequired();
+  const sessionId = payload && payload.sessionId;
+  if (!sessionId) return { ok: false, error: 'no_session', detail: 'No session id provided.' };
+  try {
+    return await kanbanRankSessionStep(sessionId);
+  } catch (e) {
+    console.error(`[kanbanRankStep] threw: ${String(e?.message || e)}`);
     return { ok: false, error: 'step_exception', detail: String(e?.message || e) };
   }
 });

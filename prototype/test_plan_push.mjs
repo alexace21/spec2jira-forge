@@ -3,7 +3,10 @@
  * Offline test for the P15 (Push plan to Jira) PURE join — src/plan_push_util.js.
  *   node prototype/test_plan_push.mjs
  */
-import { sprintPushName, sprintDateRangeISO, buildSprintPushPlan } from '../src/plan_push_util.js';
+import {
+  sprintPushName, sprintDateRangeISO, buildSprintPushPlan,
+  buildKanbanRankPlan, buildRankBatches, buildTierLabelOps, RANK_BATCH_MAX, TIER_LABELS,
+} from '../src/plan_push_util.js';
 
 let pass = 0, fail = 0;
 function check(name, cond) { if (cond) { pass++; console.log(`  ok  ${name}`); } else { fail++; console.error(`  XX  ${name}`); } }
@@ -61,6 +64,47 @@ console.log('P15 plan-push pure join:');
   const createdDup = [{ uid: 'u1', key: 'P-1' }, { uid: 'u2', key: 'P-2' }];
   const outDup = buildSprintPushPlan(planDup, createdDup, {});
   check('dup-uid: disambiguated uid#i miss the plain-uid join → noJiraKey (not mis-assigned)', outDup.noJiraKey.join() === 'u1#0,u1#1' && outDup.groups[0].keys.join() === 'P-2');
+}
+
+console.log('\nP15-kanban rank-push pure join:');
+{
+  // buildKanbanRankPlan — flatten now→next→later into the ordered pull list + per-tier groups + noJiraKey
+  const plan = {
+    methodology: 'kanban',
+    now: [{ id: 'uA', points: 8 }, { id: 'uB', points: 5 }],
+    next: [{ id: 'uC', points: 8 }],
+    later: [{ id: 'uD', points: 3 }, { id: 'uE', points: 5 }],
+  };
+  const created = [{ uid: 'uA', key: 'P-1' }, { uid: 'uB', key: 'P-2' }, { uid: 'uC', key: 'P-3' }, { uid: 'uD', key: 'P-4' }]; // uE has NO key
+  const kp = buildKanbanRankPlan(plan, created);
+  check('buildKanbanRankPlan: orderedKeys = now→next→later (pull order)', kp.orderedKeys.join() === 'P-1,P-2,P-3,P-4');
+  check('buildKanbanRankPlan: per-tier key groups', kp.tiers.now.join() === 'P-1,P-2' && kp.tiers.next.join() === 'P-3' && kp.tiers.later.join() === 'P-4');
+  check('buildKanbanRankPlan: uid with no key → noJiraKey (disjoint, never silently ranked)', kp.noJiraKey.join() === 'uE' && !kp.orderedKeys.includes(undefined));
+  let kThrew = false, kSafe;
+  try { kSafe = buildKanbanRankPlan(null, null); } catch (_) { kThrew = true; }
+  check('buildKanbanRankPlan: null-safe (no throw, empty)', !kThrew && kSafe.orderedKeys.length === 0 && kSafe.noJiraKey.length === 0);
+
+  // buildRankBatches — chained anchor; the ABSOLUTE resulting order must equal the plan order (POLARITY guard)
+  const b1 = buildRankBatches(['P-1', 'P-2', 'P-3', 'P-4']);
+  check('buildRankBatches: 1 batch for ≤51 keys', b1.length === 1);
+  check('buildRankBatches: ranks the tail AFTER orderedKeys[0] (anchor keeps its spot)', b1[0].issues.join() === 'P-2,P-3,P-4' && b1[0].rankAfterIssue === 'P-1');
+  check('buildRankBatches: 0/1 key → nothing to reorder', buildRankBatches([]).length === 0 && buildRankBatches(['only']).length === 0);
+  const big = Array.from({ length: 120 }, (_, i) => `K-${i}`); // K-0 .. K-119
+  const bb = buildRankBatches(big);
+  check('buildRankBatches: 120 keys → ceil(119/50)=3 batches', bb.length === 3);
+  check('buildRankBatches: batch1 anchors after K-0, ranks K-1..K-50', bb[0].rankAfterIssue === 'K-0' && bb[0].issues[0] === 'K-1' && bb[0].issues.length === 50);
+  check('buildRankBatches: batch2 chains after batch1 tail K-50 (no gap/overlap)', bb[1].rankAfterIssue === 'K-50' && bb[1].issues[0] === 'K-51');
+  check('buildRankBatches: every key ranked once, ABSOLUTE order == plan order (polarity)', (() => { const seq = ['K-0', ...bb.flatMap((b) => b.issues)]; return seq.join() === big.join(); })());
+  check('buildRankBatches: each batch ≤ RANK_BATCH_MAX', bb.every((b) => b.issues.length <= RANK_BATCH_MAX));
+
+  // buildTierLabelOps — idempotent: ADD my tier + REMOVE the other two (re-tier never accumulates two labels)
+  const ops = buildTierLabelOps(kp.tiers);
+  check('buildTierLabelOps: one op per keyed feature (4)', ops.length === 4);
+  const opNow = ops.find((o) => o.key === 'P-1');
+  check('buildTierLabelOps: Now item adds plan-now + removes plan-next/plan-later (idempotent)', opNow.labels[0].add === 'plan-now' && opNow.labels.some((l) => l.remove === 'plan-next') && opNow.labels.some((l) => l.remove === 'plan-later'));
+  const opLater = ops.find((o) => o.key === 'P-4');
+  check('buildTierLabelOps: Later item adds plan-later + removes the other two', opLater.labels[0].add === 'plan-later' && opLater.labels.filter((l) => l.remove).length === 2);
+  check('buildTierLabelOps: namespaced labels (no user-label collision)', Object.values(TIER_LABELS).join() === 'plan-now,plan-next,plan-later');
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

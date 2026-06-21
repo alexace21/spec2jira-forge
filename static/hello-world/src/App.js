@@ -26,6 +26,7 @@ import {
   IconSettings,
   IconLink,
   IconCalendar,
+  IconList,
 } from "./components/Icon";
 import {
   adaptToLegacyShape,
@@ -459,6 +460,12 @@ function App() {
   // P15 — plan-push (assign sprints in Jira) state, held separately from the breakdown push.
   const [planPush, setPlanPush] = useState({ status: "idle" }); // idle | running | done | error
   const planPushInFlightRef = useRef(false); // synchronous re-entrancy guard (double-click → one loop)
+  // P15 (kanban) — backlog-rank state, the sibling of planPush for a KANBAN plan (no sprints; we rank
+  // the Jira backlog Now→Next→Later + tag reach-tier labels). Held separately so the two panels never
+  // share state (a plan is either scrum or kanban → only one panel ever shows, but separate state keeps
+  // them fully independent).
+  const [kanbanRank, setKanbanRank] = useState({ status: "idle" }); // idle | running | done | error
+  const kanbanRankInFlightRef = useRef(false); // synchronous re-entrancy guard (double-click → one loop)
   // Chunked-push progress (2026-05-30) — UI loops pushStep, updates these.
   const [pushProgress, setPushProgress] = useState(0);
   const [pushPhase, setPushPhase] = useState("");
@@ -1339,6 +1346,7 @@ function App() {
     setTcDiscardedAtPush(tcGenerating);
     setCapturedExports(null); // v6: clear any prior capture; this push re-captures if it has test cases
     setPlanPush({ status: "idle" }); // P15: a fresh push → fresh plan-push state
+    setKanbanRank({ status: "idle" }); // P15 (kanban): a fresh push → fresh backlog-rank state
     setIsPushing(true);
     setPushProgress(0);
     setPushPhase("starting");
@@ -1909,6 +1917,41 @@ function App() {
       setPlanPush({ status: "error", error: { detail: "Sprint push failed — please try again." } });
     } finally {
       planPushInFlightRef.current = false;
+    }
+  }, [pushResult, jobId, pageData, planResult, planForm]);
+
+  // P15 (kanban) — rank the Jira backlog Now→Next→Later + tag reach-tier labels (the kanban sibling of
+  // handleAssignSprints; there are no sprints on a Kanban board). Mirrors the same state machine:
+  // startPlanPush (the SAME resolver — it branches on plan.methodology and returns kind:'rank' for a
+  // kanban plan) → loop kanbanRankStep until done. The panel is kanban-gated so we loop the rank step
+  // directly; we still GUARD that the start returned kind:'rank' (else surface the error).
+  const handleRankBacklog = useCallback(async () => {
+    if (kanbanRankInFlightRef.current || !pushResult) return; // synchronous guard — survives a same-frame double-click
+    kanbanRankInFlightRef.current = true;
+    setKanbanRank({ status: "running", progress: 0 });
+    try {
+      // pass the project the BACKLOG was pushed to (never the live Settings default — same gate as the
+      // scrum push). capture-before-purge: the post-push purge already deleted plan:<jobId>, so SEND the
+      // in-memory plan + form (the panel is gated on planResult.plan, so it's present).
+      const start = await invoke("startPlanPush", { jobId, createdIssues: pushResult.created_issues, projectKey: pushResult.project_key, namePrefix: pageData?.title, plan: planResult?.plan, capacityForm: planResult?.capacityForm || planForm });
+      if (!start || !start.ok || start.kind !== "rank") {
+        // not ok, or the backend didn't branch into rank mode (e.g. a non-kanban plan slipped through) →
+        // surface whatever the backend returned (error/detail), or a generic fallback.
+        setKanbanRank({ status: "error", error: (start && !start.ok ? start : null) || { detail: "Could not start the backlog ranking." } });
+        return;
+      }
+      const sessionId = start.sessionId;
+      for (let i = 0; i < 600; i++) { // generous bound; each step is one bounded chunk
+        const step = await invoke("kanbanRankStep", { sessionId });
+        if (!step || !step.ok) { setKanbanRank({ status: "error", error: step || { detail: "Backlog ranking failed." } }); return; }
+        if (step.done) { setKanbanRank({ status: "done", result: step }); return; }
+        setKanbanRank({ status: "running", progress: step.progress || 0 });
+      }
+      setKanbanRank({ status: "error", error: { detail: "Backlog ranking took too long — check Jira and retry." } });
+    } catch (e) {
+      setKanbanRank({ status: "error", error: { detail: "Backlog ranking failed — please try again." } });
+    } finally {
+      kanbanRankInFlightRef.current = false;
     }
   }, [pushResult, jobId, pageData, planResult, planForm]);
 
@@ -2511,9 +2554,12 @@ function App() {
           tcDiscarded={tcDiscardedAtPush}
           capturedExports={capturedExports}
           hasPlan={!!(planResult && planResult.ok && planResult.plan && (planResult.plan.methodology || "scrum") !== "kanban")}
+          hasKanbanPlan={!!(planResult && planResult.ok && planResult.plan && (planResult.plan.methodology) === "kanban")}
           planStale={!!(planResult && planResult.stale)}
           planPush={planPush}
           onAssignSprints={handleAssignSprints}
+          kanbanRank={kanbanRank}
+          onRankBacklog={handleRankBacklog}
         />
       );
     case "limit_reached":
@@ -4344,7 +4390,82 @@ function AssignSprintsPanel({ planPush, onAssignSprints, planStale = false }) {
   );
 }
 
-function PushedScreen({ result, onNew, jobId = null, onOpenDiagnostics, tcDiscarded = false, capturedExports = null, hasPlan = false, planStale = false, planPush = { status: "idle" }, onAssignSprints = null }) {
+// P15 (kanban) — the post-push "rank backlog in Jira" panel. The Kanban sibling of AssignSprintsPanel:
+// a Kanban board has no sprints, so instead we RANK the project's backlog to the plan's Now→Next→Later
+// order + tag each issue with a plan-now/plan-next/plan-later reach-tier label. Idempotent (re-run is
+// safe). Surfaces partial outcomes in DISJOINT honesty channels (§11): not-in-Jira / rank-failed /
+// label-failed — never silent. The boardNote caveat is the company-managed visible-order honesty: we
+// NEVER promise the board visibly shows the new order beyond exactly what boardNote says.
+function RankBacklogPanel({ kanbanRank, onRankBacklog, planStale = false }) {
+  const st = kanbanRank?.status || "idle";
+  const r = kanbanRank?.result || {};
+  // counts is the authoritative shape; summary is its alias at completion — accept either.
+  const c = r.counts || r.summary || {};
+  const boardNote = r.boardNote; // company-managed visible-order caveat (string|null) — render as INFO
+  const boardWarning = r.boardWarning; // >1 Kanban board warning (string|null)
+  const failureDetails = r.failureDetails || []; // §11 honesty: the specific failed issues
+  const ranked = c.ranked || 0;
+  const labeled = c.labeled || 0;
+  const noJiraKey = c.no_jira_key || 0;
+  const rankFailed = c.rank_failed || 0;
+  const labelFailed = c.label_failed || 0;
+  const total = c.total || 0;
+  // First failure reason (most actionable) — surfaced under the failed-count callout.
+  const firstFailure = (() => {
+    const f = failureDetails[0];
+    if (!f) return null;
+    if (typeof f === "string") return f;
+    // Read the ACTUAL backend failureDetails shapes (gate C10): rank-fail {error,detail}; partial-rank {error,count};
+    // label-fail {key,error}. Surface the most-actionable reason, falling back to the error code + the issue key so a
+    // label or partial-rank failure isn't silently reduced to the generic line.
+    return f.reason || f.detail || f.message || (f.error ? `${f.key || f.issue || "an issue"}: ${f.error}` : ((f.key || f.issue) ? `${f.key || f.issue}: could not be updated` : null));
+  })();
+  return (
+    <div style={{ border: "1px solid var(--s2j-border)", borderRadius: 10, padding: 16, marginBottom: 16, background: "var(--s2j-bg-section)" }}>
+      <div className="flex items-center gap-2" style={{ marginBottom: 6 }}>
+        <span style={{ color: "var(--s2j-blue)" }}><IconList size={16} /></span>
+        <strong style={{ fontSize: 14, color: "var(--s2j-text)" }}>Rank backlog in Jira</strong>
+      </div>
+      <p style={{ fontSize: 12.5, color: "var(--s2j-text-muted)", margin: "0 0 10px", lineHeight: 1.5 }}>
+        Order this project’s backlog Now → Next → Later to match the plan, and tag each issue with a
+        plan-now / plan-next / plan-later label. Re-running is safe.
+      </p>
+      {st === "running" ? (
+        <div style={{ fontSize: 13, color: "var(--s2j-text-muted)" }}>Ranking backlog + tagging labels… {Math.round((kanbanRank.progress || 0) * 100)}%</div>
+      ) : st === "error" ? (
+        <SignalCallout kind="error" title="Couldn’t rank the backlog">{kanbanRank.error?.detail || "Please try again."}</SignalCallout>
+      ) : st === "done" ? (
+        <div>
+          <SignalCallout kind="success" title={ranked === 0 && rankFailed === 0 && total >= 1 ? `Backlog already in plan order (${total} item${total === 1 ? "" : "s"})` : `Ranked ${ranked} issue${ranked === 1 ? "" : "s"} to match the plan (Now → Next → Later)`} style={{ marginBottom: 8 }}>
+            Tagged {labeled} issue{labeled === 1 ? "" : "s"} with plan-now / plan-next / plan-later labels.
+          </SignalCallout>
+          {boardNote ? <SignalCallout kind="info" title="Backlog rank updated" style={{ marginBottom: 6 }}>{boardNote}</SignalCallout> : null}
+          {boardWarning ? <SignalCallout kind="warning" title="Multiple Kanban boards" style={{ marginBottom: 6 }}>{boardWarning}</SignalCallout> : null}
+          {noJiraKey > 0 ? <SignalCallout kind="warning" title={`${noJiraKey} planned item${noJiraKey === 1 ? "" : "s"} not in Jira yet`} style={{ marginBottom: 6 }}>Push the backlog to Jira first so they can be ranked.</SignalCallout> : null}
+          {(rankFailed > 0 || labelFailed > 0) ? (
+            <SignalCallout kind={rankFailed > 0 ? "error" : "warning"} title={`${rankFailed} rank${rankFailed === 1 ? "" : "s"} + ${labelFailed} label${labelFailed === 1 ? "" : "s"} failed`} style={{ marginBottom: 6 }}>
+              {firstFailure ? <>Reason: {firstFailure} — </> : null}check your Jira board permissions and retry (it’s idempotent).
+            </SignalCallout>
+          ) : null}
+        </div>
+      ) : (
+        <>
+          {planStale ? (
+            <SignalCallout kind="warning" title="This plan may be out of date" style={{ marginBottom: 10 }}>
+              The breakdown changed since this plan was generated. Re-rank the plan before ranking the backlog, or any edited features won’t match.
+            </SignalCallout>
+          ) : null}
+          <button type="button" className="btn-primary" onClick={onRankBacklog}>Rank backlog in Jira</button>
+          <div style={{ fontSize: 10.5, color: "var(--s2j-text-light)", marginTop: 8, lineHeight: 1.5 }}>
+            Needs a Kanban board in this project. The backlog shows the new order when the board is sorted by Rank (board settings → filter ORDER BY Rank).
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+function PushedScreen({ result, onNew, jobId = null, onOpenDiagnostics, tcDiscarded = false, capturedExports = null, hasPlan = false, hasKanbanPlan = false, planStale = false, planPush = { status: "idle" }, onAssignSprints = null, kanbanRank = { status: "idle" }, onRankBacklog = null }) {
   const total = result?.total_items || result?.created_issues?.length || 0;
   const stories = result?.created_issues || [];
   const browseUrl = (key) =>
@@ -4583,8 +4704,12 @@ function PushedScreen({ result, onNew, jobId = null, onOpenDiagnostics, tcDiscar
 
       <PostPushExport captured={capturedExports} />
 
-      {/* P15 — assign the plan's sprints in Jira (only when a plan exists for this push) */}
+      {/* P15 — assign the plan's sprints in Jira (only when a SCRUM plan exists for this push) */}
       {hasPlan && onAssignSprints ? <AssignSprintsPanel planPush={planPush} onAssignSprints={onAssignSprints} planStale={planStale} /> : null}
+
+      {/* P15 (kanban) — rank the project's backlog Now→Next→Later (only when a KANBAN plan exists).
+          Mutually exclusive with AssignSprintsPanel above (a plan is either scrum or kanban). */}
+      {hasKanbanPlan && onRankBacklog ? <RankBacklogPanel kanbanRank={kanbanRank} onRankBacklog={onRankBacklog} planStale={planStale} /> : null}
 
       {/* F3 misplacement fix part 32 (2026-05-09) — "Run again on this
           page" was removed because re-running на same page POST-PUSH

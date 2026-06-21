@@ -32,7 +32,7 @@
 import api, { route } from '@forge/api';
 import { kvs } from '@forge/kvs';
 import { renderTestCasesAdf, normAC } from './testcases.js';
-import { buildSprintPushPlan } from './plan_push_util.js'; // P15 pure join (node-testable, §4-clean)
+import { buildSprintPushPlan, buildKanbanRankPlan, buildRankBatches, buildTierLabelOps, RANK_BATCH_MAX } from './plan_push_util.js'; // P15 pure joins (node-testable, §4-clean)
 
 const BULK_MAX = 50;
 // Concurrency cap для parallel issueLink creation. 6 concurrent stays well
@@ -1567,5 +1567,185 @@ function buildPlanPushResult(s) {
       overflowed: c.overflowed,
       sprint_failures: c.sprint_failures,
     },
+  };
+}
+
+// ════════════════════════════════════════════════════════════════
+// KANBAN PUSH (P15-kanban) — rank the backlog to the plan order + tier labels (the Kanban analogue of the
+// sprint push). A SIBLING path keyed on plan.methodology — the Scrum plan.sprints guard above stays intact, so
+// a kanban plan can't reach the sprint path and a scrum plan can't reach this one. The pure mapping lives in
+// plan_push_util.js; this is the Jira-calling + chunked-session half. ⚠ Jira WRITE path → LIVE-VERIFY on dev
+// before publish (POLICY §9 — the Scrum push proved 8 offline-invisible bugs). NO new scopes vs the Scrum push:
+// PUT /issue/rank uses write:issue:jira-software (present); labels use write:jira-work (present).
+// ════════════════════════════════════════════════════════════════
+
+const KANBAN_RANK_SESSION_PREFIX = 'kanban_rank_session:';
+const KANBAN_RANK_CHUNK_BATCHES = 2; // rank API calls per step (each ≤50 issues; stays under the 25s resolver kill)
+const KANBAN_LABEL_CHUNK = 10;       // per-issue label PUTs per step
+
+// ── JIRA: find the project's KANBAN board (the INVERSE of resolveScrumBoard). Accept a company-managed 'kanban'
+// board AND a team-managed 'simple' board (team-managed boards report 'simple' regardless of method — the
+// live-2026-06-21 lesson); exclude a company-managed 'scrum' board (a dedicated sprint board). Prefer 'kanban'.
+// 0 → fail loud. NOTE: /issue/rank is GLOBAL (issue-level), so the board is for a valid target + the
+// company-managed visible-order caveat, not strictly required by the rank write itself. ──
+export async function resolveKanbanBoard(projectKeyOrId) {
+  let res;
+  try { res = await api.asUser().requestJira(route`/rest/agile/1.0/board?projectKeyOrId=${projectKeyOrId}`); }
+  catch (e) { return { ok: false, error: 'board_fetch_failed', detail: String(e?.message || e) }; }
+  if (res.status === 403) return { ok: false, error: 'board_permission', detail: 'Spec2Tickets cannot read this project’s boards. The Jira admin must approve the Jira Software (board) permission in Manage Apps.' };
+  if (!res.ok) { const t = await res.text().catch(() => ''); console.error(`[kanban-push] board lookup HTTP ${res.status}: ${t.slice(0, 200)}`); return { ok: false, error: `board_http_${res.status}`, detail: 'Jira returned an error finding the project’s board.' }; }
+  let data; try { data = await res.json(); } catch (_) { data = {}; }
+  const all = Array.isArray(data.values) ? data.values : [];
+  const rankable = all.filter((b) => b && (b.type === 'kanban' || b.type === 'simple'));
+  if (rankable.length === 0) return { ok: false, error: 'no_kanban_board', detail: 'This Jira project has no Kanban board — create a Kanban board (or use a team-managed project), then try again.' };
+  const ordered = [...rankable.filter((b) => b.type === 'kanban'), ...rankable.filter((b) => b.type !== 'kanban')];
+  return { ok: true, boards: ordered.map((b) => ({ id: b.id, name: b.name, type: b.type })), boardId: ordered[0].id, boardType: ordered[0].type, multiple: ordered.length > 1 };
+}
+
+// ── JIRA: rank a batch of ≤50 issue keys after an anchor (the supported GLOBAL-rank write; NOT the per-instance
+// Rank custom field — gotcha #7). 204/200 = full success; 207 = partial (per-issue failures) → surfaced (§11). ──
+export async function rankIssuesInOrder({ issues, rankAfterIssue, rankBeforeIssue }) {
+  const list = Array.isArray(issues) ? issues.slice(0, RANK_BATCH_MAX) : [];
+  if (!list.length) return { ok: true, ranked: 0 };
+  const body = { issues: list };
+  if (rankBeforeIssue) body.rankBeforeIssue = rankBeforeIssue;
+  else if (rankAfterIssue) body.rankAfterIssue = rankAfterIssue;
+  else return { ok: false, error: 'no_anchor', detail: 'Internal: a rank batch had no anchor issue.' };
+  let res;
+  try { res = await api.asUser().requestJira(route`/rest/agile/1.0/issue/rank`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }); }
+  catch (e) { return { ok: false, error: 'rank_failed', detail: String(e?.message || e) }; }
+  if (res.status === 204 || res.status === 200) return { ok: true, ranked: list.length };
+  if (res.status === 207) {
+    let data; try { data = await res.json(); } catch (_) { data = {}; }
+    const entries = Array.isArray(data.entries) ? data.entries : [];
+    const failed = entries.filter((e) => e && Number(e.status) >= 400);
+    // 207 Multi-Status = Jira reported a PARTIAL outcome → NEVER a clean full success, even if the body shape is
+    // unrecognized (failed.length===0): surface it as partial so the user verifies the order (§11, gate G3 — the
+    // optimistic full-success-on-unknown-207-shape was the riskier direction on a WRITE path).
+    return { ok: true, ranked: Math.max(0, list.length - failed.length), partial: true, failedCount: failed.length };
+  }
+  if (res.status === 403) return { ok: false, error: 'rank_permission', detail: 'You can view but not reorder this board — ask your Jira admin for the schedule/rank permission.' };
+  const t = await res.text().catch(() => '');
+  console.error(`[kanban-push] rank HTTP ${res.status}: ${t.slice(0, 200)}`);
+  return { ok: false, error: `rank_http_${res.status}`, detail: t.slice(0, 160) };
+}
+
+// ── JIRA: set an issue's reach-tier label (add current, remove the other two — idempotent). write:jira-work. ──
+export async function tagIssueTier(issueKey, labelOps) {
+  let res;
+  try { res = await api.asUser().requestJira(route`/rest/api/3/issue/${issueKey}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ update: { labels: labelOps } }) }); }
+  catch (e) { return { ok: false, error: 'label_failed', detail: String(e?.message || e) }; }
+  if (res.status === 204 || res.ok) return { ok: true };
+  const t = await res.text().catch(() => '');
+  console.error(`[kanban-push] label HTTP ${res.status} on ${issueKey}: ${t.slice(0, 160)}`);
+  return { ok: false, error: `label_http_${res.status}`, detail: t.slice(0, 120) };
+}
+
+// ── ORCHESTRATION: start a chunked Kanban-rank session. Guards methodology, builds the pure rank/label ops,
+// resolves the kanban board (for the visible-order caveat), persists the session. The UI loops kanbanRankStep. ──
+export async function startKanbanRankSession({ jobId, plan, createdIssues, projectKey, boardId }) {
+  if (!plan || plan.methodology !== 'kanban') return { ok: false, error: 'wrong_methodology', detail: 'This is not a Kanban plan.' };
+  if (!projectKey) return { ok: false, error: 'no_project_key', detail: 'No Jira project key — push the backlog to Jira first.' };
+
+  const built = buildKanbanRankPlan(plan, createdIssues);
+  if (!built.orderedKeys.length) {
+    // Distinguish "never pushed" from "plan re-generated since the push" (gate G4): a re-rank re-mints the FE
+    // _uid, so the plan rows no longer join the FROZEN created_issues uids → everything lands in noJiraKey.
+    // Honest on BOTH causes (the old "push the backlog first" alone misled a user who already pushed).
+    return { ok: false, error: 'nothing_to_rank', detail: 'None of the planned items match issues in Jira. Push the backlog to Jira first — or, if you already pushed and then re-generated the plan, re-push the backlog so the items line up.' };
+  }
+
+  // The board is ADVISORY (gate G1): PUT /issue/rank is GLOBAL/issue-level and labels are issue-level — neither
+  // write needs a board to exist. So a missing/erroring board lookup must NOT hard-block the push; proceed
+  // best-effort with a soft note + NO visible-order caveat (boardType=null → we don't over- or under-promise).
+  const b = await resolveKanbanBoard(projectKey);
+  const boardType = b.ok ? b.boardType : null;
+  const resolvedBoardId = boardId || (b.ok ? b.boardId : null);
+  const boardWarning = b.ok
+    ? (b.multiple ? `This project has ${b.boards.length} Kanban boards — using “${b.boards[0].name}”. Verify it’s the right one (board selection is a follow-up).` : null)
+    : 'Could not find a Kanban board to confirm the target — ranking was applied to the issues globally. Open or create a Kanban board (sorted by Rank) to see the order.';
+
+  const rankBatches = buildRankBatches(built.orderedKeys);
+  const labelOps = buildTierLabelOps(built.tiers);
+
+  const sessionId = `${jobId || 'plan'}_${String(projectKey).replace(/[^A-Za-z0-9]/g, '')}_rank_${built.orderedKeys.length}`;
+  const session = {
+    sessionId, jobId: jobId || null, projectKey, boardId: resolvedBoardId, boardType, boardWarning,
+    rankBatches, labelOps, phase: rankBatches.length ? 'rank' : (labelOps.length ? 'labels' : 'done'), rankCursor: 0, labelCursor: 0,
+    lastGoodAnchor: rankBatches.length ? rankBatches[0].rankAfterIssue : null, // gate C11: chain after the last SUCCESSFULLY-ranked key, not a failed batch's tail
+    counts: { total: built.orderedKeys.length, ranked: 0, rank_failed: 0, labeled: 0, label_failed: 0, no_jira_key: built.noJiraKey.length },
+    noJiraKey: built.noJiraKey, failureDetails: [],
+  };
+  await kvs.set(KANBAN_RANK_SESSION_PREFIX + sessionId, session);
+  return { ok: true, kind: 'rank', sessionId, phase: session.phase, total: built.orderedKeys.length, progress: 0, boardWarning };
+}
+
+// ── ORCHESTRATION: advance the Kanban rank/label push by ONE bounded chunk. UI loops until { done:true }.
+// Never hard-fails the whole push on one batch/issue error (§11 disjoint counts). ──
+export async function kanbanRankSessionStep(sessionId) {
+  if (!sessionId) return { ok: false, error: 'no_session', detail: 'No session id.' };
+  const key = KANBAN_RANK_SESSION_PREFIX + sessionId;
+  const s = await kvs.get(key);
+  if (!s) return { ok: false, error: 'session_not_found', detail: 'Kanban-rank session expired — restart the push.' };
+  if (s.phase === 'done') { const r = buildKanbanRankResult(s); try { await kvs.delete(key); } catch (_) {} return { ok: true, done: true, phase: 'done', progress: 1, ...r }; }
+
+  try {
+    if (s.phase === 'rank') {
+      const end = Math.min(s.rankCursor + KANBAN_RANK_CHUNK_BATCHES, s.rankBatches.length);
+      for (; s.rankCursor < end; s.rankCursor++) {
+        const batch = s.rankBatches[s.rankCursor];
+        // gate C11: anchor after the LAST SUCCESSFULLY-ranked key (not the static prior-batch tail), so a mid-list
+        // batch failure doesn't anchor the next batch after an UN-MOVED key (which would corrupt absolute order
+        // downstream). Falls back to the batch's own static anchor for the first batch / before any success.
+        const anchor = s.lastGoodAnchor || batch.rankAfterIssue;
+        const r = await rankIssuesInOrder({ issues: batch.issues, rankAfterIssue: anchor });
+        if (r.ok) {
+          s.counts.ranked += (r.ranked || 0);
+          s.lastGoodAnchor = batch.issues[batch.issues.length - 1]; // chain the next batch after this batch's tail
+          if (r.partial) {
+            if (r.failedCount) { s.counts.rank_failed += r.failedCount; s.failureDetails.push({ phase: 'rank', error: 'partial_rank', count: r.failedCount }); }
+            else s.failureDetails.push({ phase: 'rank', error: 'partial_rank_unverified', detail: 'Jira reported a partial result (207) — verify the backlog order.' });
+          }
+        } else { s.counts.rank_failed += (Array.isArray(batch.issues) ? batch.issues.length : 0); s.failureDetails.push({ phase: 'rank', error: r.error, detail: r.detail }); }
+      }
+      if (s.rankCursor >= s.rankBatches.length) s.phase = (Array.isArray(s.labelOps) && s.labelOps.length) ? 'labels' : 'done';
+    } else if (s.phase === 'labels') {
+      const end = Math.min(s.labelCursor + KANBAN_LABEL_CHUNK, s.labelOps.length);
+      for (; s.labelCursor < end; s.labelCursor++) {
+        const op = s.labelOps[s.labelCursor];
+        const r = await tagIssueTier(op.key, op.labels);
+        if (r.ok) s.counts.labeled++; else { s.counts.label_failed++; s.failureDetails.push({ phase: 'labels', key: op.key, error: r.error, detail: r.detail }); } // `key` (not `issue`) for shape-parity with rank entries (gate C1/C10)
+      }
+      if (s.labelCursor >= s.labelOps.length) s.phase = 'done';
+    }
+  } catch (e) {
+    console.error(`[kanban-push] step exception (phase=${s.phase}): ${String(e?.message || e)} ref=${s.jobId || '-'}`);
+    return { ok: false, error: 'step_exception', detail: String(e?.message || e) };
+  }
+
+  if (s.phase === 'done') { const r = buildKanbanRankResult(s); try { await kvs.delete(key); } catch (_) {} return { ok: true, done: true, phase: 'done', progress: 1, ...r }; }
+  await kvs.set(key, s);
+  return { ok: true, done: false, phase: s.phase, progress: kanbanRankProgress(s), counts: s.counts };
+}
+
+function kanbanRankProgress(s) {
+  const total = ((s.rankBatches || []).length + (s.labelOps || []).length) || 1;
+  const done = Math.min(s.rankCursor, (s.rankBatches || []).length) + Math.min(s.labelCursor, (s.labelOps || []).length);
+  return Math.min(0.99, done / total);
+}
+
+function buildKanbanRankResult(s) {
+  const c = s.counts;
+  // ⚠ §11 honest visible-order caveat: a company-managed Kanban board ('kanban') only DISPLAYS the new rank if
+  // its filter is ORDER BY Rank; a team-managed board ('simple') always shows it. NEVER over-promise visible order.
+  const boardNote = s.boardType === 'kanban'
+    ? 'Backlog rank updated. If your board doesn’t show the new order, set it to sort by Rank (board settings → filter ORDER BY Rank).'
+    : null;
+  return {
+    counts: c,
+    boardWarning: s.boardWarning || null,
+    boardNote,
+    failureDetails: s.failureDetails || [],
+    summary: { total: c.total, ranked: c.ranked, rank_failed: c.rank_failed, labeled: c.labeled, label_failed: c.label_failed, no_jira_key: c.no_jira_key },
   };
 }

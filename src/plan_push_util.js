@@ -58,3 +58,77 @@ export function buildSprintPushPlan(plan, createdIssues, opts = {}) {
   const overflowed = (Array.isArray(plan && plan.overflow) ? plan.overflow : []).map((o) => o && o.id).filter(Boolean);
   return { groups, noJiraKey, overflowed };
 }
+
+// ════════════════════════════════════════════════════════════════
+// KANBAN PUSH (P15-kanban) — rank the backlog to the plan order + tier labels. PURE (node-testable).
+// ════════════════════════════════════════════════════════════════
+// Kanban has NO sprints — the plan IS the ordered backlog (now → next → later, pull from the top). The push
+// RANKS the Jira backlog to that order (PUT /rest/agile/1.0/issue/rank — the GLOBAL Rank, never the per-instance
+// Rank custom field, gotcha #7) + tags each issue with its reach tier. §4: 100% deterministic from the plan →
+// the mapping lives here as pure functions; the Jira-calling code is in push_handler.js. (The one LLM call —
+// advisory ranking — already happened upstream in assemblePlan.)
+
+export const RANK_BATCH_MAX = 50; // Agile rank API: max 50 issue keys per /issue/rank call
+export const TIER_LABELS = { now: 'plan-now', next: 'plan-next', later: 'plan-later' }; // namespaced → no collision with user labels
+
+// Compose plan(now/next/later uid order) ∘ push(uid→JiraKey) → the ordered Jira-key pull list + per-tier key
+// groups (for labels) + the DISJOINT noJiraKey honesty channel (§11). uid-keyed (rename-proof, the Task #3
+// lesson). The tiers are disjoint by construction (packBacklogReach assigns each feature to ONE tier), so
+// orderedKeys carries no duplicates.
+export function buildKanbanRankPlan(plan, createdIssues) {
+  const keyByUid = new Map();
+  for (const ci of (Array.isArray(createdIssues) ? createdIssues : [])) {
+    if (ci && ci.uid && ci.key) keyByUid.set(ci.uid, ci.key);
+  }
+  const orderedKeys = [];
+  const tiers = { now: [], next: [], later: [] };
+  const noJiraKey = [];
+  for (const t of ['now', 'next', 'later']) {
+    const rows = Array.isArray(plan && plan[t]) ? plan[t] : [];
+    for (const row of rows) {
+      const uid = row && row.id;
+      if (!uid) continue;
+      const key = keyByUid.get(uid);
+      if (key) { orderedKeys.push(key); tiers[t].push(key); }
+      else noJiraKey.push(uid);
+    }
+  }
+  return { orderedKeys, tiers, noJiraKey };
+}
+
+// Batch the ordered pull list into ≤50-issue rank ops, each chained AFTER the previous batch's last key, so the
+// final backlog rank == the plan order (orderedKeys[0] highest = pulled first). Batch 1 anchors after
+// orderedKeys[0] (which keeps its position; the planned block stays cohesive + ordered). Idempotent: the same
+// order yields the same ops → a re-push re-imposes the plan order (no dupes; rank is a MOVE, not a create).
+// ⚠ before/after POLARITY is a §9 LIVE-ONLY correctness check (inverted = the whole plan silently reversed) →
+// the offline test asserts the ABSOLUTE resulting sequence, and live-acceptance must eyeball top-of-backlog == now[0].
+export function buildRankBatches(orderedKeys) {
+  const keys = (Array.isArray(orderedKeys) ? orderedKeys : []).filter(Boolean);
+  const batches = [];
+  if (keys.length < 2) return batches; // 0 or 1 issue: nothing to re-order
+  let anchor = keys[0];
+  let i = 1;
+  while (i < keys.length) {
+    const chunk = keys.slice(i, i + RANK_BATCH_MAX);
+    batches.push({ issues: chunk, rankAfterIssue: anchor });
+    anchor = chunk[chunk.length - 1];
+    i += chunk.length;
+  }
+  return batches;
+}
+
+// Per-issue tier-label ops (idempotent): ADD the issue's plan-tier label + REMOVE the other two, so a re-tiered
+// issue (e.g. Now → Next on a re-push) never carries two tier labels. Jira's add/remove update verbs make
+// removing an absent label a no-op, so this is safe to re-apply.
+export function buildTierLabelOps(tiers) {
+  const all = Object.values(TIER_LABELS);
+  const ops = [];
+  for (const t of ['now', 'next', 'later']) {
+    const mine = TIER_LABELS[t];
+    const labels = [{ add: mine }, ...all.filter((l) => l !== mine).map((l) => ({ remove: l }))];
+    for (const key of (Array.isArray(tiers && tiers[t]) ? tiers[t] : [])) {
+      ops.push({ key, labels });
+    }
+  }
+  return ops;
+}

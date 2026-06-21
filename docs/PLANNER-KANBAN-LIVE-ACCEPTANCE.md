@@ -109,3 +109,28 @@
 **Bugs found live (the §9 payoff):**
 - **L1-live (Phase 4b, MEDIUM-UX):** cross-methodology toggle carries `availableDays` across the per-quarter↔per-sprint unit change → silent ~4× clamp (40/quarter → 10/sprint), invisible in the Scrum preview. The deep audit refuted it 0/3 ("the form warns"); live proved the passive InfoTip insufficient (§9 > offline). **FIX:** clear-on-toggle (App.js `handleCapacityFormChange` clears availableDays per person when methodology changes; fail-loud, never silent). Build green; **✅ LIVE-VERIFIED 2026-06-21** — toggling Kanban↔Scrum clears the available-days fields (fail-loud until re-entered for the new unit).
 - **L2-live (Phase 6c, LOW-tuning):** `MAX_QUARTER_DAYS` was **90 (calendar days)**, but the field is WORKING days and a quarter has ~65 (13 weeks × 5). So a "90" entry (calendar-days mistake) wouldn't even warn, and the clamp warning said "per-sprint figure" (wrong direction — an over-value is calendar-vs-working, not per-sprint). **FIX:** cap → **66** (working-days max + buffer) + reworded warning ("more than the ~66 working days in a typical quarter — did you enter calendar days?"). 290 tests green; **✅ LIVE-VERIFIED 2026-06-21** — Axel 67 → clamped + the reworded warning (Tedd 66 = on the edge, not clamped). (Cap adjustable.)
+
+---
+
+## Phase 8 — Kanban Push-to-Jira (rank the backlog + tier labels) — NEW feature, §9 BLOCKING
+> Built + §13-gated 2026-06-21 (5-lens multi-lens gate because Jira WRITE path; 11 confirmed → **7 code fixes applied** + accepted G5; 6 refuted sound). **0 new scopes** (`write:issue:jira-software` + `write:jira-work` already present from the Scrum push; manifest UNCHANGED → no re-consent). 430 offline tests + build green. NOT committed/deployed.
+
+**Objective:** push a Kanban plan → RANK the Jira backlog Now→Next→Later (`PUT /rest/agile/1.0/issue/rank`, global Rank) + tag plan-now/next/later labels. Pure-fn join + the chunked-session pattern; a SIBLING path keyed on `plan.methodology` (the Scrum sprint-push is byte-identical/untouched).
+
+**Action:** `forge deploy` (code-only, no new scopes → no re-consent). Push a breakdown to Jira (creates Stories) → on PushedScreen click **"Rank backlog in Jira"** (the kanban-gated panel; mutually exclusive with "Assign sprints"). Run on BOTH a **team-managed** ('simple') and a **company-managed** ('kanban') Kanban board (**SDKY** is the company-managed fixture).
+
+**⚠ BLOCKING §9 sign-offs (the gate's HIGH + 2 MED — offline-invisible; the Scrum push proved 8 such):**
+- **POLARITY (HIGH):** the rank API preserving the issues-array order after an anchor is UNDOCUMENTED. **EYEBALL: top of backlog == now[0], full sequence == now→next→later (NOT reversed, NOT shuffled).** Test a >50-feature plan too (the multi-batch chaining seam). If reversed → the whole plan is silently inverted.
+- **SCOPE (MED):** confirm `PUT /issue/rank` returns 2xx (NOT 401/403) on dev — the rank ROUTE is new-to-this-scope (the Scrum live caught a scope-insufficiency). 401/403 → a scope is missing → re-consent; do NOT publish.
+- **BOARD-TYPE / VISIBLE-ORDER (MED):** confirm resolveKanbanBoard reports 'simple' for team-managed + 'kanban' for company-managed; on a company-managed board the **boardNote caveat** fires + the order appears once the board filter is ORDER BY Rank (never over-promise visible order before that).
+
+**Also verify (the gate fixes):** noJiraKey channel ("push the backlog first") · a partial/permission failure surfaces a REASON (not the generic line) · re-push is idempotent (no dupes, same order) · a board-less project / board-endpoint hiccup → proceeds best-effort with a soft warning (G1) · the tier labels (plan-now/next/later) land + a re-tier removes the old label.
+
+**RESULT:** ✅✅ **PASS — LIVE-ACCEPTED on a company-managed Kanban board (SDKY, 2026-06-21).** Pushed breakdown (65 items in SDKY) → "Rank backlog in Jira" → **"Ranked 13 issues + Tagged 14 with plan-now/plan-next/plan-later labels"** + the boardNote caveat fired (company-managed detection ✓). All 3 BLOCKING §9 sign-offs GREEN:
+> - ① **POLARITY ✅** — board filter `ORDER BY Rank ASC`; filtered **plan-now (10)** = SDKY-2,6,9,7,3,8,11,12,4,14 (EXACT plan Now order, **not** creation order → rank applied; starts with Application Intake = Now[0], **not reversed**); **plan-next (4)** = SDKY-5,15,10,13 (EXACT plan Next order). The undocumented Jira array-order-preservation HELD live.
+> - ② **SCOPE ✅** — the push returned success with NO 401/403 and NO admin re-consent prompt → `write:issue:jira-software` covers `PUT /issue/rank`.
+> - ③ **BOARD-TYPE / visible-order ✅** — company-managed board detected (boardNote caveat shown); order visible because the board filter is `ORDER BY Rank`.
+> - Later=0 (whole backlog within optimistic reach) → no plan-later label, correctly. (plan-later absent because the tier was empty — expected.)
+> - Minor live-found copy bug FIXED (the idle note falsely said "may prompt … new board-rank permission" — there are NO new scopes; reworded to the ORDER-BY-Rank hint).
+>
+> **⇒ Kanban push LIVE-ACCEPTED. The WHOLE planner arc (Scrum planner + Kanban planner v1 + Kanban push) is COMPLETE + accepted → commit + prod deploy `release/v6.1.0`.**
