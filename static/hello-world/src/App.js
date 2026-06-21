@@ -4349,6 +4349,9 @@ function AssignSprintsPanel({ planPush, onAssignSprints, planStale = false }) {
   const sm = planPush?.result?.summary || {};
   const sprints = planPush?.result?.sprintsCreated || [];
   const boardWarning = planPush?.result?.boardWarning;
+  // §11: a 207 partial sprint-move bumps no assign_failed counter, so the failed-count callout below won't fire for
+  // it — surface the backend's "verify" nudge on its own channel (mirrors RankBacklogPanel's unverifiedPartial).
+  const unverifiedPartial = (planPush?.result?.failureDetails || []).find((f) => f && f.error === "partial_assign_unverified") || null;
   return (
     <div style={{ border: "1px solid var(--s2j-border)", borderRadius: 10, padding: 16, marginBottom: 16, background: "var(--s2j-bg-section)" }}>
       <div className="flex items-center gap-2" style={{ marginBottom: 6 }}>
@@ -4372,6 +4375,7 @@ function AssignSprintsPanel({ planPush, onAssignSprints, planStale = false }) {
           {sm.no_jira_key > 0 ? <SignalCallout kind="info" title={`${sm.no_jira_key} planned feature${sm.no_jira_key === 1 ? "" : "s"} not in Jira`} style={{ marginBottom: 6 }}>Not part of the pushed backlog, so they couldn’t be assigned.</SignalCallout> : null}
           {sm.overflowed > 0 ? <SignalCallout kind="info" title={`${sm.overflowed} overflowed feature${sm.overflowed === 1 ? "" : "s"}`} style={{ marginBottom: 6 }}>Didn’t fit any sprint in the plan, so they weren’t assigned.</SignalCallout> : null}
           {(sm.assign_failed > 0 || sm.sprint_failures > 0) ? <SignalCallout kind="warning" title="Some assignments failed">{sm.sprint_failures || 0} sprint(s) + {sm.assign_failed || 0} issue(s) failed — check your Jira board permissions and retry (it’s idempotent).</SignalCallout> : null}
+          {unverifiedPartial ? <SignalCallout kind="warning" title="Verify the sprint assignment" style={{ marginBottom: 6 }}>{unverifiedPartial.detail || "Jira reported a partial result (207) — open your board and verify each Story landed in its sprint."}</SignalCallout> : null}
         </div>
       ) : (
         <>
@@ -4420,6 +4424,11 @@ function RankBacklogPanel({ kanbanRank, onRankBacklog, planStale = false }) {
     // label or partial-rank failure isn't silently reduced to the generic line.
     return f.reason || f.detail || f.message || (f.error ? `${f.key || f.issue || "an issue"}: ${f.error}` : ((f.key || f.issue) ? `${f.key || f.issue}: could not be updated` : null));
   })();
+  // §11 (pre-prod gate finding #3): a 207 "partial-unverified" rank bumps NO counter (rank_failed stays 0), so the
+  // failed-count callout below never fires for it — the backend's "verify the order" instruction would be silently
+  // dropped and a Jira-reported PARTIAL would read as a clean full success. Surface it on its own honesty channel.
+  // Additive: never hides a count; the success line still renders alongside as a separate, disjoint signal.
+  const unverifiedPartial = failureDetails.find((f) => f && f.error === "partial_rank_unverified") || null;
   return (
     <div style={{ border: "1px solid var(--s2j-border)", borderRadius: 10, padding: 16, marginBottom: 16, background: "var(--s2j-bg-section)" }}>
       <div className="flex items-center gap-2" style={{ marginBottom: 6 }}>
@@ -4445,6 +4454,11 @@ function RankBacklogPanel({ kanbanRank, onRankBacklog, planStale = false }) {
           {(rankFailed > 0 || labelFailed > 0) ? (
             <SignalCallout kind={rankFailed > 0 ? "error" : "warning"} title={`${rankFailed} rank${rankFailed === 1 ? "" : "s"} + ${labelFailed} label${labelFailed === 1 ? "" : "s"} failed`} style={{ marginBottom: 6 }}>
               {firstFailure ? <>Reason: {firstFailure} — </> : null}check your Jira board permissions and retry (it’s idempotent).
+            </SignalCallout>
+          ) : null}
+          {unverifiedPartial ? (
+            <SignalCallout kind="warning" title="Verify the backlog order" style={{ marginBottom: 6 }}>
+              {unverifiedPartial.detail || "Jira reported a partial result (207) — open your board (sorted by Rank) and verify the Now → Next → Later order."}
             </SignalCallout>
           ) : null}
         </div>

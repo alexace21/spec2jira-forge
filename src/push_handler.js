@@ -1479,6 +1479,10 @@ export async function moveIssuesToSprint(sprintId, keys) {
   let res;
   try { res = await api.asUser().requestJira(route`/rest/agile/1.0/sprint/${sprintId}/issue`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ issues: list }) }); }
   catch (e) { return { ok: false, error: 'move_failed', detail: String(e?.message || e) }; }
+  // 207 Multi-Status = Jira reported a PARTIAL move → never a clean full assign on a WRITE path. The sprint-move
+  // body has no documented per-issue shape, so surface it as partial-unverified (mirrors the rank path's §11/gate-G3
+  // stance: a 207 means "verify", even on an unrecognized body). MUST precede the res.ok line — res.ok is true for 207.
+  if (res.status === 207) return { ok: true, moved: list.length, partial: true };
   if (res.status === 204 || res.ok) return { ok: true, moved: list.length };
   const t = await res.text().catch(() => '');
   console.error(`[plan-push] move-to-sprint HTTP ${res.status}: ${t.slice(0, 200)}`);
@@ -1548,8 +1552,12 @@ export async function planPushSessionStep(sessionId) {
       else {
         const chunk = g.keys.slice(g.assignCursor, g.assignCursor + SPRINT_MOVE_MAX);
         const r = await moveIssuesToSprint(g.sprintId, chunk);
-        if (r.ok) s.counts.issues_assigned += (r.moved || chunk.length);
-        else { s.counts.assign_failed += chunk.length; s.failureDetails.push({ sprint: g.name, error: r.error, detail: r.detail, count: chunk.length }); }
+        if (r.ok) {
+          s.counts.issues_assigned += (r.moved || chunk.length);
+          // §11 mirror of the rank path: a 207 partial move bumps no assign_failed counter (the body isn't per-issue
+          // countable), so record an unverified-partial detail → the FE can nudge "verify" instead of a silent full success.
+          if (r.partial) s.failureDetails.push({ sprint: g.name, error: 'partial_assign_unverified', detail: 'Jira reported a partial result (207) — verify the sprint assignment.' });
+        } else { s.counts.assign_failed += chunk.length; s.failureDetails.push({ sprint: g.name, error: r.error, detail: r.detail, count: chunk.length }); }
         g.assignCursor += chunk.length;
         if (g.assignCursor >= g.keys.length) s.cursor++;
         if (s.cursor >= s.groups.length) s.phase = 'done';
