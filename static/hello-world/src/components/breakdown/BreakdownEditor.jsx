@@ -1,5 +1,6 @@
 import { useState, useMemo, useEffect } from 'react';
 import EditableField from './EditableField.jsx';
+import { newStoryUid } from '../../lib/v3Schema';
 import CapabilityCard from './CapabilityCard.jsx';
 import SharedACPanel from './SharedACPanel.jsx';
 import LabelsEditor from './LabelsEditor.jsx';
@@ -30,7 +31,7 @@ export default function BreakdownEditor({ initialBreakdown, onPush, isPushing = 
   function deleteCapability(i) { if (breakdown.capabilities.length <= 1) return; setBreakdown((p) => ({ ...p, capabilities: p.capabilities.filter((_, idx) => idx !== i) })); }
   function addCapability() {
     setBreakdown((p) => ({ ...p, capabilities: [...p.capabilities, {
-      name: 'New Capability', features: [{ name: 'New Feature', user_story: 'As a user, I want [goal], so that [benefit].',
+      name: 'New Category', features: [{ _uid: newStoryUid(), _orig_name: 'New Feature', name: 'New Feature', user_story: 'As a user, I want [goal], so that [benefit].',
         acceptance_criteria: ['Acceptance criterion'], priority: 'Medium', story_points: 3, complexity_score: 3,
         tasks: [{ type: 'API', summary: 'New task' }] }]
     }] }));
@@ -111,12 +112,12 @@ export default function BreakdownEditor({ initialBreakdown, onPush, isPushing = 
       }}>
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-4 text-xs">
-            <StatChip label="Epics"  value={stats.capCount}     color="var(--s2j-blue)" />
+            <StatChip label="Categories"  value={stats.capCount}     color="var(--s2j-blue)" />
             <StatChip label="Stories" value={stats.featureCount} color="var(--s2j-green)" />
             <StatChip label="Tasks"  value={stats.taskCount}    color="var(--s2j-orange)" />
             <StatChip label="Total SP" value={stats.totalSP}    color="var(--s2j-text)" highlight />
             <span className="text-[11px]" style={{ color: 'var(--s2j-text-muted)' }}>
-              {stats.totalItems} JIRA items
+              {stats.totalItems} Jira items
             </span>
           </div>
           <button onClick={resetBreakdown}
@@ -210,20 +211,25 @@ export default function BreakdownEditor({ initialBreakdown, onPush, isPushing = 
         borderTop: '1px solid var(--s2j-border)',
         background: 'var(--s2j-bg-section)',
       }}>
-        <div className="flex items-center justify-between">
+        <div className="flex items-center justify-between gap-3">
           <p className="text-xs" style={{ color: 'var(--s2j-text-light)' }}>
             {stats.totalItems} items will be created
           </p>
-          <button onClick={() => onPush(breakdown)} disabled={isPushing} className="btn-primary">
-            {isPushing ? (
-              <>
-                <SpinnerInline />
-                Validating...
-              </>
-            ) : (
-              'Push to JIRA →'
-            )}
-          </button>
+          <div className="flex items-center gap-2">
+            {/* Test-case generation moved to the Review screen (ConfirmScreen) — the SINGLE
+                entry point, so the BA's edits are always lifted into pendingBreakdown (via this
+                Push→Review step) before generating. Removes the edits-trapped-in-editor bug (#1). */}
+            <button onClick={() => onPush(breakdown)} disabled={isPushing} className="btn-primary">
+              {isPushing ? (
+                <>
+                  <SpinnerInline />
+                  Creating in Jira...
+                </>
+              ) : (
+                'Continue to Review →'
+              )}
+            </button>
+          </div>
         </div>
       </div>
     </div>

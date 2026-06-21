@@ -21,7 +21,9 @@
 
 import { kvs } from '@forge/kvs';
 
-import { BREAKDOWN_SCHEMA, SYSTEM_PROMPT, buildProjectContextSystemText } from './prompts.js';
+import { BREAKDOWN_SCHEMA, SYSTEM_PROMPT, buildProjectContextSystemText, TEST_CASE_SCHEMA, TEST_CASE_SYSTEM_PROMPT, buildTestCaseUserPrompt, buildSpecSourceSystemText, PLAN_RANKING_SCHEMA, PLAN_RANKING_SYSTEM_PROMPT, buildPlanRankingUserPrompt } from './prompts.js';
+import { parseTestCaseResult } from './testcases.js';
+import { planRankingMaxTokens } from './planner.js'; // single source of truth for the ranking max_tokens (matches estimatePlanCost)
 
 // ── Constants ──────────────────────────────────────────────
 
@@ -31,6 +33,27 @@ const ANTHROPIC_VERSION = '2023-06-01';
 
 export const MODEL_PRIMARY = 'claude-sonnet-4-6';
 export const MODEL_FALLBACK = 'claude-haiku-4-5';
+
+// Output cap for the per-Story test-case Sonnet batch. 8000 tokens: headroom for the
+// richest/monster stories. Batch is async so the 25s resolver limit binds ONLY on the
+// POLL resolver (fetch+parse of the already-complete JSONL), NOT on Sonnet's generation
+// time — so a generous cap is free insurance against truncating a dense Story. The
+// reactive sub-chunk was dropped (Sonnet single-call covers ~100% on validated dense
+// stories), so this cap IS the worst-case safety margin. Engineering owns this cap (§4).
+// 24000 (8000→16000→24000, 2026-06-06): per-story output is bounded by the 20-case CEILING (raised
+// from 15 so a full decision-table story fits its whole matrix without compressing/hedging). This
+// cap tracks the densest SINGLE story (≤20 verbose cases with long verbatim ac_text + §7 rule-
+// derived cells ≈ ~20K worst case; 24K = headroom so the 20-case CEILING — not the token cap — is
+// what bounds output, never a mid-case truncation), NOT the spec size (a bigger spec = more stories
+// = more batch requests, each independently capped). CEILING, not a target — normal stories cost the
+// same; tracks the case ceiling (raise together). Poll-scale: docs §5 #4 — chunked poll is the
+// >50-dense-story follow-up.
+export const TC_MAX_OUTPUT_TOKENS = 24000;
+
+// Feed-side char cap for the shared SOURCE SPECIFICATION block injected into the test-case
+// batch (one cache-write + N-1 cache-reads). Exported so the v6 cost PROJECTOR clamps the
+// spec-source input identically to what submitTestCaseBatch actually sends — no estimate drift.
+export const TC_SPEC_SOURCE_MAX_CHARS = 80000;
 
 // Output cap. Sonnet 4.6's max output is 64K tokens — we use ALL of it for
 // maximum headroom (it is a CEILING, not a target: a small spec still emits a
@@ -53,18 +76,40 @@ export const KVS_API_KEY_NAME = 'anthropic_api_key';
 // ── BYOK key management ────────────────────────────────────
 
 /**
- * Retrieve customer's stored Anthropic API key от Forge KVS secret storage.
- * Returns null когато not configured (Settings UI not completed yet).
+ * [diag Phase 4, A4 — worst offender #2] Stored-key read WITH fault visibility.
+ * Returns { key: string|null, fault: boolean }: fault=true ONLY when the secret
+ * READ threw (a Forge storage fault — the key may still be saved); a clean read
+ * that finds nothing is { key: null, fault: false } (the honest "never set").
+ * Gate sites that map !key → not_configured MUST check fault FIRST, else a
+ * storage fault is misdiagnosed as "no key" and support chases the wrong cause.
  */
-export async function getStoredApiKey() {
+export async function getStoredApiKeyInfo() {
   try {
     const key = await kvs.getSecret(KVS_API_KEY_NAME);
-    return key || null;
+    return { key: key || null, fault: false };
   } catch (e) {
     console.warn(`[anthropic] kvs.getSecret failed: ${String(e?.message || e)}`);
-    return null;
+    return { key: null, fault: true };
   }
 }
+
+/**
+ * Retrieve customer's stored Anthropic API key от Forge KVS secret storage.
+ * Returns null когато not configured (Settings UI not completed yet).
+ * [diag Phase 4, A4] Delegates to getStoredApiKeyInfo — the fault flag collapses
+ * to null here, so every caller that doesn't need the distinction is unchanged.
+ */
+export async function getStoredApiKey() {
+  const { key } = await getStoredApiKeyInfo();
+  return key;
+}
+
+// [diag Phase 4, A4] Honest user-facing text for the storage-FAULT case, shared by every
+// gate site (testConnection below + the index.js resolvers import it) so the wording can
+// never diverge. VERBATIM RULE: not_configured's existing text is UNCHANGED everywhere —
+// this is a NEW code+detail pair, never a replacement.
+export const KEY_STORAGE_FAILED_DETAIL =
+  'We could not READ your stored Anthropic key from Forge storage (a storage fault — your key may still be saved). Try again in a moment; if it persists, contact support@spec2jira.com.';
 
 /**
  * Persist customer's Anthropic API key to Forge KVS secret storage.
@@ -149,7 +194,19 @@ Return the breakdown strictly conforming к the provided JSON schema. Apply the 
  * {ok: false, error: '...', detail: '...'} on failure.
  */
 export async function testConnection(apiKey = null) {
-  const key = apiKey || (await getStoredApiKey());
+  // [diag Phase 4, A4] When no override key was passed, read the stored key WITH fault
+  // visibility: a thrown secret read surfaces as key_storage_failed (the honest cause),
+  // never as not_configured. No recordDiagnostic here — this module has no resolver
+  // context; the index.js testConnection resolver records op 'settings.key' when it
+  // sees this error code.
+  let key = apiKey;
+  if (!key) {
+    const info = await getStoredApiKeyInfo();
+    if (!info.key && info.fault) {
+      return { ok: false, error: 'key_storage_failed', detail: KEY_STORAGE_FAILED_DETAIL };
+    }
+    key = info.key;
+  }
   if (!key) {
     return {
       ok: false,
@@ -192,18 +249,23 @@ export async function testConnection(apiKey = null) {
   if (response.status === 402 || response.status === 429) {
     // 402 = insufficient credits, 429 = rate limit
     const text = await response.text();
+    console.error(`[anthropic] testConnection HTTP ${response.status}: ${text.substring(0, 300)}`);
     return {
       ok: false,
       error: response.status === 402 ? 'insufficient_credits' : 'rate_limited',
-      detail: text.substring(0, 300),
+      detail:
+        response.status === 402
+          ? 'Your Anthropic account has insufficient credits. Add credits at console.anthropic.com, then try again.'
+          : 'Anthropic is rate-limiting requests right now. Please try again in a moment.',
     };
   }
   if (!response.ok) {
     const text = await response.text();
+    console.error(`[anthropic] testConnection HTTP ${response.status}: ${text.substring(0, 300)}`);
     return {
       ok: false,
       error: `anthropic_${response.status}`,
-      detail: text.substring(0, 300),
+      detail: 'The AI service returned an error. Please try again in a moment; if it persists, contact support@spec2jira.com.',
     };
   }
 
@@ -214,21 +276,35 @@ export async function testConnection(apiKey = null) {
 // ── Cost estimator ──────────────────────────────────────────
 
 /**
- * Estimate cost of a breakdown generation call в USD от its token usage.
- * Used by tier enforcement к decide когато customer hits subscription cap.
+ * Estimate cost of a Claude call в USD от its token usage.
+ * Used by tier enforcement + (v6) the customer-facing cost-transparency surface.
  *
- * Sonnet 4.6 pricing (verified 2026-05-27):
+ * Sonnet 4.6 pricing (verified 2026-05-27, standard/sync rates):
  *   Base input: $3.00 / MTok | Cache write 5m: $3.75 | Cache read: $0.30
  *   Output: $15.00
  *
  * Haiku 4.5 pricing:
  *   Base input: $1.00 / MTok | Cache write: $1.25 | Cache read: $0.10
  *   Output: $5.00
+ *
+ * ⭐ v6 — `opts.batch`: the Message Batches API is 50% of standard prices on ALL
+ * token usage (confirmed Anthropic API ref). BOTH breakdown AND test-case generation
+ * run via Batches, so their REAL cost is half what the sync rates above give. Pass
+ * `{ batch: true }` for any batch-submitted usage (default false preserves the default-rate
+ * math for any caller that omits the flag — byte-identical to pre-v6). Omitting it OVER-STATES
+ * the bill 2×, which on a customer-facing echo is its own trust failure.
  */
-export function estimateCost(usage, model = MODEL_PRIMARY) {
-  const rates = model.startsWith('claude-haiku')
+export function estimateCost(usage, model = MODEL_PRIMARY, { batch = false } = {}) {
+  const f = batch ? 0.5 : 1; // Batches API = 50% of standard prices, on every bucket
+  const base = model.startsWith('claude-haiku')
     ? { input: 1.0, cache_write: 1.25, cache_read: 0.1, output: 5.0 }
     : { input: 3.0, cache_write: 3.75, cache_read: 0.3, output: 15.0 };
+  const rates = {
+    input: base.input * f,
+    cache_write: base.cache_write * f,
+    cache_read: base.cache_read * f,
+    output: base.output * f,
+  };
 
   const inputTokens = usage?.input_tokens || 0;
   const cacheCreateTokens = usage?.cache_creation_input_tokens || 0;
@@ -254,6 +330,104 @@ export function estimateCost(usage, model = MODEL_PRIMARY) {
       cache_read: cacheReadTokens,
       output: outputTokens,
     },
+  };
+}
+
+/**
+ * Null-safe sum of N Anthropic usage blocks into one (for the batch-wide post-run echo).
+ * A test-case batch returns one usage block per Story (per request); the customer's bill
+ * is the SUM across the run. Pure.
+ */
+export function sumUsage(usages) {
+  const acc = { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 };
+  for (const u of usages || []) {
+    if (!u) continue;
+    acc.input_tokens += u.input_tokens || 0;
+    acc.output_tokens += u.output_tokens || 0;
+    acc.cache_creation_input_tokens += u.cache_creation_input_tokens || 0;
+    acc.cache_read_input_tokens += u.cache_read_input_tokens || 0;
+  }
+  return acc;
+}
+
+// ── v6 cost-transparency: pre-flight PROJECTOR for a test-case run ──────────────
+// PURE, deterministic (POLICY §4) — projects an HONEST batch-priced cost RANGE from the
+// breakdown shape BEFORE spending, so the customer consents against the worst realistic case.
+// It does NOT call count_tokens: the bill-driving axis is OUTPUT (16× variance) which is
+// UNCOUNTABLE ahead of time, so count_tokens would only make the cheap INPUT half precise
+// while charging an extra BYOK call + Confirm-step latency — false confidence. char/4 heuristic
+// on input + an AC-scaled output heuristic is the honest shape for a 16×-variance quantity.
+//
+// ⚠ The per-AC / per-story constants below are UNCALIBRATED heuristics (no production echo data
+// yet). They MUST be calibrated against a handful of REAL echoed runs before relying on the
+// EXPECTED figure — the post-run echo (sumUsage → estimateCost) is the ground truth that feeds
+// that calibration. Until then the UPPER bound is deliberately generous so the echo rarely
+// exceeds it (under-stating then echoing higher is a worse trust failure than over-stating).
+const CHARS_PER_TOKEN = 4; // standard rough English approximation; exact counts come from the echo
+const TC_USER_BASE_TOKENS = 500; // per-story user-prompt scaffold (buildTestCaseUserPrompt fixed parts)
+const TC_INPUT_TOKENS_PER_AC = 120; // per-AC input text in the user block
+const TC_OUTPUT_BASE_TOKENS = 400; // per-story output floor scaffold
+const TC_OUTPUT_TOKENS_PER_AC = 700; // ~one scenario cluster of output per AC
+const TC_OUTPUT_FLOOR_TOKENS = 600; // a story always emits at least this much
+// Cap the EXPECTED per-story output strictly BELOW the per-story output ceiling so expected < upper
+// ALWAYS holds (even an extreme-AC story never quotes the 24K ceiling as its EXPECTED value). The
+// UPPER bound is the full ceiling (TC_MAX_OUTPUT_TOKENS), so it is a genuine worst-case the echo
+// can never exceed (see the upper-output assignment below).
+const TC_EXPECTED_OUTPUT_CAP = Math.floor(TC_MAX_OUTPUT_TOKENS * 0.85);
+
+/**
+ * Project a test-case run's cost. The shared system + source-spec block is cache-amortized
+ * (1 cache-write + N-1 cache-reads — NOT N× full price, which would over-state ~10×). Output
+ * is heuristic, clamped to the per-story TC_MAX_OUTPUT_TOKENS ceiling but NEVER quoting the
+ * ceiling as the expected value. Returns batch-priced USD.
+ * @param {object} args
+ * @param {number[]} args.storyACcounts - per-story acceptance-criteria counts (length = story count)
+ * @param {number} [args.specSourceChars] - chars of the cached SOURCE SPECIFICATION block (0 if none)
+ * @param {string} [args.model]
+ * @returns {{expected_usd:number, upper_usd:number, story_count:number, ac_total:number}}
+ */
+export function projectTestCaseCost({ storyACcounts = [], specSourceChars = 0, model = MODEL_PRIMARY } = {}) {
+  const counts = Array.isArray(storyACcounts) ? storyACcounts : [];
+  const N = counts.length;
+  if (N === 0) return { expected_usd: 0, upper_usd: 0, story_count: 0, ac_total: 0 };
+
+  const clampedSourceChars = Math.min(Math.max(0, Number(specSourceChars) || 0), TC_SPEC_SOURCE_MAX_CHARS);
+  // Shared ephemeral block (system prompt + optional source spec): written ONCE, read N-1 times.
+  const sharedTokens = Math.ceil((TEST_CASE_SYSTEM_PROMPT.length + clampedSourceChars) / CHARS_PER_TOKEN);
+
+  let userInputTokens = 0;
+  let expectedOutputTokens = 0;
+  let upperOutputTokens = 0;
+  let acTotal = 0;
+  for (const raw of counts) {
+    const ac = Math.max(0, Number(raw) || 0);
+    acTotal += ac;
+    userInputTokens += TC_USER_BASE_TOKENS + ac * TC_INPUT_TOKENS_PER_AC;
+    const expOut = Math.min(
+      Math.max(TC_OUTPUT_BASE_TOKENS + ac * TC_OUTPUT_TOKENS_PER_AC, TC_OUTPUT_FLOOR_TOKENS),
+      TC_EXPECTED_OUTPUT_CAP, // expected stays below the ceiling so expected < upper always
+    );
+    expectedOutputTokens += expOut;
+    // ⭐ UPPER = the TRUE per-story output ceiling (TC_MAX_OUTPUT_TOKENS = the real max_tokens cap a
+    // single request can emit). "up to ~$X" must be a GENUINE ceiling the echo can NEVER exceed — the
+    // deep audit (3 personas) caught that a multiplier-on-expected upper sat 1.5–8× below the real
+    // per-story cap for typical low-AC stories, so a verbose run could blow past "up to". BYOK means
+    // over-stating the ceiling costs the vendor nothing; the "(typically ~$Y)" anchor prevents scare.
+    upperOutputTokens += TC_MAX_OUTPUT_TOKENS;
+  }
+
+  const sharedUsage = {
+    cache_creation_input_tokens: sharedTokens, // written once (story 0)
+    cache_read_input_tokens: sharedTokens * (N - 1), // read by the other N-1
+    input_tokens: userInputTokens, // per-story user blocks, uncached
+  };
+  const expected = estimateCost({ ...sharedUsage, output_tokens: expectedOutputTokens }, model, { batch: true });
+  const upper = estimateCost({ ...sharedUsage, output_tokens: upperOutputTokens }, model, { batch: true });
+  return {
+    expected_usd: expected.total_usd,
+    upper_usd: upper.total_usd,
+    story_count: N,
+    ac_total: acTotal,
   };
 }
 
@@ -394,8 +568,8 @@ export async function submitBreakdownBatch({
   }
   if (!response.ok) {
     const text = await response.text();
-    console.warn(`[anthropic-batch] submit HTTP ${response.status}: ${text.substring(0, 300)}`);
-    return { error: `anthropic_${response.status}`, detail: text.substring(0, 500) };
+    console.warn(`[anthropic-batch] submit HTTP ${response.status}: ${text.substring(0, 500)}`);
+    return { error: `anthropic_${response.status}`, detail: 'The AI service returned an error. Please try again in a moment; if it persists, contact support@spec2jira.com.' };
   }
 
   const data = await response.json();
@@ -444,7 +618,8 @@ export async function pollBatchStatus(batchId, apiKeyOverride = null) {
   if (response.status === 404) return { error: 'batch_not_found', detail: `Batch ${batchId} not found.` };
   if (!response.ok) {
     const text = await response.text();
-    return { error: `anthropic_${response.status}`, detail: text.substring(0, 300) };
+    console.error(`[anthropic-batch] poll HTTP ${response.status}: ${text.substring(0, 300)}`);
+    return { error: `anthropic_${response.status}`, detail: 'The AI service returned an error. Please try again in a moment; if it persists, contact support@spec2jira.com.' };
   }
 
   const data = await response.json();
@@ -485,7 +660,8 @@ export async function fetchBatchResults(resultsUrl, customId, apiKeyOverride = n
 
   if (!response.ok) {
     const text = await response.text();
-    return { error: `results_fetch_${response.status}`, detail: text.substring(0, 300) };
+    console.error(`[anthropic-batch] results fetch HTTP ${response.status}: ${text.substring(0, 300)}`);
+    return { error: `results_fetch_${response.status}`, detail: "Couldn't retrieve the generated result — please try Generate again." };
   }
 
   // Results are JSONL — one line per request in the batch (we have 1).
@@ -527,7 +703,7 @@ export async function fetchBatchResults(resultsUrl, customId, apiKeyOverride = n
   }
 
   if (message.stop_reason === 'refusal') {
-    return { error: 'refused', detail: 'Anthropic refused to process this spec.', usage: message.usage };
+    return { error: 'refused', detail: 'Anthropic declined to process this page. Review the page content and try again.', usage: message.usage };
   }
 
   const truncated = message.stop_reason === 'max_tokens';
@@ -552,12 +728,12 @@ export async function fetchBatchResults(resultsUrl, customId, apiKeyOverride = n
           model: message.model,
           stop_reason: message.stop_reason,
           truncated: true,
-          truncation_note: `Output exceeded ${MAX_OUTPUT_TOKENS} tokens. Recovered ${salvaged.features.length} complete features; later features may be missing. Consider splitting the spec.`,
+          truncation_note: `Output exceeded ${MAX_OUTPUT_TOKENS} tokens. Recovered ${salvaged.features.length} complete features; later features may be missing. Consider splitting the page.`,
         };
       }
       return {
         error: 'truncated',
-        detail: `Output exceeded ${MAX_OUTPUT_TOKENS} tokens and could not be recovered. The spec is too large for a single breakdown — split it into smaller specs (e.g., per major capability area) and run each separately.`,
+        detail: `Output exceeded ${MAX_OUTPUT_TOKENS} tokens and could not be recovered. The page is too large for a single breakdown — split it into smaller pages (e.g., per major capability area) and run each separately.`,
         usage: message.usage,
       };
     }
@@ -579,6 +755,342 @@ export async function fetchBatchResults(resultsUrl, customId, apiKeyOverride = n
     stop_reason: message.stop_reason,
     ...(truncated ? { truncated: true, truncation_note: `Output reached ${MAX_OUTPUT_TOKENS} tokens but parsed completely.` } : {}),
   };
+}
+
+// ── Test-case batch lifecycle (cloned from submitBreakdownBatch / pollBatchStatus /
+//    fetchBatchResults). One Anthropic Batches API batch per startTestCaseGeneration
+//    call, carrying N requests — one per Story (custom_id = story array index). The
+//    batch transport is identical; what changes is the prompt, schema, and parse.
+// ────────────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Build the per-Story cross-feature dependency-context resolver for a test-gen batch.
+ * Resolves a Story's IMMEDIATE edges (its dependsOn + the reverse "blocks") to the peer's
+ * CURRENT name + one-line, keyed by the FROZEN _orig_name so a peer (or this Story) renamed
+ * in the editor STILL resolves instead of being silently dropped as dangling (Task #4 #2,
+ * mirrors the Review-display fix). dependencies[] stays frozen name strings; _orig_name
+ * (frozen at adaptToLegacyShape) is the stable key; the LLM then reads the CURRENT name.
+ * Self-edges + genuinely-dangling edges (a deleted peer) are still dropped. Pure function,
+ * exported for the offline test. Returns (story) => {dependsOn, blocks}.
+ * @param {Array<object>} peerStories the FULL breakdown feature list (NOT a 1-Story regen batch)
+ */
+export function buildDependencyResolver(peerStories) {
+  const peers = Array.isArray(peerStories) ? peerStories : [];
+  const oneLineOf = (st) => String((st && (st.user_story || st.description)) || '').replace(/\s+/g, ' ').trim().slice(0, 160);
+  const keyOf = (st) => (st && ((typeof st._orig_name === 'string' && st._orig_name) || st.name)) || '';
+  const summaryByName = new Map();    // CURRENT name → one-line
+  const currentByOrig = new Map();    // FROZEN _orig_name → CURRENT name (resolve a frozen dep string)
+  const dependentsByOrig = new Map(); // FROZEN dep string → [CURRENT dependent names]
+  for (const st of peers) {
+    if (st && typeof st.name === 'string' && st.name) summaryByName.set(st.name, oneLineOf(st));
+    const k = keyOf(st);
+    if (k && !currentByOrig.has(k)) currentByOrig.set(k, (st && st.name) || k); // first-match on a duplicate _orig_name
+  }
+  for (const st of peers) {
+    const nm = st && st.name;
+    if (typeof nm !== 'string' || !nm) continue;
+    for (const dn of (Array.isArray(st.dependencies) ? st.dependencies : [])) {
+      if (typeof dn !== 'string' || !dn) continue;
+      if (!dependentsByOrig.has(dn)) dependentsByOrig.set(dn, []);
+      dependentsByOrig.get(dn).push(nm);
+    }
+  }
+  // Resolve names → {name: CURRENT, oneLine}. frozen=true first maps a FROZEN dep string to
+  // its current name (currentByOrig) so a renamed peer resolves; a paraphrase/deleted peer
+  // falls through summaryByName.has and is DROPPED (dangling). frozen=false = the names are
+  // already current (the reverse "blocks" dependents). A self-edge is dropped.
+  const resolve = (names, selfCurrentName, frozen) => {
+    const out = [];
+    for (const raw of (Array.isArray(names) ? names : [])) {
+      if (typeof raw !== 'string' || !raw) continue;
+      const cur = frozen ? (currentByOrig.get(raw) || raw) : raw;
+      if (!cur || cur === selfCurrentName || !summaryByName.has(cur)) continue;
+      out.push({ name: cur, oneLine: summaryByName.get(cur) || '' });
+    }
+    return out;
+  };
+  return (story) => ({
+    dependsOn: resolve(story && story.dependencies, (story && story.name) || '', true),
+    blocks: resolve(dependentsByOrig.get(keyOf(story)), (story && story.name) || '', false),
+  });
+}
+
+/**
+ * Submit an N-request test-case batch. One request per Story; custom_id = String(index).
+ * The system block is SHARED across all N requests (ephemeral cache → one cache-write
+ * cost, N-1 cache-reads). Each request's user block is per-Story (not cached).
+ *
+ * @param {object} args
+ * @param {Array<object>} args.stories               the Story objects to generate for (bulk: all; regen: a 1-element batch)
+ * @param {Array<object>} [args.allStories]          the FULL breakdown feature list — dependency peers (§8 #2) resolve against this, NOT the (possibly 1-element regen) `stories` batch; defaults to `stories`
+ * @param {string[]} [args.sharedAcceptanceCriteria] from breakdown.shared_acceptance_criteria
+ * @param {string} [args.specSummary]                from breakdown.metadata.spec_summary
+ * @param {string} args.apiKey                       caller MUST pass the resolved key (Managed or BYOK)
+ * @returns {Promise<{batchId?, status?, createdAt?, expiresAt?, error?, detail?}>}
+ */
+export async function submitTestCaseBatch({ stories, allStories, siblingNames, sharedAcceptanceCriteria, specConcerns, specSummary, specSourceText, apiKey }) {
+  if (!apiKey) {
+    return { error: 'not_configured', detail: 'Anthropic API key not configured.' };
+  }
+  if (!Array.isArray(stories) || stories.length === 0) {
+    return { error: 'no_stories', detail: 'No stories to generate test cases for.' };
+  }
+
+  // Shared ephemeral system block — identical for all N requests → maximal cache reuse.
+  const systemBlock = [{ type: 'text', text: TEST_CASE_SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } }];
+
+  // §8 fix (2026-06-06): when the breakdown's source page was snapshotted at generation, feed it
+  // as a SECOND shared ephemeral-cached block (the SOURCE SPECIFICATION) so the model can assert
+  // concrete threshold VALUES + one case per decision-table CELL (Rule 6). Shared across all N
+  // requests → the page is a single cache-write + N-1 cache-reads (~10%), not N× full price.
+  // Feed-side char cap (a pathological page can't blow the input budget; the snapshot was already
+  // byte-capped at capture). Absent snapshot → omit the block → today's behaviour (backward-compat).
+  // (TC_SPEC_SOURCE_MAX_CHARS is module-level + exported so the cost projector clamps identically.)
+  const specSource = typeof specSourceText === 'string' ? specSourceText.trim().slice(0, TC_SPEC_SOURCE_MAX_CHARS) : '';
+  const hasSpecSource = specSource.length > 0;
+  if (hasSpecSource) {
+    systemBlock.push({ type: 'text', text: buildSpecSourceSystemText(specSource), cache_control: { type: 'ephemeral' } });
+  }
+
+  // §8 scope fence. Callers MAY pass the full breakdown's story names — the single-story
+  // regen path submits stories=[oneStory], which would otherwise starve the model of its
+  // siblings (the worst §8 failure: it could test a sibling Story's behaviour). Default to
+  // the batch's own story names for the bulk path.
+  const resolvedSiblingNames = (Array.isArray(siblingNames) && siblingNames.length)
+    ? siblingNames
+    : stories.map((s) => s && (s.name || ''));
+
+  // §8 (#2): resolve each Story's IMMEDIATE cross-feature dependency edges (NOT the transitive
+  // graph) to the peer's one-line, for input-state / integration context. Resolve peers from
+  // allStories (the FULL breakdown feature list) — NOT `stories`, which on the single-Story
+  // regenerate path is a 1-element batch that would otherwise starve EVERY edge (§8 silent miss).
+  const peerStories = (Array.isArray(allStories) && allStories.length) ? allStories : stories;
+  // Resolve each Story's edges by the FROZEN _orig_name → CURRENT name, so a peer renamed in
+  // the editor is NOT dropped as dangling (Task #4 #2). Built ONCE for the batch; pure +
+  // offline-tested (prototype/test_dep_context.js).
+  const dependencyContextFor = buildDependencyResolver(peerStories);
+
+  const requests = stories.map((story, index) => ({
+    custom_id: String(index),
+    params: {
+      model: MODEL_PRIMARY,
+      max_tokens: TC_MAX_OUTPUT_TOKENS,
+      system: systemBlock,
+      messages: [
+        {
+          role: 'user',
+          content: buildTestCaseUserPrompt({
+            story,
+            siblingNames: resolvedSiblingNames,
+            sharedAcceptanceCriteria: sharedAcceptanceCriteria || [],
+            specConcerns: specConcerns || [],
+            specSummary: specSummary || '',
+            category: story && story.category,
+            hasSpecSource,
+            dependencyContext: dependencyContextFor(story),
+          }),
+        },
+      ],
+      output_config: {
+        format: {
+          type: 'json_schema',
+          schema: TEST_CASE_SCHEMA,
+        },
+      },
+    },
+  }));
+
+  const requestBody = { requests };
+
+  let response;
+  try {
+    response = await fetch(ANTHROPIC_BATCHES_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'anthropic-version': ANTHROPIC_VERSION,
+        'X-Api-Key': apiKey,
+      },
+      body: JSON.stringify(requestBody),
+    });
+  } catch (e) {
+    console.error(`[tc-batch] submit fetch threw: ${String(e?.message || e)}`);
+    return { error: 'network_failure', detail: `Fetch threw before response: ${String(e?.message || e)}` };
+  }
+
+  if (response.status === 401) return { error: 'auth_rejected', detail: 'Anthropic rejected the API key.' };
+  if (response.status === 402) return { error: 'insufficient_credits', detail: 'Anthropic account has insufficient credits.' };
+  if (response.status === 429) return { error: 'rate_limited', detail: 'Anthropic rate limit exceeded.' };
+  if (!response.ok) {
+    const text = await response.text();
+    console.warn(`[tc-batch] submit HTTP ${response.status}: ${text.substring(0, 500)}`);
+    return { error: `anthropic_${response.status}`, detail: 'The AI service returned an error. Please try again in a moment; if it persists, contact support@spec2jira.com.' };
+  }
+
+  const data = await response.json();
+  if (!data.id) {
+    return { error: 'no_batch_id', detail: `Batch submit returned no id. Raw: ${JSON.stringify(data).substring(0, 300)}` };
+  }
+
+  console.log(`[tc-batch] submitted batchId=${data.id} stories=${stories.length} status=${data.processing_status}`);
+  return {
+    batchId: data.id,
+    status: data.processing_status,
+    createdAt: data.created_at,
+    expiresAt: data.expires_at,
+  };
+}
+
+/**
+ * Poll the status of a test-case batch. This is an ALIAS of pollBatchStatus — the
+ * endpoint and response shape are identical; we expose a named export so callers
+ * in index.js never import the breakdown-named function for test-case work.
+ *
+ * @param {string} batchId
+ * @param {string} [apiKeyOverride]
+ * @returns {Promise<{status?, resultsUrl?, requestCounts?, endedAt?, error?, detail?}>}
+ */
+export const pollTestCaseBatch = pollBatchStatus;
+
+/**
+ * Fetch + parse test-case batch results. Scans ALL N JSONL rows (unlike fetchBatchResults
+ * which looks for one custom_id). Non-succeeded rows store an explicit error sentinel.
+ * The perStory array is SORTED by storyIdx so callers can index into it safely.
+ *
+ * @param {string} resultsUrl
+ * @param {Array<{idx:number,name:string}>} stampedStories   the tcjob.stampedStories list
+ * @param {string} apiKey                                    caller MUST pass the resolved key
+ * @returns {Promise<{perStory:[{storyIdx,result?,coverage?,error?,detail?}], error?, detail?}>}
+ */
+export async function fetchTestCaseResults(resultsUrl, stampedStories, apiKey) {
+  if (!apiKey) return { error: 'not_configured', detail: 'API key not configured.' };
+  if (!resultsUrl) return { error: 'no_results_url', detail: 'resultsUrl is required.' };
+
+  let response;
+  try {
+    response = await fetch(resultsUrl, {
+      method: 'GET',
+      headers: {
+        'anthropic-version': ANTHROPIC_VERSION,
+        'X-Api-Key': apiKey,
+      },
+    });
+  } catch (e) {
+    return { error: 'network_failure', detail: String(e?.message || e) };
+  }
+
+  if (!response.ok) {
+    const text = await response.text();
+    console.error(`[tc-batch] results fetch HTTP ${response.status}: ${text.substring(0, 300)}`);
+    return { error: `results_fetch_${response.status}`, detail: "Couldn't retrieve the generated test cases — please try generating again." };
+  }
+
+  const rawText = await response.text();
+  const lines = rawText.split('\n').filter((l) => l.trim().length > 0);
+
+  // Parse ALL N JSONL rows — unlike the breakdown (1 row), we scan the whole file.
+  // Key: custom_id → Integer(idx); per-row lookup is O(1) via a Map.
+  const rowsByIdx = new Map();
+  for (const line of lines) {
+    try {
+      const row = JSON.parse(line);
+      const idx = parseInt(row.custom_id, 10);
+      if (!Number.isNaN(idx)) rowsByIdx.set(idx, row);
+    } catch (_) {
+      // skip malformed JSONL line
+    }
+  }
+
+  const perStory = [];
+  const stamped = Array.isArray(stampedStories) ? stampedStories : [];
+
+  for (const stamped_entry of stamped) {
+    const storyIdx = stamped_entry.idx;
+    const row = rowsByIdx.get(storyIdx);
+
+    if (!row) {
+      // Row entirely missing from JSONL — explicit error sentinel (#3: never drop)
+      perStory.push({ storyIdx, error: 'row_missing', detail: `No JSONL row for story index ${storyIdx}.` });
+      continue;
+    }
+
+    const result = row.result || {};
+    if (result.type !== 'succeeded') {
+      // Errored/expired/canceled — explicit error sentinel (#3)
+      perStory.push({
+        storyIdx,
+        error: `batch_request_${result.type || 'unknown'}`,
+        detail: result.error?.error?.message || result.error?.message || JSON.stringify(result).substring(0, 300),
+      });
+      continue;
+    }
+
+    const message = result.message;
+    if (!message) {
+      perStory.push({ storyIdx, error: 'no_message', detail: 'Result row missing message field.' });
+      continue;
+    }
+
+    // ⭐ v6 cost-transparency: a message-bearing row consumed tokens even when its OUTPUT is
+    // unusable (refusal / max_tokens truncation / parse failure / coverage reject). Capture usage
+    // ONCE here and attach it to EVERY downstream push — dropping it on the error branches
+    // under-counts the echo, and the costliest failure (max_tokens) is the one most worth counting.
+    const usage = message.usage || null;
+
+    if (message.stop_reason === 'refusal') {
+      perStory.push({ storyIdx, error: 'refused', detail: 'Anthropic declined to process this story.', usage });
+      continue;
+    }
+
+    // [diag Phase 4, A5 — worst offender #6] The stop_reason guard the breakdown path has
+    // always had (fetchBatchResults) but the TC path lacked. A story that hit the
+    // TC_MAX_OUTPUT_TOKENS cap used to be misfiled: JSON closed by luck → persisted as a
+    // CLEAN success (silently incomplete cases); JSON unterminated → 'parse_failed' (wrong
+    // cause). Honest split: parse OK + max_tokens → keep the cases, mark `truncated: true`
+    // (additive — the poll resolvers thread it onto the stored per-story value and
+    // pollTestCaseStatus aggregates a truncation_salvaged record); parse FAIL + max_tokens
+    // → sentinel { error: 'truncated' } ('parse_failed' stays for NON-truncated failures).
+    const truncated = message.stop_reason === 'max_tokens';
+
+    const outputText = message.content?.[0]?.text || '';
+    let parsed;
+    try {
+      parsed = typeof outputText === 'string' ? JSON.parse(outputText) : outputText;
+    } catch (_) {
+      // Privacy ("Log End-User Data: No"): the raw model output is content-derived — never
+      // persist it (this detail is written to KVS). Keep the failure signal generic.
+      perStory.push(
+        truncated
+          ? { storyIdx, error: 'truncated', detail: `Output for story index ${storyIdx} hit the ${TC_MAX_OUTPUT_TOKENS}-token cap mid-JSON and could not be recovered. Regenerate this story.`, usage }
+          : { storyIdx, error: 'parse_failed', detail: `Invalid JSON returned for story index ${storyIdx} (raw output omitted for privacy).`, usage },
+      );
+      continue;
+    }
+
+    // INVARIANT: stampedStories carries {idx, name, acceptance_criteria} (the lean coverage
+    // inputs, stamped by start/regen at submit time — mitigation #7) so coverage is computed
+    // against the FROZEN ACs the model actually saw, surviving any editor edit mid-batch.
+    const storyRef = { name: stamped_entry.name, acceptance_criteria: stamped_entry.acceptance_criteria || [] };
+
+    const parseOutcome = parseTestCaseResult(parsed, storyRef);
+    if (parseOutcome.error) {
+      perStory.push({ storyIdx, error: parseOutcome.error, detail: parseOutcome.detail, usage });
+    } else {
+      // [diag Phase 4, A5] truncated-but-parsed: the cases are KEPT (the pure coverage strip
+      // stays authoritative) with an honest additive flag — never a silent clean success.
+      // ⭐ v6 cost-transparency: carry the per-request usage (input/output/cache tokens) so the
+      // poll resolver can sum a batch-wide total and price the EXACT post-run echo (captured once above).
+      perStory.push({ storyIdx, result: parseOutcome.result, coverage: parseOutcome.coverage, usage, ...(truncated ? { truncated: true } : {}) });
+    }
+  }
+
+  // Sort by storyIdx (JSONL order is not guaranteed — §design §2).
+  perStory.sort((a, b) => a.storyIdx - b.storyIdx);
+
+  // [diag Phase 4, A5] truncated count surfaced in the dev log (the record lands at the poll resolver).
+  const truncatedOk = perStory.filter((s) => !s.error && s.truncated).length;
+  console.log(`[tc-batch] results parsed: ${perStory.length} stories, ${perStory.filter((s) => !s.error).length} OK, ${perStory.filter((s) => s.error).length} errors${truncatedOk ? `, ${truncatedOk} truncated-salvaged` : ''}`);
+  return { perStory };
 }
 
 // ── Dependency-cycle resolution (tiny sync call) ───────────────────────
@@ -676,6 +1188,100 @@ Identify the single softest edge to cut so the cycle is broken.`;
   }
 }
 
+// ── Capacity-Sheet Planner: the ONE sequencing-judgment call (Batches API) ──────
+//
+// The LLM is ADVISORY (POLICY §4 + ledger LLM-1..8): it returns ONLY a relative ORDER of feature ids;
+// src/planner.normalizeRanking makes it TOTAL + legal and packSprints owns every number. ⚠ TRANSPORT =
+// the Anthropic Message BATCHES API, NOT a sync call (changed 2026-06-20): a sync /v1/messages ranking
+// over a rich backlog (30+ features, dense deps) + Sonnet reasoning exceeds Forge's 25s HARD resolver
+// kill (gotcha #5 — the same reason breakdown + test-cases use Batches; confirmed live: the sync call
+// timed out). Batches submits instantly + is polled (pollBatchStatus, reused); the 25s limit binds only
+// on the POLL fetch, never on the model's reasoning. Bonus: batch pricing is 50% (estimateCost {batch:true}).
+// On ANY failure the resolver falls back to the deterministic ordering — the plan never hard-fails (LLM-3).
+
+// Submit a 1-request ranking batch. Mirrors submitBreakdownBatch. customId = the planner jobId.
+export async function submitPlanRankingBatch({ rows, globals, specSummary, specConcerns, customId, apiKey, model = MODEL_PRIMARY }) {
+  if (!apiKey) return { error: 'not_configured', detail: 'Anthropic API key not configured.' };
+  if (!customId) return { error: 'no_custom_id', detail: 'customId is required.' };
+  const list = Array.isArray(rows) ? rows : [];
+  if (list.length === 0) return { error: 'empty_rows', detail: 'No features to rank.' };
+
+  const requestBody = {
+    requests: [
+      {
+        custom_id: customId,
+        params: {
+          model,
+          max_tokens: planRankingMaxTokens(list.length),
+          system: PLAN_RANKING_SYSTEM_PROMPT,
+          messages: [{ role: 'user', content: buildPlanRankingUserPrompt({ rows: list, globals, specSummary, specConcerns }) }],
+          output_config: { format: { type: 'json_schema', schema: PLAN_RANKING_SCHEMA } },
+        },
+      },
+    ],
+  };
+
+  let response;
+  try {
+    response = await fetch(ANTHROPIC_BATCHES_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'anthropic-version': ANTHROPIC_VERSION, 'X-Api-Key': apiKey },
+      body: JSON.stringify(requestBody),
+    });
+  } catch (e) {
+    return { error: 'network_failure', detail: String(e?.message || e) };
+  }
+  if (response.status === 401) return { error: 'auth_rejected', detail: 'Anthropic rejected the API key.' };
+  if (response.status === 402) return { error: 'insufficient_credits', detail: 'Anthropic account has insufficient credits.' };
+  if (response.status === 429) return { error: 'rate_limited', detail: 'Anthropic rate limit exceeded.' };
+  if (!response.ok) {
+    const text = await response.text();
+    return { error: `anthropic_${response.status}`, detail: String(text).slice(0, 200) };
+  }
+  const data = await response.json();
+  if (!data.id) return { error: 'no_batch_id', detail: 'Batch submit returned no id.' };
+  console.log(`[plan-batch] submitted batchId=${data.id} customId=${customId} status=${data.processing_status} features=${list.length}`);
+  return { batchId: data.id, customId, status: data.processing_status, createdAt: data.created_at, expiresAt: data.expires_at };
+}
+
+// Fetch + parse the ranking batch result. Mirrors fetchBatchResults but yields {ranking, usage}. The
+// caller (pollPlanStatus) has verified status='ended' + resultsUrl. A non-succeeded row OR a parse
+// failure returns a typed {error} → the resolver falls back to the deterministic ordering.
+export async function fetchPlanRankingResults(resultsUrl, customId, apiKeyOverride = null) {
+  const apiKey = apiKeyOverride || (await getStoredApiKey());
+  if (!apiKey) return { error: 'not_configured', detail: 'API key not configured.' };
+  if (!resultsUrl) return { error: 'no_results_url', detail: 'resultsUrl is required.' };
+
+  let response;
+  try {
+    response = await fetch(resultsUrl, { method: 'GET', headers: { 'anthropic-version': ANTHROPIC_VERSION, 'X-Api-Key': apiKey } });
+  } catch (e) {
+    return { error: 'network_failure', detail: String(e?.message || e) };
+  }
+  if (!response.ok) {
+    return { error: `results_fetch_${response.status}`, detail: "Couldn't retrieve the ranking result." };
+  }
+
+  const rawText = await response.text();
+  const lines = rawText.split('\n').filter((l) => l.trim().length > 0);
+  let targetRow = null;
+  for (const line of lines) {
+    try { const row = JSON.parse(line); if (row.custom_id === customId) { targetRow = row; break; } } catch (_) { /* skip malformed line */ }
+  }
+  if (!targetRow) return { error: 'result_row_missing', detail: `No row with custom_id=${customId}.` };
+
+  const result = targetRow.result || {};
+  if (result.type !== 'succeeded') {
+    return { error: `batch_request_${result.type || 'unknown'}`, detail: result.error?.error?.message || result.error?.message || 'Batch request did not succeed.' };
+  }
+  const message = result.message;
+  if (!message) return { error: 'no_message', detail: 'Result row missing message field.' };
+  const outputText = message.content?.[0]?.text || '';
+  let parsed;
+  try { parsed = JSON.parse(outputText); } catch (_) { return { error: 'parse_failed', detail: String(outputText).slice(0, 200), usage: message.usage }; }
+  return { ranking: Array.isArray(parsed?.ranking) ? parsed.ranking : [], usage: message.usage, model: message.model };
+}
+
 // ── Project Context distillation (tiny sync helper for Settings) ────────────────
 // A setup-time convenience: condense a user's raw paste (e.g. a long Confluence
 // page) or rough notes into a concise, bounded PROJECT CONTEXT profile. Distilling
@@ -720,7 +1326,7 @@ export const DISTILL_CATEGORIES = [
     key: 'domain',
     label: 'Domain',
     maxTokens: 500,
-    instruction: `Extract the DOMAIN section ONLY (3-5 sentences, end cleanly — never stop mid-sentence). Output starts with "Domain:". Give: the domain and what the system does, in one breath. Then fold in, ONLY where the input actually establishes them, the durable cross-cutting facts as short clauses — (a) any STANDING DESIGN TENSION the team deliberately balances: name BOTH poles, and that it is intentional, unresolved, and must never be collapsed to one side (it is a constraint the engine inherits, not a problem to solve); (b) any durable CROSS-CUTTING fact that shapes everything downstream — most often that SEVERAL parallel mechanisms run side by side, are independently configurable, and must ALL be honoured, never silently collapsed to a single canonical one. Capture only the tensions/facts the input genuinely states; if the input establishes none, give just the domain and what the system does. Do NOT list individual terms, personas, systems, regulations, or rules here — those belong to their own sections. Keep it tight.`,
+    instruction: `Extract the DOMAIN section ONLY (3-5 sentences, end cleanly — never stop mid-sentence). Output starts with "Domain:". Give: the domain and what the system does, in one breath. Then fold in, ONLY where the input actually establishes them, the durable cross-cutting facts as short clauses — (a) any design tension the input EXPLICITLY names as deliberate and ongoing: state the two poles in the input's own words and that the source treats it as an intentional, unresolved balance — nothing more; do NOT assert what the engine must or must not do with it, and do NOT add a tension the input does not name; (b) any durable CROSS-CUTTING fact the input EXPLICITLY states that shapes everything downstream — e.g. that several mechanisms run in parallel and are each independently configurable: state it plainly in the input's OWN terms; do NOT add editorial the input does not state (such as that they 'must all be honoured' or are 'never collapsed' / 'never override one another') — restate only what the source asserts. Capture only the tensions/facts the input genuinely states; if the input establishes none, give just the domain and what the system does. Do NOT list individual terms, personas, systems, regulations, or rules here — those belong to their own sections. Keep it tight.`,
     userAsk: `Produce the Domain section only — concise, ending on a complete sentence.`,
   },
   {
@@ -764,15 +1370,15 @@ Also preserve, when present: any ABBREVIATION COLLISION where one acronym means 
   {
     key: 'conventions',
     label: 'Conventions',
-    maxTokens: 600,
-    instruction: `Extract the CONVENTIONS ONLY — the durable house-style and the STANDING counterintuitive rules the engine must always respect (NOT one-off procedure, timers, or data-rates). Output starts with "Conventions:". Do NOT repeat any term, score, metric, system, or persona already covered by the Glossary / Tech / Personas sections — this section is ONLY house-style and standing action-rules. Capture, compactly, only what the input establishes:
-(1) HOUSE-STYLE that persists across specs: working languages, any operational terms used verbatim in a particular language, spelling/naming conventions, and fixed state/status vocabularies.
-(2) STANDING COUNTERINTUITIVE rules — these are easy to miss and are the HIGHEST-VALUE rules to preserve, so hunt the input specifically for each KIND below and state EVERY one it contains (in the input's own terms):
-  - a rule that REVERSES a default or a prior behaviour — something that, against the obvious expectation, is NOT auto-undone, NOT auto-cancelled, or still applies despite a later contradicting signal (e.g. a scheduled re-check or hold that a subsequent normal/contradicting reading does NOT cancel);
+    maxTokens: 800,
+    instruction: `Extract the CONVENTIONS ONLY — the durable DELIVERY conventions and the STANDING counterintuitive rules the engine must always respect (NOT one-off procedure, timers, or data-rates). Output starts with "Conventions:". Do NOT repeat any term, score, metric, system, or persona already covered by the Glossary / Tech / Personas sections. You are EXTRACTING + COMPRESSING what the input states — you NEVER author a rule, invariant, or emphasis the input does not state. Capture, compactly, only what the input establishes:
+(1) STRUCTURAL DELIVERY CONVENTIONS — HIGHEST-PRIORITY to keep because they cannot be recovered from the feature spec alone: how work items are typed (epic / story / subtask definitions and the distinction between them), component and label taxonomy, any explicit ANTI-TEMPLATING guidance (e.g. "subtasks should reflect the actual work the story needs, not a fixed template" — capture such guidance verbatim, it is the single most valuable convention), and team composition / how the team treats a generated breakdown. THEN house-style that persists across specs: working languages, operational terms used verbatim in a particular language, spelling/naming conventions, and fixed state/status vocabularies. Do NOT reproduce canonical reference-data tables (numeric thresholds, band ranges, pricing parameters, time windows) — those live in the spec, not the context card. Prefer content UNIQUE to this project's conventions over anything the spec already carries.
+(2) STANDING COUNTERINTUITIVE rules — the rules most likely to be lost and cause silent errors downstream. DECISIVE TEST before emitting ANY rule: can you point to a specific sentence in the input that asserts this exact rule? If you cannot, DO NOT emit it — a rule inferred or generalized from a nearby pattern is FABRICATION (the most dangerous distill error: it can contradict the very spec this context accompanies). Emit ONLY rules the input states explicitly, in the input's own terms; if the input contains no rule of a given kind below, omit that kind entirely — never fill a slot to be complete:
+  - a rule that REVERSES a default or a prior behaviour — something that, against the obvious expectation, is NOT auto-undone, NOT auto-cancelled, or still applies despite a later contradicting signal;
   - a DUAL-CONTROL or second-approval requirement (an action that needs a second person to confirm or co-sign);
   - a SURFACE-vs-BLOCK policy (the system warns/cautions and logs but does NOT hard-block, leaving final judgment to a human);
-  - a LINEAGE / SUPERSESSION carve-out (this version replaces a prior one only IN PART, with specific elements deliberately RETAINED — never flatten to "replaces X"; capture this carve-out even when the only in-text trace of the prior version is a single retained or reversed rule — the "replaces only IN PART / these elements retained" boundary is itself the durable fact).
-State each rule the input actually contains as one short clause. Do not invent rules of a kind the input does not contain, and do not enumerate kinds that are absent.`,
+  - a LINEAGE / SUPERSESSION carve-out (this version replaces a prior one only IN PART, with specific elements deliberately RETAINED — never flatten to "replaces X").
+State each rule the input actually contains as one short clause. Do not generalize a rule to an adjacent case the input does not mention.`,
     userAsk: `Produce the Conventions section only — durable house-style plus any standing counterintuitive or lineage/supersession rules the input establishes.`,
   },
 ];
@@ -856,7 +1462,8 @@ export async function distillCategory({ text, category, apiKey, model }) {
   if (response.status === 429) return { error: 'rate_limited', detail: 'Anthropic rate limit exceeded.' };
   if (!response.ok) {
     const t = await response.text();
-    return { error: `anthropic_${response.status}`, detail: t.substring(0, 300) };
+    console.error(`[distill] category=${category.key} HTTP ${response.status}: ${t.substring(0, 300)}`);
+    return { error: `anthropic_${response.status}`, detail: 'The AI service returned an error. Please try again in a moment; if it persists, contact support@spec2jira.com.' };
   }
 
   let data;

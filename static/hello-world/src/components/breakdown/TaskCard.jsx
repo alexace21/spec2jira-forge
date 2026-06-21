@@ -2,6 +2,7 @@ import { useState, useRef, useLayoutEffect, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import EditableField from './EditableField.jsx';
 import { TASK_TYPES, TASK_TYPE_COLORS } from './constants.js';
+import { IconCheck } from '../Icon';
 
 /**
  * SelectBadge — Badge that doubles as a dropdown selector.
@@ -106,7 +107,7 @@ function SelectBadge({ value, options, colorMap, labelMap, onChange }) {
                 >
                   <span className={`inline-block h-2 w-2 rounded-full ring-1 ring-inset ${optColor}`} />
                   {optLabel}
-                  {isSelected && <span className="ml-auto" style={{ color: 'var(--s2j-green)' }}>✓</span>}
+                  {isSelected && <span className="ml-auto inline-flex" style={{ color: 'var(--s2j-green)' }}><IconCheck size={14} /></span>}
                 </button>
               );
             })}
@@ -166,14 +167,15 @@ export default function TaskCard({ task, index, onUpdate, onDelete }) {
 
       {/* Details */}
       <div className="mt-2.5 ml-7 space-y-2.5">
-        {task.description && (
-          <div>
-            <span className="text-[11px] font-medium uppercase tracking-wider block mb-1"
-              style={{ color: 'var(--s2j-text-muted)' }}>Description</span>
-            <EditableField value={task.description} onChange={(val) => updateField('description', val)}
-              multiline className="text-xs leading-relaxed mt-1" style={{ color: 'var(--s2j-text-light)' }} />
-          </div>
-        )}
+        {/* Always render so a NEW or description-less subtask can get a description (the old
+            `task.description &&` guard hid the editor → no way to add one). EditableField shows the
+            placeholder in muted italic when empty. */}
+        <div>
+          <span className="text-[11px] font-medium uppercase tracking-wider block mb-1"
+            style={{ color: 'var(--s2j-text-muted)' }}>Description</span>
+          <EditableField value={task.description || ''} onChange={(val) => updateField('description', val)}
+            multiline placeholder="Click to add a description…" className="text-xs leading-relaxed mt-1" style={{ color: 'var(--s2j-text-light)' }} />
+        </div>
       </div>
     </div>
   );

@@ -8,32 +8,36 @@
  *   counting + threshold compare is *structure*, not meaning-reading → a pure
  *   function, never a model call).
  *
- * THE MODEL — trial → paid, two Paid-via-Atlassian editions (simplified
- * 2026-06-03: the in-app perpetual Free 3/mo tier was REMOVED). Evaluation is
- * covered by the 30-day Atlassian trial that Paid-via-Atlassian apps get for free
- * (a trial reads as an ACTIVE license at runtime → resolves to a paid tier), so a
- * separate in-app free path — and the unverified/spoofable unlicensed-access
- * surface it rode on — is obsolete:
- *   - BYOK Pro:    "Standard" edition, $6.70/user/mo → UNLIMITED. The customer's
- *                  own Anthropic key pays compute, so unlimited is no cost
- *                  liability for us; the subscription is pure app-value.
- *   - Managed Pro: "Advanced" edition, $13/user/mo (editions Phase 2 — not yet a
- *                  published edition) → CAPPED (we call Anthropic with OUR key, so usage = our
- *                  cost). Fair-use 10 breakdowns/user/mo (MANAGED_USER_CAP),
- *                  metered PER USER, NOT pooled (no runtime seat count) —
- *                  loss-proof per seat. See below.
- *   - Unlicensed:  a minimal DEFENSIVE tier (limit 0, blocked) for the
- *                  no-active-license case. Not a product offering — by default
- *                  Atlassian blocks non-licensed users from a Paid-via-Atlassian
- *                  app surface, so this is a backstop the resolvers turn into a
- *                  clean "subscribe or start a trial" prompt, never a raw error.
+ * THE MODEL — trial → paid, two Paid-via-Atlassian editions on a VALUE axis
+ * (v6 value-split, 2026-06-17: editions pivoted from KEY-SOURCE to VALUE; BOTH are
+ * now BYOK). Evaluation is the 30-day Atlassian trial (a trial reads as an ACTIVE
+ * license at runtime → resolves to a paid tier; the in-app Free 3/mo tier was removed
+ * 2026-06-03):
+ *   - Standard:   "Standard" edition, $6.70/user/mo, BYOK → UNLIMITED. Core breakdown
+ *                 + push + Project Context. The customer's own Anthropic key pays
+ *                 compute, so unlimited is no cost liability for us.
+ *   - Advanced:   "Advanced" edition, $13.40/user/mo, BYOK → UNLIMITED + TEST-CASE
+ *                 GENERATION (the SINGLE headline anchor TODAY; custom prompts + the
+ *                 Capacity-Sheet vision are FUTURE — do NOT advertise them until built).
+ *                 Still BYOK → still $0 compute cost to us, so still no cap. The ONLY
+ *                 differentiator vs Standard is the feature set (test-cases today).
+ *   - Unlicensed: a minimal DEFENSIVE tier (limit 0, blocked) for the no-active-license
+ *                 case. Not a product offering — the resolvers turn it into a clean
+ *                 "subscribe or start a trial" prompt, never a raw error.
  *
- *   Edition discrimination is by license.capabilitySet (capabilityStandard /
- *   capabilityAdvanced) — see resolveTier. An active license with no recognised
- *   set ⇒ BYOK Pro (the SAFE default: unlimited, customer-key, never bills us).
+ *   THREE concerns are now DECOUPLED (they used to be conflated on edition==='advanced'):
+ *   edition (label) · keySource (byok|managed) · hasTestCases (feature). Edition
+ *   discrimination is by license.capabilitySet (capabilityStandard/capabilityAdvanced)
+ *   — see resolveTier. An active license with no recognised set ⇒ Standard (the SAFE
+ *   default: BYOK, unlimited, no test-cases, never bills us).
  *
- *   ⚠ "Unlimited" is safe ONLY for BYOK (customer pays compute). Managed is
- *   capped precisely because WE pay — never give Managed an unlimited tier.
+ *   The "Managed Pro" (we-pay-with-OUR-key, capped) model is DROPPED as a Marketplace
+ *   edition — it survives only as a DORMANT off-Marketplace fallback (TIERS.managedPro,
+ *   not reachable from any capabilitySet). MANAGED_ANTHROPIC_KEY + the per-user cap +
+ *   the metering exist solely for that dormant path + legacy in-flight jobs (see below).
+ *
+ *   ⚠ "Unlimited" is safe because BOTH editions are BYOK (the customer pays compute).
+ *   The cap below applies ONLY to the dormant Managed (we-pay) path.
  *
  * ENFORCEMENT MODE — governs the MANAGED per-user fair-use cap
  *   'block' = hard-block when a Managed user reaches the per-user monthly cap,
@@ -55,53 +59,106 @@
 import { kvs } from '@forge/kvs';
 import { getAppContext } from '@forge/api';
 
-// ── Managed Pro per-user fair-use cap ────────────────────────────────
-// Managed Pro meters PER USER per month (each seat its own allowance), NOT pooled
-// per instance — the Forge License object exposes NO seat count at runtime
-// (verified @forge/api runtime.d.ts 2026-06-03), so 10×seats is uncomputable, and
-// per-user is the loss-bounded shape that needs no seat count: 10 × worst-case
-// ~$0.50 = ~$5 < $13/seat revenue → ≥60% margin at the cap, any instance size;
-// and abuse is self-funding (each extra seat is paid revenue). Market research
-// (2026-06-03) confirmed 10 is GENEROUS — typical use 1-3/mo, power 5-8/mo — so it
-// rarely binds; heavy users → BYOK or a future Managed-Plus. Env-tunable for
-// signal-driven adaptation: `forge variables set ... MANAGED_USER_CAP <n>`.
+// ── Managed per-user fair-use cap (DORMANT under v6) ─────────────────
+// ⭐ v6 value-split: BOTH live Marketplace editions are now BYOK (no cap — the customer
+// pays compute). This cap applies ONLY to the dormant off-Marketplace Managed (we-pay)
+// fallback + any legacy pre-v6 job stamped keySource:'managed'. It is no longer reached
+// by any capabilitySet-resolved edition. The historical margin math below is retained for
+// the day Managed is ever re-enabled off-Marketplace.
+//
+// Managed meters PER USER per calendar month (each seat its own allowance),
+// NOT pooled per instance — the Forge License object exposes NO seat count at
+// runtime (verified @forge/api runtime.d.ts 2026-06-03), so N×seats is
+// uncomputable; per-user is the loss-bounded shape that needs no seat count.
+//
+// CAP = 25 (raised from 10, 2026-06-16). v5.4.0 Managed ships BREAKDOWN-ONLY
+// (test-case generation is a v5.5.0 feature, NOT in this build), and a breakdown
+// costs only ~$0.118 avg / $0.24 max on our key → 25 × $0.24 = $6.00 worst-case
+// vs $13/seat revenue ⇒ ~54% margin FLOOR (cap × max cost; typical use stays
+// well under the cap → ~90%+ margin). The cap is pure
+// cost-protection / abuse circuit-breaker, NOT a value gate, so it is set
+// GENEROUS: a real BA (typ. 1-3 specs/mo, power 5-8, PLUS each regeneration
+// consuming one) effectively never reaches 25, so Managed feels "unlimited" — its
+// value prop (no key to manage). Raising a cap is customer-friendly, lowering is
+// hostile, so 25 is committable: we will NOT lower it for breakdown-only. Abuse is
+// self-funding (each seat is paid revenue). Env-tunable for signal-driven
+// adaptation: `forge variables set ... MANAGED_USER_CAP <n>`.
+//
+// ⭐ v5.5.0 forward note: test-case generation costs $1-3.67 (8.6× a breakdown),
+// which would blow this cap's margin if folded in. The fix is NOT to lower this
+// cap — it is to give test-cases their OWN separate budget/meter (a surgical
+// compute-budget on the expensive driver), so breakdowns stay generously
+// count-capped at 25. Test cases must justify their price as a premium feature.
 export const MANAGED_USER_CAP =
   Number.parseInt(process.env.MANAGED_USER_CAP, 10) > 0
     ? Number.parseInt(process.env.MANAGED_USER_CAP, 10)
-    : 10;
+    : 25;
 
-// ── Tier model — single source of truth ─────────────────────────────
-// `limit`: breakdowns per calendar month. `null` = unlimited, `0` = blocked.
-// `edition`: the Paid-via-Atlassian edition that maps to this tier — 'standard'
-//   = BYOK Pro, 'advanced' = Managed Pro, null = Unlicensed (no edition).
-// `price`: the Marketplace SUBSCRIPTION price shown in the UI (NOT API cost —
-//          under BYOK the customer pays Anthropic; the subscription buys the app).
-export const TIERS = {
-  byokPro: {
-    key: 'byokPro',
-    label: 'BYOK Pro',
+// ── Tier model — single source of truth (v6 value-split) ────────────
+// THREE concerns are now EXPLICIT, decoupled fields. They USED to be inferred from
+// `edition==='advanced'` (which conflated edition + key-source + cap into one flag);
+// the v6 value-split split them so editions are a VALUE axis, key-source a SEPARATE axis:
+//   `edition`     : Marketplace edition LABEL only — 'standard' | 'advanced' |
+//                   'managed' (dormant) | null. NEVER infer key-source/features from it.
+//   `keySource`   : 'byok' (customer's Anthropic key) | 'managed' (our MANAGED_ANTHROPIC_KEY).
+//                   BOTH live Marketplace editions are 'byok'; 'managed' is the DORMANT
+//                   off-Marketplace fallback only — NOT reachable from resolveTier (see there).
+//   `hasTestCases`: feature capability. Test-case generation is an Advanced-edition feature
+//                   (the v6 headline value anchor) — gate features on THIS, never on `edition`.
+//   `limit`       : breakdowns / calendar month. null = unlimited, 0 = blocked. A cap is
+//                   needed ONLY when WE pay (keySource 'managed'); BYOK is always unlimited.
+//   `price`       : the Marketplace SUBSCRIPTION price shown in the UI (NOT API cost — under
+//                   BYOK the customer pays Anthropic; the subscription buys the app).
+// Object.freeze: the resolved tier is shared BY REFERENCE across the resolver and spread
+// into getUsage — a mutating consumer would corrupt the singleton for later callers.
+export const TIERS = Object.freeze({
+  byokPro: Object.freeze({
+    key: 'byokPro', // KEY kept 'byokPro' (not renamed) so every findPrice/tier-literal site is churn-free
+    label: 'Standard', // v6: relabeled BYOK Pro → "Standard" (value framing)
     limit: null, // unlimited — customer's own key pays compute
     price: '$6.70/user/mo', // matches the live Marketplace portal (USD; ≤10 users = $57/mo flat)
     edition: 'standard',
-  },
-  managedPro: {
+    keySource: 'byok',
+    hasTestCases: false, // test-cases are an Advanced feature
+  }),
+  // v6 NEW: Advanced = BYOK + test-case generation (the value-split headline). BYOK →
+  // unlimited (the customer pays compute), so NO cap and $0 compute cost to us.
+  byokAdvanced: Object.freeze({
+    key: 'byokAdvanced',
+    label: 'Advanced',
+    limit: null, // unlimited — BYOK, customer's key pays compute
+    price: '$13.40/user/mo', // 2× Standard via the declining curve (live portal figure)
+    edition: 'advanced',
+    keySource: 'byok',
+    hasTestCases: true,
+  }),
+  // DORMANT — the off-Marketplace Managed fallback. NOT reachable from any capabilitySet
+  // (resolveTier maps capabilityAdvanced → byokAdvanced, never here). Kept alive ONLY so a
+  // legacy in-flight job stamped keySource:'managed' (pre-v6) still resolves OUR key at its
+  // poll/fetch legs. edition is 'managed' (NOT 'advanced') so no stray `edition==='advanced'`
+  // read can ever re-bind the managed key. limit kept for the (re-enabled) we-pay case.
+  managedPro: Object.freeze({
     key: 'managedPro',
     label: 'Managed Pro',
     limit: MANAGED_USER_CAP, // we pay compute → per-USER fair-use cap (see above)
-    price: null, // null until Phase 2 launches — so the app never advertises a not-yet-buyable "Subscribe to Managed" CTA. Planned at $13/user/mo; the public site shows that as "coming soon".
-    edition: 'advanced',
-  },
+    price: null, // dormant — never advertised
+    edition: 'managed', // v6: was 'advanced' — decoupled so it can't re-couple to the edition flag
+    keySource: 'managed',
+    hasTestCases: true, // if ever re-enabled, Managed Advanced would include test-cases on their OWN budget
+  }),
   // Defensive backstop for the no-active-license case (no trial, no subscription).
   // Not a product offering — the resolvers turn this into a clean "subscribe or
   // start a trial" prompt (license_required) rather than a raw 401 / silent fail.
-  unlicensed: {
+  unlicensed: Object.freeze({
     key: 'unlicensed',
     label: 'Unlicensed',
     limit: 0, // blocked — no breakdowns without an active license/trial
     price: null,
     edition: null,
-  },
-};
+    keySource: 'byok', // never our key, even defensively
+    hasTestCases: false,
+  }),
+});
 
 export const DEFAULT_TIER = 'unlicensed';
 
@@ -170,10 +227,15 @@ function resolveLicense(context) {
  * Resolve the active tier from a Forge license object. PURE (the async caller
  * obtains the license and passes it) so it is unit-testable in isolation.
  *
- *   capabilityAdvanced   ⇒ Managed Pro (we pay Anthropic; per-user cap)
- *   capabilityStandard   ⇒ BYOK Pro    (customer's key; unlimited)
- *   active, unknown set  ⇒ BYOK Pro    (SAFE default — never bill us by accident)
+ *   capabilityAdvanced   ⇒ Advanced (BYOK + test-cases; unlimited — customer's key)
+ *   capabilityStandard   ⇒ Standard (BYOK, core; unlimited — customer's key)
+ *   active, unknown set  ⇒ Standard (SAFE default — BYOK, no test-cases; never our key)
  *   no active license    ⇒ Unlicensed  (blocked — no trial, no subscription)
+ *
+ * v6 value-split: BOTH live editions are BYOK (keySource 'byok'); the Managed (we-pay)
+ * tier is DORMANT and is NOT reachable here. Only an EXACT 'capabilityadvanced' grants
+ * the Advanced feature set (hasTestCases) — an unknown set falls through to Standard, so
+ * the premium feature is never granted by accident (safe-default polarity preserved).
  *
  * A 30-day Atlassian trial reads as an ACTIVE license, so a trialling user
  * resolves to BYOK/Managed Pro normally; only a truly unlicensed install (no
@@ -196,15 +258,16 @@ export function resolveTier(license) {
   );
   if (!active) return TIERS[DEFAULT_TIER];
   const cap = String(license.capabilitySet || '').toLowerCase();
-  if (cap === 'capabilityadvanced') return TIERS.managedPro;
+  if (cap === 'capabilityadvanced') return TIERS.byokAdvanced; // v6: Advanced = BYOK + test-cases (was managedPro)
   return TIERS.byokPro;
 }
 
 /**
  * Convenience: the active tier for THIS invocation, license-resolved. Used by the
- * resolvers for the Anthropic key source (Managed/Advanced ⇒ our key, else BYOK)
- * and for the defensive license_required gate (unlicensed ⇒ no trial/subscription).
- * Sync-license read; fail-open via resolveLicense.
+ * resolvers for the Anthropic key source (tier.keySource — both live editions BYOK),
+ * the feature gate (tier.hasTestCases ⇒ test-case generation), and the defensive
+ * license_required gate (unlicensed ⇒ no trial/subscription). Sync-license read;
+ * fail-open via resolveLicense.
  */
 export function getActiveTier(context) {
   return resolveTier(resolveLicense(context));
@@ -221,7 +284,10 @@ export function getActiveTier(context) {
  * client payload).
  */
 function usageKeyFor(tier, context, period) {
-  if (tier && tier.key === 'managedPro') {
+  // v6: meter per-user ONLY when WE pay compute (keySource 'managed'), not on the edition
+  // flag — the per-user cap is a cost-protection, so it follows key-source, not the label.
+  // Both live (BYOK) editions meter per-site (analytics only, never blocks).
+  if (tier && tier.keySource === 'managed') {
     const acct = (context && context.accountId) || 'unknown';
     return `${USAGE_KEY_PREFIX}${period}:u:${acct}`;
   }
@@ -270,7 +336,9 @@ export async function checkQuota(context) {
   return {
     tier: tier.key,
     tierLabel: tier.label,
-    edition: tier.edition, // 'standard'|'advanced'|null — for tier-aware messaging
+    edition: tier.edition, // 'standard'|'advanced'|'managed'(dormant)|null — LABEL only, for messaging
+    keySource: tier.keySource, // v6 decouple: 'byok'|'managed' — explicit, never inferred from edition
+    hasTestCases: tier.hasTestCases, // v6: feature capability (Advanced ⇒ true) — the FE gates test-cases on this
     limit: tier.limit, // null = unlimited
     unlimited,
     used,
@@ -282,9 +350,10 @@ export async function checkQuota(context) {
     overLimit,
     allowed,
     enforcementMode: ENFORCEMENT_MODE,
-    // Managed's cap is FAIR-USE (we pay compute), NOT a free-trial limit — an
-    // over-limit Managed user is routed to BYOK (unlimited), not "subscribe".
-    fairUse: tier.key === 'managedPro',
+    // The cap is FAIR-USE (it exists only when WE pay compute), NOT a free-trial limit
+    // — an over-limit user is routed to BYOK (unlimited), not "subscribe". v6: keyed on
+    // keySource 'managed' (dormant for live editions), not the edition flag.
+    fairUse: tier.keySource === 'managed',
   };
 }
 
@@ -371,11 +440,14 @@ export async function getInstallMeta() {
  * per POLICY).
  */
 export function pricingTable() {
-  return [TIERS.byokPro, TIERS.managedPro].map((t) => ({
+  // v6: the two LIVE Marketplace editions are Standard (byokPro) + Advanced (byokAdvanced),
+  // both BYOK. managedPro is dormant (off-Marketplace fallback) and intentionally NOT listed.
+  return [TIERS.byokPro, TIERS.byokAdvanced].map((t) => ({
     key: t.key,
     label: t.label,
     limit: t.limit, // null = unlimited
     price: t.price,
     edition: t.edition,
+    hasTestCases: t.hasTestCases, // v6: drives the value-framing "+ test cases" copy from the capability (so marketing can't drift from code)
   }));
 }

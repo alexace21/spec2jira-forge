@@ -60,12 +60,24 @@ modules:
       resource: main
       resolver:
         function: resolver
-      title: Spec2JIRA Settings
+      title: Spec2Tickets Settings
       useAsConfig: true
       # NOTE: confluence:globalSettings does NOT support unlicensedAccess (a hard
       # forge-lint error — verified 2026-06-03). Moot now: the app is licensed-only
       # (the in-app Free tier was removed 2026-06-03), so no surface declares
       # unlicensedAccess.
+  # ── Task #13: never-pushed-orphan cleanup (2026-06-14) ───────────────────────
+  # Daily sweep that deletes a generated-but-never-pushed breakdown 7 days after its
+  # last access — the privacy / data-minimization backstop for abandoned generations
+  # (purgeJob already removes a breakdown on push; this covers the never-pushed case).
+  # ACCESS-renewed (jobmeta.lastAccessedAt, bumped on every meaningful access — review/reconnect + TC/push),
+  # NOT a creation-anchored native TTL — a KVS TTL renews only on `set`, so a read-only
+  # review would silently lose the deliverable (§11). System trigger (no user context)
+  # → KVS only (asApp, storage:app). Per-installation. interval: day | hour | week.
+  scheduledTrigger:
+    - key: orphan-sweep
+      function: orphan-sweep-fn
+      interval: day
   function:
     # Single resolver handles ALL backend work in v3.0.1+:
     #   - Settings (BYOK API key), Confluence page fetch/search
@@ -79,6 +91,9 @@ modules:
     #     unavailable in async context (AUTH_TYPE_UNAVAILABLE); resolver-only.
     - key: resolver
       handler: index.handler
+    # Task #13 orphan sweep (scheduledTrigger above). System invocation, KVS-only.
+    - key: orphan-sweep-fn
+      handler: index.sweepHandler
 resources:
   - key: main
     path: static/hello-world/build
@@ -94,7 +109,7 @@ permissions:
       # Property name 'backend' е the Forge manifest schema's predefined
       # key for external fetch egress (не arbitrary). Despite the name,
       # this declares egress access TO https://api.anthropic.com — there
-      # е no Spec2JIRA-operated backend.
+      # е no Spec2Tickets-operated backend.
       backend:
         - address: https://api.anthropic.com
   scopes:
@@ -124,6 +139,28 @@ permissions:
     # read:jira-work — read project metadata (issue types, fields) before create
     - write:jira-work
     - read:jira-work
+    # ── P15 (2026-06-20) — Push plan to Jira (real Agile Sprints) ──────────
+    # The Agile API (/rest/agile/1.0/board + /sprint) requires the jira-software
+    # scope family — write:jira-work does NOT cover board/sprint resources.
+    # ⚠ ADDING THESE FORCES CUSTOMER RE-CONSENT (forge install --upgrade +
+    # every site admin re-approves in Manage Apps; the v6.0.0 deploy banked
+    # "no new scopes → no re-consent" — this deliberately spends that, partner-
+    # chosen for native sprints over fix-versions). LIVE-VERIFY the exact scope
+    # strings + that asUser reaches /rest/agile/1.0/ on dev (POLICY §9) BEFORE
+    # publishing — Atlassian renamed several jira-software granular scopes.
+    # read:board-scope:jira-software — GET /board (discover the scrum board)
+    # read:project:jira — ALSO required by GET /board (live-acceptance 2026-06-21: board
+    #   discovery 401'd "Authentication Required" without it; the granular Agile endpoint does
+    #   NOT accept classic read:jira-work for the project read — Atlassian docs api-group-board).
+    # read:sprint:jira-software — GET board/{id}/sprint (idempotent reuse)
+    # write:sprint:jira-software — POST /sprint (create) + /sprint/{id}/issue (move)
+    # write:issue:jira-software — ALSO required by POST /sprint/{id}/issue (move+rank issues
+    #   into a sprint = "rank and estimate issues"; docs scopes-for-oauth-2-3LO-and-forge-apps).
+    - read:board-scope:jira-software
+    - read:project:jira
+    - read:sprint:jira-software
+    - write:sprint:jira-software
+    - write:issue:jira-software
 app:
   runtime:
     name: nodejs24.x
@@ -145,11 +182,18 @@ app:
       required: false
   # ── Paid-via-Atlassian + TWO editions (Standard/Advanced) ────────────
   # The platform cap is EXACTLY two editions. editionsEnabled is MANDATORY for
-  # the two-price hybrid (licensing.enabled alone → a SINGLE price):
-  #   Standard = BYOK Pro    (customer's own key, UNLIMITED) — portal price (set 2026-06-04):
-  #                            100% of Confluence ($6.70/user, $57 ≤10, declining, 1.5x multi)
-  #   Advanced = Managed Pro (our key; capped 10/USER/mo) — editions are a POST-PUBLISH phase,
-  #                            so Advanced is ADDED AFTER the app is live (Phase 2; price $13/user planned)
+  # the two-price model (licensing.enabled alone → a SINGLE price).
+  # ⭐ v6 VALUE-SPLIT (2026-06-17): BOTH editions are BYOK (customer's own key); they
+  # differ by VALUE (feature set), NOT key-source:
+  #   Standard = core breakdown + push + Project Context (UNLIMITED, BYOK) — portal price
+  #              (set 2026-06-04): 100% of Confluence ($6.70/user, $57 ≤10, declining, 1.5x multi)
+  #   Advanced = Standard + test-case generation (UNLIMITED, BYOK; $13.40/user). Single anchor =
+  #              test-cases; custom prompts + Capacity-Sheet are FUTURE (don't advertise until built).
+  # ⚠ DEPLOY-TIMING: the portal Advanced edition is currently still the v5 "Managed" edition
+  #   (pending). Re-config it to the BYOK test-cases value at editions Phase 2 (POST-PUBLISH),
+  #   and deploy the v6 code only in lockstep with that re-config (portal copy FIRST, code
+  #   SECOND) so a new Advanced subscriber promised "no key" is never handed a must-bring-key
+  #   product. See the handover deploy-timing note.
   # Runtime tells them apart via context.license.capabilitySet
   # (capabilitystandard / capabilityadvanced) — see src/usage.js resolveTier.
   # Prices/edition names are set in the vendor portal, NOT here. Evaluation is the

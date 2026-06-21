@@ -96,6 +96,41 @@ search space. Inside it, search for the maximum.
 
 ---
 
+## 3.5 Simplicity over complexity — the simple design IS the high-value one
+
+> Partner's framing (2026-06-08, verbatim): *"Simplicity over complexity."* —
+> e.g. a stable `story_uid` instead of fragile index/name-matching heuristics IS
+> simplicity, and improves the design.
+
+When two designs solve the same problem, prefer the one with **fewer moving parts
+and a clearer invariant** — even if it touches more files to introduce. A stable
+identity (a minted `uid`) is SIMPLER than re-deriving identity from position or
+name at every comparison, because the invariant ("this id always means this thing")
+removes a whole class of drift bugs (reorder / rename / restructure mis-targeting).
+Heuristic matching (index → name → content) is *more code at every call site* and
+*more failure modes*; a single source of truth is *less*. **"Simplicity" is measured
+by the invariants a reader must hold in their head, NOT by lines-of-diff today.**
+
+  ❌ Re-derive identity (index/name) at every binding site → N places to drift-wrong.
+  ✅ Mint a stable id once, thread it → the binding is trivially correct everywhere.
+
+This composes with §3 (highest-value): the simplest correct design that deletes a
+bug *class* is usually also the highest-value one. Reach for it even when the quick
+patch (one more heuristic) looks cheaper in the moment — the heuristic is the
+complexity; the stable invariant is the simplicity.
+
+**Addendum — Simplicity over over-engineering + SOLID (2026-06-11, partner directive,
+binding):** build what the NAMED use-case needs end-to-end — no speculative abstractions,
+config flags, or extension points for futures nobody has asked for. Prefer extending an
+existing proven pattern over introducing a new shape. **SOLID (§2, priority 3) is the
+boundary discipline** — one responsibility per module/helper, pure functions testable in
+isolation, no hidden state — not an invitation to layer architecture. The acceptance test
+for any piece of design: *which requirement, nameable TODAY, does it serve?* No answer =
+cut it. Complete ≠ maximal: a feature is DONE when its use-case closes end-to-end
+(§9-measured), not when every conceivable extension is scaffolded.
+
+---
+
 ## 4. Pure-function vs LLM — the dispatch rule
 
 The dispatch is binary. Each task is either **deterministic** (answer derivable
@@ -336,6 +371,25 @@ steps (a typo, a one-line rename, a pure function with exhaustive unit tests) do
 need the full ceremony; use judgment, and when unsure lean toward orchestration (the
 partner's stated preference: more efficient, more detailed, higher quality). The opt-in
 is **STANDING** — do not wait to be re-asked each task.
+
+**⭐ Conductor-holds-context rule (2026-06-13, partner directive — binding; the guard
+against performative orchestration):** delegate work that genuinely BENEFITS from what
+an agent adds — independent fresh-eyes lenses, adversarial fan-out, parallel coverage,
+or simply more hands. Do NOT delegate work where the conductor holds context an agent
+would LACK and could not be cheaply handed — synthesis of a long arc (handover notes,
+commit messages, the through-line of a multi-session effort), integrating reports
+already gathered, or a decision that needs the whole history in one head. Spawning
+agents for those DEGRADES the result (the agent starts blind) and wastes tokens —
+**that is performative orchestration, and it is a defect, not diligence.** The test
+before delegating one piece: *would an agent have MORE or LESS context/capability than
+me for THIS specific piece?* More → delegate. Less → do it directly, and say why.
+⚠ This rule holds **even under a standing "use agents / Ultracode" directive** — that
+directive pushes toward orchestration for the SUBSTANTIVE work, never toward faking it
+on synthesis the conductor is uniquely positioned to do. Forgetting this under
+orchestration-pressure (delegating a handover/commit/synthesis to look thorough) is the
+exact inattention this rule exists to catch. Composes with §3 (highest-value) and §13
+(the conductor owns the policy; the agents apply it — but the conductor still does the
+conductor's own work).
 
 ---
 

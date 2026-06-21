@@ -3,6 +3,7 @@ import EditableField from './EditableField.jsx';
 import TaskCard from './TaskCard.jsx';
 import LabelsEditor from './LabelsEditor.jsx';
 import { parseConcernPrefix, SEVERITY_PALETTE, CONCERN_TYPE_LABEL } from '../../lib/v3Schema.js';
+import { IconX } from '../Icon';
 
 /**
  * FeatureCard — Editor for a single Feature (→ JIRA Story).
@@ -118,7 +119,7 @@ export default function FeatureCard({ feature, index, onUpdate, onDelete }) {
   }
 
   function addTask() {
-    const newTask = { type: 'API', summary: 'New task' };
+    const newTask = { type: 'API', summary: 'New task', description: '' };
     onUpdate({ ...feature, tasks: [...feature.tasks, newTask] });
     if (!expanded) setExpanded(true);
   }
@@ -259,7 +260,7 @@ export default function FeatureCard({ feature, index, onUpdate, onDelete }) {
             <div className="space-y-1.5 pb-1">
               <span className="text-[11px] font-medium uppercase tracking-wider"
                 style={{ color: 'var(--s2j-text-muted)' }}>
-                AI flagged ({feature.concerns.length})
+                AI-flagged concerns ({feature.concerns.length})
               </span>
               {feature.concerns.map((raw, i) => {
                 const { type, severity, text } = parseConcernPrefix(raw);
@@ -345,14 +346,13 @@ export default function FeatureCard({ feature, index, onUpdate, onDelete }) {
               multiline className="text-xs leading-relaxed italic" style={{ color: 'var(--s2j-text-light)' }} />
           </div>
 
-          {feature.description && (
-            <div>
-              <label className="text-[11px] font-medium uppercase tracking-wider mb-1 block"
-                style={{ color: 'var(--s2j-text-muted)' }}>Description</label>
-              <EditableField value={feature.description} onChange={(val) => updateField('description', val)}
-                multiline className="text-xs leading-relaxed" style={{ color: 'var(--s2j-text-light)' }} />
-            </div>
-          )}
+          {/* Always render so a description-less Story can get one (parity with subtasks). */}
+          <div>
+            <label className="text-[11px] font-medium uppercase tracking-wider mb-1 block"
+              style={{ color: 'var(--s2j-text-muted)' }}>Description</label>
+            <EditableField value={feature.description || ''} onChange={(val) => updateField('description', val)}
+              multiline placeholder="Click to add a description…" className="text-xs leading-relaxed" style={{ color: 'var(--s2j-text-light)' }} />
+          </div>
 
           {/* Story Acceptance Criteria */}
           <div className="space-y-1.5">
@@ -377,7 +377,7 @@ export default function FeatureCard({ feature, index, onUpdate, onDelete }) {
                 {(feature.acceptance_criteria || []).length > 1 && (
                   <button onClick={() => deleteAC(i)}
                     className="mt-0.5 opacity-0 group-hover/ac:opacity-100 transition-all text-xs px-1"
-                    style={{ color: 'var(--s2j-red)' }}>✕</button>
+                    style={{ color: 'var(--s2j-red)' }}><IconX size={14} /></button>
                 )}
               </div>
             ))}

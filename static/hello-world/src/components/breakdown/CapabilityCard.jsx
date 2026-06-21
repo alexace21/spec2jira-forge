@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import FeatureCard from './FeatureCard.jsx';
+import { newStoryUid } from '../../lib/v3Schema';
 
 /**
  * CapabilityCard — Editor for a single Capability (→ JIRA Epic).
@@ -40,6 +41,8 @@ export default function CapabilityCard({ capability, index, onUpdate, onDelete }
 
   function addFeature() {
     const newFeature = {
+      _uid: newStoryUid(),
+      _orig_name: 'New Feature', // Task #3: mint _orig_name WITH _uid so every feature upholds the invariant adaptToLegacyShape sets (dep-name→uid binding relies on it)
       name: 'New Feature',
       user_story: 'As a user, I want [goal], so that [benefit].',
       acceptance_criteria: ['Acceptance criterion'],
@@ -100,7 +103,7 @@ export default function CapabilityCard({ capability, index, onUpdate, onDelete }
           style={{ color: 'var(--s2j-text-muted)' }}
           onMouseEnter={e => { e.target.style.background = 'var(--s2j-red-bg)'; e.target.style.color = 'var(--s2j-red)'; }}
           onMouseLeave={e => { e.target.style.background = 'transparent'; e.target.style.color = 'var(--s2j-text-muted)'; }}
-          title="Delete capability"
+          title="Delete category"
           role="button"
         >
           <svg className="h-3.5 w-3.5" viewBox="0 0 20 20" fill="currentColor">

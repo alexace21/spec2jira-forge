@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { IconCheck } from '../Icon';
 
 /**
  * SharedACPanel — displays shared (cross-cutting) acceptance criteria from the
@@ -63,7 +64,7 @@ export default function SharedACPanel({
 
         <span className="rounded px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider"
           style={{ background: 'var(--s2j-orange-border)', color: '#92400e' }}>
-          Source AC
+          Shared AC
         </span>
 
         <span className="flex-1 text-sm font-semibold" style={{ color: 'var(--s2j-text)' }}>
@@ -176,7 +177,7 @@ function RemovedSubsection({ items, collapsed, onToggle, onRestore }) {
           className="flex-1 text-[11px]"
           style={{ color: 'var(--s2j-text-muted)' }}
         >
-          {items.length} {items.length === 1 ? 'item' : 'items'} excluded from JIRA push
+          {items.length} {items.length === 1 ? 'item' : 'items'} excluded from Jira push
           (restorable)
         </span>
       </button>
@@ -321,7 +322,7 @@ function SharedACItem({
         </select>
 
         {isAssigned && (
-          <span className="shrink-0 text-xs" style={{ color: 'var(--s2j-green)' }}>✓</span>
+          <span className="shrink-0 text-xs inline-flex items-center" style={{ color: 'var(--s2j-green)' }}><IconCheck size={14} /></span>
         )}
       </div>
     </div>
