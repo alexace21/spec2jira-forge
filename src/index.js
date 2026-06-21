@@ -58,10 +58,36 @@ import {
   projectTestCaseCost, // v6 cost-transparency: pre-flight projector
   sumUsage, // v6 cost-transparency: batch-wide usage aggregation for the post-run echo
   TC_SPEC_SOURCE_MAX_CHARS, // v6: clamp the projector's spec-source input identically to submit
+  submitPlanRankingBatch, // Capacity-Sheet Planner: the advisory ranking call via the Batches API (async)
+  fetchPlanRankingResults,
 } from './anthropic_client.js';
-import { startPushSession, pushSessionStep, flattenBreakdown, lookupProject } from './push_handler.js';
+import { startPushSession, pushSessionStep, flattenBreakdown, lookupProject, startPlanPushSession, planPushSessionStep } from './push_handler.js';
 import { isOrphanStale } from './sweep_util.js'; // Task #13: pure staleness decision (unit-tested; index.js isn't node-importable)
 import { detectCycles } from './graph.js';
+// Capacity-Sheet Planner pure-fn core (src/planner.js — node-testable; prototype/test_planner.mjs).
+// The planner's dispatch (POLICY §4): all of capacity math / graph / packing is deterministic here;
+// the ONE meaning-judgment is rankFeaturesForPlan (above). assemblePlan composes them given an
+// (optional) ranking — the resolver supplies the LLM output or null (deterministic fallback).
+import {
+  computeCapacity,
+  assemblePlan,
+  buildPlannerGraph,
+  topoSortAndCycles,
+  computeSchedulingSignals,
+  buildRankingRows,
+  computeRiskSignals,
+  summarizeSpecConcerns,
+  diffPlans,
+  validateSizing,
+  featureId,
+  priorityRankOf,
+  planSourceHash,
+  estimatePlanCost,
+} from './planner.js';
+// P12: the planning-objective allow-list is OWNED by prompts.js (it must stay lock-step with the
+// OBJECTIVE_CLAUSES the ranker actually understands). Import it rather than re-hardcoding the set here
+// — a second literal list would silently drift the moment a new objective is added (P12-04 audit finding).
+import { PLAN_OBJECTIVES } from './prompts.js';
 import { renderGherkin, renderManualTable, parseTestCaseResult, normAC } from './testcases.js';
 import {
   TIERS,
@@ -238,6 +264,17 @@ const SETTINGS_MAX_BYTES = 200000;
 // KVS prefix for generation job state (Anthropic batch lifecycle).
 const JOB_KEY_PREFIX = 'job:';
 
+// Capacity-Sheet Planner: a generated sprint plan, keyed by jobId (ledger UX-2/3). Holds the LLM
+// ranking + usage + sourceHash + capacity form + the packed result so a reconnect rehydrates the
+// BILLED plan (no re-pay) and an assumption-only re-pack reuses the CACHED ranking (no LLM). Deleted
+// by deleteJobKeys on push-purge AND swept after 7-day inactivity (same lifecycle as the breakdown).
+const PLAN_KEY_PREFIX = 'plan:';
+
+// The in-flight ranking BATCH lifecycle record (separate from the completed plan: record), keyed by
+// jobId. Holds batchId/keySource + the inputs needed to finalize (features/capacityForm/sourceHash) so
+// pollPlanStatus can assemble + persist the plan when the batch ends. Deleted on completion + in deleteJobKeys.
+const PLAN_BATCH_PREFIX = 'planjob:';
+
 // (KVS-cost optimization 2026-06-10) The heavy job: record holds the full breakdown (~240KB).
 // jobmeta: is a tiny SIBLING (~100B: status/pageTitle/startedAt) the dashboard reads instead of
 // dereferencing the 240KB job: on every reconcile sweep — KVS has NO field projection, so a lean
@@ -328,6 +365,11 @@ async function deleteJobKeys(jobId, job, accountId) {
   await kvs.delete(`${JOB_KEY_PREFIX}${jobId}`);
   // pagesnap: holds a full source-page copy (~180KB) — the privacy-critical item.
   await kvs.delete(`${PAGE_SNAP_PREFIX}${jobId}`);
+  // plan: holds a generated sprint plan (feature names + LLM rationale = content) — core privacy
+  // tier like pagesnap (throws → caller's catch → purge_incomplete / sweep retry). Ledger UX-3.
+  await kvs.delete(`${PLAN_KEY_PREFIX}${jobId}`);
+  // planjob: any in-flight ranking-batch record (carries feature names too) — same core tier.
+  await kvs.delete(`${PLAN_BATCH_PREFIX}${jobId}`);
   // drop from the per-user tracked list (best-effort; getDashboardJobs also prunes dead refs).
   try {
     if (accountId) {
@@ -2565,6 +2607,409 @@ resolver.define('purgeJob', async ({ payload, context }) => {
 });
 
 // ════════════════════════════════════════════════════════════
+// CAPACITY-SHEET PLANNER — review-only sprint plan (2026-06-19)
+// ════════════════════════════════════════════════════════════
+//
+// Flow: the frontend sends the CURRENT edited breakdown (slim features: _uid/_orig_name/name/
+// story_points/complexity_score/priority/dependencies) + the in-app capacity form. The pure-fn core
+// (src/planner.js) validates the form (fail-loud, no LLM spend on a bad form — ledger CAP-1), builds
+// the uid-keyed dependency graph with push parity, and the ONE advisory LLM call orders the backlog;
+// packSprints does all the arithmetic. The plan is persisted (plan:<jobId>) so a reconnect rehydrates
+// the BILLED plan and an assumption-only edit re-packs over the CACHED ranking for FREE (ledger UX-2/4).
+// v1 is REVIEW-ONLY (no Jira write); the planner is licensed but NOT edition-gated (structurally ready
+// behind getActiveTier should it become Advanced-only).
+
+const PLAN_FEATURE_CAP = 300; // bound payload / packing loop / KVS size (a breakdown is dozens; ledger CAP-6 spirit)
+const PLAN_SPEC_CONCERN_CAP = 25;   // SN-3: bound the spec-wide concern list fed to the ranker (the prompt re-slices to 10)
+const PLAN_CONCERN_CHAR_CAP = 240;  // bound each concern string (a typed concern is a sentence, not a paragraph)
+const PLAN_TASK_TYPE_CAP = 40;      // Tier-2: bound the per-feature task-type token list in the persisted lean projection
+
+// Map an rankFeaturesForPlan {error} to an HONEST user-facing note. The planner NEVER hard-fails —
+// the deterministic fallback ordering (topo + priority + critical-path) still produces a valid plan
+// (ledger LLM-3); this note tells the user the AI prioritization was skipped and how to retry.
+function planLlmNote(code) {
+  if (typeof code === 'string' && (code.startsWith('http_5') || code.startsWith('anthropic_5') || code.startsWith('results_fetch_5'))) return 'Claude is temporarily unavailable, so the plan is ordered by dependencies and priority. Re-rank to retry.';
+  switch (code) {
+    case 'http_401':
+    case 'auth_rejected': return 'Your Anthropic key was rejected, so the plan is ordered by dependencies and priority — check the key in Settings.';
+    case 'http_429':
+    case 'rate_limited': return 'Claude is rate-limited right now, so the plan is ordered by dependencies and priority. Re-rank in a moment.';
+    case 'http_402':
+    case 'insufficient_credits': return 'Your Anthropic account is out of credits, so the plan is ordered by dependencies and priority.';
+    case 'network_failure': return 'Claude could not be reached, so the plan is ordered by dependencies and priority. Re-rank to retry.';
+    case 'parse_failed': return 'Claude’s prioritization could not be read, so the plan is ordered by dependencies and priority. Re-rank to retry.';
+    case 'timeout': return 'Claude took too long to respond, so the plan is ordered by dependencies and priority. Re-rank to retry.';
+    case 'batch_not_found':
+    case 'batch_request_expired': return 'Claude’s batch expired before it finished, so the plan is ordered by dependencies and priority. Re-rank to retry.';
+    default: return 'AI prioritization was unavailable, so the plan is ordered by dependencies and priority.';
+  }
+}
+
+// precomputedRisk for a CACHED plan (re-pack / what-if): a legacy record persisted `risk` separately;
+// new records don't (KVS-footprint dedup) — riskByFeature + specConcernSummary are sibling keys on the
+// stored plan, so derive from there. A pre-risk-layer plan has neither → undefined → assemblePlan recomputes.
+function riskFromRecord(record) {
+  if (record && record.risk) return record.risk;
+  if (record && record.plan) return { riskByFeature: record.plan.riskByFeature, specConcernSummary: record.plan.specConcernSummary };
+  return undefined;
+}
+
+/**
+ * finalizePlanJob — the SINGLE plan-completion point (success OR fallback). Given the batch job record
+ * + the ranking (null on ANY LLM failure → deterministic ordering), it recomputes capacity, assembles
+ * the plan, persists plan:<jobId>, drops the in-flight planjob: record, and returns the completed
+ * response. The planner NEVER hard-fails (ledger LLM-3): a missing/failed ranking still yields a plan.
+ */
+async function finalizePlanJob(planjob, ranking, usage, llmNote) {
+  const capacity = computeCapacity(planjob.capacityForm);
+  if (!capacity.ok) {
+    await kvs.delete(`${PLAN_BATCH_PREFIX}${planjob.jobId}`).catch(() => {});
+    return { ok: false, status: 'completed', stage: 'capacity', capacityErrors: capacity.errors, assumptions: capacity.assumptions, warnings: capacity.warnings };
+  }
+  let plan;
+  try {
+    // precomputedRisk reuses the compact risk from startPlan (concerns are GONE from planjob.features); the
+    // specConcerns fallback covers an in-flight job created by pre-fix code during a deploy window (graceful).
+    plan = assemblePlan({ features: planjob.features, capacity, ranking, specConcerns: planjob.specConcerns, precomputedRisk: planjob.risk });
+    // §11 self-audit: the skill packer's invariant channel must stay empty. If it ever fires (a packer
+    // regression: a feature overflowed a bucket that had room), surface it loudly in the logs (gate finding).
+    if (plan && Array.isArray(plan.violations) && plan.violations.length) console.warn(`[plan] packer invariant VIOLATIONS (${plan.violations.length}) — should never happen ref=${planjob.jobId}`);
+  } catch (e) {
+    console.error(`[plan] finalize assemble threw (non-fatal): ${String(e?.message || e)} ref=${planjob.jobId}`);
+    await kvs.delete(`${PLAN_BATCH_PREFIX}${planjob.jobId}`).catch(() => {});
+    return { ok: false, status: 'completed', stage: 'plan', error: 'plan_failed', detail: 'The plan could not be computed from this breakdown — please try again.' };
+  }
+  const usedLlm = !!(plan.ranking && plan.ranking.usedLlm);
+  if (!usedLlm && Array.isArray(ranking) && ranking.length && !llmNote) {
+    llmNote = 'Claude’s prioritization could not be matched to your features, so the plan is ordered by dependencies and priority.';
+  }
+  const cost = usage ? estimateCost(usage, planjob.model || MODEL_PRIMARY, { batch: true }) : null; // Batches API = 50%
+  const warnings = Array.isArray(planjob.warnings) ? planjob.warnings : [];
+  // deep-audit KVS-footprint dedup (2026-06-20): do NOT persist `risk` separately — riskByFeature +
+  // specConcernSummary are ALREADY sibling keys on `plan`. Storing them twice pushed a 300-feature
+  // skill+risk record to ~263KB > the ~240KB cap (silent persist loss). re-pack/what-if derive
+  // precomputedRisk from record.plan (riskFromRecord); a legacy record.risk is still honoured.
+  const objective = planjob.objective || 'balanced'; // P12: which objective produced this plan (echo for the drift hint + brief)
+  const record = { jobId: planjob.jobId, features: planjob.features, capacityForm: planjob.capacityForm, ranking, usage: usage || null, sourceHash: planjob.sourceHash, plan, assumptions: capacity.assumptions, warnings, llmNote, cost, usedLlm, objective, createdAt: Date.now() };
+  try { await kvs.set(`${PLAN_KEY_PREFIX}${planjob.jobId}`, record); } catch (e) { console.warn(`[plan] persist failed (non-fatal): ${String(e?.message || e)} ref=${planjob.jobId}`); }
+  await kvs.delete(`${PLAN_BATCH_PREFIX}${planjob.jobId}`).catch(() => {}); // batch lifecycle complete
+  await touchJobAccess(planjob.jobId);
+  // SELF-DESCRIBING PLAN (reload fix 2026-06-20): every completion return carries the lean features so the
+  // FE name-source (result.features) survives a reload/re-pack regardless of the live in-memory breakdown.
+  return { ok: true, status: 'completed', plan, features: planjob.features, assumptions: capacity.assumptions, warnings, perSprintCapacityPoints: capacity.perSprintCapacityPoints, sourceHash: planjob.sourceHash, usedLlm, llmNote, cost, objective };
+}
+
+/**
+ * startPlan — SUBMIT the advisory ranking BATCH (the "Generate plan" / "Re-rank with Claude" action).
+ * computeCapacity validates BEFORE any spend. Returns {status:'batched'} immediately; the UI then polls
+ * pollPlanStatus until {status:'completed'}. TRANSPORT = Batches API — a sync ranking over a rich backlog
+ * exceeds Forge's 25s HARD kill (confirmed live; gotcha #5). A submit failure falls back to a plan now.
+ */
+resolver.define('startPlan', async ({ payload, context }) => {
+  if (getActiveTier(context).key === 'unlicensed') return buildLicenseRequired();
+  const { jobId, features, capacityForm, specSummary, specConcerns } = payload || {};
+  // P12: the planning OBJECTIVE rides capacityForm.objective. SANITIZE against the frozen allow-list (never
+  // trust a raw client string into the prompt) — unknown/missing → 'balanced' (no clause; today's behaviour).
+  const PLAN_OBJECTIVE_SET = new Set(PLAN_OBJECTIVES);
+  const objective = PLAN_OBJECTIVE_SET.has(capacityForm && capacityForm.objective) ? capacityForm.objective : 'balanced';
+  // spec-WIDE concerns (SN-3): a bounded, string-only list — passed ONCE to the ranker as plan-level
+  // context, NEVER attributed per-feature. Also carried on the job so a fallback/poll finalize keeps it.
+  const planSpecConcerns = Array.isArray(specConcerns)
+    ? specConcerns.filter((c) => typeof c === 'string' && c.trim()).slice(0, PLAN_SPEC_CONCERN_CAP).map((c) => String(c).slice(0, PLAN_CONCERN_CHAR_CAP))
+    : [];
+  const list = Array.isArray(features) ? features.slice(0, PLAN_FEATURE_CAP) : [];
+  // §11: a backlog OVER the cap is surfaced as a warning, never silently dropped (PLAN-07).
+  const truncationWarnings = Array.isArray(features) && features.length > PLAN_FEATURE_CAP
+    ? [{ code: 'PLAN_FEATURES_TRUNCATED', message: `Only the first ${PLAN_FEATURE_CAP} features were planned (${features.length} total) — split very large breakdowns into smaller ones.` }]
+    : [];
+
+  // CAP-1 short-circuit: a bad form is a typed blocker — render it, fire NO batch.
+  const capacity = computeCapacity(capacityForm);
+  if (!capacity.ok) {
+    return { ok: false, stage: 'capacity', capacityErrors: capacity.errors, assumptions: capacity.assumptions, warnings: capacity.warnings };
+  }
+  // GRAPH-6 empty backlog → nothing to plan, no batch.
+  if (list.length === 0) {
+    // P12-01: every completion path carries `objective` so the completion-shape invariant holds (the
+    // FE reads r.objective for the "Ordered for" line; a missing key would silently read as undefined).
+    return { ok: true, status: 'completed', empty: true, plan: null, objective, assumptions: capacity.assumptions, warnings: capacity.warnings };
+  }
+
+  const { apiKey, keyFault, keySource } = await resolveAnthropicKey(context);
+  if (keyFault) return { ok: false, stage: 'key', error: 'key_fault', detail: KEY_STORAGE_FAILED_DETAIL };
+  if (!apiKey) return { ok: false, stage: 'key', error: 'not_configured', detail: 'Add your Anthropic API key in Settings to generate a plan.' };
+
+  // §8 ranking input (pure). Wrapped so a MALFORMED payload can never throw an unhandled resolver 500.
+  try {
+    const graph = buildPlannerGraph(list);
+    // base topo MUST use the SAME priority tiebreak as assemblePlan (PLAN-13) so the signals shown to the
+    // advisory LLM match those in the final plan when a cycle's cut-edge choice depends on the tiebreak.
+    const prRank = (id) => priorityRankOf(graph.byId.get(id) || {});
+    const base = topoSortAndCycles(graph, () => 0, prRank);
+    const signals = computeSchedulingSignals(graph, base.order);
+    const sizing = validateSizing(list, (f, i) => graph.idByIndex[i]);
+    // Tier-1 risk signals: SAME idOf as the graph/sizing (IR-3) so the compact risk_flags on each row
+    // line up with the feature the model ranks. Advisory only — the de-risk-early tiebreak input (§8).
+    const riskByFeature = computeRiskSignals(list, (f, i) => graph.idByIndex[i]);
+    const rows = buildRankingRows(graph, signals, sizing.points, riskByFeature);
+    const totalBacklogPoints = Array.from(sizing.points.values()).reduce((a, b) => a + b, 0);
+    const globals = {
+      sprintCount: capacity.perSprintCapacityPoints.length,
+      perSprintCapacityPoints: capacity.perSprintCapacityPoints,
+      totalCapacity: capacity.totalCapacityPoints,
+      totalBacklogPoints,
+      deficitPoints: Math.max(0, totalBacklogPoints - capacity.totalCapacityPoints),
+      objective, // P12: the ranking prompt reads globals.objective → the abstract goal clause
+    };
+    const planWarnings = [...capacity.warnings, ...truncationWarnings];
+    // deep-audit (2026-06-20): a duplicate _uid makes buildPlannerGraph disambiguate to `uid#i`, which then
+    // can't join the push's plain-_uid created_issues → those features land in noJiraKey (surfaced, not
+    // silent, but they won't assign to a Jira sprint). _uid is FE-minted-unique, so this is malformed input;
+    // warn LOUDLY at the boundary (PlanDiagnostics also shows duplicateUids) so the cause is clear up front.
+    if (Array.isArray(graph.duplicateUids) && graph.duplicateUids.length) {
+      planWarnings.push({ code: 'DUPLICATE_FEATURE_IDS', message: `${graph.duplicateUids.length} feature(s) share an internal id — they’re planned but may not assign to Jira sprints. Regenerate the breakdown to fix.` });
+    }
+    // ⭐ KVS-footprint fix (gate HIGH 2026-06-20): risk is computed HERE, once, from the upstream concerns.
+    // The persisted job/plan records carry the COMPACT risk (riskByFeature + spec-wide summary) + a LEAN
+    // feature projection (heavy concerns / user_story DROPPED) — at the 300-feature cap the full-concern
+    // features were ~816KB > the ~240KB KVS value cap → silent persist loss. finalize / re-pack reuse this
+    // precomputed risk (assemblePlan never re-reads concerns), so the band stays identical (IR-2).
+    const planRisk = { riskByFeature: Object.fromEntries(riskByFeature), specConcernSummary: summarizeSpecConcerns(planSpecConcerns) };
+    const leanFeatures = list.map((f) => ({
+      _uid: f._uid, _orig_name: f._orig_name, name: f.name,
+      story_points: f.story_points, complexity_score: f.complexity_score,
+      priority: f.priority, dependencies: Array.isArray(f.dependencies) ? f.dependencies : [],
+      // confidence_indicator kept (deep-audit RISK-01): ~1 byte/feature, so the deploy-window risk FALLBACK
+      // (when an in-flight pre-fix job has no precomputedRisk) computes the low-confidence signal correctly.
+      confidence_indicator: f.confidence_indicator,
+      // Tier-2: keep the compact task-type tokens so re-pack / what-if recompute skill demand (light — a
+      // few enum tokens/feature; the heavy concerns/user_story are still dropped for the KVS cap).
+      task_types: Array.isArray(f.task_types) ? f.task_types.slice(0, PLAN_TASK_TYPE_CAP) : [],
+    }));
+    const planjob = { jobId, features: leanFeatures, capacityForm, sourceHash: planSourceHash(list), warnings: planWarnings, model: MODEL_PRIMARY, keySource: keySource || 'byok', risk: planRisk, objective };
+
+    // Submit the ranking batch (advisory). A submit failure → produce the deterministic plan NOW (never block).
+    const submit = await submitPlanRankingBatch({ rows, globals, specSummary: specSummary || '', specConcerns: planSpecConcerns, customId: jobId, apiKey, model: MODEL_PRIMARY });
+    if (submit.error) {
+      console.warn(`[startPlan] batch submit failed (${submit.error}) → deterministic fallback ref=${jobId}`);
+      return await finalizePlanJob(planjob, null, null, planLlmNote(submit.error));
+    }
+
+    // Store the in-flight batch record (keySource stamped once, reused by poll — gotcha). UI polls pollPlanStatus.
+    const batchRecord = { ...planjob, batchId: submit.batchId, status: 'batched', batchStatus: submit.status, submittedAt: Date.now(), expiresAt: submit.expiresAt };
+    try { await kvs.set(`${PLAN_BATCH_PREFIX}${jobId}`, batchRecord); } catch (e) { console.warn(`[startPlan] planjob persist failed (non-fatal): ${String(e?.message || e)} ref=${jobId}`); }
+    await touchJobAccess(jobId);
+    return { ok: true, status: 'batched', planJobId: jobId, sourceHash: planjob.sourceHash, assumptions: capacity.assumptions, warnings: planWarnings, perSprintCapacityPoints: capacity.perSprintCapacityPoints };
+  } catch (e) {
+    console.error(`[startPlan] plan pipeline threw (non-fatal): ${String(e?.message || e)} ref=${jobId}`);
+    return { ok: false, stage: 'plan', error: 'plan_failed', detail: 'The plan could not be computed from this breakdown — please try again or adjust the breakdown.' };
+  }
+});
+
+/**
+ * pollPlanStatus — the UI loops this after a 'batched' startPlan. Polls the ranking batch; on 'ended'
+ * it fetches + finalizes (assemble + persist). On a hard batch error OR a key loss it falls back to the
+ * deterministic plan (never-hard-fails). Reuses the same key the batch was created with (keySource).
+ */
+resolver.define('pollPlanStatus', async ({ payload, context }) => {
+  if (getActiveTier(context).key === 'unlicensed') return buildLicenseRequired();
+  const { jobId } = payload || {};
+  let planjob;
+  try { planjob = await kvs.get(`${PLAN_BATCH_PREFIX}${jobId}`); } catch (_) { planjob = null; }
+
+  if (!planjob || !planjob.batchId) {
+    // No in-flight batch → maybe it already completed (e.g. a concurrent poll finalized it).
+    let done; try { done = await kvs.get(`${PLAN_KEY_PREFIX}${jobId}`); } catch (_) { done = null; }
+    if (done && done.plan) {
+      await touchJobAccess(jobId);
+      return { ok: true, status: 'completed', plan: done.plan, features: done.features, assumptions: done.assumptions, warnings: done.warnings, sourceHash: done.sourceHash, usedLlm: done.usedLlm, llmNote: done.llmNote, cost: done.cost, objective: done.objective || 'balanced' };
+    }
+    return { ok: true, status: 'idle' };
+  }
+
+  const elapsed = Math.round((Date.now() - (planjob.submittedAt || Date.now())) / 1000);
+  const jobKey = await anthropicKeyForSource(planjob.keySource || 'byok');
+  if (!jobKey) return await finalizePlanJob(planjob, null, null, planLlmNote('not_configured')); // key vanished → fallback
+
+  const poll = await pollBatchStatus(planjob.batchId, jobKey);
+  if (poll.error) {
+    // a HARD error (gone / key rejected) → fallback now; a transient one → keep polling
+    if (poll.error === 'batch_not_found' || poll.error === 'auth_rejected') {
+      return await finalizePlanJob(planjob, null, null, planLlmNote(poll.error));
+    }
+    return { ok: true, status: 'batched', elapsed };
+  }
+  if (poll.status === 'in_progress' || poll.status === 'canceling') {
+    return { ok: true, status: 'batched', elapsed };
+  }
+  // ended → fetch the ranking + finalize (a fetch error falls back to the deterministic plan)
+  const fetched = await fetchPlanRankingResults(poll.resultsUrl, jobId, jobKey);
+  if (fetched.error) {
+    console.warn(`[pollPlanStatus] fetch failed (${fetched.error}) → deterministic fallback ref=${jobId}`);
+    return await finalizePlanJob(planjob, null, null, planLlmNote(fetched.error));
+  }
+  return await finalizePlanJob(planjob, fetched.ranking, fetched.usage, null);
+});
+
+/**
+ * repackPlan — assumption-only re-pack (ledger UX-4): a capacity edit re-runs computeCapacity +
+ * packSprints over the CACHED ranking. FREE — no LLM, no spend. Requires an existing plan.
+ */
+resolver.define('repackPlan', async ({ payload, context }) => {
+  if (getActiveTier(context).key === 'unlicensed') return buildLicenseRequired();
+  const { jobId, capacityForm } = payload || {};
+  // Cross-tab race (gate finding): if a re-rank BATCH is in flight (e.g. another tab fired it), refuse the
+  // free re-pack — its write over the CACHED ranking could clobber the FRESH ranking finalizePlanJob is
+  // about to persist (Forge KVS has no compare-and-set; the per-tab planBusy gate can't serialize tabs).
+  let inFlight;
+  try { inFlight = await kvs.get(`${PLAN_BATCH_PREFIX}${jobId}`); } catch (_) { inFlight = null; }
+  if (inFlight && inFlight.batchId) return { ok: false, stage: 'plan', error: 'rerank_in_flight', detail: 'A re-rank is in progress — wait for it to finish, then re-pack.' };
+  let record;
+  try { record = await kvs.get(`${PLAN_KEY_PREFIX}${jobId}`); } catch (_) { record = null; }
+  if (!record || !Array.isArray(record.features)) return { ok: false, error: 'no_plan', detail: 'Generate a plan first.' };
+
+  const capacity = computeCapacity(capacityForm);
+  if (!capacity.ok) {
+    return { ok: false, stage: 'capacity', capacityErrors: capacity.errors, assumptions: capacity.assumptions, warnings: capacity.warnings };
+  }
+
+  let plan;
+  try {
+    // CACHED ranking + the COMPACT precomputed risk (concerns are gone from record.features) → no LLM, no
+    // recompute; only sprintRiskProfiles re-derive for the new packing. record.specConcerns covers old records.
+    plan = assemblePlan({ features: record.features, capacity, ranking: record.ranking, specConcerns: record.specConcerns, precomputedRisk: riskFromRecord(record) });
+  } catch (e) {
+    console.error(`[repackPlan] re-pack threw (non-fatal): ${String(e?.message || e)} ref=${jobId}`);
+    return { ok: false, stage: 'plan', error: 'plan_failed', detail: 'The plan could not be re-packed — please try again.' };
+  }
+  const updated = { ...record, capacityForm, plan, assumptions: capacity.assumptions, warnings: capacity.warnings, repackedAt: Date.now() };
+  try { await kvs.set(`${PLAN_KEY_PREFIX}${jobId}`, updated); } catch (_) { /* best-effort */ }
+  await touchJobAccess(jobId);
+
+  // SELF-DESCRIBING PLAN (gate HIGH 2026-06-20): a free re-pack REPLACES the FE planResult, so it MUST
+  // re-carry features — else a reload→re-pack drops the name source and the chips re-render raw uids.
+  return { ok: true, plan, features: record.features, assumptions: capacity.assumptions, warnings: capacity.warnings, perSprintCapacityPoints: capacity.perSprintCapacityPoints, sourceHash: record.sourceHash, usedLlm: record.usedLlm, llmNote: record.llmNote, cost: record.cost, objective: record.objective || 'balanced', repacked: true };
+});
+
+/**
+ * getPlan — rehydrate a persisted plan on reconnect (ledger UX-2). Compares the LIVE breakdown's
+ * hash to the stored one server-side (planSourceHash is backend-only) → reports `stale` so the UI
+ * fires the "this plan is out of date" banner and forces a re-plan (UX-1).
+ */
+resolver.define('getPlan', async ({ payload }) => {
+  const { jobId, features } = payload || {};
+  // 1) a COMPLETED plan?
+  let record;
+  try { record = await kvs.get(`${PLAN_KEY_PREFIX}${jobId}`); } catch (_) { record = null; }
+  if (record && record.plan) {
+    await touchJobAccess(jobId);
+    let stale = false;
+    if (Array.isArray(features) && features.length) {
+      stale = planSourceHash(features.slice(0, PLAN_FEATURE_CAP)) !== record.sourceHash;
+    }
+    // SELF-DESCRIBING PLAN (reload fix 2026-06-20): the persisted plan is uid-keyed (sprints[].ids,
+    // riskByFeature) — the human names live in record.features (the lean projection: _uid/name/SP/priority).
+    // Return them so the FE can resolve uid→name on RELOAD without the live in-memory breakdown (which is
+    // lost on a hard reload → names were rendering as raw uids). Lean + already capped → bounded payload.
+    return { ok: true, status: 'completed', plan: record.plan, features: record.features, capacityForm: record.capacityForm, assumptions: record.assumptions, warnings: record.warnings, sourceHash: record.sourceHash, usedLlm: record.usedLlm, llmNote: record.llmNote, cost: record.cost, objective: record.objective || 'balanced', stale };
+  }
+  // 2) an IN-FLIGHT ranking batch? (reconnect mid-plan → the UI resumes polling)
+  let planjob;
+  try { planjob = await kvs.get(`${PLAN_BATCH_PREFIX}${jobId}`); } catch (_) { planjob = null; }
+  if (planjob && planjob.batchId) {
+    return { ok: true, status: 'batched', planJobId: jobId, capacityForm: planjob.capacityForm, elapsed: Math.round((Date.now() - (planjob.submittedAt || Date.now())) / 1000) };
+  }
+  return { ok: true, status: 'idle', plan: null };
+});
+
+/**
+ * estimatePlanCost — read-only pre-flight estimate for the ranking call (ledger UX-5). Pure; no key,
+ * no spend. The FE shows "up to ~$X" on the Generate button before the user commits.
+ */
+resolver.define('estimatePlanCost', async ({ payload }) => {
+  const featureCount = Number(payload && payload.featureCount) || 0;
+  return estimatePlanCost({ featureCount, model: MODEL_PRIMARY });
+});
+
+/**
+ * previewCapacity — LIVE form-side capacity preview (read-only; NO LLM, NO spend). Runs the SAME pure
+ * computeCapacity the plan uses so the user SEES the derived points/sprint as they edit (transparency
+ * for the focus-factor sensitivity finding 2026-06-20 — a multiplier change swings capacity a lot, and
+ * the user couldn't see why). Single source of truth = computeCapacity, so the preview can never drift.
+ */
+resolver.define('previewCapacity', async ({ payload, context }) => {
+  if (getActiveTier(context).key === 'unlicensed') return buildLicenseRequired();
+  const cap = computeCapacity(payload && payload.capacityForm);
+  return {
+    ok: cap.ok,
+    perSprintCapacityPoints: cap.perSprintCapacityPoints,
+    totalCapacityPoints: cap.totalCapacityPoints,
+    perSprintBucketCapacity: cap.perSprintBucketCapacity, // Tier-2: per-skill breakdown (BE/FE/QA/GEN)
+    bucketsActive: cap.bucketsActive,
+    assumptions: cap.assumptions,
+    warnings: cap.warnings,
+    errors: cap.errors,
+  };
+});
+
+/**
+ * previewWhatIf — P20 free what-if scenarios (read-only; NO LLM, NO spend, persists NOTHING). Re-packs the
+ * CACHED ranking + CACHED compact risk over a scenario form (±sprint / focus override) and/or a deferred
+ * feature SUBSET, then diffs vs the baseline plan. Reuses the EXACT pure code the real plan used (computeCapacity
+ * + assemblePlan + diffPlans) so a preview can never drift from reality (the previewCapacity guarantee). A
+ * "defer X" scenario removes X from the feature set; normalizeRanking already drops X's now-unknown rank entry,
+ * so every other feature keeps its relative order — the frozen ordering is NOT re-optimized (stated in the UI).
+ */
+resolver.define('previewWhatIf', async ({ payload, context }) => {
+  if (getActiveTier(context).key === 'unlicensed') return buildLicenseRequired();
+  const { jobId, scenario } = payload || {};
+  let record;
+  try { record = await kvs.get(`${PLAN_KEY_PREFIX}${jobId}`); } catch (_) { record = null; }
+  if (!record || !record.plan || !Array.isArray(record.features)) return { ok: false, error: 'no_plan', detail: 'Generate a plan first.' };
+
+  const sc = scenario && typeof scenario === 'object' ? scenario : {};
+  const baseForm = record.capacityForm || {};
+  const scenarioForm = { ...baseForm };
+  const sprintDelta = Number(sc.sprintCountDelta);
+  if (Number.isFinite(sprintDelta) && sprintDelta !== 0) {
+    scenarioForm.sprintCount = Math.max(1, (Number(baseForm.sprintCount) || 0) + sprintDelta);
+  }
+  if (sc.focusFactor !== undefined && sc.focusFactor !== null && sc.focusFactor !== '') {
+    scenarioForm.focusFactor = sc.focusFactor; // computeCapacity validates it fail-loud (rejects e.g. 70-for-0.7)
+  }
+  const deferred = new Set(Array.isArray(sc.deferredUids) ? sc.deferredUids : []);
+  const scenarioFeatures = record.features.filter((f) => f && !deferred.has(f._uid));
+
+  const capacity = computeCapacity(scenarioForm);
+  if (!capacity.ok) {
+    // a bad scenario input (e.g. a typo'd focus factor) is surfaced fail-loud, never silently 0/NaN.
+    return { ok: false, stage: 'capacity', capacityErrors: capacity.errors, assumptions: capacity.assumptions, warnings: capacity.warnings };
+  }
+  if (!scenarioFeatures.length) {
+    return { ok: true, empty: true, detail: 'This scenario defers every feature — nothing left to plan.' };
+  }
+  let scenarioPlan, delta;
+  try {
+    // CACHED ranking + CACHED compact risk → no LLM, no recompute from concerns (which the lean record dropped).
+    scenarioPlan = assemblePlan({ features: scenarioFeatures, capacity, ranking: record.ranking, specConcerns: record.specConcerns, precomputedRisk: riskFromRecord(record) });
+    delta = diffPlans(record.plan, scenarioPlan);
+  } catch (e) {
+    console.error(`[previewWhatIf] threw (non-fatal): ${String(e?.message || e)} ref=${jobId}`);
+    return { ok: false, error: 'whatif_failed', detail: 'Could not compute this scenario — please try again.' };
+  }
+  await touchJobAccess(jobId); // a what-if is activity → renews the orphan-sweep clock (read-only otherwise)
+  return {
+    ok: true,
+    scenarioMetrics: scenarioPlan.metrics,
+    delta,
+    assumptions: capacity.assumptions,
+    warnings: capacity.warnings,
+    perSprintCapacityPoints: capacity.perSprintCapacityPoints,
+    deferredCount: deferred.size,
+  };
+});
+
+// ════════════════════════════════════════════════════════════
 // JIRA PUSH — chunked asUser() resolver (startPush + looped pushStep); 2026-05-30
 // ════════════════════════════════════════════════════════════
 
@@ -2881,6 +3326,74 @@ resolver.define('pushStep', async ({ payload, context }) => {
     progress: outcome.progress,
     counts: outcome.counts,
   };
+});
+
+// ════════════════════════════════════════════════════════════════
+// P15 — PUSH PLAN TO JIRA (real Agile Sprints). Writes the planner's sprint assignment to Jira.
+// Mirrors the chunked push (startPlanPush → loop planPushStep). PURE mapping, NO LLM. The plan + its
+// capacityForm come from the persisted plan:<jobId>; the uid→Jira-key join comes from the breakdown
+// push's created_issues (FE-supplied). Confirm-gated outward write (the FE arms it). ⚠ NEEDS the new
+// Agile scopes — LIVE-VERIFY on dev before publish (POLICY §9).
+// ════════════════════════════════════════════════════════════════
+resolver.define('startPlanPush', async ({ payload, context }) => {
+  if (getActiveTier(context).key === 'unlicensed') return buildLicenseRequired();
+  const { jobId, createdIssues, projectKey: payloadProjectKey, namePrefix, boardId, plan: payloadPlan, capacityForm: payloadForm } = payload || {};
+  // ⭐ POST-PUSH LIFECYCLE FIX (live-acceptance 2026-06-21): "Assign sprints in Jira" runs from the POST-PUSH
+  // success screen — but purgeJob (data-min on push) has ALREADY deleted plan:<jobId> by then, so a KVS read
+  // returns no_plan ("Generate a plan first"). The plan is still in FE memory (the panel is gated on
+  // planResult.plan), so accept it from the PAYLOAD — same capture-before-purge pattern as the post-push
+  // export. Fall back to KVS for any pre-purge / non-success-screen caller. ⚠ The FE-plan contract requires a
+  // `.sprints` array (planner.js) — if a future plan shape renames it, this guard must move with it.
+  // SECURITY (§13 gate): every Jira write runs under asUser, so it is bounded by the END USER'S OWN Jira
+  // permissions (NOT to "only the pushed backlog" — that earlier claim was write-time optimism; a tampered
+  // client can only touch issues the user can already reach, no cross-user escalation). We additionally scope
+  // moves to `projectKey` below so a mismatched/crafted projectKey+keys can't sprint issues in another project.
+  let plan = payloadPlan && Array.isArray(payloadPlan.sprints) ? payloadPlan : null;
+  let form = payloadForm || null;
+  if (!plan) {
+    let record;
+    try { record = await kvs.get(`${PLAN_KEY_PREFIX}${jobId}`); } catch (_) { record = null; }
+    if (record && record.plan) { plan = record.plan; if (!form) form = record.capacityForm; }
+  }
+  if (!plan) return { ok: false, error: 'no_plan', detail: 'Generate a plan first.' };
+  // §13 gate: defensive size bound on the FE-supplied payload (DoS / accidental-giant guard).
+  if ((Array.isArray(plan.sprints) && plan.sprints.length > 100) || (Array.isArray(createdIssues) && createdIssues.length > PLAN_FEATURE_CAP)) {
+    return { ok: false, error: 'payload_too_large', detail: 'The plan or issue list is unexpectedly large — regenerate the plan and retry.' };
+  }
+  const projectKey = await getProjectKey(payloadProjectKey);
+  if (!projectKey) return { ok: false, error: 'no_project_key', detail: 'Set a default Jira project key in Settings (and push the backlog to Jira first).' };
+  // §13 gate (project-scoping): bound the moves to the target project. A Jira key is `<PROJECTKEY>-<n>`; drop
+  // any createdIssue whose key isn't in projectKey → a mismatched/crafted projectKey then simply yields no
+  // movable issues (surfaced honestly via the noJiraKey channel), never a cross-project sprint+move.
+  const keyPrefix = `${String(projectKey).toUpperCase()}-`;
+  const scopedIssues = Array.isArray(createdIssues)
+    ? createdIssues.filter((ci) => ci && typeof ci.key === 'string' && ci.key.toUpperCase().startsWith(keyPrefix))
+    : [];
+  form = form || {};
+  let outcome;
+  try {
+    outcome = await startPlanPushSession({
+      jobId, plan, createdIssues: scopedIssues, projectKey, boardId,
+      sprintStartDate: form.sprintStartDate, sprintLengthDays: form.sprintLengthDays, namePrefix,
+    });
+  } catch (e) {
+    console.error(`[startPlanPush] threw (non-fatal): ${String(e?.message || e)} ref=${jobId}`);
+    return { ok: false, error: 'plan_push_failed', detail: 'Could not start the sprint push — please try again.' };
+  }
+  if (outcome.ok) await touchJobAccess(jobId);
+  return outcome;
+});
+
+resolver.define('planPushStep', async ({ payload, context }) => {
+  if (getActiveTier(context).key === 'unlicensed') return buildLicenseRequired();
+  const sessionId = payload && payload.sessionId;
+  if (!sessionId) return { ok: false, error: 'no_session', detail: 'No session id provided.' };
+  try {
+    return await planPushSessionStep(sessionId);
+  } catch (e) {
+    console.error(`[planPushStep] threw: ${String(e?.message || e)}`);
+    return { ok: false, error: 'step_exception', detail: String(e?.message || e) };
+  }
 });
 
 // ════════════════════════════════════════════════════════════════

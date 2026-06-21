@@ -354,6 +354,24 @@ package names de-scaffolded (→ `spec2tickets`). Build green (bundle ≈ −1.4
 
 ---
 
+## ⚡ HANDOVER NOTE (2026-06-21 — ⭐⭐⭐ Capacity-Sheet Planner arc LIVE E2E ACCEPTED on dev (all 9 phases green) + 8 live-only bugs found & fixed; agent-conducted)
+
+> ⚠ Branch `feature/capacity-sheet-planner` (off `release/v6.0.0`). **NOT committed/deployed to prod — dev-only; partner commits.** Branch-independent record: **`memory/capacity-sheet-planner.md`** (the full LIVE-acceptance record + the 8 fixes + what's next) · [[deep-audit-vs-per-change-gate]]. Durable in-repo: **`docs/PLANNER-LIVE-ACCEPTANCE.md`** (the filled 9-phase sign-off) + **`docs/PLANNER-MR1-TEST-SPEC.md`** (the crafted MR-1 test spec + rubric).
+
+This session: a full **LIVE end-to-end acceptance** of the whole Tier-1 + Tier-2 planner arc on `spec2jira-dev` (real Anthropic key, real Confluence pages, real Jira), conducted via the §13 model throughout (Workflow agent gates after every fix; I = conductor + verdict-taker). **All 9 runbook phases GREEN. 310 offline tests + build green.**
+
+**MR-1 SHIP gates (partner-run, ≥3 live runs rule-by-rule):** Phase 3 risk-sequencing **PASS** (R1 hard-dep 3/3 · R3 de-risk-subordinate 3/3 · R2 3/3, zero flicker; **zero variance** across 3 runs). Phase 9 P12 **PASS-with-findings** (hard-dep 3/3 all objectives; `min_risk` visibly+correctly distinct — AI Triage S4→S3; no LESSON-E leak. ⚠ FINDING: for a backlog where priority=value=MVP align, `mvp`≈`max_value`≈Balanced — only `min_risk` re-weights; `max_value` may be GENERALLY close to Balanced. Accepted, not a bug — the clauses inject + re-weight, they just converge).
+
+**P15 Push-to-Jira (real Agile Sprints) — WORKS end-to-end, incl. TEAM-MANAGED projects** (the new Jira "Spaces"): "Assigned 17 issues across 5 sprints", native sprints on the SCRUM-DEV board with the right Stories + dates + points. ⚠⚠ **P15 adds 5 jira-software scopes (was 3) → customer RE-CONSENT** (`forge install --upgrade -p jira`).
+
+⭐ **Live acceptance caught 8 REAL bugs that 310 offline tests + EVERY per-change §13 gate missed** ([[deep-audit-vs-per-change-gate]] strongest run yet; POLICY §9 live-is-authority repeatedly vindicated). All found → fixed → §13-gated → live-re-verified. Classes: **write-time optimism · cross-layer ref-correlation breaks (uid↔name, plan↔purge) · live-only scope/platform truths**. Headlines (full detail in `memory/capacity-sheet-planner.md`): (1) reload → names shown as raw uids (self-describing plan — return `record.features`); (2) reload → false stale banner (`planSourceHash` keyed on volatile FE-minted `_uid` → re-key on stable CONTENT); (3) brief verdict over-promised vs skill-overflow; (4) skill-bottleneck attribution (`bucketOverDemand` not `bucketUnmet` collateral; GEN excluded); (5) post-push "Assign sprints" → "Generate a plan first" (purge deletes `plan:<jobId>` → capture-before-purge via payload); (6) Agile 401 — manifest scopes valid but INSUFFICIENT (+`read:project:jira` for GET /board, +`write:issue:jira-software` for move); (7) team-managed board not found (type `'simple'` not `'scrum'`); (8) sprint name HTTP 400 (<30-char cap → truncate prefix, keep "Sprint N"). **For an outward-facing WRITE path (Jira), live acceptance is non-negotiable — none of these were offline-detectable.**
+
+❌ **user-named sprints — DISMISSED (partner, 2026-06-21):** users can rename a sprint (and edit it) natively in Jira → an in-app naming field is redundant. The auto `"{page} · Sprint N"` (truncated ≤29) is just the initial name; no code change. ⇒ **No blocking 'next' — the arc is ACCEPTED.** Remaining is optional secondary (CORE arc accepted): Phase-8 idempotent-re-run confirm · company-managed Scrum test (§9-③; team-managed PASSED, company-managed is the more-standard Agile case) · Phase-7 opt-out · copy-failure fallback (full list in `memory/capacity-sheet-planner.md`). Then commit (DONE this session) + (when ready) fold toward release (⚠ P15 = customer re-consent, 5 jira-software scopes).
+
+С усмивка ✨ — целият spec → backlog → **PLAN** arc е жив и приет на дев: risk-aware sequencing, what-if, defensible brief, skill-aware capacity, goal-directed re-rank, и Push-to-Jira с native sprints (вкл. team-managed). Live acceptance-ът хвана 8 реални бъга, които offline никога нямаше да види — точно затова го правим. Следва user-named sprints.
+
+---
+
 ## ⚡ HANDOVER NOTE (2026-06-18 — ⭐⭐⭐ v6.0.0 SHIPPED TO PRODUCTION + LIVE-acceptance GREEN + UI/UX pass + site filtered; agent-conducted)
 
 > ⚠ Branch-independent record in `memory/` (always-loaded), ALL updated this session: testcase-generation-feature · site-launch-punchlist · marketplace-launch-state · v6-value-split-editions · deep-audit-vs-per-change-gate · **capacity-sheet-planner (NEW — the next chapter)**.

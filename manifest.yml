@@ -139,6 +139,28 @@ permissions:
     # read:jira-work — read project metadata (issue types, fields) before create
     - write:jira-work
     - read:jira-work
+    # ── P15 (2026-06-20) — Push plan to Jira (real Agile Sprints) ──────────
+    # The Agile API (/rest/agile/1.0/board + /sprint) requires the jira-software
+    # scope family — write:jira-work does NOT cover board/sprint resources.
+    # ⚠ ADDING THESE FORCES CUSTOMER RE-CONSENT (forge install --upgrade +
+    # every site admin re-approves in Manage Apps; the v6.0.0 deploy banked
+    # "no new scopes → no re-consent" — this deliberately spends that, partner-
+    # chosen for native sprints over fix-versions). LIVE-VERIFY the exact scope
+    # strings + that asUser reaches /rest/agile/1.0/ on dev (POLICY §9) BEFORE
+    # publishing — Atlassian renamed several jira-software granular scopes.
+    # read:board-scope:jira-software — GET /board (discover the scrum board)
+    # read:project:jira — ALSO required by GET /board (live-acceptance 2026-06-21: board
+    #   discovery 401'd "Authentication Required" without it; the granular Agile endpoint does
+    #   NOT accept classic read:jira-work for the project read — Atlassian docs api-group-board).
+    # read:sprint:jira-software — GET board/{id}/sprint (idempotent reuse)
+    # write:sprint:jira-software — POST /sprint (create) + /sprint/{id}/issue (move)
+    # write:issue:jira-software — ALSO required by POST /sprint/{id}/issue (move+rank issues
+    #   into a sprint = "rank and estimate issues"; docs scopes-for-oauth-2-3LO-and-forge-apps).
+    - read:board-scope:jira-software
+    - read:project:jira
+    - read:sprint:jira-software
+    - write:sprint:jira-software
+    - write:issue:jira-software
 app:
   runtime:
     name: nodejs24.x

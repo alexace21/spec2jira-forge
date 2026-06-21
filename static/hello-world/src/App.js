@@ -13,6 +13,7 @@ import AdminSettings from "./components/AdminSettings";
 import PagePickerScreen from "./components/PagePicker";
 import BackButton from "./components/BackButton";
 import TestCasesScreen from "./components/TestCasesScreen";
+import PlanScreen from "./components/PlanScreen";
 import { SignalCallout, SignalIcon } from "./components/Signal";
 import {
   IconRefresh,
@@ -24,6 +25,7 @@ import {
   IconExternalLink,
   IconSettings,
   IconLink,
+  IconCalendar,
 } from "./components/Icon";
 import {
   adaptToLegacyShape,
@@ -105,6 +107,70 @@ const SCREEN_MAX_WIDTH_STYLE = {
  * caller context. Connection-class messages ignore label (universal
  * "Backend is unreachable" applies regardless of which call failed).
  */
+// ── Capacity-Sheet Planner: the default capacity form + the slim-feature projection ──
+// The form holds RAW strings (the backend computeCapacity coerces + validates fail-loud, so '' is a
+// blocker not a silent 0). availableDays is PER SPRINT (the pinned contract). Empty multipliers →
+// the backend applies its honest defaults and ECHOES them in `assumptions`.
+const DEFAULT_PLAN_FORM = {
+  people: [{ _rid: "r0", name: "", availableDays: "8" }],
+  sprintCount: "4",
+  sprintLengthDays: "10",
+  sprintStartDate: "",
+  hoursPerDay: "",
+  focusFactor: "",
+  hoursPerPoint: "",
+  pointsPerSprintOverride: "",
+  objective: "balanced", // P12: goal-directed re-rank — balanced (default) / mvp / min_risk / max_value
+};
+
+// Bounds for the per-feature concern projection (SLIM-1): a feature carries a few typed concerns, each a
+// sentence — forward enough to compute risk, never the whole prose (the planner re-derives risk from these).
+const PLAN_FEATURE_CONCERN_CAP = 8;
+const PLAN_CONCERN_CHAR_CAP = 240;
+const PLAN_TASK_TYPE_CAP = 40; // Tier-2: bound the per-feature task-type token list (a feature has a handful of tasks)
+
+// Slim per-feature projection sent to the planner (bounded payload; the planner only needs sizing +
+// the uid-keyed dependency identity + the risk signals). Reads the EDITED breakdown (capabilities →
+// features, or v3 flat). concerns + confidence_indicator drive the Tier-1 risk layer (computeRiskSignals).
+function buildSlimFeatures(bd) {
+  const caps = bd && Array.isArray(bd.capabilities) ? bd.capabilities : null;
+  const feats = caps ? caps.flatMap((c) => (c && c.features) || []) : (bd && Array.isArray(bd.features) ? bd.features : []);
+  return feats.map((f) => ({
+    _uid: f._uid,
+    _orig_name: f._orig_name,
+    name: f.name,
+    story_points: f.story_points,
+    complexity_score: f.complexity_score,
+    priority: f.priority,
+    user_story: typeof f.user_story === "string" ? f.user_story.slice(0, 240) : undefined, // §8 enrichment for the ranking
+    confidence_indicator: f.confidence_indicator, // ✓/⚠/✗ — low confidence is a Tier-1 risk signal
+    concerns: Array.isArray(f.concerns)
+      ? f.concerns.filter((c) => typeof c === "string" && c.trim()).slice(0, PLAN_FEATURE_CONCERN_CAP).map((c) => c.slice(0, PLAN_CONCERN_CHAR_CAP))
+      : [],
+    // Tier-2: the per-task discipline tokens (API/UI/DB/…) — the ONLY signal the skill-aware packer needs.
+    // Compact (just the enum tokens, bounded); the planner maps them 7→3 (BE/FE/QA). Light enough to persist.
+    task_types: Array.isArray(f.tasks) ? [...new Set(f.tasks.map((t) => t && t.type).filter((t) => typeof t === "string" && t))].slice(0, PLAN_TASK_TYPE_CAP) : [], // deduped — requiredSkillsOf only needs the SET
+    dependencies: Array.isArray(f.dependencies) ? f.dependencies : [],
+  }));
+}
+
+// Spec-WIDE concerns (SN-3) — passed ONCE to the ranker as plan-level context, never per-feature. Lives at
+// the top-level spec_concerns (adapted shape) or _v3_original.spec_concerns (native v3). Backend re-bounds.
+function extractSpecConcerns(bd) {
+  const arr = (bd && Array.isArray(bd.spec_concerns) && bd.spec_concerns)
+    || (bd && bd._v3_original && Array.isArray(bd._v3_original.spec_concerns) && bd._v3_original.spec_concerns)
+    || [];
+  return arr.filter((c) => typeof c === "string" && c.trim());
+}
+
+// The breakdown's executive summary — fed to the ranking model as PRODUCT CONTEXT (§8). Lives on
+// metadata.spec_summary (native v3) or _v3_original.metadata (legacy-adapted shape).
+function extractSpecSummary(bd) {
+  const v3 = (bd && bd._v3_original) || bd || {};
+  const s = (v3 && v3.metadata && v3.metadata.spec_summary) || (bd && bd.metadata && bd.metadata.spec_summary);
+  return typeof s === "string" ? s.slice(0, 800) : "";
+}
+
 function _classifyBackendError(errorShape, contextLabel = "") {
   const errorStr = String(errorShape?.error || "");
   const detailRaw = String(errorShape?.detail || "");
@@ -388,6 +454,9 @@ function App() {
   const [results, setResults] = useState(null);
   const [isPushing, setIsPushing] = useState(false);
   const [pushResult, setPushResult] = useState(null);
+  // P15 — plan-push (assign sprints in Jira) state, held separately from the breakdown push.
+  const [planPush, setPlanPush] = useState({ status: "idle" }); // idle | running | done | error
+  const planPushInFlightRef = useRef(false); // synchronous re-entrancy guard (double-click → one loop)
   // Chunked-push progress (2026-05-30) — UI loops pushStep, updates these.
   const [pushProgress, setPushProgress] = useState(0);
   const [pushPhase, setPushPhase] = useState("");
@@ -397,6 +466,17 @@ function App() {
   // Confirmation flow
   const [dryRunResult, setDryRunResult] = useState(null);
   const [pendingBreakdown, setPendingBreakdown] = useState(null);
+
+  // ── Capacity-Sheet Planner state ──
+  const [planForm, setPlanForm] = useState(null); // the capacity form (lifted so Plan↔Confirm survives)
+  const [planSlim, setPlanSlim] = useState([]); // slim features sent to the planner (uid→display map source)
+  const [planResult, setPlanResult] = useState(null); // last startPlan/repackPlan/getPlan response
+  const [planBusy, setPlanBusy] = useState(false); // a plan/re-pack call is in flight
+  const [planEstimate, setPlanEstimate] = useState(null); // pre-flight cost {expected_usd, upper_usd}
+  const [planArmed, setPlanArmed] = useState(false); // 2-step armed confirm for the billed re-rank
+  const [planElapsed, setPlanElapsed] = useState(0); // seconds the ranking BATCH has been running (live timer + server echo)
+  const planPollRef = useRef(null); // pollPlanStatus interval (the ranking batch runs async, like generation)
+  const currentPlanPollJobIdRef = useRef(null); // stale-tick guard (mirrors the breakdown poll's currentPollJobIdRef)
 
   // Stale-page detection (2026-06-02). When a completed breakdown is reopened, we
   // compare the Confluence page version it was generated against (from getResults)
@@ -693,6 +773,7 @@ function App() {
       clearInterval(timerRef.current);
       clearInterval(pushPollRef.current);
       clearInterval(tcPollRef.current);
+      clearInterval(planPollRef.current); // parity: the plan-batch poll must tear down like every other poll
       Object.values(regenPollRefs.current).forEach(clearInterval);
     };
     // reinitNonce: bumped by handleCloseSettings → re-runs the init/config gate after
@@ -1255,6 +1336,7 @@ function App() {
     // confirmation note so they don't have to check Diagnostics to know it happened).
     setTcDiscardedAtPush(tcGenerating);
     setCapturedExports(null); // v6: clear any prior capture; this push re-captures if it has test cases
+    setPlanPush({ status: "idle" }); // P15: a fresh push → fresh plan-push state
     setIsPushing(true);
     setPushProgress(0);
     setPushPhase("starting");
@@ -1648,6 +1730,182 @@ function App() {
     // Intentionally does NOT clear testCaseResults — they persist until page change / regenerate
   }, []);
 
+  // ── Capacity-Sheet Planner handlers ──
+  // Reached from the Confirm/Review screen (the single lift point, like test-cases) so the planner
+  // consumes the EDITED breakdown (pendingBreakdown). Restores a persisted plan + detects staleness.
+  // The ranking runs on the Batches API (async, like generation) — poll until it completes. On
+  // completion the resolver has ALREADY assembled + persisted the plan; we just render its result.
+  const PLAN_POLL_MS = 5000;
+  const startPlanPolling = useCallback((jid) => {
+    clearInterval(planPollRef.current);
+    currentPlanPollJobIdRef.current = jid; // mark this job current; a stale tick from an abandoned job is ignored
+    planPollRef.current = setInterval(async () => {
+      try {
+        const st = await invoke("pollPlanStatus", { jobId: jid });
+        const isCurrent = jid === currentPlanPollJobIdRef.current; // gate every side effect (mirrors startPolling)
+        if (!st) return;
+        // {error}-shaped payload (e.g. license_required from the resolver guard) has NO status — without
+        // this branch the loop would spin forever (gate finding). Surface it + stop, like startPolling.
+        if (st.error) {
+          if (isCurrent) {
+            clearInterval(planPollRef.current);
+            setPlanBusy(false);
+            setPlanResult({ ok: false, stage: "plan", error: st.error, detail: st.detail || "Planning could not continue — please try again." });
+          }
+          return;
+        }
+        if (st.status === "completed") {
+          if (isCurrent) { clearInterval(planPollRef.current); setPlanBusy(false); setPlanResult(st); }
+        } else if (st.status === "idle") {
+          if (isCurrent) { clearInterval(planPollRef.current); setPlanBusy(false); }
+        } else if (st.status === "batched" && typeof st.elapsed === "number") {
+          if (isCurrent) setPlanElapsed(st.elapsed); // server-authoritative (survives a reconnect mid-batch)
+        }
+      } catch (_) { /* transient — keep polling */ }
+    }, PLAN_POLL_MS);
+  }, []);
+
+  const handleOpenPlan = useCallback(async () => {
+    const bd = pendingBreakdown || results?.breakdown;
+    const slim = buildSlimFeatures(bd);
+    clearInterval(planPollRef.current); // drop any prior poll
+    // Synchronously CLEAR any prior page's plan + estimate BEFORE showing the screen (cross-page stale render).
+    setPlanResult(null);
+    setPlanEstimate(null);
+    setPlanBusy(false);
+    setPlanElapsed(0);
+    setPlanSlim(slim);
+    setPlanArmed(false);
+    if (!planForm) setPlanForm(DEFAULT_PLAN_FORM);
+    setScreen("plan");
+    invoke("estimatePlanCost", { featureCount: slim.length })
+      .then((r) => { if (r && !r.error) setPlanEstimate(r); })
+      .catch(() => {});
+    // restore a COMPLETED plan OR resume an IN-FLIGHT ranking batch (reconnect) + report staleness
+    try {
+      const existing = await invoke("getPlan", { jobId, features: slim });
+      if (existing && existing.status === "completed" && existing.plan) {
+        setPlanResult(existing);
+        if (existing.capacityForm) setPlanForm(existing.capacityForm);
+      } else if (existing && existing.status === "batched") {
+        if (existing.capacityForm) setPlanForm(existing.capacityForm);
+        setPlanElapsed(existing.elapsed || 0);
+        setPlanBusy(true);
+        startPlanPolling(jobId); // a plan batch is still running → resume polling
+      }
+      // else idle → the fresh form (already cleared above)
+    } catch (_) {
+      setPlanResult(null); // a transient getPlan failure must NOT leave a prior page's plan rendered
+    }
+  }, [pendingBreakdown, results, planForm, jobId, startPlanPolling]);
+
+  const handleCapacityFormChange = useCallback((patch) => {
+    setPlanArmed(false); // editing capacity disarms the billed re-rank confirm
+    setPlanForm((prev) => ({ ...(prev || DEFAULT_PLAN_FORM), ...patch }));
+  }, []);
+
+  // Generate / re-rank — SUBMITS the ranking batch (async). On 'batched' we poll; on 'completed'
+  // (empty backlog or a submit-failure fallback) we render immediately. Never hard-fails the plan.
+  const handleStartPlan = useCallback(async () => {
+    if (planBusy) return;
+    setPlanArmed(false);
+    setPlanBusy(true);
+    setPlanElapsed(0);
+    try {
+      const bd = pendingBreakdown || results?.breakdown;
+      const slim = planSlim.length ? planSlim : buildSlimFeatures(bd);
+      const specSummary = extractSpecSummary(bd);
+      const specConcerns = extractSpecConcerns(bd); // spec-wide risk/compliance band for the ranker (SN-3)
+      const res = await invoke("startPlan", { jobId, features: slim, capacityForm: planForm, specSummary, specConcerns });
+      if (res && res.status === "batched") {
+        startPlanPolling(jobId); // poll until completed (planBusy stays true)
+      } else {
+        setPlanBusy(false);
+        setPlanResult(res); // completed (fallback/empty) or a capacity/key blocker (ok:false)
+      }
+    } catch (err) {
+      invoke("recordClientDiagnostic", { error_class: "invoke_rejected", ref: jobId || undefined }).catch(() => {});
+      setPlanBusy(false);
+      setPlanResult({ ok: false, stage: "plan", error: "invoke_failed", detail: "Planning failed — please try again." });
+    }
+  }, [planBusy, planSlim, pendingBreakdown, results, jobId, planForm, startPlanPolling]);
+
+  // Re-pack — FREE (no LLM): an assumption-only capacity edit re-runs the deterministic packer over
+  // the CACHED ranking (ledger UX-4).
+  const handleRepackPlan = useCallback(async () => {
+    if (planBusy) return;
+    setPlanBusy(true);
+    try {
+      const res = await invoke("repackPlan", { jobId, capacityForm: planForm });
+      // PLAN-03: a FREE re-pack uses the CACHED breakdown — it never consumed the edited breakdown, so it
+      // cannot legitimately CLEAR a staleness banner. Carry the prior `stale` flag forward.
+      // Reload fix (gate HIGH 2026-06-20): also carry `features` forward — repackPlan returns them now, but
+      // belt-and-suspenders so a future return that drops them can't re-break the reload name source.
+      setPlanResult((prev) => (res && res.ok ? { ...res, features: res.features || (prev && prev.features), stale: !!(prev && prev.stale) } : res));
+    } catch (err) {
+      setPlanResult({ ok: false, stage: "plan", error: "invoke_failed", detail: "Re-pack failed — please try again." });
+    } finally {
+      setPlanBusy(false);
+    }
+  }, [planBusy, jobId, planForm]);
+
+  // Apply a what-if's CAPACITY change (±sprint / focus) to the real form + free re-pack. Re-packs with the
+  // MERGED form directly (not via state) so it can't race the async setPlanForm. Deferrals are preview-only
+  // (a real scope change → routed to the editor in the panel), so they never reach here.
+  const handleApplyScenario = useCallback(async (formPatch) => {
+    if (planBusy) return;
+    const merged = { ...(planForm || DEFAULT_PLAN_FORM), ...(formPatch || {}) };
+    setPlanForm(merged);
+    setPlanBusy(true);
+    try {
+      const res = await invoke("repackPlan", { jobId, capacityForm: merged });
+      // carry `features` forward too (reload name source) — same belt-and-suspenders as handleRepackPlan.
+      setPlanResult((prev) => (res && res.ok ? { ...res, features: res.features || (prev && prev.features), stale: !!(prev && prev.stale) } : res));
+    } catch (err) {
+      setPlanResult({ ok: false, stage: "plan", error: "invoke_failed", detail: "Re-pack failed — please try again." });
+    } finally {
+      setPlanBusy(false);
+    }
+  }, [planBusy, jobId, planForm]);
+
+  const handleBackFromPlan = useCallback(() => { setScreen("confirming"); }, []);
+
+  // P15 — assign the plan's sprints in Jira. Loops the chunked planPushStep (mirrors handleConfirmedPush).
+  // Uses the breakdown push's created_issues (uid→Jira key) — so it runs from the post-push success screen.
+  const handleAssignSprints = useCallback(async () => {
+    if (planPushInFlightRef.current || !pushResult) return; // synchronous guard — survives a same-frame double-click
+    planPushInFlightRef.current = true;
+    setPlanPush({ status: "running", progress: 0 });
+    try {
+      // pass the project the BACKLOG was pushed to (gate MED) — never the live Settings default, which may
+      // have changed → board/sprint writes would target a different project than the created issues.
+      // capture-before-purge: the post-push purge already deleted plan:<jobId>, so SEND the in-memory plan +
+      // form (the panel is gated on planResult.plan, so it's present). startPlanPush falls back to KVS otherwise.
+      const start = await invoke("startPlanPush", { jobId, createdIssues: pushResult.created_issues, projectKey: pushResult.project_key, namePrefix: pageData?.title, plan: planResult?.plan, capacityForm: planResult?.capacityForm || planForm });
+      if (!start || !start.ok) { setPlanPush({ status: "error", error: start || { detail: "Could not start the sprint push." } }); return; }
+      const sessionId = start.sessionId;
+      for (let i = 0; i < 600; i++) { // generous bound; each step is one bounded chunk
+        const step = await invoke("planPushStep", { sessionId });
+        if (!step || !step.ok) { setPlanPush({ status: "error", error: step || { detail: "Sprint push failed." } }); return; }
+        if (step.done) { setPlanPush({ status: "done", result: step }); return; }
+        setPlanPush({ status: "running", progress: step.progress || 0 });
+      }
+      setPlanPush({ status: "error", error: { detail: "Sprint push took too long — check Jira and retry." } });
+    } catch (e) {
+      setPlanPush({ status: "error", error: { detail: "Sprint push failed — please try again." } });
+    } finally {
+      planPushInFlightRef.current = false;
+    }
+  }, [pushResult, jobId, pageData, planResult, planForm]);
+
+  // Live 1-second timer while a ranking batch is in flight (smooth count between the 5s polls; the
+  // poll's server `elapsed` re-syncs it). Stops when planBusy clears (on completion / fallback).
+  useEffect(() => {
+    if (!planBusy) return undefined;
+    const t = setInterval(() => setPlanElapsed((e) => e + 1), 1000);
+    return () => clearInterval(t);
+  }, [planBusy]);
+
   // ── Navigation ────────────────────────────────────────────────
   // handleRetry — same page, fresh attempt. Used by ErrorScreen
   // "Try again". Preserves pageId + pageData so user retries same spec
@@ -1661,6 +1919,7 @@ function App() {
   const handleRetry = useCallback(() => {
     clearInterval(pollRef.current);
     clearInterval(pushPollRef.current);
+    clearInterval(planPollRef.current); // stop the plan-batch poll too (interval-leak parity — gate finding)
     // Fix 4: stop in-flight TC + regen polls (interval-leak on SPA navigation)
     clearInterval(tcPollRef.current);
     Object.values(regenPollRefs.current).forEach(clearInterval);
@@ -1694,6 +1953,7 @@ function App() {
   const handleRegenerate = useCallback(() => {
     clearInterval(pollRef.current);
     clearInterval(pushPollRef.current);
+    clearInterval(planPollRef.current); // stop the plan-batch poll too (interval-leak parity — gate finding)
     // Fix 4: stop in-flight TC + regen polls (interval-leak on SPA navigation)
     clearInterval(tcPollRef.current);
     Object.values(regenPollRefs.current).forEach(clearInterval);
@@ -1739,6 +1999,7 @@ function App() {
   const handleNewPage = useCallback(() => {
     clearInterval(pollRef.current);
     clearInterval(pushPollRef.current);
+    clearInterval(planPollRef.current); // stop the plan-batch poll too (interval-leak parity — gate finding)
     // Fix 4: stop in-flight TC + regen polls (interval-leak on SPA navigation)
     clearInterval(tcPollRef.current);
     Object.values(regenPollRefs.current).forEach(clearInterval);
@@ -1761,6 +2022,14 @@ function App() {
     setIsPushing(false);
     setSelectedContextProfileId("none");
     setContextLoadedForPageId(null);
+    // Planner: clear the PAGE-specific plan state (the plan/slim/estimate belong to the old jobId);
+    // KEEP planForm — the team capacity is stable + reusable across pages (the user can still edit it).
+    clearInterval(planPollRef.current);
+    setPlanResult(null);
+    setPlanSlim([]);
+    setPlanEstimate(null);
+    setPlanArmed(false);
+    setPlanBusy(false);
     setScreen("picker");
   }, []);
 
@@ -2192,6 +2461,28 @@ function App() {
           tcStale={tcStaleVsEdits}
           usage={usage}
           jobId={jobId}
+          onOpenPlan={handleOpenPlan}
+        />
+      );
+    case "plan":
+      return (
+        <PlanScreen
+          featureCount={planSlim.length}
+          slimFeatures={planSlim}
+          form={planForm}
+          result={planResult}
+          busy={planBusy}
+          estimate={planEstimate}
+          armed={planArmed}
+          elapsed={planElapsed}
+          pageTitle={pageData?.title}
+          jobId={jobId}
+          onArmToggle={setPlanArmed}
+          onFormChange={handleCapacityFormChange}
+          onGenerate={handleStartPlan}
+          onRepack={handleRepackPlan}
+          onApplyScenario={handleApplyScenario}
+          onBack={handleBackFromPlan}
         />
       );
     case "pushing":
@@ -2205,6 +2496,10 @@ function App() {
           onOpenDiagnostics={handleOpenDiagnostics}
           tcDiscarded={tcDiscardedAtPush}
           capturedExports={capturedExports}
+          hasPlan={!!(planResult && planResult.ok && planResult.plan)}
+          planStale={!!(planResult && planResult.stale)}
+          planPush={planPush}
+          onAssignSprints={handleAssignSprints}
         />
       );
     case "limit_reached":
@@ -2867,6 +3162,7 @@ function ConfirmScreen({
   testCaseResults,
   onGenerateTestCases,
   onOpenTestCases,
+  onOpenPlan,
   tcGenerating,
   tcStale,
   usage,
@@ -3313,6 +3609,49 @@ function ConfirmScreen({
             {signals.ambiguityNote}
           </div>
         </details>
+      )}
+
+      {/* Capacity-Sheet Planner — its OWN dedicated section (partner: it deserves a section, not a
+          button crammed into the test-case action row). Review-only; consumes the EDITED breakdown
+          (single lift point). Placed before the test-case section so the spec→backlog→PLAN step reads
+          as a distinct, first-class option. */}
+      {onOpenPlan && (
+        <div
+          className="rounded-lg p-3 mb-3 flex items-center justify-between gap-3"
+          style={{ background: "var(--s2j-blue-bg)", border: "1px solid var(--s2j-blue-border)" }}
+        >
+          <div style={{ minWidth: 0 }}>
+            <p className="text-xs font-medium" style={{ color: "var(--s2j-text)", display: "inline-flex", alignItems: "center", gap: 6 }}>
+              <IconCalendar size={13} /> Sprint plan from team capacity
+            </p>
+            <p className="text-xs" style={{ color: "var(--s2j-text-muted)" }}>
+              Allocate these stories across sprints from your team's capacity — Claude orders the work,
+              the sprint math is deterministic. Review-only; nothing is written to Jira.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => onOpenPlan()}
+            disabled={isPushing}
+            className="shrink-0"
+            style={{
+              background: "var(--s2j-blue)",
+              border: "none",
+              color: "#fff",
+              padding: "7px 14px",
+              borderRadius: "6px",
+              fontSize: "13px",
+              fontWeight: 500,
+              cursor: isPushing ? "not-allowed" : "pointer",
+              whiteSpace: "nowrap",
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 6,
+            }}
+          >
+            <IconCalendar size={14} /> Plan sprints
+          </button>
+        </div>
       )}
 
       {/* Optional pre-push step (P5) — generate acceptance test cases for these stories. This is
@@ -3943,7 +4282,55 @@ function PostPushExport({ captured }) {
   );
 }
 
-function PushedScreen({ result, onNew, jobId = null, onOpenDiagnostics, tcDiscarded = false, capturedExports = null }) {
+// P15 — the post-push "assign sprints in Jira" panel. Idempotent (re-run reuses same-named sprints).
+// Surfaces partial outcomes in DISJOINT honesty channels: not-in-Jira / overflowed / failed (never silent).
+function AssignSprintsPanel({ planPush, onAssignSprints, planStale = false }) {
+  const st = planPush?.status || "idle";
+  const sm = planPush?.result?.summary || {};
+  const sprints = planPush?.result?.sprintsCreated || [];
+  const boardWarning = planPush?.result?.boardWarning;
+  return (
+    <div style={{ border: "1px solid var(--s2j-border)", borderRadius: 10, padding: 16, marginBottom: 16, background: "var(--s2j-bg-section)" }}>
+      <div className="flex items-center gap-2" style={{ marginBottom: 6 }}>
+        <span style={{ color: "var(--s2j-blue)" }}><IconCalendar size={16} /></span>
+        <strong style={{ fontSize: 14, color: "var(--s2j-text)" }}>Assign sprints in Jira</strong>
+      </div>
+      <p style={{ fontSize: 12.5, color: "var(--s2j-text-muted)", margin: "0 0 10px", lineHeight: 1.5 }}>
+        Create the planned sprints on your Scrum board and move each Story into its sprint, per your plan.
+        Re-running is safe — it reuses sprints of the same name.
+      </p>
+      {st === "running" ? (
+        <div style={{ fontSize: 13, color: "var(--s2j-text-muted)" }}>Creating sprints + assigning issues… {Math.round((planPush.progress || 0) * 100)}%</div>
+      ) : st === "error" ? (
+        <SignalCallout kind="error" title="Couldn’t assign sprints">{planPush.error?.detail || "Please try again."}</SignalCallout>
+      ) : st === "done" ? (
+        <div>
+          <SignalCallout kind="success" title={`Assigned ${sm.issues_assigned || 0} issue${sm.issues_assigned === 1 ? "" : "s"} across ${sm.sprints || sprints.length} sprint${(sm.sprints || sprints.length) === 1 ? "" : "s"}`} style={{ marginBottom: 8 }}>
+            {sprints.map((g) => `${g.name} (${g.assigned})`).join(" · ")}
+          </SignalCallout>
+          {boardWarning ? <SignalCallout kind="info" title="Multiple Scrum boards" style={{ marginBottom: 6 }}>{boardWarning}</SignalCallout> : null}
+          {sm.no_jira_key > 0 ? <SignalCallout kind="info" title={`${sm.no_jira_key} planned feature${sm.no_jira_key === 1 ? "" : "s"} not in Jira`} style={{ marginBottom: 6 }}>Not part of the pushed backlog, so they couldn’t be assigned.</SignalCallout> : null}
+          {sm.overflowed > 0 ? <SignalCallout kind="info" title={`${sm.overflowed} overflowed feature${sm.overflowed === 1 ? "" : "s"}`} style={{ marginBottom: 6 }}>Didn’t fit any sprint in the plan, so they weren’t assigned.</SignalCallout> : null}
+          {(sm.assign_failed > 0 || sm.sprint_failures > 0) ? <SignalCallout kind="warning" title="Some assignments failed">{sm.sprint_failures || 0} sprint(s) + {sm.assign_failed || 0} issue(s) failed — check your Jira board permissions and retry (it’s idempotent).</SignalCallout> : null}
+        </div>
+      ) : (
+        <>
+          {planStale ? (
+            <SignalCallout kind="warning" title="This plan may be out of date" style={{ marginBottom: 10 }}>
+              The breakdown changed since this plan was generated. Re-rank the plan before assigning sprints, or any edited features won’t match.
+            </SignalCallout>
+          ) : null}
+          <button type="button" className="btn-primary" onClick={onAssignSprints}>Assign sprints in Jira</button>
+          <div style={{ fontSize: 10.5, color: "var(--s2j-text-light)", marginTop: 8, lineHeight: 1.5 }}>
+            Needs a Scrum board in this project. The first run may prompt your Jira admin to approve the new board/sprint permission in Manage Apps.
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+function PushedScreen({ result, onNew, jobId = null, onOpenDiagnostics, tcDiscarded = false, capturedExports = null, hasPlan = false, planStale = false, planPush = { status: "idle" }, onAssignSprints = null }) {
   const total = result?.total_items || result?.created_issues?.length || 0;
   const stories = result?.created_issues || [];
   const browseUrl = (key) =>
@@ -4181,6 +4568,9 @@ function PushedScreen({ result, onNew, jobId = null, onOpenDiagnostics, tcDiscar
       })()}
 
       <PostPushExport captured={capturedExports} />
+
+      {/* P15 — assign the plan's sprints in Jira (only when a plan exists for this push) */}
+      {hasPlan && onAssignSprints ? <AssignSprintsPanel planPush={planPush} onAssignSprints={onAssignSprints} planStale={planStale} /> : null}
 
       {/* F3 misplacement fix part 32 (2026-05-09) — "Run again on this
           page" was removed because re-running на same page POST-PUSH

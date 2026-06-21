@@ -21,8 +21,9 @@
 
 import { kvs } from '@forge/kvs';
 
-import { BREAKDOWN_SCHEMA, SYSTEM_PROMPT, buildProjectContextSystemText, TEST_CASE_SCHEMA, TEST_CASE_SYSTEM_PROMPT, buildTestCaseUserPrompt, buildSpecSourceSystemText } from './prompts.js';
+import { BREAKDOWN_SCHEMA, SYSTEM_PROMPT, buildProjectContextSystemText, TEST_CASE_SCHEMA, TEST_CASE_SYSTEM_PROMPT, buildTestCaseUserPrompt, buildSpecSourceSystemText, PLAN_RANKING_SCHEMA, PLAN_RANKING_SYSTEM_PROMPT, buildPlanRankingUserPrompt } from './prompts.js';
 import { parseTestCaseResult } from './testcases.js';
+import { planRankingMaxTokens } from './planner.js'; // single source of truth for the ranking max_tokens (matches estimatePlanCost)
 
 // ── Constants ──────────────────────────────────────────────
 
@@ -1185,6 +1186,100 @@ Identify the single softest edge to cut so the cycle is broken.`;
   } catch (_) {
     return { error: 'parse_failed', detail: String(text).slice(0, 200) };
   }
+}
+
+// ── Capacity-Sheet Planner: the ONE sequencing-judgment call (Batches API) ──────
+//
+// The LLM is ADVISORY (POLICY §4 + ledger LLM-1..8): it returns ONLY a relative ORDER of feature ids;
+// src/planner.normalizeRanking makes it TOTAL + legal and packSprints owns every number. ⚠ TRANSPORT =
+// the Anthropic Message BATCHES API, NOT a sync call (changed 2026-06-20): a sync /v1/messages ranking
+// over a rich backlog (30+ features, dense deps) + Sonnet reasoning exceeds Forge's 25s HARD resolver
+// kill (gotcha #5 — the same reason breakdown + test-cases use Batches; confirmed live: the sync call
+// timed out). Batches submits instantly + is polled (pollBatchStatus, reused); the 25s limit binds only
+// on the POLL fetch, never on the model's reasoning. Bonus: batch pricing is 50% (estimateCost {batch:true}).
+// On ANY failure the resolver falls back to the deterministic ordering — the plan never hard-fails (LLM-3).
+
+// Submit a 1-request ranking batch. Mirrors submitBreakdownBatch. customId = the planner jobId.
+export async function submitPlanRankingBatch({ rows, globals, specSummary, specConcerns, customId, apiKey, model = MODEL_PRIMARY }) {
+  if (!apiKey) return { error: 'not_configured', detail: 'Anthropic API key not configured.' };
+  if (!customId) return { error: 'no_custom_id', detail: 'customId is required.' };
+  const list = Array.isArray(rows) ? rows : [];
+  if (list.length === 0) return { error: 'empty_rows', detail: 'No features to rank.' };
+
+  const requestBody = {
+    requests: [
+      {
+        custom_id: customId,
+        params: {
+          model,
+          max_tokens: planRankingMaxTokens(list.length),
+          system: PLAN_RANKING_SYSTEM_PROMPT,
+          messages: [{ role: 'user', content: buildPlanRankingUserPrompt({ rows: list, globals, specSummary, specConcerns }) }],
+          output_config: { format: { type: 'json_schema', schema: PLAN_RANKING_SCHEMA } },
+        },
+      },
+    ],
+  };
+
+  let response;
+  try {
+    response = await fetch(ANTHROPIC_BATCHES_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'anthropic-version': ANTHROPIC_VERSION, 'X-Api-Key': apiKey },
+      body: JSON.stringify(requestBody),
+    });
+  } catch (e) {
+    return { error: 'network_failure', detail: String(e?.message || e) };
+  }
+  if (response.status === 401) return { error: 'auth_rejected', detail: 'Anthropic rejected the API key.' };
+  if (response.status === 402) return { error: 'insufficient_credits', detail: 'Anthropic account has insufficient credits.' };
+  if (response.status === 429) return { error: 'rate_limited', detail: 'Anthropic rate limit exceeded.' };
+  if (!response.ok) {
+    const text = await response.text();
+    return { error: `anthropic_${response.status}`, detail: String(text).slice(0, 200) };
+  }
+  const data = await response.json();
+  if (!data.id) return { error: 'no_batch_id', detail: 'Batch submit returned no id.' };
+  console.log(`[plan-batch] submitted batchId=${data.id} customId=${customId} status=${data.processing_status} features=${list.length}`);
+  return { batchId: data.id, customId, status: data.processing_status, createdAt: data.created_at, expiresAt: data.expires_at };
+}
+
+// Fetch + parse the ranking batch result. Mirrors fetchBatchResults but yields {ranking, usage}. The
+// caller (pollPlanStatus) has verified status='ended' + resultsUrl. A non-succeeded row OR a parse
+// failure returns a typed {error} → the resolver falls back to the deterministic ordering.
+export async function fetchPlanRankingResults(resultsUrl, customId, apiKeyOverride = null) {
+  const apiKey = apiKeyOverride || (await getStoredApiKey());
+  if (!apiKey) return { error: 'not_configured', detail: 'API key not configured.' };
+  if (!resultsUrl) return { error: 'no_results_url', detail: 'resultsUrl is required.' };
+
+  let response;
+  try {
+    response = await fetch(resultsUrl, { method: 'GET', headers: { 'anthropic-version': ANTHROPIC_VERSION, 'X-Api-Key': apiKey } });
+  } catch (e) {
+    return { error: 'network_failure', detail: String(e?.message || e) };
+  }
+  if (!response.ok) {
+    return { error: `results_fetch_${response.status}`, detail: "Couldn't retrieve the ranking result." };
+  }
+
+  const rawText = await response.text();
+  const lines = rawText.split('\n').filter((l) => l.trim().length > 0);
+  let targetRow = null;
+  for (const line of lines) {
+    try { const row = JSON.parse(line); if (row.custom_id === customId) { targetRow = row; break; } } catch (_) { /* skip malformed line */ }
+  }
+  if (!targetRow) return { error: 'result_row_missing', detail: `No row with custom_id=${customId}.` };
+
+  const result = targetRow.result || {};
+  if (result.type !== 'succeeded') {
+    return { error: `batch_request_${result.type || 'unknown'}`, detail: result.error?.error?.message || result.error?.message || 'Batch request did not succeed.' };
+  }
+  const message = result.message;
+  if (!message) return { error: 'no_message', detail: 'Result row missing message field.' };
+  const outputText = message.content?.[0]?.text || '';
+  let parsed;
+  try { parsed = JSON.parse(outputText); } catch (_) { return { error: 'parse_failed', detail: String(outputText).slice(0, 200), usage: message.usage }; }
+  return { ranking: Array.isArray(parsed?.ranking) ? parsed.ranking : [], usage: message.usage, model: message.model };
 }
 
 // ── Project Context distillation (tiny sync helper for Settings) ────────────────

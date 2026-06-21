@@ -646,3 +646,176 @@ export function buildTestCaseUserPrompt({ story, siblingNames, sharedAcceptanceC
   lines.push(`Author the ${coverageType ? `"${coverageType}" ` : ''}test cases for the STORY UNDER TEST now, conforming strictly to the schema.`);
   return lines.join('\n');
 }
+
+// ════════════════════════════════════════════════════════════════
+// PLAN_RANKING_SCHEMA + PROMPT — the Capacity-Sheet Planner's ONE LLM call
+// ════════════════════════════════════════════════════════════════
+//
+// The planner's dispatch (POLICY §4): capacity math, dependency topology, scheduling signals, and
+// sprint packing are deterministic PURE FUNCTIONS (src/planner.js). The ONE meaning-judgment is the
+// SEQUENCING trade-off when business priority / dependency leverage / risk conflict and not all the
+// work fits — that is THIS call. It produces ONLY a relative ORDER (advisory); a deterministic packer
+// owns every number and enforces dependency legality on top of it. The schema therefore has NO sprint
+// or points field (LLM-4 fence — no slot for the model to do arithmetic it would drift on). Anthropic
+// structured outputs reject numeric constraints (maxItems/minimum/…), so the array bound + the ordinal
+// live in engineering (normalizeRanking) — the model's `rank` int is advisory display; the array ORDER
+// is authoritative.
+
+export const PLAN_RANKING_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['ranking'],
+  properties: {
+    ranking: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['feature_id'],
+        properties: {
+          feature_id: { type: 'string' }, // EXACTLY one of the provided ids — never a name (the planner keys on it)
+          rank: { type: 'integer' }, // advisory 1-based position; the ARRAY ORDER is authoritative (engineering owns the ordinal)
+          rationale: { type: 'string' }, // ONE clause, ONLY where a non-obvious trade-off was made (a deferral / priority-inversion-for-dependency / early de-risk); omitted otherwise
+        },
+      },
+    },
+  },
+};
+
+// 5 mandatory slots (POLICY §6). Bug-Y-clean (§5): ONE abstract decisive test for ordering, never a
+// domain heuristic list; the few-shots teach DISTINCT trade-off lessons on a generic toy backlog.
+export const PLAN_RANKING_SYSTEM_PROMPT = `You are Spec2Tickets' Sprint Sequencer — a senior delivery lead / release planner who orders a sized, dependency-aware product backlog so a team can plan a quarter of sprints. Your output seeds a capacity-bounded plan a Product Owner reviews; the highest-stakes sequencing calls must be defensible.
+
+# ROLE
+You decide ONE thing: the relative ORDER in which the team should take on the features, given each feature's size, business priority, complexity, and — decisively — the dependency edges between them. You are ADVISORY: a deterministic packer consumes your order and does ALL the arithmetic. You NEVER count story points, NEVER assign sprint numbers, NEVER decide what "fits" — those are the packer's job and it will compute them from your order. Your contribution is the judgment a packer cannot make: when priorities and dependencies and risk pull in different directions and not everything can be early, what should the team do first, and why.
+
+# RULES — internalize the cost asymmetry first
+COST ASYMMETRY. Deferring high-leverage work — a feature that unblocks many others, or a high-priority core-path item — is EXPENSIVE: it delays everything downstream of it and pushes value out of the quarter. Mis-ordering two independent, low-priority, high-slack items costs essentially nothing: the packer places both and the reviewer reorders in one click. These are NOT symmetric. So spend your judgment on the high-leverage, high-priority, and blocking work — get THAT early and right; do not agonize over ties among independent low-stakes items.
+
+1. RESPECT DEPENDENCIES — they are HARD. A feature lists the features that block it (blocked_by). You must NEVER order a feature above something in its blocked_by — its blockers come first. The packer enforces this and will re-sort any order that violates it, discarding your preference there, so an illegal order wastes your signal. Order only within the dependency-legal space.
+
+2. USE THE PROVIDED SIGNALS — do not re-derive them. For each feature you are given: story_points (size — DO NOT add these up, that is the packer's job), complexity_score (1-5 inherent difficulty/risk), priority (High/Medium/Low business priority), blocked_by (the hard ordering constraint), critical_path_length (how deep in a dependency chain it sits), downstream_unblock_count (how many features it transitively unblocks — its LEVERAGE), slack (how freely it can move without delaying the critical path), and — only when present — risk_flags: a compact set of delivery-risk markers the breakdown already flagged (risk:high / risk:medium, external_dep, low_confidence). MOST features have NO flags; treat their absence as "not notably risky," not as a signal. Reason FROM these; never estimate a number a pure function already computed for you.
+
+3. NO ARITHMETIC, NO SPRINTS. Do not state which sprint a feature lands in, do not sum points, do not declare "fits in sprint 2". You have no field for it because it is not your decision. If you are tempted to reason about capacity, instead express the PRIORITY of the work and let the packer place it.
+
+# OUTPUT FORMAT
+Return ONLY a JSON object conforming to the schema: a "ranking" array with one entry per feature, in the ORDER you recommend (most-important-to-start first). Each entry:
+- feature_id: EXACTLY one of the feature ids provided in the input — never a feature name, never an invented id. Include every feature exactly once.
+- rank: the 1-based position (advisory; the array order is what is read).
+- rationale: ONE short clause, and ONLY when the placement embodies a non-obvious trade-off the reviewer deserves to see — a deliberate DEFERRAL of otherwise-important work, a HIGH-priority item ordered late because a dependency forces it, or an item pulled EARLY to de-risk or to unblock many others. For an obvious placement, OMIT rationale entirely. Never write prose, markdown, or sprint numbers.
+
+# AGILE / DELIVERY LENS
+This order becomes a sprint plan. Front-load the work that delivers the most blocked-downstream value and the highest business priority, defer low-priority / high-slack work, and make every non-obvious deferral or inversion explainable in one clause so a skeptical PO can trust — or challenge — it.
+
+THE DECISIVE TEST (holds in every domain — apply it to the whole ordering):
+Within the dependency-legal space, does the work that best serves the active goal — by default (no objective set) the most downstream leverage and highest business priority — come EARLIEST, with low-priority / high-slack work deferred — and is every place where the goal and dependency order genuinely CONFLICT resolved with a one-clause reason a reviewer could accept or overrule? If a feature could move earlier with no dependency or goal cost, it should; if it is late only because a blocker forces it, say so.
+
+A THIRD, SUBORDINATE pressure — DE-RISK EARLY: work carrying flagged uncertainty (risk_flags — high/medium delivery risk, an external dependency, or low author confidence) should generally surface EARLIER than its slack alone would suggest, because front-loading an unknown is cheaper than discovering it broke late in the quarter. This is a TIEBREAK ONLY: it breaks a NEAR-TIE toward the riskier item; it NEVER overrides a dependency (a blocker always comes first) and NEVER crowds out higher-leverage or higher-priority work — a risky leaf that blocks nothing must not push ahead of a feature many others depend on. The pressure order is: dependencies (hard) > leverage + business priority > de-risk-early (the near-tie tiebreak). When you DO move an item earlier to de-risk, name it in one clause.
+
+A PLANNING OBJECTIVE MAY BE SET (in the user input). When one is, it tells you WHICH of the soft pressures above should LEAD — surface delivery risk first, pack the most leverage/priority first, or assemble a minimal shippable slice first. Honour it by re-weighting the SOFT pressures (leverage + priority, and de-risk-early) toward that goal — but it NEVER changes the HARD floor: a feature still cannot precede anything in its blocked_by, and the dependency-legal space is unchanged. The objective bends WHICH legal order you pick; it cannot make an illegal order legal. When no objective is set, keep the default order (leverage + priority lead, de-risk-early breaks near-ties). Do not invent goal-specific heuristics beyond what the stated objective says — reason from the SAME signals (points, priority, leverage, depth, slack, risk_flags) toward the stated goal.
+
+# FEW-SHOT — four DISTINCT trade-off lessons (generic toy backlog; the reasoning transfers, the surface does not)
+Toy backlog ids f1..f5. (Illustrations of HOW to reason about a trade-off — not a template, not a fixed count, not domain rules.)
+
+LESSON A — LEVERAGE PULLED EARLY (a medium-priority feature that unblocks many is taken first because its downstream_unblock_count is high — deferring it would stall everything that depends on it):
+{ "feature_id": "f3", "rank": 1, "rationale": "Pulled first: unblocks 4 downstream features — its leverage outweighs its medium priority." }
+
+LESSON B — HIGH PRIORITY DEFERRED BY A DEPENDENCY (a High-priority feature is ordered late, honestly, because a feature it is blocked_by must ship first; the inversion is named so it is not read as a planning error):
+{ "feature_id": "f4", "rank": 4, "rationale": "High priority but blocked_by f2; cannot start until f2 lands, so it follows it." }
+
+LESSON D — DE-RISK PULLED EARLY (a medium-priority feature with plenty of slack is pulled EARLIER than its slack suggests ONLY because it carries flagged delivery risk + an external dependency — surfacing the unknown while there is runway; it still sits BELOW its blockers and below higher-leverage work, so this is a near-tie tiebreak, not an override):
+{ "feature_id": "f2", "rank": 2, "rationale": "Pulled earlier to de-risk: flagged risk + an external dependency — better to hit the unknown early than discover it broke late." }
+
+LESSON C — OBVIOUS PLACEMENT, NO RATIONALE (a low-priority, high-slack, leaf feature placed last needs no explanation — silence is correct):
+{ "feature_id": "f5", "rank": 5 }
+
+LESSON E — OBJECTIVE INVERTS A TIEBREAK (ONLY when a minimize-risk objective is set: de-risk rises from the subordinate tiebreak to the LEAD soft pressure, so a flagged-risk feature ranks ABOVE lower-risk higher-priority work — still under its blockers. This is the objective re-weighting the soft tier, exactly as the planning-objective rule allows):
+{ "feature_id": "f2", "rank": 1, "rationale": "Pulled ahead under the minimize-risk objective: it carries the highest flagged uncertainty, so it surfaces before lower-risk, higher-priority work." }`;
+
+// P12 goal-directed re-rank — the v1 objective set + their ABSTRACT goal clauses (§5 Bug-Y: each is a GOAL,
+// NEVER an enumerated heuristic list — the model reasons from the signals already on each row toward the goal).
+// 'balanced' injects NOTHING (the SYSTEM prompt's default pressure order stands). hit_deadlines is DEFERRED
+// (no per-feature date signal exists). The allow-list is the §4 pure dispatch the resolver sanitizes against.
+// ⚠ ADDING/RENAMING an objective = update ALL FIVE in lockstep: this list, OBJECTIVE_CLAUSES (below),
+// PLAN_OBJECTIVE_SET (index.js startPlan sanitize), OBJECTIVE_LABEL (planBrief.js), and the <option>s (PlanScreen.jsx).
+export const PLAN_OBJECTIVES = ['balanced', 'mvp', 'min_risk', 'max_value'];
+const OBJECTIVE_CLAUSES = {
+  mvp: 'ship a usable end-to-end slice as EARLY as possible — front-load the smallest dependency-legal set of features that together form a coherent working product, and defer anything not needed for that first slice, even otherwise-attractive work.',
+  min_risk: 'drive DOWN the chance of a late surprise — surface the work carrying the most delivery uncertainty (flagged risk, an external dependency, low author confidence, or a deep position in a dependency chain) as early as the dependency order allows, accepting that some well-understood high-priority work waits.',
+  max_value: "put the most business value in the team's hands SOONEST — order the highest-leverage and highest-priority work as early as the dependency order permits, accepting more deferred risk and a less-coherent first slice in exchange for value delivered earlier.",
+};
+export function objectiveClause(token) { return OBJECTIVE_CLAUSES[token] || null; } // balanced / unknown → no clause
+
+/**
+ * Build the ranking USER prompt — the §8 four-part informational contract for the planner's one LLM
+ * call. ALWAYS injects, per feature: id/name/SP/complexity/priority/blocked_by + the PRE-COMPUTED
+ * signals (critical_path_length / downstream_unblock_count / slack), plus the globals (sprint count,
+ * per-sprint capacity, total capacity vs total backlog, the hard topo rule) so the model knows HOW
+ * MUCH will not fit. A starved call silently produces a worse order with no error (§8) — so this is
+ * the blocking caller the schema assumes. The model never sees raw breakdown text (names + signals
+ * are the decision surface) which also keeps the call tiny (gotcha #5 — sync output bound).
+ *
+ * @param {object} p
+ * @param {Array<object>} p.rows  buildRankingRows output (one per feature)
+ * @param {object} p.globals { sprintCount, perSprintCapacityPoints, totalCapacity, totalBacklogPoints, deficitPoints }
+ * @returns {string}
+ */
+export function buildPlanRankingUserPrompt({ rows, globals, specSummary, specConcerns } = {}) {
+  const list = Array.isArray(rows) ? rows : [];
+  const g = globals && typeof globals === 'object' ? globals : {};
+  const lines = [];
+
+  // §8 enrichment (2026-06-20): the product summary + each feature's user story give the model the
+  // SEMANTIC business-value context to weigh priority, not just the priority enum + the numeric signals.
+  if (specSummary && String(specSummary).trim()) {
+    lines.push('# PRODUCT CONTEXT (what this backlog delivers — weigh business value against it)');
+    lines.push(String(specSummary).trim().slice(0, 600));
+    lines.push('');
+  }
+
+  // SN-3: spec_concerns are spec-WIDE (not per-feature). Passed ONCE as global context — e.g. a
+  // [COMPLIANCE] concern raises the plan's overall risk posture, but is NEVER attributed to one feature.
+  const specCns = Array.isArray(specConcerns) ? specConcerns.filter((c) => typeof c === 'string' && c.trim()) : [];
+  if (specCns.length) {
+    lines.push('# SPEC-WIDE CONCERNS (apply to the WHOLE backlog — overall risk/compliance posture, NOT any single feature)');
+    specCns.slice(0, 10).forEach((c) => lines.push(`- ${String(c).trim().slice(0, 180)}`));
+    lines.push('');
+  }
+
+  // P12: a planning OBJECTIVE re-weights the SOFT pressures toward a goal — a spec-WIDE GLOBAL line (NOT
+  // per-row; mirrors the SN-3 spec_concerns precedent). Read off globals so submitPlanRankingBatch is untouched.
+  const objClause = objectiveClause(g.objective);
+  if (objClause) {
+    lines.push('# PLANNING OBJECTIVE (the goal this plan must serve — bias the SOFT ordering toward it; it NEVER reorders past a dependency)');
+    lines.push(`This plan is being sequenced to: ${objClause}`);
+    lines.push('');
+  }
+
+  lines.push('# CAPACITY CONTEXT (globals — so you know how much will NOT fit; you do NOT compute placement)');
+  if (g.sprintCount != null) lines.push(`Sprints available: ${g.sprintCount}`);
+  if (Array.isArray(g.perSprintCapacityPoints) && g.perSprintCapacityPoints.length) {
+    lines.push(`Capacity per sprint (story points): ${g.perSprintCapacityPoints.map((c) => Math.round(c * 10) / 10).join(', ')}`);
+  }
+  if (g.totalCapacity != null) lines.push(`Total capacity across all sprints: ${Math.round(g.totalCapacity * 10) / 10} pts`);
+  if (g.totalBacklogPoints != null) lines.push(`Total backlog size: ${g.totalBacklogPoints} pts`);
+  if (g.deficitPoints != null && g.deficitPoints > 0) {
+    lines.push(`⚠ The backlog exceeds capacity by ${Math.round(g.deficitPoints * 10) / 10} pts — not everything fits. Order so the highest-leverage, highest-priority work is earliest; what spills past capacity should be the most deferrable.`);
+  }
+  lines.push('');
+
+  lines.push('# FEATURES TO ORDER (each row already carries its computed signals — reason from them, never re-derive)');
+  lines.push('Fields: id | name | points | complexity(1-5) | priority | blocked_by (each as name [id] — order that id earlier) | downstream_unblock | critical_path_depth | slack | flags (delivery-risk markers — risk:high/medium, external_dep, low_confidence; usually ABSENT)');
+  lines.push('(a ↳ line under a feature is its user story — the WHY, for weighing business value)');
+  for (const r of list) {
+    const blocked = Array.isArray(r.blocked_by) && r.blocked_by.length
+      ? r.blocked_by.map((b) => (b && typeof b === 'object' ? `${b.name} [${b.id}]` : String(b))).join('; ')
+      : 'none';
+    const pts = r.unsized ? 'UNSIZED' : (r.story_points != null ? String(r.story_points) : '?');
+    const flags = Array.isArray(r.risk_flags) && r.risk_flags.length ? ` | flags: ${r.risk_flags.join(', ')}` : ''; // trailing — only when a flag genuinely bites
+    lines.push(`- ${r.feature_id} | ${r.name} | ${pts} | ${r.complexity_score ?? '?'} | ${r.priority || '?'} | blocked_by: ${blocked} | unblocks: ${r.downstream_unblock_count ?? 0} | depth: ${r.critical_path_length ?? 1} | slack: ${r.slack ?? 0}${flags}`);
+    if (r.user_story) lines.push(`    ↳ ${String(r.user_story).replace(/\s+/g, ' ').trim().slice(0, 200)}`);
+  }
+  lines.push('');
+  lines.push('Return the "ranking" array: every feature_id above exactly once, most-important-to-start first, respecting every blocked_by. Add a one-clause rationale ONLY for a non-obvious deferral or dependency-forced inversion. Conform strictly to the schema.');
+  return lines.join('\n');
+}

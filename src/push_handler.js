@@ -32,6 +32,7 @@
 import api, { route } from '@forge/api';
 import { kvs } from '@forge/kvs';
 import { renderTestCasesAdf, normAC } from './testcases.js';
+import { buildSprintPushPlan } from './plan_push_util.js'; // P15 pure join (node-testable, §4-clean)
 
 const BULK_MAX = 50;
 // Concurrency cap для parallel issueLink creation. 6 concurrent stays well
@@ -1076,7 +1077,9 @@ async function stepStories(s) {
       // Append-only list (preserves duplicate-named stories, unlike the
       // name-keyed storyKeyMap) so the success screen can deep-link every
       // created Story, not just the last one per name.
-      s.createdStories.push({ name: slice[j].name, key: bulk.issues[j].key });
+      // P15 prerequisite: stamp the stable _uid so the plan-push join is uid-keyed (rename-proof),
+      // NOT name-keyed — else a duplicate-named Story mis-resolves to the wrong sprint (the Task #3 class).
+      s.createdStories.push({ name: slice[j].name, key: bulk.issues[j].key, uid: slice[j]._uid || null });
       s.counts.stories_created++;
       // tc_embedded counts OUTCOME (the embed actually landed in a created
       // Story), not intent — see the payload-build note above.
@@ -1382,6 +1385,187 @@ function buildFinalResult(s) {
         links_api_failed: diag.links_api_failed || 0,
         subtasks_orphaned: c.subtasks_orphaned || 0,
       },
+    },
+  };
+}
+
+// ════════════════════════════════════════════════════════════════
+// P15 — PUSH PLAN TO JIRA (real Agile Sprints). Writes the planner's deterministic feature→sprint
+// assignment to Jira as native sprints on the project's SCRUM board. §4: PURE mapping, NO LLM — the
+// LLM already did its one advisory job (sequencing) upstream; this only WRITES the decision. Mirrors
+// the chunked push (gotcha #4 25s): board → sprints → assign → done. ⚠ NEEDS the Agile scopes
+// (read:board-scope:jira-software / read:sprint:jira-software / write:sprint:jira-software) + LIVE
+// verification on dev (POLICY §9 — the team-managed/company-managed split is the gotcha #7 class).
+// ════════════════════════════════════════════════════════════════
+
+const PLAN_PUSH_SESSION_PREFIX = 'plan_push_session:';
+const SPRINT_CREATE_CHUNK = 5;   // sprints created per step (fast calls; stays under 25s)
+const SPRINT_MOVE_MAX = 50;      // Agile API: max 50 issue keys per move-to-sprint call
+
+// ── JIRA: find the project's SPRINT-CAPABLE board. 0 -> fail loud (no sprint target); >1 -> return all + flag. ──
+export async function resolveScrumBoard(projectKeyOrId) {
+  let res;
+  // NO &type=scrum filter (§9-③ live-acceptance 2026-06-21): a TEAM-MANAGED project (new Jira "Spaces") has a
+  // board of type 'simple', NOT 'scrum' — the server-side type filter excluded it → a false "no Scrum board" on
+  // a project that visibly has a sprint board. Query ALL boards for the project, then accept the sprint-capable
+  // types below.
+  try { res = await api.asUser().requestJira(route`/rest/agile/1.0/board?projectKeyOrId=${projectKeyOrId}`); }
+  catch (e) { return { ok: false, error: 'board_fetch_failed', detail: String(e?.message || e) }; }
+  if (res.status === 403) return { ok: false, error: 'board_permission', detail: 'Spec2Tickets cannot read this project’s boards. The Jira admin must approve the new Jira Software (board/sprint) permission in Manage Apps.' };
+  if (!res.ok) { const t = await res.text().catch(() => ''); console.error(`[plan-push] board lookup HTTP ${res.status}: ${t.slice(0, 200)}`); return { ok: false, error: `board_http_${res.status}`, detail: 'Jira returned an error finding the project’s board.' }; }
+  let data; try { data = await res.json(); } catch (_) { data = {}; }
+  // Accept a company-managed Scrum board ('scrum') AND a team-managed board ('simple') — both can hold sprints.
+  // A company-managed 'kanban' board (no sprints) is excluded. The board type does NOT reveal whether Sprints
+  // are ENABLED on a team-managed board, so a team-managed board with Sprints off will surface a loud failure at
+  // POST /sprint (honest, not silent). Prefer a 'scrum' board when both exist (the Agile sprint API's most
+  // reliable case).
+  const all = Array.isArray(data.values) ? data.values : [];
+  const sprintCapable = all.filter((b) => b && (b.type === 'scrum' || b.type === 'simple'));
+  if (sprintCapable.length === 0) return { ok: false, error: 'no_scrum_board', detail: 'This Jira project has no sprint-capable board — use a Scrum board (company-managed) or a team-managed project with Sprints enabled, then try again.' };
+  const ordered = [...sprintCapable.filter((b) => b.type === 'scrum'), ...sprintCapable.filter((b) => b.type !== 'scrum')];
+  return { ok: true, boards: ordered.map((b) => ({ id: b.id, name: b.name })), multiple: ordered.length > 1 };
+}
+
+// ── JIRA: idempotent sprint — reuse an existing FUTURE sprint of the same name, else create it. ──
+export async function resolveOrCreateSprint(boardId, name, startDate, endDate) {
+  try {
+    // future AND active (gate MED): a re-run after a sprint STARTED must reuse it, not duplicate (it leaves
+    // the future state once started). We do NOT reuse a CLOSED sprint (issues can't be moved into one) → a
+    // re-run after closure creates a fresh same-named sprint (acceptable; the closed one is done).
+    // ⚠ KNOWN v1 LIMIT: a reused sprint keeps its EXISTING dates (we don't PUT new dates on re-plan).
+    const res = await api.asUser().requestJira(route`/rest/agile/1.0/board/${boardId}/sprint?state=future,active`);
+    if (res.ok) {
+      const data = await res.json().catch(() => ({}));
+      const existing = (Array.isArray(data.values) ? data.values : []).find((sp) => sp && sp.name === name);
+      if (existing) return { ok: true, sprint: { id: existing.id, name: existing.name }, created: false };
+    }
+  } catch (_) { /* fall through to create */ }
+  const body = { name, originBoardId: boardId };
+  if (startDate) body.startDate = startDate;
+  if (endDate) body.endDate = endDate;
+  let res;
+  try { res = await api.asUser().requestJira(route`/rest/agile/1.0/sprint`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }); }
+  catch (e) { return { ok: false, error: 'sprint_create_failed', detail: String(e?.message || e) }; }
+  if (res.status === 403) return { ok: false, error: 'sprint_permission', detail: 'No permission to create sprints (needs the Jira Software write permission + board access).' };
+  if (!res.ok) { const t = await res.text().catch(() => ''); console.error(`[plan-push] sprint create HTTP ${res.status}: ${t.slice(0, 200)}`); return { ok: false, error: `sprint_create_http_${res.status}`, detail: t.slice(0, 160) }; }
+  const sprint = await res.json().catch(() => ({}));
+  return { ok: true, sprint: { id: sprint.id, name: sprint.name }, created: true };
+}
+
+// ── JIRA: move issues (<=50 keys) into a sprint. The supported write path (NOT the custom-field PUT). ──
+export async function moveIssuesToSprint(sprintId, keys) {
+  const list = Array.isArray(keys) ? keys.slice(0, SPRINT_MOVE_MAX) : [];
+  if (!list.length) return { ok: true, moved: 0 };
+  let res;
+  try { res = await api.asUser().requestJira(route`/rest/agile/1.0/sprint/${sprintId}/issue`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ issues: list }) }); }
+  catch (e) { return { ok: false, error: 'move_failed', detail: String(e?.message || e) }; }
+  if (res.status === 204 || res.ok) return { ok: true, moved: list.length };
+  const t = await res.text().catch(() => '');
+  console.error(`[plan-push] move-to-sprint HTTP ${res.status}: ${t.slice(0, 200)}`);
+  return { ok: false, error: `move_http_${res.status}`, detail: t.slice(0, 160) };
+}
+
+// ── ORCHESTRATION: start a chunked plan-push session. Resolves the board up front (fail-loud on 0/>1),
+// builds the pure sprint groups, persists the session. The UI then loops planPushSessionStep. ──
+export async function startPlanPushSession({ jobId, plan, createdIssues, projectKey, boardId, sprintStartDate, sprintLengthDays, namePrefix }) {
+  if (!plan || !Array.isArray(plan.sprints)) return { ok: false, error: 'no_plan', detail: 'No plan to push.' };
+  if (!projectKey) return { ok: false, error: 'no_project_key', detail: 'No Jira project key — push the backlog to Jira first.' };
+
+  const built = buildSprintPushPlan(plan, createdIssues, { sprintStartDate, sprintLengthDays, namePrefix });
+  if (!built.groups.length) {
+    return { ok: false, error: 'nothing_to_assign', detail: 'None of the planned features are in Jira yet — push the backlog to Jira first, then assign sprints.' };
+  }
+
+  // resolve the board (fail loud on 0 — never silently no-op). >1 board: use the FIRST + WARN loudly
+  // (not a silent first-board-win; the boardId param lets a future picker override). The caller may also
+  // pre-resolve the board and pass boardId.
+  let resolvedBoardId = boardId;
+  let boardWarning = null;
+  if (!resolvedBoardId) {
+    const b = await resolveScrumBoard(projectKey);
+    if (!b.ok) return { ok: false, error: b.error, detail: b.detail };
+    resolvedBoardId = b.boards[0].id;
+    if (b.multiple) boardWarning = `This project has ${b.boards.length} Scrum boards — using “${b.boards[0].name}”. Verify it’s the right one (board selection is a follow-up).`;
+  }
+
+  // sessionId scoped by project (gate LOW): two pushes of the same job to different projects can't collide.
+  const sessionId = `${jobId || 'plan'}_${String(projectKey).replace(/[^A-Za-z0-9]/g, '')}_${built.groups.length}_${(plan.sprints || []).length}`;
+  const session = {
+    sessionId, jobId: jobId || null, projectKey, boardId: resolvedBoardId, boardWarning,
+    groups: built.groups, phase: 'sprints', cursor: 0,
+    counts: { sprints_created: 0, sprints_reused: 0, sprint_failures: 0, issues_assigned: 0, assign_failed: 0, no_jira_key: built.noJiraKey.length, overflowed: built.overflowed.length },
+    noJiraKey: built.noJiraKey, overflowed: built.overflowed, failureDetails: [],
+  };
+  await kvs.set(PLAN_PUSH_SESSION_PREFIX + sessionId, session);
+  return { ok: true, sessionId, phase: 'sprints', totalSprints: built.groups.length, progress: 0, boardWarning };
+}
+
+// ── ORCHESTRATION: advance the plan-push by ONE bounded chunk (<=SPRINT_CREATE_CHUNK creates, OR one
+// <=50-key move). The UI loops until { done:true }. Never hard-fails the whole push on one sprint's error. ──
+export async function planPushSessionStep(sessionId) {
+  if (!sessionId) return { ok: false, error: 'no_session', detail: 'No session id.' };
+  const key = PLAN_PUSH_SESSION_PREFIX + sessionId;
+  const s = await kvs.get(key);
+  if (!s) return { ok: false, error: 'session_not_found', detail: 'Plan-push session expired — restart the push.' };
+
+  if (s.phase === 'done') { const r = buildPlanPushResult(s); try { await kvs.delete(key); } catch (_) {} return { ok: true, done: true, phase: 'done', progress: 1, ...r }; }
+
+  try {
+    if (s.phase === 'sprints') {
+      const end = Math.min(s.cursor + SPRINT_CREATE_CHUNK, s.groups.length);
+      for (; s.cursor < end; s.cursor++) {
+        const g = s.groups[s.cursor];
+        const r = await resolveOrCreateSprint(s.boardId, g.name, g.startDate, g.endDate);
+        if (r.ok) { g.sprintId = r.sprint.id; if (r.created) s.counts.sprints_created++; else s.counts.sprints_reused++; }
+        else { s.counts.sprint_failures++; s.failureDetails.push({ sprint: g.name, error: r.error, detail: r.detail }); }
+      }
+      if (s.cursor >= s.groups.length) { s.phase = 'assign'; s.cursor = 0; }
+    } else if (s.phase === 'assign') {
+      let g = s.groups[s.cursor];
+      // skip groups whose sprint failed to create or whose keys are exhausted
+      while (g && (!g.sprintId || g.assignCursor >= g.keys.length)) { s.cursor++; g = s.groups[s.cursor]; }
+      if (!g) { s.phase = 'done'; }
+      else {
+        const chunk = g.keys.slice(g.assignCursor, g.assignCursor + SPRINT_MOVE_MAX);
+        const r = await moveIssuesToSprint(g.sprintId, chunk);
+        if (r.ok) s.counts.issues_assigned += (r.moved || chunk.length);
+        else { s.counts.assign_failed += chunk.length; s.failureDetails.push({ sprint: g.name, error: r.error, detail: r.detail, count: chunk.length }); }
+        g.assignCursor += chunk.length;
+        if (g.assignCursor >= g.keys.length) s.cursor++;
+        if (s.cursor >= s.groups.length) s.phase = 'done';
+      }
+    }
+  } catch (e) {
+    console.error(`[plan-push] step exception (phase=${s.phase}): ${String(e?.message || e)} ref=${s.jobId || '-'}`);
+    return { ok: false, error: 'step_exception', detail: String(e?.message || e) };
+  }
+
+  if (s.phase === 'done') { const r = buildPlanPushResult(s); try { await kvs.delete(key); } catch (_) {} return { ok: true, done: true, phase: 'done', progress: 1, ...r }; }
+  await kvs.set(key, s);
+  return { ok: true, done: false, phase: s.phase, progress: planPushProgress(s), counts: s.counts };
+}
+
+function planPushProgress(s) {
+  const total = (s.groups.length * 2) || 1; // create + assign per group (rough)
+  const created = s.groups.filter((g) => g.sprintId).length;
+  const assigned = s.groups.filter((g) => g.assignCursor >= g.keys.length).length;
+  return Math.min(0.99, (created + assigned) / total);
+}
+
+function buildPlanPushResult(s) {
+  const c = s.counts;
+  return {
+    counts: c,
+    boardWarning: s.boardWarning || null,
+    sprintsCreated: s.groups.filter((g) => g.sprintId).map((g) => ({ number: g.number, name: g.name, sprintId: g.sprintId, assigned: g.keys.length })),
+    failureDetails: s.failureDetails || [],
+    summary: {
+      sprints: s.groups.length,
+      issues_assigned: c.issues_assigned,
+      assign_failed: c.assign_failed,
+      no_jira_key: c.no_jira_key,
+      overflowed: c.overflowed,
+      sprint_failures: c.sprint_failures,
     },
   };
 }
