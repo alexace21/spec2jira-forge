@@ -312,16 +312,36 @@ export async function lookupProject(projectKey) {
   // never hardcode customfield ids; they vary per instance, and team-managed
   // projects name it "Story point estimate" vs company-managed "Story Points").
   // Graceful: if not found, SP simply isn't pushed.
+  // ⭐ Resolve from the PROJECT'S Story CREATE SCREEN (createmeta), NOT the global field list (live-acceptance
+  // 2026-06-21, team-managed break): a MIXED instance has BOTH a company-managed "Story Points"
+  // (e.g. customfield_10074) AND a team-managed "Story point estimate" (a different id). The global list
+  // returns the company-managed one, which a TEAM-MANAGED project REJECTS as "not on the appropriate screen"
+  // → every Story create 400s. createmeta returns ONLY the fields actually on THIS project's Story screen, so
+  // we set the field that exists there (or none — graceful). Falls back to the global list ONLY if createmeta
+  // itself errors (preserves the prior best-effort; the worst case is "no SP set", never a hard fail).
+  const pickSp = (fields) => {
+    const arr = Array.isArray(fields) ? fields : [];
+    const isCustom = (f) => f && (f.schema ? !!f.schema.custom : !!f.custom);
+    const f = arr.find((x) => isCustom(x) && /^story points$/i.test(x.name || ''))
+      || arr.find((x) => isCustom(x) && /story point/i.test(x.name || ''));
+    return f ? (f.fieldId || f.key || f.id || null) : null;
+  };
   let storyPointsFieldId = null;
+  const storyType = issueTypes.find((t) => !t.subtask && /^story$/i.test(t.name || ''))
+    || issueTypes.find((t) => !t.subtask && /story/i.test(t.name || ''));
   try {
-    const fr = await api.asUser().requestJira(route`/rest/api/3/field`);
-    if (fr.ok) {
-      const list = await fr.json();
-      const all = Array.isArray(list) ? list : [];
-      const sp =
-        all.find((f) => f.custom && /^story points$/i.test(f.name || '')) ||
-        all.find((f) => f.custom && /story point/i.test(f.name || ''));
-      storyPointsFieldId = sp?.id || null;
+    if (storyType && storyType.id) {
+      const cm = await api.asUser().requestJira(route`/rest/api/3/issue/createmeta/${project.id}/issuetypes/${storyType.id}`);
+      if (cm.ok) {
+        const meta = await cm.json();
+        storyPointsFieldId = pickSp(meta && (meta.fields || meta.values)); // null = SP isn't on this project's Story screen → don't set it
+      } else { // createmeta blocked → prior global best-effort (no regression for an instance where it works)
+        const fr = await api.asUser().requestJira(route`/rest/api/3/field`);
+        if (fr.ok) storyPointsFieldId = pickSp(await fr.json());
+      }
+    } else { // no Story type resolved → global best-effort
+      const fr = await api.asUser().requestJira(route`/rest/api/3/field`);
+      if (fr.ok) storyPointsFieldId = pickSp(await fr.json());
     }
   } catch (_) {
     /* SP just won't be pushed — graceful */
