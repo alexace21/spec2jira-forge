@@ -4420,6 +4420,11 @@ function RankBacklogPanel({ kanbanRank, onRankBacklog, planStale = false }) {
     // label or partial-rank failure isn't silently reduced to the generic line.
     return f.reason || f.detail || f.message || (f.error ? `${f.key || f.issue || "an issue"}: ${f.error}` : ((f.key || f.issue) ? `${f.key || f.issue}: could not be updated` : null));
   })();
+  // §11 (pre-prod gate finding #3): a 207 "partial-unverified" rank bumps NO counter (rank_failed stays 0), so the
+  // failed-count callout below never fires for it — the backend's "verify the order" instruction would be silently
+  // dropped and a Jira-reported PARTIAL would read as a clean full success. Surface it on its own honesty channel.
+  // Additive: never hides a count; the success line still renders alongside as a separate, disjoint signal.
+  const unverifiedPartial = failureDetails.find((f) => f && f.error === "partial_rank_unverified") || null;
   return (
     <div style={{ border: "1px solid var(--s2j-border)", borderRadius: 10, padding: 16, marginBottom: 16, background: "var(--s2j-bg-section)" }}>
       <div className="flex items-center gap-2" style={{ marginBottom: 6 }}>
@@ -4445,6 +4450,11 @@ function RankBacklogPanel({ kanbanRank, onRankBacklog, planStale = false }) {
           {(rankFailed > 0 || labelFailed > 0) ? (
             <SignalCallout kind={rankFailed > 0 ? "error" : "warning"} title={`${rankFailed} rank${rankFailed === 1 ? "" : "s"} + ${labelFailed} label${labelFailed === 1 ? "" : "s"} failed`} style={{ marginBottom: 6 }}>
               {firstFailure ? <>Reason: {firstFailure} — </> : null}check your Jira board permissions and retry (it’s idempotent).
+            </SignalCallout>
+          ) : null}
+          {unverifiedPartial ? (
+            <SignalCallout kind="warning" title="Verify the backlog order" style={{ marginBottom: 6 }}>
+              {unverifiedPartial.detail || "Jira reported a partial result (207) — open your board (sorted by Rank) and verify the Now → Next → Later order."}
             </SignalCallout>
           ) : null}
         </div>
