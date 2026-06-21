@@ -2729,8 +2729,9 @@ resolver.define('startPlan', async ({ payload, context }) => {
   const tier = getActiveTier(context);
   if (tier.key === 'unlicensed') return buildLicenseRequired();
   // v6.1 value-split: the Capacity-Sheet Planner is an Advanced-edition feature (bundled with test-cases).
-  // FAIL-CLOSED by construction — resolveTier defaults an unknown/failed license to Standard (no hasPlanner),
-  // so a license-read fault denies the premium rather than leaking it (POLICY §3 cost-asymmetry).
+  // FAIL-CLOSED by construction (POLICY §3 cost-asymmetry): a license-read FAULT resolves to UNLICENSED (caught
+  // by the line above → license_required); an unknown/garbage ACTIVE capabilitySet defaults to Standard (no
+  // hasPlanner → upgrade). Either way the premium planner is denied, never leaked.
   if (!tier.hasPlanner) return buildUpgradeRequired('planner');
   const { jobId, features, capacityForm, specSummary, specConcerns } = payload || {};
   // P12: the planning OBJECTIVE rides capacityForm.objective. SANITIZE against the frozen allow-list (never
@@ -2977,7 +2978,9 @@ resolver.define('estimatePlanCost', async ({ payload }) => {
  * the user couldn't see why). Single source of truth = computeCapacity, so the preview can never drift.
  */
 resolver.define('previewCapacity', async ({ payload, context }) => {
-  if (getActiveTier(context).key === 'unlicensed') return buildLicenseRequired();
+  const tier = getActiveTier(context);
+  if (tier.key === 'unlicensed') return buildLicenseRequired();
+  if (!tier.hasPlanner) return buildUpgradeRequired('planner'); // v6.1: planner-only — capacity/throughput preview IS planner value (deep-audit parity with startPlan/repackPlan; the only never-Advanced-reachable planner surface)
   const form = payload && payload.capacityForm;
   // Kanban: preview the quarter throughput + reach band (the SAME computeThroughput the plan uses → can't drift).
   if (planMethodology(form) === 'kanban') {
@@ -3016,7 +3019,9 @@ resolver.define('previewCapacity', async ({ payload, context }) => {
  * so every other feature keeps its relative order — the frozen ordering is NOT re-optimized (stated in the UI).
  */
 resolver.define('previewWhatIf', async ({ payload, context }) => {
-  if (getActiveTier(context).key === 'unlicensed') return buildLicenseRequired();
+  const tier = getActiveTier(context);
+  if (tier.key === 'unlicensed') return buildLicenseRequired();
+  if (!tier.hasPlanner) return buildUpgradeRequired('planner'); // v6.1: planner-only — what-if is the TWIN of the gated repackPlan (re-packs the CACHED ranking, "core planner VALUE, no spend"); the deep audit caught this was left open
   const { jobId, scenario } = payload || {};
   let record;
   try { record = await kvs.get(`${PLAN_KEY_PREFIX}${jobId}`); } catch (_) { record = null; }

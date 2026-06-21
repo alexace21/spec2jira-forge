@@ -2850,7 +2850,8 @@ function ReadyScreen({
                 {usage.tierLabel} plan
               </strong>{" "}
               · unlimited breakdowns
-              {usage.hasTestCases && " · includes test cases"}
+              {(usage.hasTestCases || usage.hasPlanner) &&
+                ` · includes ${[usage.hasTestCases && "test cases", usage.hasPlanner && "capacity planner"].filter(Boolean).join(" + ")}`}
             </span>
           ) : usage.tier === "managedPro" ? (
             // DORMANT under v6 — resolveTier never returns managedPro for a live customer
@@ -3719,7 +3720,7 @@ function ConfirmScreen({
               <IconCalendar size={14} /> Plan capacity
             </button>
           ) : (
-            <span className="shrink-0 text-xs font-medium" style={{ color: "var(--s2j-blue)", whiteSpace: "nowrap", padding: "7px 10px" }}>Advanced</span>
+            <span className="shrink-0 text-xs font-medium" title="The Capacity-Sheet Planner is included in the Advanced edition. Upgrade in your Atlassian site admin to plan your backlog." style={{ color: "var(--s2j-blue)", whiteSpace: "nowrap", padding: "7px 10px" }}>Advanced</span>
           )}
         </div>
       )}
@@ -4834,7 +4835,7 @@ function LimitReachedScreen({ quota, onBack, backToReview = false }) {
       ? "Subscription required"
       : "You've used this month's breakdowns";
   const fallbackBody = isEditionRequired
-    ? "Test-case generation is included in the Advanced edition. Upgrade to generate BA-grade acceptance test cases for every story."
+    ? "The Advanced edition includes test-case generation and the Capacity-Sheet Planner. Upgrade to generate BA-grade acceptance test cases and turn your backlog into a Scrum or Kanban delivery plan."
     : isLicenseRequired
       ? "An active subscription is required to use Spec2Tickets. Manage your subscription from your Atlassian site admin."
       : limit
@@ -4902,7 +4903,7 @@ function LimitReachedScreen({ quota, onBack, backToReview = false }) {
             <EditionRow
               name="Advanced"
               price={advancedPrice}
-              blurb="+ test-case generation"
+              blurb="+ test-case generation + capacity planner"
             />
           ) : isFairUse ? (
             <EditionRow
@@ -4920,7 +4921,7 @@ function LimitReachedScreen({ quota, onBack, backToReview = false }) {
               <EditionRow
                 name="Advanced"
                 price={advancedPrice}
-                blurb="+ test-case generation"
+                blurb="+ test-case generation + capacity planner"
               />
             </>
           )}
