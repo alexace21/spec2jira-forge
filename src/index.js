@@ -70,6 +70,7 @@ import { detectCycles } from './graph.js';
 // (optional) ranking — the resolver supplies the LLM output or null (deterministic fallback).
 import {
   computeCapacity,
+  computeThroughput, // Kanban v1: capacity → quarter throughput → Now/Next/Later reach band (methodology fork)
   assemblePlan,
   buildPlannerGraph,
   topoSortAndCycles,
@@ -2654,6 +2655,17 @@ function riskFromRecord(record) {
   return undefined;
 }
 
+// METHODOLOGY DISPATCH (Kanban v1): the capacity form carries `methodology`. Kanban uses computeThroughput (a
+// quarter flow total → a Now/Next/Later reach band); Scrum uses computeCapacity (per-sprint boxes). Default
+// 'scrum' for back-compat (old forms/records have no methodology field). SANITIZED to the 2-value allow-list —
+// never trust a raw client string deciding which capacity model runs (the P12 objective sanitize pattern).
+function planMethodology(form) {
+  return (form && form.methodology) === 'kanban' ? 'kanban' : 'scrum';
+}
+function computePlanCapacity(form) {
+  return planMethodology(form) === 'kanban' ? computeThroughput(form) : computeCapacity(form);
+}
+
 /**
  * finalizePlanJob — the SINGLE plan-completion point (success OR fallback). Given the batch job record
  * + the ranking (null on ANY LLM failure → deterministic ordering), it recomputes capacity, assembles
@@ -2661,7 +2673,7 @@ function riskFromRecord(record) {
  * response. The planner NEVER hard-fails (ledger LLM-3): a missing/failed ranking still yields a plan.
  */
 async function finalizePlanJob(planjob, ranking, usage, llmNote) {
-  const capacity = computeCapacity(planjob.capacityForm);
+  const capacity = computePlanCapacity(planjob.capacityForm);
   if (!capacity.ok) {
     await kvs.delete(`${PLAN_BATCH_PREFIX}${planjob.jobId}`).catch(() => {});
     return { ok: false, status: 'completed', stage: 'capacity', capacityErrors: capacity.errors, assumptions: capacity.assumptions, warnings: capacity.warnings };
@@ -2670,7 +2682,7 @@ async function finalizePlanJob(planjob, ranking, usage, llmNote) {
   try {
     // precomputedRisk reuses the compact risk from startPlan (concerns are GONE from planjob.features); the
     // specConcerns fallback covers an in-flight job created by pre-fix code during a deploy window (graceful).
-    plan = assemblePlan({ features: planjob.features, capacity, ranking, specConcerns: planjob.specConcerns, precomputedRisk: planjob.risk });
+    plan = assemblePlan({ features: planjob.features, capacity, ranking, specConcerns: planjob.specConcerns, precomputedRisk: planjob.risk, methodology: planMethodology(planjob.capacityForm) });
     // §11 self-audit: the skill packer's invariant channel must stay empty. If it ever fires (a packer
     // regression: a feature overflowed a bucket that had room), surface it loudly in the logs (gate finding).
     if (plan && Array.isArray(plan.violations) && plan.violations.length) console.warn(`[plan] packer invariant VIOLATIONS (${plan.violations.length}) — should never happen ref=${planjob.jobId}`);
@@ -2696,7 +2708,7 @@ async function finalizePlanJob(planjob, ranking, usage, llmNote) {
   await touchJobAccess(planjob.jobId);
   // SELF-DESCRIBING PLAN (reload fix 2026-06-20): every completion return carries the lean features so the
   // FE name-source (result.features) survives a reload/re-pack regardless of the live in-memory breakdown.
-  return { ok: true, status: 'completed', plan, features: planjob.features, assumptions: capacity.assumptions, warnings, perSprintCapacityPoints: capacity.perSprintCapacityPoints, sourceHash: planjob.sourceHash, usedLlm, llmNote, cost, objective };
+  return { ok: true, status: 'completed', plan, features: planjob.features, assumptions: capacity.assumptions, warnings, perSprintCapacityPoints: capacity.perSprintCapacityPoints, sourceHash: planjob.sourceHash, usedLlm, llmNote, cost, objective, methodology: planMethodology(planjob.capacityForm) };
 }
 
 /**
@@ -2712,6 +2724,9 @@ resolver.define('startPlan', async ({ payload, context }) => {
   // trust a raw client string into the prompt) — unknown/missing → 'balanced' (no clause; today's behaviour).
   const PLAN_OBJECTIVE_SET = new Set(PLAN_OBJECTIVES);
   const objective = PLAN_OBJECTIVE_SET.has(capacityForm && capacityForm.objective) ? capacityForm.objective : 'balanced';
+  // Kanban v1: 'kanban' → computeThroughput + a Now/Next/Later reach band; default 'scrum' (sprint boxes).
+  const methodology = planMethodology(capacityForm);
+  const isKanban = methodology === 'kanban';
   // spec-WIDE concerns (SN-3): a bounded, string-only list — passed ONCE to the ranker as plan-level
   // context, NEVER attributed per-feature. Also carried on the job so a fallback/poll finalize keeps it.
   const planSpecConcerns = Array.isArray(specConcerns)
@@ -2724,7 +2739,7 @@ resolver.define('startPlan', async ({ payload, context }) => {
     : [];
 
   // CAP-1 short-circuit: a bad form is a typed blocker — render it, fire NO batch.
-  const capacity = computeCapacity(capacityForm);
+  const capacity = computePlanCapacity(capacityForm);
   if (!capacity.ok) {
     return { ok: false, stage: 'capacity', capacityErrors: capacity.errors, assumptions: capacity.assumptions, warnings: capacity.warnings };
   }
@@ -2732,7 +2747,7 @@ resolver.define('startPlan', async ({ payload, context }) => {
   if (list.length === 0) {
     // P12-01: every completion path carries `objective` so the completion-shape invariant holds (the
     // FE reads r.objective for the "Ordered for" line; a missing key would silently read as undefined).
-    return { ok: true, status: 'completed', empty: true, plan: null, objective, assumptions: capacity.assumptions, warnings: capacity.warnings };
+    return { ok: true, status: 'completed', empty: true, plan: null, objective, methodology, assumptions: capacity.assumptions, warnings: capacity.warnings };
   }
 
   const { apiKey, keyFault, keySource } = await resolveAnthropicKey(context);
@@ -2753,13 +2768,22 @@ resolver.define('startPlan', async ({ payload, context }) => {
     const riskByFeature = computeRiskSignals(list, (f, i) => graph.idByIndex[i]);
     const rows = buildRankingRows(graph, signals, sizing.points, riskByFeature);
     const totalBacklogPoints = Array.from(sizing.points.values()).reduce((a, b) => a + b, 0);
-    const globals = {
+    const globals = isKanban ? {
+      // Kanban: no sprint boxes — give the advisory ranker the quarter throughput total vs backlog (what won't
+      // fit). The ranking is methodology-agnostic (it only ORDERS); these globals just inform the deferral calls.
+      totalCapacity: capacity.expectedPointsQuarter,
+      totalBacklogPoints,
+      deficitPoints: Math.max(0, totalBacklogPoints - capacity.expectedPointsQuarter),
+      objective,
+      methodology, // C3 (deep-audit): the prompt's capacity-context label reads "Quarter throughput" (not "across all sprints") for kanban
+    } : {
       sprintCount: capacity.perSprintCapacityPoints.length,
       perSprintCapacityPoints: capacity.perSprintCapacityPoints,
       totalCapacity: capacity.totalCapacityPoints,
       totalBacklogPoints,
       deficitPoints: Math.max(0, totalBacklogPoints - capacity.totalCapacityPoints),
       objective, // P12: the ranking prompt reads globals.objective → the abstract goal clause
+      methodology, // 'scrum' here → the prompt keeps the existing "Total capacity across all sprints" label (byte-identical)
     };
     const planWarnings = [...capacity.warnings, ...truncationWarnings];
     // deep-audit (2026-06-20): a duplicate _uid makes buildPlannerGraph disambiguate to `uid#i`, which then
@@ -2786,7 +2810,7 @@ resolver.define('startPlan', async ({ payload, context }) => {
       // few enum tokens/feature; the heavy concerns/user_story are still dropped for the KVS cap).
       task_types: Array.isArray(f.task_types) ? f.task_types.slice(0, PLAN_TASK_TYPE_CAP) : [],
     }));
-    const planjob = { jobId, features: leanFeatures, capacityForm, sourceHash: planSourceHash(list), warnings: planWarnings, model: MODEL_PRIMARY, keySource: keySource || 'byok', risk: planRisk, objective };
+    const planjob = { jobId, features: leanFeatures, capacityForm, sourceHash: planSourceHash(list), warnings: planWarnings, model: MODEL_PRIMARY, keySource: keySource || 'byok', risk: planRisk, objective, methodology };
 
     // Submit the ranking batch (advisory). A submit failure → produce the deterministic plan NOW (never block).
     const submit = await submitPlanRankingBatch({ rows, globals, specSummary: specSummary || '', specConcerns: planSpecConcerns, customId: jobId, apiKey, model: MODEL_PRIMARY });
@@ -2799,7 +2823,7 @@ resolver.define('startPlan', async ({ payload, context }) => {
     const batchRecord = { ...planjob, batchId: submit.batchId, status: 'batched', batchStatus: submit.status, submittedAt: Date.now(), expiresAt: submit.expiresAt };
     try { await kvs.set(`${PLAN_BATCH_PREFIX}${jobId}`, batchRecord); } catch (e) { console.warn(`[startPlan] planjob persist failed (non-fatal): ${String(e?.message || e)} ref=${jobId}`); }
     await touchJobAccess(jobId);
-    return { ok: true, status: 'batched', planJobId: jobId, sourceHash: planjob.sourceHash, assumptions: capacity.assumptions, warnings: planWarnings, perSprintCapacityPoints: capacity.perSprintCapacityPoints };
+    return { ok: true, status: 'batched', planJobId: jobId, sourceHash: planjob.sourceHash, assumptions: capacity.assumptions, warnings: planWarnings, perSprintCapacityPoints: capacity.perSprintCapacityPoints, methodology };
   } catch (e) {
     console.error(`[startPlan] plan pipeline threw (non-fatal): ${String(e?.message || e)} ref=${jobId}`);
     return { ok: false, stage: 'plan', error: 'plan_failed', detail: 'The plan could not be computed from this breakdown — please try again or adjust the breakdown.' };
@@ -2822,7 +2846,7 @@ resolver.define('pollPlanStatus', async ({ payload, context }) => {
     let done; try { done = await kvs.get(`${PLAN_KEY_PREFIX}${jobId}`); } catch (_) { done = null; }
     if (done && done.plan) {
       await touchJobAccess(jobId);
-      return { ok: true, status: 'completed', plan: done.plan, features: done.features, assumptions: done.assumptions, warnings: done.warnings, sourceHash: done.sourceHash, usedLlm: done.usedLlm, llmNote: done.llmNote, cost: done.cost, objective: done.objective || 'balanced' };
+      return { ok: true, status: 'completed', plan: done.plan, features: done.features, assumptions: done.assumptions, warnings: done.warnings, sourceHash: done.sourceHash, usedLlm: done.usedLlm, llmNote: done.llmNote, cost: done.cost, objective: done.objective || 'balanced', methodology: planMethodology(done.capacityForm) }; // G1 (deep-audit): top-level methodology parity with the other completion paths (latent race-trap close)
     }
     return { ok: true, status: 'idle' };
   }
@@ -2868,7 +2892,7 @@ resolver.define('repackPlan', async ({ payload, context }) => {
   try { record = await kvs.get(`${PLAN_KEY_PREFIX}${jobId}`); } catch (_) { record = null; }
   if (!record || !Array.isArray(record.features)) return { ok: false, error: 'no_plan', detail: 'Generate a plan first.' };
 
-  const capacity = computeCapacity(capacityForm);
+  const capacity = computePlanCapacity(capacityForm);
   if (!capacity.ok) {
     return { ok: false, stage: 'capacity', capacityErrors: capacity.errors, assumptions: capacity.assumptions, warnings: capacity.warnings };
   }
@@ -2877,7 +2901,7 @@ resolver.define('repackPlan', async ({ payload, context }) => {
   try {
     // CACHED ranking + the COMPACT precomputed risk (concerns are gone from record.features) → no LLM, no
     // recompute; only sprintRiskProfiles re-derive for the new packing. record.specConcerns covers old records.
-    plan = assemblePlan({ features: record.features, capacity, ranking: record.ranking, specConcerns: record.specConcerns, precomputedRisk: riskFromRecord(record) });
+    plan = assemblePlan({ features: record.features, capacity, ranking: record.ranking, specConcerns: record.specConcerns, precomputedRisk: riskFromRecord(record), methodology: planMethodology(capacityForm) });
   } catch (e) {
     console.error(`[repackPlan] re-pack threw (non-fatal): ${String(e?.message || e)} ref=${jobId}`);
     return { ok: false, stage: 'plan', error: 'plan_failed', detail: 'The plan could not be re-packed — please try again.' };
@@ -2888,7 +2912,7 @@ resolver.define('repackPlan', async ({ payload, context }) => {
 
   // SELF-DESCRIBING PLAN (gate HIGH 2026-06-20): a free re-pack REPLACES the FE planResult, so it MUST
   // re-carry features — else a reload→re-pack drops the name source and the chips re-render raw uids.
-  return { ok: true, plan, features: record.features, assumptions: capacity.assumptions, warnings: capacity.warnings, perSprintCapacityPoints: capacity.perSprintCapacityPoints, sourceHash: record.sourceHash, usedLlm: record.usedLlm, llmNote: record.llmNote, cost: record.cost, objective: record.objective || 'balanced', repacked: true };
+  return { ok: true, plan, features: record.features, assumptions: capacity.assumptions, warnings: capacity.warnings, perSprintCapacityPoints: capacity.perSprintCapacityPoints, sourceHash: record.sourceHash, usedLlm: record.usedLlm, llmNote: record.llmNote, cost: record.cost, objective: record.objective || 'balanced', methodology: planMethodology(capacityForm), repacked: true };
 });
 
 /**
@@ -2911,7 +2935,7 @@ resolver.define('getPlan', async ({ payload }) => {
     // riskByFeature) — the human names live in record.features (the lean projection: _uid/name/SP/priority).
     // Return them so the FE can resolve uid→name on RELOAD without the live in-memory breakdown (which is
     // lost on a hard reload → names were rendering as raw uids). Lean + already capped → bounded payload.
-    return { ok: true, status: 'completed', plan: record.plan, features: record.features, capacityForm: record.capacityForm, assumptions: record.assumptions, warnings: record.warnings, sourceHash: record.sourceHash, usedLlm: record.usedLlm, llmNote: record.llmNote, cost: record.cost, objective: record.objective || 'balanced', stale };
+    return { ok: true, status: 'completed', plan: record.plan, features: record.features, capacityForm: record.capacityForm, assumptions: record.assumptions, warnings: record.warnings, sourceHash: record.sourceHash, usedLlm: record.usedLlm, llmNote: record.llmNote, cost: record.cost, objective: record.objective || 'balanced', methodology: planMethodology(record.capacityForm), stale };
   }
   // 2) an IN-FLIGHT ranking batch? (reconnect mid-plan → the UI resumes polling)
   let planjob;
@@ -2939,9 +2963,25 @@ resolver.define('estimatePlanCost', async ({ payload }) => {
  */
 resolver.define('previewCapacity', async ({ payload, context }) => {
   if (getActiveTier(context).key === 'unlicensed') return buildLicenseRequired();
-  const cap = computeCapacity(payload && payload.capacityForm);
+  const form = payload && payload.capacityForm;
+  // Kanban: preview the quarter throughput + reach band (the SAME computeThroughput the plan uses → can't drift).
+  if (planMethodology(form) === 'kanban') {
+    const t = computeThroughput(form);
+    return {
+      ok: t.ok,
+      methodology: 'kanban',
+      expectedPointsQuarter: t.expectedPointsQuarter,
+      conservativePoints: t.conservativePoints,
+      optimisticPoints: t.optimisticPoints,
+      assumptions: t.assumptions,
+      warnings: t.warnings,
+      errors: t.errors,
+    };
+  }
+  const cap = computeCapacity(form);
   return {
     ok: cap.ok,
+    methodology: 'scrum',
     perSprintCapacityPoints: cap.perSprintCapacityPoints,
     totalCapacityPoints: cap.totalCapacityPoints,
     perSprintBucketCapacity: cap.perSprintBucketCapacity, // Tier-2: per-skill breakdown (BE/FE/QA/GEN)
@@ -2966,6 +3006,8 @@ resolver.define('previewWhatIf', async ({ payload, context }) => {
   let record;
   try { record = await kvs.get(`${PLAN_KEY_PREFIX}${jobId}`); } catch (_) { record = null; }
   if (!record || !record.plan || !Array.isArray(record.features)) return { ok: false, error: 'no_plan', detail: 'Generate a plan first.' };
+  // Kanban v1 has no sprint-boxed what-if (deferred §3.5); guard so a kanban form never mis-runs the sprint scenario path.
+  if (planMethodology(record.capacityForm) === 'kanban') return { ok: false, error: 'whatif_unsupported', detail: 'What-if scenarios are available for sprint plans.' };
 
   const sc = scenario && typeof scenario === 'object' ? scenario : {};
   const baseForm = record.capacityForm || {};

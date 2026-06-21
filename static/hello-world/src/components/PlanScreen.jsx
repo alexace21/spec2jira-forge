@@ -2,13 +2,13 @@ import React, { useMemo, useState, useRef, useEffect } from "react";
 import { invoke } from "@forge/bridge";
 import { SignalIcon, SignalCallout } from "./Signal";
 import {
-  IconCalendar, IconUsers, IconRefresh, IconCost, IconPlus, IconTrash, IconArrowLeft, IconBan, IconLink,
+  IconCalendar, IconUsers, IconRefresh, IconCost, IconPlus, IconTrash, IconArrowLeft, IconBan, IconLink, IconList,
 } from "./Icon";
 // Shared pure view-derivations — the SINGLE source of truth so PlanScreen + the Plan Brief can never
 // tell two different stories (§13 gate "BRIEF-DRIFT"). See static/hello-world/src/lib/planView.js.
 import {
-  fmt1, fmtUsd, sprintDates, riskReasons, isRiskFlagged, buildRiskRegister,
-  overflowReasonText, deficitHeadline, fragmentationNote, skillLabel,
+  fmt1, fmtUsd, sprintDates, riskReasons, isRiskFlagged, buildRiskRegister, registerWhereLabel,
+  overflowReasonText, deficitHeadline, fragmentationNote, skillLabel, kanbanReachVerdict,
 } from "../lib/planView";
 
 const SKILL_METER_ORDER = ["BE", "FE", "QA", "GEN"]; // Tier-2: per-bucket meter order
@@ -140,43 +140,101 @@ function NumField({ label, value, onChange, placeholder, disabled, hint, tip }) 
   );
 }
 
+// ── Methodology toggle — a clear segmented control (Sprints (Scrum) | Kanban backlog) ───────────────
+// Bound to form.methodology (default 'scrum'). a11y: role=radiogroup; the active option carries the blue
+// fill AND aria-checked (state isn't colour-alone). Switching re-runs the live preview (App.js debounce).
+function MethodologyToggle({ value, onChange, disabled }) {
+  const v = value === "kanban" ? "kanban" : "scrum";
+  const opts = [
+    { key: "scrum", label: "Sprints (Scrum)", icon: <IconCalendar size={13} /> },
+    { key: "kanban", label: "Kanban backlog", icon: <IconList size={13} /> },
+  ];
+  return (
+    <div style={{ marginBottom: 14 }}>
+      <span style={labelStyle}>Planning mode<InfoTip text="Sprints (Scrum) packs the backlog into capacity-bounded sprints with dates. Kanban backlog produces a pull-ready, dependency-legal ordered backlog cut into Now / Next / Later by how much your team is likely to reach this quarter — no sprints, no dates. Both are review-only." /></span>
+      <div role="radiogroup" aria-label="Planning mode" style={{ display: "inline-flex", border: "1px solid var(--s2j-border)", borderRadius: 8, overflow: "hidden", background: "var(--s2j-bg)" }}>
+        {opts.map((o, i) => {
+          const active = v === o.key;
+          return (
+            <button
+              key={o.key}
+              type="button"
+              role="radio"
+              aria-checked={active}
+              disabled={disabled}
+              onClick={() => { if (!active) onChange({ methodology: o.key }); }}
+              className="flex items-center gap-1"
+              style={{
+                padding: "7px 14px",
+                fontSize: 12.5,
+                fontWeight: active ? 600 : 500,
+                cursor: disabled ? "not-allowed" : "pointer",
+                border: "none",
+                borderLeft: i === 0 ? "none" : "1px solid var(--s2j-border)",
+                background: active ? "var(--s2j-blue)" : "transparent",
+                color: active ? "#fff" : "var(--s2j-text-muted)",
+              }}
+            >
+              {o.icon} {o.label}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 // ── Capacity form (controlled; the backend validates every field fail-loud) ─────────
 function CapacityForm({ form, onChange, disabled }) {
   const f = form || {};
+  const isKanban = f.methodology === "kanban";
   const people = Array.isArray(f.people) ? f.people : [];
   const set = (patch) => onChange(patch);
   const setPerson = (i, patch) => set({ people: people.map((p, j) => (j === i ? { ...p, ...patch } : p)) });
   const addPerson = () => set({ people: [...people, { _rid: rid(), name: "", availableDays: f.sprintLengthDays || 8 }] });
   const removePerson = (i) => set({ people: people.filter((_, j) => j !== i) });
   const [advanced, setAdvanced] = React.useState(false);
-  const overrideMode = f.pointsPerSprintOverride !== undefined && f.pointsPerSprintOverride !== "" && f.pointsPerSprintOverride !== null;
+  // The override field differs per methodology: pts/sprint (scrum) vs pts/quarter (kanban). The multiplier
+  // inputs (hours/day, focus, hours/point) are disabled when EITHER override is set (they're then unused).
+  const overrideKey = isKanban ? "pointsPerQuarterOverride" : "pointsPerSprintOverride";
+  const overrideMode = f[overrideKey] !== undefined && f[overrideKey] !== "" && f[overrideKey] !== null;
 
   return (
     <div style={{ border: "1px solid var(--s2j-border)", borderRadius: 10, padding: 16, background: "var(--s2j-bg-section)" }}>
+      {/* methodology selector — top of the form (task-1) */}
+      <MethodologyToggle value={f.methodology} onChange={set} disabled={disabled} />
+
       <div className="flex items-center gap-2" style={{ marginBottom: 4 }}>
         <span style={{ color: "var(--s2j-blue)" }}><IconUsers size={16} /></span>
         <h3 style={{ fontSize: 14, fontWeight: 600, color: "var(--s2j-text)", margin: 0 }}>Team capacity</h3>
       </div>
       <p style={{ fontSize: 11, color: "var(--s2j-text-muted)", margin: "0 0 12px", lineHeight: 1.5 }}>
-        Capacity per sprint is computed from each person's available days. Click the&nbsp;
-        <SignalIcon kind="info" size={11} style={{ verticalAlign: "-0.1em" }} />&nbsp;icons for what each
-        field means; every multiplier (and its default) is also listed in <strong>Assumptions</strong> after you generate.
+        {isKanban
+          ? <>Expected throughput this quarter is computed from each person's available days. Click the&nbsp;<SignalIcon kind="info" size={11} style={{ verticalAlign: "-0.1em" }} />&nbsp;icons for what each field means; every multiplier (and its default) is also listed in <strong>Assumptions</strong> after you generate.</>
+          : <>Capacity per sprint is computed from each person's available days. Click the&nbsp;<SignalIcon kind="info" size={11} style={{ verticalAlign: "-0.1em" }} />&nbsp;icons for what each field means; every multiplier (and its default) is also listed in <strong>Assumptions</strong> after you generate.</>}
       </p>
 
-      {/* team roster — availableDays is PER SPRINT (the pinned contract) */}
+      {/* team roster — availableDays is PER SPRINT (Scrum) or PER QUARTER (Kanban) — the pinned contract */}
       <div style={{ marginBottom: 12 }}>
         <div className="flex" style={{ gap: 8, marginBottom: 4, fontSize: 11, fontWeight: 600, color: "var(--s2j-text-muted)" }}>
           <span style={{ flex: 1, display: "inline-flex", alignItems: "center" }}>
             Team member
-            <InfoTip text="A label for this capacity row — a person's name. The name is NOT sent to Claude; it only labels the row. Set the Skill next to it to plan per-discipline." />
+            <InfoTip text="A label for this capacity row — a person's name. The name is NOT sent to Claude; it only labels the row." />
           </span>
-          <span style={{ width: 92, display: "inline-flex", alignItems: "center" }}>
-            Skill
-            <InfoTip text="The discipline this person works in — Backend / Frontend / QA. When you set ANY skills, the planner splits capacity into those buckets and checks each feature against the skill it needs (so it can flag “short on backend” while QA sits idle). Leave it blank to keep one pooled team number (no skill matching). Untagged members become a generalist pool that only fills features with no recognizable skill." />
-          </span>
+          {/* Skill is Scrum-only in v1 (Kanban is a pooled team — no skill buckets) */}
+          {!isKanban ? (
+            <span style={{ width: 92, display: "inline-flex", alignItems: "center" }}>
+              Skill
+              <InfoTip text="The discipline this person works in — Backend / Frontend / QA. When you set ANY skills, the planner splits capacity into those buckets and checks each feature against the skill it needs (so it can flag “short on backend” while QA sits idle). Leave it blank to keep one pooled team number (no skill matching). Untagged members become a generalist pool that only fills features with no recognizable skill." />
+            </span>
+          ) : null}
           <span style={{ width: 120, display: "inline-flex", alignItems: "center" }}>
-            Available days / sprint
-            <InfoTip align="right" text="Days each person is available to work IN ONE SPRINT — not the whole quarter. A 2-week sprint is ≈ 8–10 working days, minus that person's planned time off. (Entering whole-quarter days here over-counts capacity; values above the sprint length are clamped.)" />
+            {isKanban ? "Available days (this quarter)" : "Available days / sprint"}
+            {isKanban ? (
+              <InfoTip align="right" text="Days each person is available to work OVER THE WHOLE QUARTER — the entire period, NOT per sprint. A full quarter is ≈ 60–65 working days, minus that person's planned time off. (Entering per-sprint days here under-counts the quarter's throughput.)" />
+            ) : (
+              <InfoTip align="right" text="Days each person is available to work IN ONE SPRINT — not the whole quarter. A 2-week sprint is ≈ 8–10 working days, minus that person's planned time off. (Entering whole-quarter days here over-counts capacity; values above the sprint length are clamped.)" />
+            )}
           </span>
           <span style={{ width: 28 }} />
         </div>
@@ -190,23 +248,25 @@ function CapacityForm({ form, onChange, disabled }) {
               onChange={(e) => setPerson(i, { name: e.target.value })}
               style={{ ...fieldStyle, flex: 1 }}
             />
-            <select
-              value={p.skill ?? ""}
-              disabled={disabled}
-              onChange={(e) => setPerson(i, { skill: e.target.value })}
-              title="Discipline — Backend / Frontend / QA (blank = generalist)"
-              style={{ ...fieldStyle, width: 92 }}
-            >
-              <option value="">—</option>
-              <option value="BE">Backend</option>
-              <option value="FE">Frontend</option>
-              <option value="QA">QA</option>
-            </select>
+            {!isKanban ? (
+              <select
+                value={p.skill ?? ""}
+                disabled={disabled}
+                onChange={(e) => setPerson(i, { skill: e.target.value })}
+                title="Discipline — Backend / Frontend / QA (blank = generalist)"
+                style={{ ...fieldStyle, width: 92 }}
+              >
+                <option value="">—</option>
+                <option value="BE">Backend</option>
+                <option value="FE">Frontend</option>
+                <option value="QA">QA</option>
+              </select>
+            ) : null}
             <input
               type="text"
               inputMode="decimal"
               value={p.availableDays ?? ""}
-              placeholder="8"
+              placeholder={isKanban ? "60" : "8"}
               disabled={disabled}
               onChange={(e) => setPerson(i, { availableDays: e.target.value })}
               style={{ ...fieldStyle, width: 120 }}
@@ -233,17 +293,19 @@ function CapacityForm({ form, onChange, disabled }) {
         </button>
       </div>
 
-      {/* sprint structure */}
-      <div className="flex" style={{ gap: 10, marginBottom: 12, flexWrap: "wrap" }}>
-        <div style={{ width: 120 }}><NumField label="Sprints" value={f.sprintCount} onChange={(v) => set({ sprintCount: v })} placeholder="4" disabled={disabled} /></div>
-        <div style={{ width: 150 }}><NumField label="Sprint length (days)" value={f.sprintLengthDays} onChange={(v) => set({ sprintLengthDays: v })} placeholder="10" disabled={disabled} /></div>
-        <div style={{ width: 160 }}>
-          <label style={{ display: "block" }}>
-            <span style={labelStyle}>Start date (optional)</span>
-            <input type="date" value={f.sprintStartDate ?? ""} disabled={disabled} onChange={(e) => set({ sprintStartDate: e.target.value })} style={fieldStyle} />
-          </label>
+      {/* sprint structure — Scrum-only (Kanban has no sprint count / length / start date in v1) */}
+      {!isKanban ? (
+        <div className="flex" style={{ gap: 10, marginBottom: 12, flexWrap: "wrap" }}>
+          <div style={{ width: 120 }}><NumField label="Sprints" value={f.sprintCount} onChange={(v) => set({ sprintCount: v })} placeholder="4" disabled={disabled} /></div>
+          <div style={{ width: 150 }}><NumField label="Sprint length (days)" value={f.sprintLengthDays} onChange={(v) => set({ sprintLengthDays: v })} placeholder="10" disabled={disabled} /></div>
+          <div style={{ width: 160 }}>
+            <label style={{ display: "block" }}>
+              <span style={labelStyle}>Start date (optional)</span>
+              <input type="date" value={f.sprintStartDate ?? ""} disabled={disabled} onChange={(e) => set({ sprintStartDate: e.target.value })} style={fieldStyle} />
+            </label>
+          </div>
         </div>
-      </div>
+      ) : null}
 
       {/* advanced multipliers + override — collapsible (every default echoed in assumptions) */}
       <button
@@ -257,23 +319,37 @@ function CapacityForm({ form, onChange, disabled }) {
       {advanced ? (
         <div>
           <p style={{ fontSize: 10.5, color: "var(--s2j-text-light)", margin: "0 0 8px", lineHeight: 1.5 }}>
-            The model: <strong>available days × hours/day × focus factor ÷ hours/point = points per sprint</strong>. Leave blank to use the defaults.
+            {isKanban
+              ? <>The model: <strong>available days × hours/day × focus factor ÷ hours/point = points this quarter</strong>. Leave blank to use the defaults.</>
+              : <>The model: <strong>available days × hours/day × focus factor ÷ hours/point = points per sprint</strong>. Leave blank to use the defaults.</>}
           </p>
           <div className="flex" style={{ gap: 10, marginBottom: 10, flexWrap: "wrap" }}>
             <div style={{ width: 140 }}><NumField label="Hours / day" value={f.hoursPerDay} onChange={(v) => set({ hoursPerDay: v })} placeholder="6" disabled={disabled || overrideMode} hint="default 6" tip="Productive delivery hours in one working day, after standing overhead (stand-ups, email). Default 6 out of an 8-hour day." /></div>
             <div style={{ width: 140 }}><NumField label="Focus factor" value={f.focusFactor} onChange={(v) => set({ focusFactor: v })} placeholder="0.7" disabled={disabled || overrideMode} hint="0–1, e.g. 0.7" tip="The fraction of working time actually spent delivering stories — the rest goes to meetings, reviews and context-switching. Industry range 0.6–0.8. Default 0.7. Enter a fraction (0.7), NOT a percent (70)." /></div>
-            <div style={{ width: 140 }}><NumField label="Hours / point" value={f.hoursPerPoint} onChange={(v) => set({ hoursPerPoint: v })} placeholder="6" disabled={disabled || overrideMode} hint="default 6" tip="How many hours one story point typically takes your team. Lower = more capacity per sprint. Default 6. Calibrate from past sprints if you know it." /></div>
+            <div style={{ width: 140 }}><NumField label="Hours / point" value={f.hoursPerPoint} onChange={(v) => set({ hoursPerPoint: v })} placeholder="6" disabled={disabled || overrideMode} hint="default 6" tip="How many hours one story point typically takes your team. Lower = more capacity. Default 6. Calibrate from past sprints if you know it." /></div>
           </div>
           <div style={{ width: 260 }}>
-            <NumField
-              label="Manual capacity (pts/sprint)"
-              value={f.pointsPerSprintOverride}
-              onChange={(v) => set({ pointsPerSprintOverride: v })}
-              placeholder="(optional — overrides the team math)"
-              disabled={disabled}
-              hint="If set, used directly instead of the team calculation."
-              tip="Already know your team's velocity? Enter story points per sprint directly and skip all the math above — this overrides the team calculation."
-            />
+            {isKanban ? (
+              <NumField
+                label="Manual capacity (pts/quarter)"
+                value={f.pointsPerQuarterOverride}
+                onChange={(v) => set({ pointsPerQuarterOverride: v })}
+                placeholder="(optional — overrides the team math)"
+                disabled={disabled}
+                hint="If set, used directly as the expected quarter throughput."
+                tip="Already know your team's quarterly throughput? Enter story points per quarter directly and skip all the math above — this overrides the team calculation."
+              />
+            ) : (
+              <NumField
+                label="Manual capacity (pts/sprint)"
+                value={f.pointsPerSprintOverride}
+                onChange={(v) => set({ pointsPerSprintOverride: v })}
+                placeholder="(optional — overrides the team math)"
+                disabled={disabled}
+                hint="If set, used directly instead of the team calculation."
+                tip="Already know your team's velocity? Enter story points per sprint directly and skip all the math above — this overrides the team calculation."
+              />
+            )}
           </div>
         </div>
       ) : null}
@@ -374,14 +450,14 @@ function FeatureChip({ feat, id, oversized, risk }) {
 
 // Async-batch wait state — the ranking runs on Anthropic's Batch API (minutes), so we show a spinner +
 // live timer + "you can leave" reassurance, mirroring the breakdown GeneratingScreen.
-function PlanningState({ elapsed }) {
+function PlanningState({ elapsed, kanban }) {
   const e = Number(elapsed) || 0;
   const mins = Math.floor(e / 60);
   const secs = e % 60;
   return (
     <div style={{ border: "1px dashed var(--s2j-border)", borderRadius: 10, padding: 32, textAlign: "center" }}>
       <div className="animate-spin" style={{ width: 48, height: 48, margin: "0 auto 14px", borderRadius: "50%", border: "3px solid var(--s2j-border)", borderTopColor: "var(--s2j-blue)" }} />
-      <p style={{ fontSize: 14, fontWeight: 600, color: "var(--s2j-text)", margin: "0 0 4px" }}>Claude is planning your sprints…</p>
+      <p style={{ fontSize: 14, fontWeight: 600, color: "var(--s2j-text)", margin: "0 0 4px" }}>{kanban ? "Claude is ordering your backlog…" : "Claude is planning your sprints…"}</p>
       <p style={{ fontSize: 12.5, color: "var(--s2j-text-muted)", margin: "0 0 8px", lineHeight: 1.5 }}>
         Ordering the backlog by dependencies, leverage and business value. This runs on Anthropic's
         Batch API and usually takes a few minutes.
@@ -425,6 +501,44 @@ function CapacityPreview({ preview, form }) {
   );
 }
 
+// Kanban live preview — the THROUGHPUT range (never a single reach number as the headline). Mirrors
+// CapacityPreview's pattern but reads the kanban preview shape (expectedPointsQuarter / conservative /
+// optimistic). The same computeThroughput the plan uses backs it, so it can't drift (the preview guarantee).
+function KanbanCapacityPreview({ preview, form }) {
+  const expected = fmt1(preview.expectedPointsQuarter);
+  const cons = fmt1(preview.conservativePoints);
+  const opt = fmt1(preview.optimisticPoints);
+  const ff = Number(form && form.focusFactor) || 0.7;
+  const override = form && form.pointsPerQuarterOverride !== undefined && form.pointsPerQuarterOverride !== "" && form.pointsPerQuarterOverride !== null;
+  return (
+    <div style={{ marginTop: 10, border: "1px solid var(--s2j-blue-border)", background: "var(--s2j-blue-bg)", borderRadius: 8, padding: "8px 12px" }}>
+      <div style={{ fontSize: 13, color: "var(--s2j-text)" }}>
+        Expected ≈ <strong>{expected} pts</strong> this quarter · likely reach <strong>{cons}–{opt} pts</strong> (conservative–optimistic)
+      </div>
+      {!override && Math.abs(ff - 0.7) > 1e-9 ? (
+        <div style={{ fontSize: 11, color: "var(--s2j-text-muted)", marginTop: 3, lineHeight: 1.5 }}>
+          At focus factor {ff} — focus factor scales throughput directly, so it's your single biggest lever.
+        </div>
+      ) : null}
+      <div style={{ fontSize: 10.5, color: "var(--s2j-text-light)", marginTop: 4, lineHeight: 1.5 }}>
+        A forecast, not a target — it sharpens once the team has real flow history.
+      </div>
+      {/* live warnings (deep-audit G4): clamp / duplicate-name / override-discrepancy surfaced AT PREVIEW time
+          — the cheapest place to catch the most-likely Kanban data-entry mistake (per-sprint days in the
+          per-quarter field), instead of only after a billed Generate. */}
+      {Array.isArray(preview.warnings) && preview.warnings.length ? (
+        <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 3 }}>
+          {preview.warnings.map((w, i) => (
+            <div key={i} style={{ fontSize: 11, color: "var(--s2j-orange)", display: "inline-flex", alignItems: "flex-start", gap: 4, lineHeight: 1.5 }}>
+              <SignalIcon kind="warning" size={11} /> <span>{w && w.message ? w.message : String(w)}</span>
+            </div>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 // ── Spec-wide concerns band (SN-3) — plan-LEVEL risk/compliance posture, never attributed to a feature ──
 function SpecConcernsBand({ summary }) {
   if (!summary || !summary.total) return null;
@@ -455,7 +569,8 @@ function SpecConcernsBand({ summary }) {
 }
 
 // ── Risk register — the decision-grade list of flagged features (sorted by risk), with WHY + where ──
-function RiskRegister({ entries, usedLlm }) {
+// `kanban` true → the WHERE-tag reads the reach tier (Now/Next/Later), never "Sprint N" (task-5).
+function RiskRegister({ entries, usedLlm, kanban }) {
   if (!entries || !entries.length) return null;
   return (
     <div style={{ border: "1px solid var(--s2j-border)", borderRadius: 10, background: "var(--s2j-bg)", padding: 12, marginBottom: 12 }}>
@@ -469,7 +584,7 @@ function RiskRegister({ entries, usedLlm }) {
         {usedLlm
           ? "Features carrying delivery risk — Claude was nudged to sequence these earlier so problems surface sooner. "
           : "Features carrying delivery risk — the order fell back to dependencies + priority (Claude was unavailable), so these were not re-sequenced by risk. "}
-        Front-load discovery, line up external dependencies, and tighten low-confidence specs before the sprint they land in.
+        Front-load discovery, line up external dependencies, and tighten low-confidence specs before {kanban ? "they come up for pull" : "the sprint they land in"}.
       </p>
       <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
         {entries.map((e) => {
@@ -480,7 +595,7 @@ function RiskRegister({ entries, usedLlm }) {
               <div className="flex items-center" style={{ justifyContent: "space-between", gap: 8 }}>
                 <span style={{ fontSize: 12.5, color: "var(--s2j-text)", fontWeight: 500, wordBreak: "break-word" }}>{name}</span>
                 <span style={{ fontSize: 10.5, color: "var(--s2j-text-light)", flexShrink: 0 }}>
-                  {e.sprint ? `Sprint ${e.sprint}` : "Doesn’t fit"}
+                  {registerWhereLabel(e, kanban)}
                 </span>
               </div>
               <div className="flex" style={{ gap: 6, flexWrap: "wrap", marginTop: 5 }}>
@@ -495,6 +610,112 @@ function RiskRegister({ entries, usedLlm }) {
         })}
       </div>
     </div>
+  );
+}
+
+// ── KANBAN: the Now / Next / Later backlog band (replaces the sprint columns for methodology=kanban) ──
+// A pull-ready, dependency-legal ordered backlog cut into three confidence tiers, with VISIBLE reach lines
+// (the conservative / optimistic thresholds) between them. Later is SHOWN, never hidden — so the scope
+// trade-off is negotiable (research). Each tier reuses FeatureChip (name + SP + priority tint + risk mark).
+function BacklogSection({ title, subtitle, kind, rows, subtotal, byUid, riskByUid, empty }) {
+  return (
+    <div style={{ border: `1px solid var(--s2j-border)`, borderRadius: 10, background: "var(--s2j-bg)", marginBottom: 10 }}>
+      <div style={{ padding: "10px 12px", borderBottom: "1px solid var(--s2j-border)" }}>
+        <div className="flex items-center" style={{ justifyContent: "space-between", gap: 8 }}>
+          <span style={{ display: "inline-flex", alignItems: "center", gap: 6, fontSize: 13, fontWeight: 600, color: "var(--s2j-text)" }}>
+            <SignalIcon kind={kind} size={13} /> {title}
+          </span>
+          <span style={{ fontSize: 11.5, color: "var(--s2j-text-muted)", flexShrink: 0 }}>
+            {rows.length} item{rows.length === 1 ? "" : "s"} · {fmt1(subtotal)} pts
+          </span>
+        </div>
+        {subtitle ? <div style={{ fontSize: 10.5, color: "var(--s2j-text-light)", marginTop: 2 }}>{subtitle}</div> : null}
+      </div>
+      <div style={{ padding: 10, display: "flex", flexDirection: "column", gap: 6 }}>
+        {rows.length === 0 ? (
+          <span style={{ fontSize: 11.5, color: "var(--s2j-text-light)", fontStyle: "italic" }}>{empty}</span>
+        ) : (
+          rows.map((row) => <FeatureChip key={row.id} feat={byUid.get(row.id)} id={row.id} oversized={false} risk={riskByUid && riskByUid.get(row.id)} />)
+        )}
+      </div>
+    </div>
+  );
+}
+
+// The labeled reach divider between two bands (a11y: it's text, not colour) — "— conservative reach ≈ X pts —".
+function ReachLine({ label, pts }) {
+  return (
+    <div className="flex items-center" style={{ gap: 8, margin: "2px 0 10px" }}>
+      <span style={{ flex: 1, height: 1, background: "var(--s2j-border)" }} />
+      <span style={{ fontSize: 10.5, color: "var(--s2j-text-muted)", whiteSpace: "nowrap" }}>— {label} ≈ {fmt1(pts)} pts —</span>
+      <span style={{ flex: 1, height: 1, background: "var(--s2j-border)" }} />
+    </div>
+  );
+}
+
+function BacklogBand({ plan, byUid, riskByUid }) {
+  const m = plan.metrics || {};
+  const now = Array.isArray(plan.now) ? plan.now : [];
+  const next = Array.isArray(plan.next) ? plan.next : [];
+  const later = Array.isArray(plan.later) ? plan.later : [];
+  const sub = (arr) => arr.reduce((a, r) => a + (Number(r.points) || 0), 0);
+  return (
+    <div style={{ marginBottom: 12 }}>
+      <BacklogSection
+        title="Now — high confidence" subtitle="Likely delivered this quarter — pull these first." kind="success"
+        rows={now} subtotal={m.reachedNowPoints != null ? m.reachedNowPoints : sub(now)} byUid={byUid} riskByUid={riskByUid}
+        empty="Nothing reaches high confidence yet — raise capacity or split the earliest items."
+      />
+      <ReachLine label="conservative reach" pts={m.conservativePoints} />
+      <BacklogSection
+        title="Next — stretch (might fit)" subtitle="Within optimistic reach — a stretch, not a commitment." kind="warning"
+        rows={next} subtotal={sub(next)} byUid={byUid} riskByUid={riskByUid}
+        empty="No stretch items in this band."
+      />
+      <ReachLine label="optimistic reach" pts={m.optimisticPoints} />
+      <BacklogSection
+        title="Later — beyond this quarter’s likely reach" subtitle="Shown so the scope trade-off is negotiable — defer, descope, or add capacity." kind="info"
+        rows={later} subtotal={m.beyondReachPoints != null ? m.beyondReachPoints : sub(later)} byUid={byUid} riskByUid={riskByUid}
+        empty="The whole backlog is within optimistic reach — nothing beyond this quarter."
+      />
+    </div>
+  );
+}
+
+// ── KANBAN honesty panel (load-bearing — THIS is the product per the research) ──────────────────────
+// Renders the band framings + the backend-echoed assumptions + the upgrade path, in the SignalCallout info
+// style. NEVER says "will deliver" — uses "likely reach this quarter" + "a forecast, not a target/commitment".
+function KanbanHonestyPanel({ assumptions }) {
+  const asm = (Array.isArray(assumptions) ? assumptions : []).filter((a) => a && a.label);
+  return (
+    <SignalCallout kind="info" title="How to read this plan — a forecast, not a commitment" style={{ marginBottom: 12 }}>
+      <div style={{ fontSize: 12, color: "var(--s2j-text)", lineHeight: 1.55 }}>
+        <p style={{ margin: "0 0 6px" }}>
+          This is the <strong>likely reach this quarter</strong> — a forecast, not a target or a commitment. The backlog
+          is dependency-legal and pull-ready; pull from the top.
+        </p>
+        <ul style={{ margin: "0 0 6px", paddingLeft: 18 }}>
+          <li style={{ marginBottom: 2 }}><strong>Now</strong> — high confidence (within conservative reach).</li>
+          <li style={{ marginBottom: 2 }}><strong>Next</strong> — stretch, “might fit” (within optimistic reach).</li>
+          <li style={{ marginBottom: 2 }}><strong>Later</strong> — beyond likely reach this quarter, shown so the scope trade-off is negotiable.</li>
+        </ul>
+        {asm.length ? (
+          <div style={{ marginTop: 4 }}>
+            <div style={{ fontSize: 10.5, fontWeight: 700, color: "var(--s2j-text-muted)", textTransform: "uppercase", letterSpacing: 0.4, marginBottom: 3 }}>Assumptions</div>
+            <ul style={{ margin: 0, paddingLeft: 18 }}>
+              {asm.map((a, i) => (
+                <li key={i} style={{ marginBottom: 2, fontSize: 11.5, color: "var(--s2j-text-muted)" }}>
+                  {a.label}: <span style={{ color: "var(--s2j-text)", fontWeight: 500 }}>{String(a.value)}</span>{a.source === "default" ? " (default)" : ""}
+                </li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
+        <p style={{ margin: "6px 0 0", fontSize: 11, color: "var(--s2j-text-light)" }}>
+          The estimate sharpens once your team has real flow history.
+        </p>
+      </div>
+    </SignalCallout>
   );
 }
 
@@ -812,6 +1033,17 @@ export default function PlanScreen({
   const oversizedSet = useMemo(() => new Set((plan && plan.oversized ? plan.oversized : []).map((o) => o.id)), [plan]);
   const nameOfUid = (id) => (byUid.get(id) && byUid.get(id).name) || id;
 
+  // ⭐ METHODOLOGY BRANCH (Kanban v1): the #1 trap is reading sprint-only fields on a kanban plan (no
+  // plan.sprints / overflow / oversized / deficit). Branch FIRST on the plan's OWN methodology (NOT the
+  // form's — the rendered plan may pre-date a form toggle). Default 'scrum' so an OLD plan (no methodology
+  // field) reads as Scrum. `formIsKanban` drives the FORM/preview (the live, possibly-unsubmitted state).
+  const isKanban = (plan && plan.methodology) === "kanban";
+  const formIsKanban = (form && form.methodology) === "kanban";
+  // The HEADER sits above the PLAN BODY when one exists (→ match the plan's own methodology, not an
+  // unsubmitted form toggle), and above the FORM before first generate (→ match the form). Resolves the
+  // toggle-without-regenerate contradiction (audit M1) without falsely relabelling a still-Scrum plan body.
+  const headerIsKanban = hasPlan ? isKanban : formIsKanban;
+
   // Tier-1 risk views — all default-GUARDED so a plan cached before the risk layer (no riskByFeature /
   // sprintRiskProfiles / specConcernSummary keys) renders cleanly as "no risk surfaced", never crashes.
   const riskByUid = useMemo(() => new Map(Object.entries((plan && plan.riskByFeature) || {})), [plan]);
@@ -819,25 +1051,31 @@ export default function PlanScreen({
   const specConcernSummary = (plan && plan.specConcernSummary) || null;
   // The register: shared derivation (buildRiskRegister) so the screen + the Plan Brief list the SAME
   // features in the SAME order (BRIEF-DRIFT). nameOfUid resolves the display name from the slim features.
+  // buildRiskRegister itself branches on plan.methodology to tag by reach tier (kanban) vs sprint (scrum).
   const riskRegister = useMemo(() => buildRiskRegister(plan, nameOfUid), [plan, byUid]);
-  // Capacity verdict (deficit / fragmentation) — shared with the brief so they read the same numbers.
-  const deficit = plan ? deficitHeadline(metrics, plan.sprints.length) : null;
-  const fragmentation = plan ? fragmentationNote(metrics) : null;
+  // Capacity verdict (deficit / fragmentation) — Scrum-only (they read plan.sprints + deficit metrics that a
+  // kanban plan does NOT have). Guarded so reading them for a kanban plan can't crash (the #1 trap).
+  const deficit = plan && !isKanban ? deficitHeadline(metrics, plan.sprints.length) : null;
+  const fragmentation = plan && !isKanban ? fragmentationNote(metrics) : null;
   // P12: the objective the CURRENT plan was ranked for (r.objective) vs the form's selection. A mismatch
   // means the form changed but the plan hasn't re-ranked → nudge a billed Re-rank (a free Re-pack keeps the old order).
   const objectiveChanged = hasPlan && form && ((form.objective || "balanced") !== (r.objective || "balanced"));
+  // Methodology toggled on an existing plan → the plan body still reflects the OLD mode. A FREE Re-pack switches
+  // methodology (the cached ranking is methodology-agnostic — only the packing step changes), so nudge Re-pack,
+  // NOT a billed Re-rank (audit M1 — parity with objectiveChanged, but cheaper because order is unchanged).
+  const methodologyChanged = hasPlan && form && ((form.methodology || "scrum") !== ((plan && plan.methodology) || "scrum"));
 
-  // P18 Defensible Plan Brief — pure render from the in-memory plan (purge-safe, $0). Recomputed only when
-  // the plan / form / breakdown changes; "as of" stamped at render time. Drawn entirely from already-loaded data.
+  // P18 Defensible Plan Brief — Scrum-only in v1 (the brief is sprint-shaped; a kanban brief is deferred to
+  // v2 per the locked scope). Guarded so renderPlanBrief (which reads plan.sprints) is never called for kanban.
   const brief = useMemo(() => {
-    if (!plan) return null;
+    if (!plan || isKanban) return null;
     let when = "";
     try { when = new Date().toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" }); } catch (_) { /* date optional */ }
     return renderPlanBrief({
       plan, assumptions: r.assumptions, warnings: r.warnings, cost: r.cost,
       slimFeatures: nameFeatures, form, usedLlm: r.usedLlm, stale: r.stale, pageTitle, generatedAt: when, objective: r.objective,
     });
-  }, [result, nameFeatures, form, pageTitle]);
+  }, [result, nameFeatures, form, pageTitle, isKanban]);
 
   return (
     <div className="p-6" style={WRAP}>
@@ -852,12 +1090,13 @@ export default function PlanScreen({
           <IconArrowLeft size={13} /> Back to review
         </button>
         <h2 style={{ fontSize: 18, fontWeight: 700, color: "var(--s2j-text)", margin: 0, display: "inline-flex", alignItems: "center", gap: 8 }}>
-          <span style={{ color: "var(--s2j-blue)" }}><IconCalendar size={18} /></span> Sprint plan
+          <span style={{ color: "var(--s2j-blue)" }}>{headerIsKanban ? <IconList size={18} /> : <IconCalendar size={18} />}</span> {headerIsKanban ? "Backlog plan" : "Sprint plan"}
         </h2>
       </div>
       <p style={{ fontSize: 12.5, color: "var(--s2j-text-muted)", marginTop: 0, marginBottom: 16 }}>
-        Allocate this breakdown across sprints from your team’s capacity. Claude orders the work; the
-        sprint math is deterministic. Review-only — nothing is written to Jira.
+        {headerIsKanban
+          ? <>Order this breakdown into a pull-ready backlog, cut into Now / Next / Later by how much your team is likely to reach this quarter. Claude orders the work; the reach math is deterministic. Review-only — nothing is written to Jira.</>
+          : <>Allocate this breakdown across sprints from your team’s capacity. Claude orders the work; the sprint math is deterministic. Review-only — nothing is written to Jira.</>}
       </p>
 
       {/* stale banner (UX-1) */}
@@ -872,9 +1111,12 @@ export default function PlanScreen({
         <div style={{ flex: "1 1 320px", minWidth: 300, maxWidth: 440 }}>
           <CapacityForm form={form} onChange={onFormChange} disabled={busy} />
 
-          {/* Live computed-capacity preview — the derived pts/sprint + the focus-factor sensitivity,
-              visible BEFORE generating (transparency for the multiplier-weight finding). */}
-          {!busy && preview && preview.ok && Array.isArray(preview.perSprintCapacityPoints) && preview.perSprintCapacityPoints.length ? (
+          {/* Live computed-capacity preview — the derived pts (and the focus-factor sensitivity), visible
+              BEFORE generating (transparency for the multiplier-weight finding). Branch on the preview's OWN
+              methodology echo: kanban shows the THROUGHPUT RANGE (never a single reach number as headline). */}
+          {!busy && preview && preview.ok && preview.methodology === "kanban" && Number.isFinite(Number(preview.expectedPointsQuarter)) ? (
+            <KanbanCapacityPreview preview={preview} form={form} />
+          ) : !busy && preview && preview.ok && preview.methodology !== "kanban" && Array.isArray(preview.perSprintCapacityPoints) && preview.perSprintCapacityPoints.length ? (
             <CapacityPreview preview={preview} form={form} />
           ) : null}
 
@@ -933,6 +1175,11 @@ export default function PlanScreen({
                 <div style={{ fontSize: 10.5, color: "var(--s2j-text-light)", marginTop: 4 }}>Changing this re-orders the plan — a billed Re-rank.</div>
               ) : null}
             </div>
+            {methodologyChanged ? (
+              <div style={{ fontSize: 10.5, color: "var(--s2j-orange)", marginTop: 0, marginBottom: 6, display: "inline-flex", alignItems: "center", gap: 4, lineHeight: 1.5 }}>
+                <SignalIcon kind="warning" size={11} /> Planning mode changed — Re-pack (free) to apply it.
+              </div>
+            ) : null}
             <button
               type="button"
               onClick={() => {
@@ -957,7 +1204,7 @@ export default function PlanScreen({
                 opacity: busy ? 0.7 : 1,
               }}
             >
-              {busy ? "Planning…" : armed ? (hasPlan ? "Confirm re-rank with Claude" : "Confirm & generate plan") : hasPlan ? "Re-rank with Claude" : <><IconCalendar size={15} /> Generate plan</>}
+              {busy ? "Planning…" : armed ? (hasPlan ? "Confirm re-rank with Claude" : "Confirm & generate plan") : hasPlan ? "Re-rank with Claude" : <>{formIsKanban ? <IconList size={15} /> : <IconCalendar size={15} />} Generate plan</>}
             </button>
 
             {/* re-pack (free) — only once a plan exists; assumption-only edits */}
@@ -969,7 +1216,7 @@ export default function PlanScreen({
                 className="flex items-center justify-center gap-2"
                 style={{ width: "100%", marginTop: 8, background: "var(--s2j-bg-section)", border: "1px solid var(--s2j-border)", color: "var(--s2j-text)", cursor: busy ? "not-allowed" : "pointer", padding: "8px 14px", borderRadius: 8, fontSize: 13, fontWeight: 500 }}
               >
-                <IconRefresh size={14} /> Re-pack sprints (free)
+                <IconRefresh size={14} /> {formIsKanban ? "Re-pack backlog (free)" : "Re-pack sprints (free)"}
               </button>
             ) : null}
 
@@ -992,8 +1239,9 @@ export default function PlanScreen({
             ) : null}
           </div>
 
-          {/* assumptions echo (every multiplier visible — the trust mechanism) */}
-          {assumptions && assumptions.length ? (
+          {/* assumptions echo (every multiplier visible — the trust mechanism). Kanban surfaces these in its
+              dedicated honesty panel (right pane) → suppress the left echo here to avoid a duplicate list. */}
+          {!isKanban && assumptions && assumptions.length ? (
             <div style={{ marginTop: 14, border: "1px solid var(--s2j-border)", borderRadius: 8, padding: "10px 12px", background: "var(--s2j-bg)" }}>
               <div style={{ fontSize: 11, fontWeight: 700, color: "var(--s2j-text-muted)", marginBottom: 6, textTransform: "uppercase", letterSpacing: 0.4 }}>Assumptions</div>
               {assumptions.map((a, i) => (
@@ -1011,16 +1259,51 @@ export default function PlanScreen({
         {/* RIGHT: the plan */}
         <div style={{ flex: "2 1 460px", minWidth: 340 }}>
           {busy ? (
-            <PlanningState elapsed={elapsed} />
+            <PlanningState elapsed={elapsed} kanban={formIsKanban} />
           ) : r.empty ? (
             <SignalCallout kind="info" title="No features to plan">
               This breakdown has no features yet. Add features in the editor, then come back to plan.
             </SignalCallout>
           ) : !hasPlan ? (
             <div style={{ border: "1px dashed var(--s2j-border)", borderRadius: 10, padding: 32, textAlign: "center", color: "var(--s2j-text-light)" }}>
-              <div style={{ display: "inline-flex", color: "var(--s2j-border)", marginBottom: 8 }}><IconCalendar size={32} /></div>
-              <p style={{ fontSize: 13, margin: 0 }}>Fill in your team capacity and generate a plan to see {featureCount} features allocated across your sprints.</p>
+              <div style={{ display: "inline-flex", color: "var(--s2j-border)", marginBottom: 8 }}>{formIsKanban ? <IconList size={32} /> : <IconCalendar size={32} />}</div>
+              <p style={{ fontSize: 13, margin: 0 }}>
+                {formIsKanban
+                  ? `Fill in your team capacity and generate a plan to see ${featureCount} features ordered into a Now / Next / Later backlog.`
+                  : `Fill in your team capacity and generate a plan to see ${featureCount} features allocated across your sprints.`}
+              </p>
             </div>
+          ) : isKanban ? (
+            // ── KANBAN plan view (methodology=kanban): Now / Next / Later band + the honesty panel ──
+            // NO sprint columns, NO overflow bucket, NO what-if, NO brief, NO sprint-capacity / fragile meters
+            // (all sprint-shaped → deferred to v2 per the locked scope). The diagnostics + Risk Register +
+            // spec-wide concerns channels are REUSED (they're methodology-agnostic).
+            <>
+              {/* fallback note (LLM unavailable → deterministic order) */}
+              {r.llmNote ? (
+                <SignalCallout kind="info" title="Ordered without Claude" style={{ marginBottom: 12 }}>{r.llmNote}</SignalCallout>
+              ) : null}
+
+              {/* THE HONESTY PANEL (load-bearing — this IS the product per the research) */}
+              <KanbanHonestyPanel assumptions={assumptions} />
+
+              {/* grounded reach verdict (shared derivation — no "will deliver", a forecast) */}
+              <SignalCallout kind="info" title="Likely reach this quarter" style={{ marginBottom: 12 }}>
+                {kanbanReachVerdict(metrics)}
+              </SignalCallout>
+
+              {/* spec-wide concerns (plan-level risk/compliance posture — never per-feature) */}
+              <SpecConcernsBand summary={specConcernSummary} />
+
+              {/* the Now / Next / Later backlog band, with visible reach lines */}
+              <BacklogBand plan={plan} byUid={byUid} riskByUid={riskByUid} />
+
+              {/* risk register — the flagged features, sorted, with WHY + tier (Tier-1; tier-tagged, not sprint) */}
+              <RiskRegister entries={riskRegister} usedLlm={r.usedLlm} kanban />
+
+              {/* diagnostics — each its own honest channel, never silent (dangling / unsized / dup / cycles …) */}
+              <PlanDiagnostics g={g} sizingIssues={plan.sizingIssues} nameOfUid={nameOfUid} />
+            </>
           ) : (
             <>
               {/* P18 — copy a defensible, stakeholder-ready brief out of the iframe */}
@@ -1083,8 +1366,13 @@ export default function PlanScreen({
               {/* risk register — the flagged features, sorted, with WHY + where (Tier-1) */}
               <RiskRegister entries={riskRegister} usedLlm={r.usedLlm} />
 
-              {/* what-if scenarios (P20) — explore changes free; no re-rank */}
-              <WhatIfPanel jobId={jobId} baselineForm={form} slimFeatures={nameFeatures} stale={r.stale} planBusy={busy} onApplyScenario={onApplyScenario} />
+              {/* what-if scenarios (P20) — explore changes free; no re-rank. HIDDEN while the form methodology is
+                  toggled away from the rendered (Scrum) plan: a sprint scenario applied under a kanban form would
+                  silently drop the sprint delta (computeThroughput ignores sprintCount) — §11 no silent action.
+                  The methodologyChanged nudge directs the user to Re-pack first. (deep-audit G2) */}
+              {!methodologyChanged ? (
+                <WhatIfPanel jobId={jobId} baselineForm={form} slimFeatures={nameFeatures} stale={r.stale} planBusy={busy} onApplyScenario={onApplyScenario} />
+              ) : null}
 
               {/* diagnostics — each its own honest channel, never silent */}
               <PlanDiagnostics g={g} sizingIssues={plan.sizingIssues} nameOfUid={nameOfUid} />

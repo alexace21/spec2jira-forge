@@ -44,20 +44,47 @@ export function isRiskFlagged(d) {
   return !!d && (d.risk_level === "high" || d.risk_level === "medium" || d.has_external_dep || d.low_confidence);
 }
 
-// The Risk Register membership + sort + sprint-tagging — the SINGLE derivation both the screen panel and
+// The Risk Register membership + sort + WHERE-tagging — the SINGLE derivation both the screen panel and
 // the brief use (so they can never list different features). `nameOf(id)` resolves the display name (the
 // caller owns the uid→name map). Default-GUARDED: a plan cached before the Tier-1 risk layer (no
 // riskByFeature) yields []. Bounded so a huge backlog can't produce an endless register.
+//
+// WHERE-tag (the single noun-source, task-5): a Scrum plan tags each entry with its `sprint` number (1-based).
+// A Kanban plan has NO sprints → it tags each entry with its reach `tier` (Now/Next/Later) instead. We change
+// the noun HERE, once, so a consumer never has to re-derive "Sprint N" vs "Now" (which would reintroduce drift).
+// Both shapes are returned: `sprint` (number|null) and `tier` (string|null) — a consumer reads whichever is set.
 export function buildRiskRegister(plan, nameOf, limit = 12) {
   if (!plan || !plan.riskByFeature) return [];
+  const isKanban = plan.methodology === "kanban";
+  // Scrum: id → sprint number. Kanban: id → reach tier label (the now/next/later band membership).
   const sprintOf = new Map();
-  (plan.sprints || []).forEach((s, i) => (Array.isArray(s && s.ids) ? s.ids : []).forEach((id) => sprintOf.set(id, i + 1)));
+  const tierOf = new Map();
+  if (isKanban) {
+    const TIER = [["now", "Now"], ["next", "Next"], ["later", "Later"]];
+    TIER.forEach(([key, label]) => (Array.isArray(plan[key]) ? plan[key] : []).forEach((row) => { if (row && row.id != null) tierOf.set(row.id, label); }));
+  } else {
+    (plan.sprints || []).forEach((s, i) => (Array.isArray(s && s.ids) ? s.ids : []).forEach((id) => sprintOf.set(id, i + 1)));
+  }
   return Object.entries(plan.riskByFeature)
     .map(([id, d]) => ({ id, ...d }))
     .filter(isRiskFlagged)
     .sort((a, b) => (b.riskScore || 0) - (a.riskScore || 0))
     .slice(0, limit)
-    .map((e) => ({ ...e, sprint: sprintOf.get(e.id) || null, name: (typeof nameOf === "function" && nameOf(e.id)) || e.id }));
+    .map((e) => ({
+      ...e,
+      sprint: isKanban ? null : (sprintOf.get(e.id) || null),
+      tier: isKanban ? (tierOf.get(e.id) || null) : null,
+      name: (typeof nameOf === "function" && nameOf(e.id)) || e.id,
+    }));
+}
+
+// The register's WHERE-label (the single noun-source, task-5): "Sprint N" for Scrum, the reach tier for
+// Kanban, "Beyond reach" / "Doesn't fit" when a flagged feature isn't placed. The screen + brief both call
+// this so they can never disagree on the noun (BRIEF-DRIFT). `kanban` true ⇒ never say "Sprint".
+export function registerWhereLabel(entry, kanban) {
+  if (!entry) return "";
+  if (kanban) return entry.tier || "Beyond reach";
+  return entry.sprint ? `Sprint ${entry.sprint}` : "Doesn’t fit";
 }
 
 // Tier-2 skill labels (the internal BE/FE/QA/GEN bucket → the user-facing word). Shared so the screen + brief agree.
@@ -120,6 +147,23 @@ export function capacityVerdict(metrics, sprintCount) {
     return `Backlog ${totalBacklog} pts is within ${sc}-sprint total capacity ${totalCap} pts (${spare} pts spare overall), but ${oc} feature${oc === 1 ? "" : "s"} ${oc === 1 ? "doesn’t" : "don’t"} fit the sprint layout — see What doesn’t fit.`;
   }
   return `Backlog ${totalBacklog} pts fits within ${sc}-sprint capacity ${totalCap} pts (${spare} pts to spare).`;
+}
+
+// ── KANBAN reach verdict (methodology=kanban) — the noun-agnostic "reach" headline, never "sprint" ──
+// A pull-ready backlog has no sprints/dates → the honest one-liner is "how much of the backlog likely fits
+// this quarter", framed as a forecast (a range), never a commitment. Shared so the screen reads one story.
+// Returns a plain sentence. Metrics come from the kanban packer (reachedNowPoints / beyondReachPoints / …).
+export function kanbanReachVerdict(metrics) {
+  const m = metrics || {};
+  const total = fmt1(m.totalBacklogPoints || 0);
+  const cons = fmt1(m.conservativePoints || 0);
+  const opt = fmt1(m.optimisticPoints || 0);
+  const beyond = Number(m.beyondReachPoints) || 0;
+  const laterCount = Number(m.laterCount) || 0;
+  if (beyond > 0.05 || laterCount > 0) {
+    return `Backlog ${total} pts · likely reach this quarter is ${cons}–${opt} pts (conservative–optimistic), so ${laterCount} feature${laterCount === 1 ? "" : "s"} (${fmt1(beyond)} pts) ${laterCount === 1 ? "is" : "are"} beyond likely reach — a forecast, not a commitment.`;
+  }
+  return `Backlog ${total} pts · likely reach this quarter is ${cons}–${opt} pts (conservative–optimistic) — the whole backlog is within optimistic reach. A forecast, not a commitment.`;
 }
 
 // ── HARDENED CSV (ported VERBATIM from src/testcases.js — keep the guard identical; BRIEF-CSV-RUNTIME) ──

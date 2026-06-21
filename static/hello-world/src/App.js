@@ -112,6 +112,7 @@ const SCREEN_MAX_WIDTH_STYLE = {
 // blocker not a silent 0). availableDays is PER SPRINT (the pinned contract). Empty multipliers →
 // the backend applies its honest defaults and ECHOES them in `assumptions`.
 const DEFAULT_PLAN_FORM = {
+  methodology: "scrum", // Kanban v1: 'scrum' (sprint boxes, default) | 'kanban' (Now/Next/Later reach band)
   people: [{ _rid: "r0", name: "", availableDays: "8" }],
   sprintCount: "4",
   sprintLengthDays: "10",
@@ -120,6 +121,7 @@ const DEFAULT_PLAN_FORM = {
   focusFactor: "",
   hoursPerPoint: "",
   pointsPerSprintOverride: "",
+  pointsPerQuarterOverride: "", // Kanban: a direct points-per-QUARTER override (the kanban analogue of pointsPerSprintOverride)
   objective: "balanced", // P12: goal-directed re-rank — balanced (default) / mvp / min_risk / max_value
 };
 
@@ -1801,7 +1803,19 @@ function App() {
 
   const handleCapacityFormChange = useCallback((patch) => {
     setPlanArmed(false); // editing capacity disarms the billed re-rank confirm
-    setPlanForm((prev) => ({ ...(prev || DEFAULT_PLAN_FORM), ...patch }));
+    setPlanForm((prev) => {
+      const base = prev || DEFAULT_PLAN_FORM;
+      const next = { ...base, ...patch };
+      // L1 (live-acceptance 2026-06-21): a methodology toggle CHANGES the availableDays UNIT — Kanban counts
+      // PER QUARTER, Scrum counts PER SPRINT. Carrying the old values silently mis-scales (e.g. 40/quarter →
+      // clamped to 10/sprint = a ~4× drop, invisible in the preview). Clear ONLY availableDays (keep names /
+      // skill / focus / hours) so the user re-enters for the new unit — fail-loud (empty → INVALID_AVAILABLE_DAYS),
+      // never a silent carry. Partner-chosen fix direction (clear-on-toggle over surface-the-clamp).
+      if (patch && patch.methodology && patch.methodology !== base.methodology && Array.isArray(next.people)) {
+        next.people = next.people.map((p) => ({ ...p, availableDays: "" }));
+      }
+      return next;
+    });
   }, []);
 
   // Generate / re-rank — SUBMITS the ranking batch (async). On 'batched' we poll; on 'completed'
@@ -2496,7 +2510,7 @@ function App() {
           onOpenDiagnostics={handleOpenDiagnostics}
           tcDiscarded={tcDiscardedAtPush}
           capturedExports={capturedExports}
-          hasPlan={!!(planResult && planResult.ok && planResult.plan)}
+          hasPlan={!!(planResult && planResult.ok && planResult.plan && (planResult.plan.methodology || "scrum") !== "kanban")}
           planStale={!!(planResult && planResult.stale)}
           planPush={planPush}
           onAssignSprints={handleAssignSprints}
@@ -3622,11 +3636,11 @@ function ConfirmScreen({
         >
           <div style={{ minWidth: 0 }}>
             <p className="text-xs font-medium" style={{ color: "var(--s2j-text)", display: "inline-flex", alignItems: "center", gap: 6 }}>
-              <IconCalendar size={13} /> Sprint plan from team capacity
+              <IconCalendar size={13} /> Capacity plan from your team
             </p>
             <p className="text-xs" style={{ color: "var(--s2j-text-muted)" }}>
-              Allocate these stories across sprints from your team's capacity — Claude orders the work,
-              the sprint math is deterministic. Review-only; nothing is written to Jira.
+              Turn these stories into a plan from your team's capacity — Scrum sprints or a Kanban Now /
+              Next / Later backlog. Claude orders the work; the math is deterministic. Review-only; nothing is written to Jira.
             </p>
           </div>
           <button
@@ -3649,7 +3663,7 @@ function ConfirmScreen({
               gap: 6,
             }}
           >
-            <IconCalendar size={14} /> Plan sprints
+            <IconCalendar size={14} /> Plan capacity
           </button>
         </div>
       )}

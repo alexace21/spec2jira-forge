@@ -11,6 +11,7 @@ import {
   parseConcernType, computeRiskSignals, computeSprintRiskProfile, summarizeSpecConcerns, diffPlans,
   SKILL_BUCKETS, TASK_TYPE_TO_SKILL, requiredSkillsOf, apportionPoints, featureSkillSplit,
   DEFAULT_FOCUS_FACTOR, DEFAULT_HOURS_PER_DAY, DEFAULT_HOURS_PER_POINT, MAX_SPRINTS,
+  computeThroughput, packBacklogReach, REACH_CONSERVATIVE_FACTOR, REACH_OPTIMISTIC_FACTOR,
 } from '../src/planner.js';
 import { buildPlanRankingUserPrompt, objectiveClause, PLAN_OBJECTIVES } from '../src/prompts.js';
 
@@ -777,6 +778,125 @@ console.log('\ngoal-directed re-rank (P12) — objective clauses + prompt inject
   check('P12 sanitize: unknown string → balanced', sanitizeObjective('hit_deadlines') === 'balanced' && sanitizeObjective('') === 'balanced');
   check('P12 sanitize: missing / wrong-type → balanced', sanitizeObjective(undefined) === 'balanced' && sanitizeObjective(null) === 'balanced' && sanitizeObjective(42) === 'balanced');
   check('P12 sanitize: every allow-listed token passes through unchanged', PLAN_OBJECTIVES.every((t) => sanitizeObjective(t) === t));
+}
+
+// ════════════════ Kanban v1 — computeThroughput (capacity-derived reach band) ════════════════
+console.log('\nKanban — computeThroughput (reach band, fail-loud parity with computeCapacity):');
+{
+  // 2 people × 30 quarter-days × 6h × 0.7 ÷ 6 = 42 expected pts/quarter
+  const ok = computeThroughput({ people: [{ name: 'A', availableDays: 30 }, { name: 'B', availableDays: 30 }], focusFactor: 0.7, hoursPerDay: 6, hoursPerPoint: 6 });
+  check('throughput valid → ok', ok.ok === true && ok.errors.length === 0);
+  check('throughput: 2×30×6×0.7/6 = 42 expected pts/quarter', approx(ok.expectedPointsQuarter, 42));
+  check('throughput: conservative = 42 × 0.8', approx(ok.conservativePoints, 42 * REACH_CONSERVATIVE_FACTOR));
+  check('throughput: optimistic = 42 × 1.1', approx(ok.optimisticPoints, 42 * REACH_OPTIMISTIC_FACTOR));
+  check('throughput: a RANGE, not a point (conservative < expected < optimistic)', ok.conservativePoints < ok.expectedPointsQuarter && ok.expectedPointsQuarter < ok.optimisticPoints);
+  // C6 (deep-audit): prove sprint fields are INERT (accepted-and-ignored), not the tautology "no SPRINT error on an already-empty errors array"
+  const withSprintFields = computeThroughput({ people: [{ name: 'A', availableDays: 30 }, { name: 'B', availableDays: 30 }], focusFactor: 0.7, hoursPerDay: 6, hoursPerPoint: 6, sprintCount: 4, sprintLengthDays: 10 });
+  check('throughput: sprint fields are INERT (same expectedPointsQuarter with or without them)', withSprintFields.ok && approx(withSprintFields.expectedPointsQuarter, ok.expectedPointsQuarter));
+  check('throughput: honesty echoes present (noFlowHistory + reachBand + steadyFlow)', ['noFlowHistory', 'reachBand', 'steadyFlow'].every((k) => ok.assumptions.some((a) => a.key === k)));
+  check('throughput: availableDays labelled PER QUARTER (not per sprint)', ok.assumptions.some((a) => a.key === 'availableDaysContract' && /per quarter/i.test(a.label)));
+
+  // fail-loud parity with computeCapacity
+  check('throughput empty roster → ZERO_CAPACITY', hasErr(computeThroughput({ people: [] }), 'ZERO_CAPACITY'));
+  check('throughput all days 0 → ZERO_CAPACITY', hasErr(computeThroughput({ people: [{ name: 'A', availableDays: 0 }] }), 'ZERO_CAPACITY'));
+  check('throughput focusFactor 70 (unit trap) → INVALID_FOCUS_FACTOR', hasErr(computeThroughput({ people: [{ name: 'A', availableDays: 30 }], focusFactor: 70 }), 'INVALID_FOCUS_FACTOR'));
+  check("throughput availableDays '' → INVALID (not silent 0)", hasErr(computeThroughput({ people: [{ name: 'A', availableDays: '' }] }), 'INVALID_AVAILABLE_DAYS'));
+  check('throughput availableDays negative → INVALID', hasErr(computeThroughput({ people: [{ name: 'A', availableDays: -5 }] }), 'INVALID_AVAILABLE_DAYS'));
+  check('throughput hoursPerPoint 0 → INVALID (divisor guard)', hasErr(computeThroughput({ people: [{ name: 'A', availableDays: 30 }], hoursPerPoint: 0 }), 'INVALID_HOURS_PER_POINT'));
+  const clamp = computeThroughput({ people: [{ name: 'A', availableDays: 200 }], hoursPerDay: 6, focusFactor: 0.7, hoursPerPoint: 6 });
+  check('throughput availableDays > MAX_QUARTER_DAYS → clamped + warn (catches a per-sprint figure)', clamp.ok && hasWarn(clamp, 'AVAILABLE_DAYS_CLAMPED'));
+
+  // override path (precedence + surfaced)
+  const ov = computeThroughput({ people: [{ name: 'A', availableDays: 30 }], pointsPerQuarterOverride: 50 });
+  check('throughput override → expected = override', ov.ok && approx(ov.expectedPointsQuarter, 50));
+  check('throughput override → band derived from override', approx(ov.conservativePoints, 50 * REACH_CONSERVATIVE_FACTOR) && approx(ov.optimisticPoints, 50 * REACH_OPTIMISTIC_FACTOR));
+
+  // deep-audit branch coverage (the fail-loud parity branches the +35 block missed)
+  check('throughput override <= 0 → INVALID_OVERRIDE', hasErr(computeThroughput({ people: [{ name: 'A', availableDays: 30 }], pointsPerQuarterOverride: 0 }), 'INVALID_OVERRIDE'));
+  check('throughput override far from team-derived → OVERRIDE_DISCREPANCY warn', hasWarn(computeThroughput({ people: [{ name: 'A', availableDays: 30 }], focusFactor: 0.7, hoursPerDay: 6, hoursPerPoint: 6, pointsPerQuarterOverride: 500 }), 'OVERRIDE_DISCREPANCY'));
+  check('throughput duplicate person name (case-insensitive) → DUPLICATE_PERSON_NAME warn', hasWarn(computeThroughput({ people: [{ name: 'A', availableDays: 10 }, { name: 'a', availableDays: 10 }] }), 'DUPLICATE_PERSON_NAME'));
+  check('throughput blank-named person with days → BLANK_PERSON_NAME warn', hasWarn(computeThroughput({ people: [{ name: '', availableDays: 10 }] }), 'BLANK_PERSON_NAME'));
+}
+
+// ════════════════ Kanban v1 — packBacklogReach (Now / Next / Later) ════════════════
+console.log('\nKanban — packBacklogReach (cumulative reach tiers):');
+{
+  const feats = [mkF('u1', 'A', 10), mkF('u2', 'B', 10), mkF('u3', 'C', 10), mkF('u4', 'D', 10)];
+  const graph = buildPlannerGraph(feats);
+  const sizing = validateSizing(feats, idFn());
+  const r = packBacklogReach(['u1', 'u2', 'u3', 'u4'], { conservativePoints: 15, optimisticPoints: 25, expectedPointsQuarter: 20 }, graph, sizing.points, sizing.unsized);
+  check('reach: Now = items FULLY under conservative (A only, cum 10 ≤ 15)', r.now.map((x) => x.id).join(',') === 'u1');
+  check('reach: Next = conservative < cum ≤ optimistic (B, cum 20)', r.next.map((x) => x.id).join(',') === 'u2');
+  check('reach: Later = beyond optimistic (C cum30, D cum40)', r.later.map((x) => x.id).join(',') === 'u3,u4');
+  check('reach: cumulative carried + monotonic', r.now[0].cumulative === 10 && r.next[0].cumulative === 20 && r.later[0].cumulative === 30);
+  check('reach metrics: reachedNow=10, beyondReach=20, total=40', approx(r.metrics.reachedNowPoints, 10) && approx(r.metrics.beyondReachPoints, 20) && approx(r.metrics.totalBacklogPoints, 40));
+  check('reach metrics: counts (1/1/2)', r.metrics.nowCount === 1 && r.metrics.nextCount === 1 && r.metrics.laterCount === 2);
+
+  // oversized first item → Later (honest "too big for the quarter", NEVER force-placed)
+  const big = [mkF('u1', 'Big', 100)];
+  const rB = packBacklogReach(['u1'], { conservativePoints: 15, optimisticPoints: 25 }, buildPlannerGraph(big), validateSizing(big, idFn()).points, []);
+  check('reach: oversized first item → Later (no force-place)', rB.now.length === 0 && rB.next.length === 0 && rB.later.length === 1);
+
+  // unsized → DISJOINT sizingIssues channel (never fake-fit at 0)
+  const mixed = [mkF('u1', 'A', 10), { _uid: 'u2', _orig_name: 'B', name: 'B', priority: 'Medium', dependencies: [] }];
+  const sM = validateSizing(mixed, idFn());
+  const rM = packBacklogReach(['u1', 'u2'], { conservativePoints: 100, optimisticPoints: 100 }, buildPlannerGraph(mixed), sM.points, sM.unsized);
+  check('reach: unsized → sizingIssues, excluded from tiers', rM.sizingIssues.length === 1 && (rM.now.length + rM.next.length + rM.later.length) === 1);
+
+  // C5 (deep-audit): the EXACT reach boundary — the EPS-inclusive <= decision the tiering depends on (would slip silently if <= became <)
+  const bd = [mkF('u1', 'A', 15), mkF('u2', 'B', 10)];
+  const rBd = packBacklogReach(['u1', 'u2'], { conservativePoints: 15, optimisticPoints: 25 }, buildPlannerGraph(bd), validateSizing(bd, idFn()).points, []);
+  check('reach boundary: cum == conservative → Now (EPS-inclusive, NOT demoted)', rBd.now.map((x) => x.id).join(',') === 'u1');
+  check('reach boundary: cum == optimistic → Next (B at cum 25 ≤ 25)', rBd.next.map((x) => x.id).join(',') === 'u2');
+  // straddle: an item that pushes cumulative just PAST conservative is honestly demoted to Next (the design claim)
+  const stf = [mkF('u1', 'A', 14), mkF('u2', 'B', 3)];
+  const rSt = packBacklogReach(['u1', 'u2'], { conservativePoints: 15, optimisticPoints: 25 }, buildPlannerGraph(stf), validateSizing(stf, idFn()).points, []);
+  check('reach straddle: A(14)≤15 Now; B pushes cum→17 >15 → demoted to Next', rSt.now.map((x) => x.id).join(',') === 'u1' && rSt.next.map((x) => x.id).join(',') === 'u2');
+  // C1 (deep-audit): band rows carry { id, points, cumulative } ONLY — no redundant name (single name source = record.features)
+  check('reach: band rows carry id/points/cumulative only — no name (KVS thrift)', rBd.now.every((x) => x.name === undefined && typeof x.id === 'string' && typeof x.cumulative === 'number'));
+
+  // edge: empty order + zero capacity
+  check('reach: empty order → all empty, no throw', (() => { const e = packBacklogReach([], { conservativePoints: 10, optimisticPoints: 20 }, graph, new Map(), []); return e.now.length === 0 && e.later.length === 0 && e.metrics.totalBacklogPoints === 0; })());
+  check('reach: zero capacity → everything Later (honest, never silent)', (() => { const z = packBacklogReach(['u1', 'u2', 'u3', 'u4'], { conservativePoints: 0, optimisticPoints: 0 }, graph, sizing.points, sizing.unsized); return z.now.length === 0 && z.next.length === 0 && z.later.length === 4; })());
+}
+
+// ════════════════ Kanban v1 — assemblePlan methodology fork (+ back-compat) ════════════════
+console.log('\nKanban — assemblePlan fork (kanban path + scrum back-compat):');
+{
+  const feats = [mkF('u1', 'A', 10, 'High'), mkF('u2', 'B', 10, 'Medium', ['A']), mkF('u3', 'C', 10, 'Low')];
+  const capK = computeThroughput({ people: [{ name: 'A', availableDays: 30 }], focusFactor: 0.7, hoursPerDay: 6, hoursPerPoint: 6 }); // ~21 expected
+  const planK = assemblePlan({ features: feats, capacity: capK, ranking: null, methodology: 'kanban' });
+  check('kanban plan: methodology tagged "kanban"', planK.methodology === 'kanban');
+  check('kanban plan: now/next/later present, NO sprints key', Array.isArray(planK.now) && Array.isArray(planK.later) && planK.sprints === undefined);
+  check('kanban plan: sprintRiskProfiles empty (no sprints in Kanban)', Array.isArray(planK.sprintRiskProfiles) && planK.sprintRiskProfiles.length === 0);
+  check('kanban plan: riskByFeature still present (per-feature risk works)', planK.riskByFeature && typeof planK.riskByFeature === 'object');
+  check('kanban plan: dependency order respected (A before B across the reach tiers)', (() => { const all = [...planK.now, ...planK.next, ...planK.later].map((x) => x.id); return all.indexOf('u1') >= 0 && all.indexOf('u1') < all.indexOf('u2'); })());
+
+  // BACK-COMPAT: methodology omitted/'scrum' → the existing sprint path, byte-identical
+  const capS = computeCapacity({ people: [{ name: 'A', availableDays: 10 }], sprintCount: 2, sprintLengthDays: 10, focusFactor: 0.7, hoursPerDay: 6, hoursPerPoint: 6 });
+  const planOmitted = assemblePlan({ features: feats, capacity: capS, ranking: null });
+  const planScrum = assemblePlan({ features: feats, capacity: capS, ranking: null, methodology: 'scrum' });
+  check('scrum plan: methodology omitted → "scrum" + has sprints (back-compat)', planOmitted.methodology === 'scrum' && Array.isArray(planOmitted.sprints));
+  check('scrum plan: explicit "scrum" === omitted (byte-identical)', JSON.stringify(planOmitted) === JSON.stringify(planScrum));
+  check('scrum plan: keeps sprintRiskProfiles + NO now/next/later', Array.isArray(planOmitted.sprintRiskProfiles) && planOmitted.now === undefined);
+}
+
+// ════════════════ Kanban v1 — dependency-tier invariant + LLM ranking interaction (deep-audit G3) ════════════════
+console.log('\nKanban — dependency-tier consistency invariant (why packBacklogReach skips the readiness gate) + ranking:');
+{
+  // A blocks B blocks C. Through the REAL topo (assemblePlan, not a hardcoded order) with a TIGHT band, a blocker
+  // must NEVER land in a LATER reach tier than its dependent — i.e. no Now/Next feature may depend on a Later one.
+  const chain = [mkF('u1', 'A', 10, 'High'), mkF('u2', 'B', 10, 'High', ['A']), mkF('u3', 'C', 10, 'High', ['B'])];
+  const capK = computeThroughput({ people: [{ name: 'A', availableDays: 15 }], focusFactor: 0.7, hoursPerDay: 6, hoursPerPoint: 6 }); // ~10.5 expected → tight band
+  const planK = assemblePlan({ features: chain, capacity: capK, ranking: null, methodology: 'kanban' });
+  const tierOf = (id) => (planK.now.some((x) => x.id === id) ? 0 : planK.next.some((x) => x.id === id) ? 1 : 2);
+  check('invariant: blocker tier ≤ dependent tier (A ≤ B ≤ C) — no Now/Next item depends on a Later item', tierOf('u1') <= tierOf('u2') && tierOf('u2') <= tierOf('u3'));
+
+  // kanban + a NON-NULL ranking that CONTRADICTS the dependency order: the DAG must still win (B cannot precede A)
+  const contrary = [{ feature_id: 'u2', rank: 1, rationale: '' }, { feature_id: 'u1', rank: 2, rationale: '' }, { feature_id: 'u3', rank: 3, rationale: '' }];
+  const planR = assemblePlan({ features: chain, capacity: capK, ranking: contrary, methodology: 'kanban' });
+  const order = [...planR.now, ...planR.next, ...planR.later].map((x) => x.id);
+  check('kanban + contrary ranking: DAG wins — A before B before C despite the LLM order', order.indexOf('u1') < order.indexOf('u2') && order.indexOf('u2') < order.indexOf('u3'));
 }
 
 // ════════════════ summary ════════════════

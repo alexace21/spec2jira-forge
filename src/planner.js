@@ -41,6 +41,14 @@ export const MAX_SPRINTS = 52; // ledger CAP-6: bound the array / packing loop /
 export const MAX_SPRINT_LENGTH_DAYS = 90;
 export const EPS = 1e-9; // ledger CAP-10: float capacity compare, epsilon-tolerant against IEEE-754 boundary flips
 
+// ── Kanban reach band (methodology=kanban; research 2026-06-21) ──
+export const MAX_QUARTER_DAYS = 66; // WORKING-days-per-quarter sanity bound (13 weeks × 5 ≈ 65 max; catches the calendar-days-entered-as-working-days error + typos — live-acceptance 2026-06-21 L2: 90 was calendar days, too loose)
+// A single reach NUMBER is "fake precision" with no flow history → the reach is a RANGE, derived from the
+// SAME multipliers (ZERO new inputs). Conservative is skewed DOWN (ramp-up / steady-flow is a future state,
+// not week 1 — research countermeasure to the steady-flow fallacy); optimistic adds modest stretch headroom.
+export const REACH_CONSERVATIVE_FACTOR = 0.8;
+export const REACH_OPTIMISTIC_FACTOR = 1.1;
+
 // ════════════════════════════════════════════════════════════════
 // 1. CAPACITY  — fail-loud validation + the points/sprint math (ledger CAP-*, SIZE-1)
 // ════════════════════════════════════════════════════════════════
@@ -245,6 +253,123 @@ export function computeCapacity(form) {
 }
 
 function round1(n) { return Math.round(n * 10) / 10; }
+
+// ════════════════════════════════════════════════════════════════
+// 1.4 THROUGHPUT  — Kanban capacity (methodology=kanban). Same fail-loud validation as computeCapacity.
+// ════════════════════════════════════════════════════════════════
+//
+/**
+ * Kanban throughput — "how much can the team get through this quarter", expressed as a flow TOTAL (no sprint
+ * boxes). Same fail-loud numOf validation + honest echoes as computeCapacity, with two differences: (1) NO
+ * sprint structure (sprintCount/length), and (2) availableDays is PER QUARTER — the whole period, NOT per
+ * sprint (the one semantic that differs from the Scrum form; it MUST be labelled on the form, else it's the
+ * per-sprint×N silent error in reverse). The forecast is a RANGE, not a point (a single number is the #1
+ * Kanban-forecast pitfall — fake precision; research 2026-06-21): conservative/optimistic = expected ×
+ * the echoed REACH_*_FACTOR. A direct pointsPerQuarterOverride takes precedence (team-derived still surfaced).
+ *
+ * @param {object} form { people:[{name,availableDays}], hoursPerDay?, focusFactor?, hoursPerPoint?, pointsPerQuarterOverride? }
+ * @returns {{ok, expectedPointsQuarter, conservativePoints, optimisticPoints, assumptions, warnings, errors}}
+ */
+export function computeThroughput(form) {
+  const f = form && typeof form === 'object' ? form : {};
+  const errors = [];
+  const warnings = [];
+  const assumptions = [];
+  const err = (code, field, message) => errors.push({ code, field, message });
+  const warn = (code, message) => warnings.push({ code, message });
+
+  // ── multipliers (defaulted, echoed with provenance — ledger CAP-3) ──
+  let hoursPerDay = DEFAULT_HOURS_PER_DAY;
+  if (f.hoursPerDay !== undefined && f.hoursPerDay !== '' && f.hoursPerDay !== null) {
+    const r = numOf(f.hoursPerDay);
+    if (!r.ok || r.val <= 0) err('INVALID_HOURS_PER_DAY', 'hoursPerDay', 'Productive hours per day must be a number greater than 0.');
+    else hoursPerDay = r.val;
+    assumptions.push({ key: 'hoursPerDay', label: 'Productive hours / day', value: hoursPerDay, source: 'user' });
+  } else assumptions.push({ key: 'hoursPerDay', label: 'Productive hours / day', value: hoursPerDay, source: 'default' });
+
+  let focusFactor = DEFAULT_FOCUS_FACTOR;
+  if (f.focusFactor !== undefined && f.focusFactor !== '' && f.focusFactor !== null) {
+    const r = numOf(f.focusFactor);
+    if (!r.ok || r.val <= 0 || r.val > 1) err('INVALID_FOCUS_FACTOR', 'focusFactor', 'Focus factor must be a fraction between 0 and 1 (e.g. 0.7, not 70).');
+    else focusFactor = r.val;
+    assumptions.push({ key: 'focusFactor', label: 'Focus factor', value: focusFactor, source: 'user' });
+  } else assumptions.push({ key: 'focusFactor', label: 'Focus factor', value: focusFactor, source: 'default' });
+
+  let hoursPerPoint = DEFAULT_HOURS_PER_POINT;
+  if (f.hoursPerPoint !== undefined && f.hoursPerPoint !== '' && f.hoursPerPoint !== null) {
+    const r = numOf(f.hoursPerPoint);
+    if (!r.ok || r.val <= 0) err('INVALID_HOURS_PER_POINT', 'hoursPerPoint', 'Hours per story point must be a number greater than 0.'); // divisor guard
+    else hoursPerPoint = r.val;
+    assumptions.push({ key: 'hoursPerPoint', label: 'Hours / story point', value: hoursPerPoint, source: 'user' });
+  } else assumptions.push({ key: 'hoursPerPoint', label: 'Hours / story point', value: hoursPerPoint, source: 'default' });
+
+  // ── per-person available days (PER QUARTER — the whole period, NOT per sprint) ──
+  const people = Array.isArray(f.people) ? f.people : [];
+  let teamDays = 0;
+  let validPeople = 0;
+  const seenNames = new Set();
+  people.forEach((p, i) => {
+    const person = p && typeof p === 'object' ? p : {};
+    const name = typeof person.name === 'string' ? person.name.trim() : '';
+    const r = numOf(person.availableDays);
+    if (!r.ok) { err('INVALID_AVAILABLE_DAYS', `people[${i}].availableDays`, `Available days for ${name || `person ${i + 1}`} must be a number ≥ 0.`); return; }
+    if (r.val < 0) { err('INVALID_AVAILABLE_DAYS', `people[${i}].availableDays`, `Available days for ${name || `person ${i + 1}`} cannot be negative.`); return; }
+    let days = r.val; // fractional (half-days) legitimate
+    if (days > MAX_QUARTER_DAYS + EPS) { warn('AVAILABLE_DAYS_CLAMPED', `${name || `Person ${i + 1}`} is marked available ${days} days this quarter, more than the ~${MAX_QUARTER_DAYS} working days in a typical quarter; clamped — did you enter calendar days instead of working days?`); days = MAX_QUARTER_DAYS; }
+    if (name) {
+      if (seenNames.has(name.toLowerCase())) warn('DUPLICATE_PERSON_NAME', `"${name}" appears more than once — check for an accidental duplicate row.`);
+      seenNames.add(name.toLowerCase());
+    } else if (days > 0) warn('BLANK_PERSON_NAME', `A team member with ${days} available days has no name — its capacity still counts.`);
+    teamDays += days;
+    validPeople += 1;
+  });
+
+  // ── override path (precedence + surfaced, never silent shadow — ledger CAP-9) ──
+  const overridePresent = f.pointsPerQuarterOverride !== undefined && f.pointsPerQuarterOverride !== '' && f.pointsPerQuarterOverride !== null;
+  let overrideVal = null;
+  if (overridePresent) {
+    const r = numOf(f.pointsPerQuarterOverride);
+    if (!r.ok || r.val <= 0) err('INVALID_OVERRIDE', 'pointsPerQuarterOverride', 'The points-per-quarter override must be a number greater than 0.');
+    else overrideVal = r.val;
+  }
+
+  const multipliersOk = !errors.some((e) => ['INVALID_HOURS_PER_DAY', 'INVALID_FOCUS_FACTOR', 'INVALID_HOURS_PER_POINT'].includes(e.code));
+  const teamExpected = multipliersOk && hoursPerPoint > 0 ? (teamDays * hoursPerDay * focusFactor) / hoursPerPoint : NaN;
+
+  if (!overridePresent) {
+    if (validPeople === 0 && !people.length) err('ZERO_CAPACITY', 'people', 'Add at least one team member with available days.');
+    else if (multipliersOk && teamDays <= 0 && validPeople > 0) err('ZERO_CAPACITY', 'people', 'Total available days is 0 — the team has no capacity to plan against.');
+  }
+
+  if (errors.length > 0) return { ok: false, errors, expectedPointsQuarter: null, conservativePoints: null, optimisticPoints: null, assumptions, warnings };
+
+  let expected;
+  if (overridePresent) {
+    expected = overrideVal;
+    assumptions.push({ key: 'override', label: 'Capacity source', value: `manual override: ${overrideVal} pts/quarter`, source: 'user' });
+    if (Number.isFinite(teamExpected)) {
+      assumptions.push({ key: 'computedTeam', label: 'Team-derived (for reference)', value: `${round1(teamExpected)} pts/quarter`, source: 'computed' });
+      if (teamExpected > 0 && Math.abs(overrideVal - teamExpected) / teamExpected > 0.5) warn('OVERRIDE_DISCREPANCY', `Manual override (${overrideVal}) differs from the team-derived capacity (${round1(teamExpected)} pts/quarter) — confirm the override is intended.`);
+    }
+  } else {
+    expected = teamExpected;
+    assumptions.push({ key: 'availableDaysContract', label: 'Available days are PER QUARTER', value: 'each person’s days count once over the whole quarter, not per sprint', source: 'contract' }); // the reverse of CAP-4
+  }
+
+  if (!Number.isFinite(expected) || expected < 0) return { ok: false, errors: [{ code: 'NON_FINITE_CAPACITY', field: 'capacity', message: 'The computed capacity is not a valid number — check the team and multiplier inputs.' }], expectedPointsQuarter: null, conservativePoints: null, optimisticPoints: null, assumptions, warnings };
+
+  const conservativePoints = expected * REACH_CONSERVATIVE_FACTOR;
+  const optimisticPoints = expected * REACH_OPTIMISTIC_FACTOR;
+  // honesty echoes (research 2026-06-21 — wear the no-history imprecision on the OUTSIDE, the cost-estimate pattern)
+  assumptions.push({ key: 'noFlowHistory', label: 'Capacity-based estimate', value: 'no flow history yet — a capacity estimate, not a measured forecast; it sharpens once the team has real throughput', source: 'contract' });
+  assumptions.push({ key: 'reachBand', label: 'Reach is a range', value: `conservative ${round1(conservativePoints)} – optimistic ${round1(optimisticPoints)} pts (×${REACH_CONSERVATIVE_FACTOR} / ×${REACH_OPTIMISTIC_FACTOR} of the ${round1(expected)} expected)`, source: 'contract' });
+  assumptions.push({ key: 'steadyFlow', label: 'Assumes steady flow + limited WIP', value: 'early throughput is typically lower (ramp-up); starting too much work at once lowers real throughput below this', source: 'assumption' });
+  // C4 (deep-audit): surface the focus-factor leverage on the COMPLETED plan, not only the pre-generate preview —
+  // the research names it the single biggest lever, so it belongs with the other two honesty assumptions always.
+  assumptions.push({ key: 'focusLever', label: 'Focus factor is your biggest lever', value: 'it scales throughput directly — a small change moves the whole reach line', source: 'contract' });
+
+  return { ok: true, errors: [], expectedPointsQuarter: expected, conservativePoints, optimisticPoints, assumptions, warnings };
+}
 
 // ════════════════════════════════════════════════════════════════
 // 1.5 SKILL BUCKETS  — Tier-2 skill-aware capacity (BE/FE/QA + a generalist fallback). PURE.
@@ -873,6 +998,76 @@ export function packSprints(preferenceOrder, perSprintCapacityPoints, graph, poi
 }
 
 // ════════════════════════════════════════════════════════════════
+// 7.5 PACK BACKLOG REACH  — Kanban v1: a pull-ready ordered backlog cut by a Now/Next/Later reach band
+// ════════════════════════════════════════════════════════════════
+//
+// The Kanban analogue of packSprints (the methodology fork seam in assemblePlan). Kanban has NO sprints and
+// NO time-boxes (§0): the plan IS the dependency-legal ranked order, presented as one pull list, cut by a
+// THROUGHPUT reach band. We deliberately do NOT build a probabilistic forecaster (Monte Carlo / percentile
+// SLEs) — those need flow history the team does not have yet, and faking it is the dishonest path (research
+// 2026-06-21). Instead we walk the ALREADY topo-legal order accumulating story points and assign each sized
+// feature a confidence TIER:
+//   now   = cumulative ≤ conservative reach          (high confidence)
+//   next  = conservative < cumulative ≤ optimistic   (stretch — "might fit")
+//   later = beyond optimistic                        (explicitly NOT forecast this quarter)
+// An item goes `now` only if it FULLY fits under conservative (cumulative-WITH-it ≤ conservative) — the
+// straddling item is honestly demoted to `next`. Because the order is dependency-legal (a blocker always
+// precedes its dependent) and cumulative points are monotonic, a feature's tier is ALWAYS ≥ its blockers'
+// tier → no `now` item ever depends on a `next`/`later` item (dependency-tier consistency is AUTOMATIC; no
+// readiness loop needed, unlike packSprints). Honest, never silent: an item bigger than the whole optimistic
+// quarter lands in `later` (a real "too big for this quarter" signal, not a force-place), and unsized items
+// go to the DISJOINT sizingIssues channel (never fake-fit at 0 points).
+//
+// @param {string[]} preferenceOrder the dependency-legal order (legal.order from topoSortAndCycles)
+// @param {object} band { conservativePoints, optimisticPoints, expectedPointsQuarter }
+// @param {object} graph
+// @param {Map<string,number>} points sized features only (validateSizing.points)
+// @param {Array} unsized from validateSizing
+// @returns {object} { now, next, later, sizingIssues, metrics }
+export function packBacklogReach(preferenceOrder, band, graph, points, unsized) {
+  const conservative = Math.max(0, Number(band && band.conservativePoints) || 0);
+  const optimistic = Math.max(conservative, Number(band && band.optimisticPoints) || 0); // optimistic ≥ conservative (guard)
+  const sizedSet = new Set(points.keys());
+  const queue = (Array.isArray(preferenceOrder) ? preferenceOrder : []).filter((id) => sizedSet.has(id));
+
+  const now = [], next = [], later = [];
+  let cumulative = 0;
+  for (const id of queue) {
+    const p = points.get(id) || 0;
+    cumulative += p;
+    // C1 (deep-audit): rows carry id/points/cumulative ONLY — NOT name. The FE resolves the display name from
+    // record.features via byUid (the single self-describing name source the 2026-06-20/21 reload fix established);
+    // a per-row name here would be dead weight in the persisted plan (KVS ~240KB watch) AND a second name source.
+    const row = { id, points: p, cumulative };
+    if (cumulative <= conservative + EPS) now.push(row);
+    else if (cumulative <= optimistic + EPS) next.push(row);
+    else later.push(row);
+  }
+
+  const sum = (arr) => arr.reduce((a, r) => a + r.points, 0);
+  const reachedNowPoints = sum(now);
+  const reachedNextPoints = reachedNowPoints + sum(next);
+  const beyondReachPoints = sum(later);
+
+  return {
+    now, next, later,
+    sizingIssues: Array.isArray(unsized) ? unsized : [],
+    metrics: {
+      totalBacklogPoints: reachedNextPoints + beyondReachPoints,
+      expectedPointsQuarter: Math.max(0, Number(band && band.expectedPointsQuarter) || 0),
+      conservativePoints: conservative,
+      optimisticPoints: optimistic,
+      reachedNowPoints,
+      reachedNextPoints,
+      beyondReachPoints,
+      nowCount: now.length,
+      nextCount: next.length,
+      laterCount: later.length,
+    },
+  };
+}
+
+// ════════════════════════════════════════════════════════════════
 // 8. COST PROJECTION  — pre-flight honest estimate for the ranking call (ledger UX-5)
 // ════════════════════════════════════════════════════════════════
 
@@ -1146,7 +1341,8 @@ export function buildRankingRows(graph, signals, points, riskByFeature) {
  * @param {object} args { features, capacity (computeCapacity result), ranking (LLM output | null) }
  * @returns {object} { graph signals + diagnostics, preferenceOrder meta, packed plan }
  */
-export function assemblePlan({ features, capacity, ranking, specConcerns, precomputedRisk }) {
+export function assemblePlan({ features, capacity, ranking, specConcerns, precomputedRisk, methodology }) {
+  const isKanban = methodology === 'kanban';
   const graph = buildPlannerGraph(features);
   // sizing keyed by the EXACT id the graph assigned per POSITION (graph.idByIndex) — never indexOf
   // (which collapses a duplicate object ref + is O(n²)). One id source of truth across both layers.
@@ -1169,11 +1365,21 @@ export function assemblePlan({ features, capacity, ranking, specConcerns, precom
   // overflow for lack of BE while QA sits idle (the honest "can my team deliver this?" answer). The skill
   // split is keyed on graph.idByIndex (sizing parity). Pure; NO LLM (the task-type enum already classifies).
   const skill = featureSkillSplit(features, (f, i) => graph.idByIndex[i], sizing.points);
-  const bucketCtx = capacity && capacity.bucketsActive
-    ? { demand: skill.demand, bucketCaps: capacity.perSprintBucketCapacity }
-    : undefined;
-  // pass the cut edges so the packer's readiness gate ignores cycle-broken edges (PLAN-01)
-  const packed = packSprints(legal.order, capacity.perSprintCapacityPoints, graph, sizing.points, sizing.unsized, legal.cutEdges, bucketCtx);
+  // ⭐ METHODOLOGY FORK (POLICY §3.5 — a sibling pack fn, NOT a flag inside packSprints): everything ABOVE this
+  // line (graph / sizing / signals / ranking / legal order / skill split) is methodology-agnostic. Kanban produces
+  // a Now/Next/Later reach band over the SAME dependency-legal order; Scrum packs into capacity-bounded sprints.
+  let packed;
+  if (isKanban) {
+    packed = packBacklogReach(legal.order,
+      { conservativePoints: capacity.conservativePoints, optimisticPoints: capacity.optimisticPoints, expectedPointsQuarter: capacity.expectedPointsQuarter },
+      graph, sizing.points, sizing.unsized);
+  } else {
+    // skill-aware capacity is a Scrum-only concept in v1 (Kanban is pooled); cut edges keep the readiness gate honest (PLAN-01)
+    const bucketCtx = capacity && capacity.bucketsActive
+      ? { demand: skill.demand, bucketCaps: capacity.perSprintBucketCapacity }
+      : undefined;
+    packed = packSprints(legal.order, capacity.perSprintCapacityPoints, graph, sizing.points, sizing.unsized, legal.cutEdges, bucketCtx);
+  }
 
   // RISK-AWARE layer (Tier-1) — ADDITIVE post-pass: keyed on graph.idByIndex (dup-_uid '#i' safe — IR-3),
   // computed AFTER packing, NEVER touching the packer / DAG legality / capacity (DAG-1). riskByFeature +
@@ -1185,12 +1391,15 @@ export function assemblePlan({ features, capacity, ranking, specConcerns, precom
   const riskByFeature = precomputedRisk && precomputedRisk.riskByFeature
     ? (precomputedRisk.riskByFeature instanceof Map ? precomputedRisk.riskByFeature : new Map(Object.entries(precomputedRisk.riskByFeature)))
     : computeRiskSignals(features, (f, i) => graph.idByIndex[i]);
-  const sprintRiskProfiles = computeSprintRiskProfile(packed.sprints, riskByFeature, sizing.points);
+  // Kanban has no sprints → no per-sprint fragile-meter in v1 (a backlog-segment risk profile is deferred v2);
+  // per-feature risk still flows through riskByFeature + the Risk Register, which do NOT depend on sprints.
+  const sprintRiskProfiles = isKanban ? [] : computeSprintRiskProfile(packed.sprints, riskByFeature, sizing.points);
   const specConcernSummary = (precomputedRisk && precomputedRisk.specConcernSummary)
     ? precomputedRisk.specConcernSummary
     : summarizeSpecConcerns(specConcerns); // spec-WIDE band, never per-feature (SN-3)
 
   return {
+    methodology: isKanban ? 'kanban' : 'scrum',
     graph: {
       danglingRefs: graph.danglingRefs,
       ambiguousDeps: graph.ambiguousDeps,

@@ -218,3 +218,15 @@ export const IconUsers = (p) => (
     <path d="M16 3.13a4 4 0 0 1 0 7.75" />
   </S>
 );
+
+// Backlog / Kanban — an ordered list glyph (the pull-ready backlog, no time-boxes).
+export const IconList = (p) => (
+  <S {...p}>
+    <line x1="8" y1="6" x2="21" y2="6" />
+    <line x1="8" y1="12" x2="21" y2="12" />
+    <line x1="8" y1="18" x2="21" y2="18" />
+    <line x1="3" y1="6" x2="3.01" y2="6" />
+    <line x1="3" y1="12" x2="3.01" y2="12" />
+    <line x1="3" y1="18" x2="3.01" y2="18" />
+  </S>
+);

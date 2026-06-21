@@ -796,7 +796,7 @@ export function buildPlanRankingUserPrompt({ rows, globals, specSummary, specCon
   if (Array.isArray(g.perSprintCapacityPoints) && g.perSprintCapacityPoints.length) {
     lines.push(`Capacity per sprint (story points): ${g.perSprintCapacityPoints.map((c) => Math.round(c * 10) / 10).join(', ')}`);
   }
-  if (g.totalCapacity != null) lines.push(`Total capacity across all sprints: ${Math.round(g.totalCapacity * 10) / 10} pts`);
+  if (g.totalCapacity != null) lines.push(`${g.methodology === 'kanban' ? 'Quarter throughput (expected story points deliverable)' : 'Total capacity across all sprints'}: ${Math.round(g.totalCapacity * 10) / 10} pts`);
   if (g.totalBacklogPoints != null) lines.push(`Total backlog size: ${g.totalBacklogPoints} pts`);
   if (g.deficitPoints != null && g.deficitPoints > 0) {
     lines.push(`⚠ The backlog exceeds capacity by ${Math.round(g.deficitPoints * 10) / 10} pts — not everything fits. Order so the highest-leverage, highest-priority work is earliest; what spills past capacity should be the most deferrable.`);
