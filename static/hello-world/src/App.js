@@ -4349,6 +4349,9 @@ function AssignSprintsPanel({ planPush, onAssignSprints, planStale = false }) {
   const sm = planPush?.result?.summary || {};
   const sprints = planPush?.result?.sprintsCreated || [];
   const boardWarning = planPush?.result?.boardWarning;
+  // §11: a 207 partial sprint-move bumps no assign_failed counter, so the failed-count callout below won't fire for
+  // it — surface the backend's "verify" nudge on its own channel (mirrors RankBacklogPanel's unverifiedPartial).
+  const unverifiedPartial = (planPush?.result?.failureDetails || []).find((f) => f && f.error === "partial_assign_unverified") || null;
   return (
     <div style={{ border: "1px solid var(--s2j-border)", borderRadius: 10, padding: 16, marginBottom: 16, background: "var(--s2j-bg-section)" }}>
       <div className="flex items-center gap-2" style={{ marginBottom: 6 }}>
@@ -4372,6 +4375,7 @@ function AssignSprintsPanel({ planPush, onAssignSprints, planStale = false }) {
           {sm.no_jira_key > 0 ? <SignalCallout kind="info" title={`${sm.no_jira_key} planned feature${sm.no_jira_key === 1 ? "" : "s"} not in Jira`} style={{ marginBottom: 6 }}>Not part of the pushed backlog, so they couldn’t be assigned.</SignalCallout> : null}
           {sm.overflowed > 0 ? <SignalCallout kind="info" title={`${sm.overflowed} overflowed feature${sm.overflowed === 1 ? "" : "s"}`} style={{ marginBottom: 6 }}>Didn’t fit any sprint in the plan, so they weren’t assigned.</SignalCallout> : null}
           {(sm.assign_failed > 0 || sm.sprint_failures > 0) ? <SignalCallout kind="warning" title="Some assignments failed">{sm.sprint_failures || 0} sprint(s) + {sm.assign_failed || 0} issue(s) failed — check your Jira board permissions and retry (it’s idempotent).</SignalCallout> : null}
+          {unverifiedPartial ? <SignalCallout kind="warning" title="Verify the sprint assignment" style={{ marginBottom: 6 }}>{unverifiedPartial.detail || "Jira reported a partial result (207) — open your board and verify each Story landed in its sprint."}</SignalCallout> : null}
         </div>
       ) : (
         <>
