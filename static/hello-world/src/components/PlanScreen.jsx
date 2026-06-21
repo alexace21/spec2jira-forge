@@ -1022,8 +1022,12 @@ export default function PlanScreen({
   const plan = r.ok && r.plan ? r.plan : null;
   const capacityErrors = r.ok === false && r.stage === "capacity" ? r.errors || r.capacityErrors : null;
   const keyError = r.ok === false && r.stage === "key" ? r : null;
-  // any other ok:false (a backend pipeline throw → stage:'plan', or an invoke rejection) — never silent
-  const planError = r.ok === false && r.stage !== "capacity" && r.stage !== "key" ? r : null;
+  // any other ok:false (a backend pipeline throw → stage:'plan', or an invoke rejection) — never silent.
+  // §11: ALSO surface a resolver-GUARD payload that carries `error` but no `ok` — edition_required (a Standard
+  // user who reached generate/re-pack via a mid-session downgrade or crafted client) or license_required. These
+  // previously fell through (r.ok===false was false) and the "Upgrade to Advanced" / "start a trial" detail was
+  // silently swallowed; the push paths already surface it, so this brings generate/re-pack to parity.
+  const planError = (r.ok === false || (!!r.error && r.ok === undefined)) && r.stage !== "capacity" && r.stage !== "key" ? r : null;
   const assumptions = r.assumptions || [];
   const warnings = r.warnings || [];
   const hasPlan = !!plan;

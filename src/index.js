@@ -207,11 +207,19 @@ function buildLicenseRequired() {
  * pricing table so the UI can present the Advanced edition. `feature` lets the UI tailor copy.
  */
 function buildUpgradeRequired(feature = 'test_cases') {
+  // Feature-aware detail so the upgrade prompt names the RIGHT premium feature — both test-case
+  // generation AND the Capacity-Sheet Planner are Advanced-only (v6.1). `feature` also lets the UI
+  // tailor copy. Unknown feature → the test-case message (back-compat default).
+  const detailByFeature = {
+    test_cases:
+      'Test-case generation is an Advanced feature. Upgrade to the Advanced edition to generate acceptance test cases for your stories.',
+    planner:
+      'The Capacity-Sheet Planner is an Advanced feature. Upgrade to the Advanced edition to turn your backlog into a Scrum or Kanban delivery plan and push it to Jira.',
+  };
   return {
     error: 'edition_required',
     feature,
-    detail:
-      'Test-case generation is an Advanced feature. Upgrade to the Advanced edition to generate acceptance test cases for your stories.',
+    detail: detailByFeature[feature] || detailByFeature.test_cases,
     pricing: pricingTable(),
   };
 }
@@ -2718,7 +2726,12 @@ async function finalizePlanJob(planjob, ranking, usage, llmNote) {
  * exceeds Forge's 25s HARD kill (confirmed live; gotcha #5). A submit failure falls back to a plan now.
  */
 resolver.define('startPlan', async ({ payload, context }) => {
-  if (getActiveTier(context).key === 'unlicensed') return buildLicenseRequired();
+  const tier = getActiveTier(context);
+  if (tier.key === 'unlicensed') return buildLicenseRequired();
+  // v6.1 value-split: the Capacity-Sheet Planner is an Advanced-edition feature (bundled with test-cases).
+  // FAIL-CLOSED by construction — resolveTier defaults an unknown/failed license to Standard (no hasPlanner),
+  // so a license-read fault denies the premium rather than leaking it (POLICY §3 cost-asymmetry).
+  if (!tier.hasPlanner) return buildUpgradeRequired('planner');
   const { jobId, features, capacityForm, specSummary, specConcerns } = payload || {};
   // P12: the planning OBJECTIVE rides capacityForm.objective. SANITIZE against the frozen allow-list (never
   // trust a raw client string into the prompt) — unknown/missing → 'balanced' (no clause; today's behaviour).
@@ -2880,7 +2893,9 @@ resolver.define('pollPlanStatus', async ({ payload, context }) => {
  * packSprints over the CACHED ranking. FREE — no LLM, no spend. Requires an existing plan.
  */
 resolver.define('repackPlan', async ({ payload, context }) => {
-  if (getActiveTier(context).key === 'unlicensed') return buildLicenseRequired();
+  const tier = getActiveTier(context);
+  if (tier.key === 'unlicensed') return buildLicenseRequired();
+  if (!tier.hasPlanner) return buildUpgradeRequired('planner'); // v6.1: Advanced-only planner (re-pack is core planner VALUE; it re-runs the deterministic packer over the CACHED ranking — no spend)
   const { jobId, capacityForm } = payload || {};
   // Cross-tab race (gate finding): if a re-rank BATCH is in flight (e.g. another tab fired it), refuse the
   // free re-pack — its write over the CACHED ranking could clobber the FRESH ranking finalizePlanJob is
@@ -3378,7 +3393,9 @@ resolver.define('pushStep', async ({ payload, context }) => {
 // Agile scopes — LIVE-VERIFY on dev before publish (POLICY §9).
 // ════════════════════════════════════════════════════════════════
 resolver.define('startPlanPush', async ({ payload, context }) => {
-  if (getActiveTier(context).key === 'unlicensed') return buildLicenseRequired();
+  const tier = getActiveTier(context);
+  if (tier.key === 'unlicensed') return buildLicenseRequired();
+  if (!tier.hasPlanner) return buildUpgradeRequired('planner'); // v6.1: Advanced-only planner (Jira write path)
   const { jobId, createdIssues, projectKey: payloadProjectKey, namePrefix, boardId, plan: payloadPlan, capacityForm: payloadForm } = payload || {};
   // ⭐ POST-PUSH LIFECYCLE FIX (live-acceptance 2026-06-21): "Assign sprints in Jira" runs from the POST-PUSH
   // success screen — but purgeJob (data-min on push) has ALREADY deleted plan:<jobId> by then, so a KVS read
