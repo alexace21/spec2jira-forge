@@ -120,6 +120,7 @@ export const TIERS = Object.freeze({
     edition: 'standard',
     keySource: 'byok',
     hasTestCases: false, // test-cases are an Advanced feature
+    hasPlanner: false, // v6.1: the Capacity-Sheet Planner is an Advanced feature too
   }),
   // v6 NEW: Advanced = BYOK + test-case generation (the value-split headline). BYOK →
   // unlimited (the customer pays compute), so NO cap and $0 compute cost to us.
@@ -131,6 +132,7 @@ export const TIERS = Object.freeze({
     edition: 'advanced',
     keySource: 'byok',
     hasTestCases: true,
+    hasPlanner: true, // v6.1: Advanced bundles the Capacity-Sheet Planner with test-cases (strengthens the Advanced value)
   }),
   // DORMANT — the off-Marketplace Managed fallback. NOT reachable from any capabilitySet
   // (resolveTier maps capabilityAdvanced → byokAdvanced, never here). Kept alive ONLY so a
@@ -145,6 +147,7 @@ export const TIERS = Object.freeze({
     edition: 'managed', // v6: was 'advanced' — decoupled so it can't re-couple to the edition flag
     keySource: 'managed',
     hasTestCases: true, // if ever re-enabled, Managed Advanced would include test-cases on their OWN budget
+    hasPlanner: true, // dormant — mirrors hasTestCases (Managed Advanced is the same value tier)
   }),
   // Defensive backstop for the no-active-license case (no trial, no subscription).
   // Not a product offering — the resolvers turn this into a clean "subscribe or
@@ -157,6 +160,7 @@ export const TIERS = Object.freeze({
     edition: null,
     keySource: 'byok', // never our key, even defensively
     hasTestCases: false,
+    hasPlanner: false,
   }),
 });
 
@@ -339,6 +343,7 @@ export async function checkQuota(context) {
     edition: tier.edition, // 'standard'|'advanced'|'managed'(dormant)|null — LABEL only, for messaging
     keySource: tier.keySource, // v6 decouple: 'byok'|'managed' — explicit, never inferred from edition
     hasTestCases: tier.hasTestCases, // v6: feature capability (Advanced ⇒ true) — the FE gates test-cases on this
+    hasPlanner: tier.hasPlanner, // v6.1: Capacity-Sheet Planner is Advanced-only too — the FE gates the planner on this
     limit: tier.limit, // null = unlimited
     unlimited,
     used,
@@ -449,5 +454,6 @@ export function pricingTable() {
     price: t.price,
     edition: t.edition,
     hasTestCases: t.hasTestCases, // v6: drives the value-framing "+ test cases" copy from the capability (so marketing can't drift from code)
+    hasPlanner: t.hasPlanner, // v6.1: same — drives the "+ capacity planner" value-framing from the capability
   }));
 }

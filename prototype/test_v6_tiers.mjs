@@ -95,5 +95,17 @@ check('pricingTable Advanced is priced ($13.40)', /13\.40/.test(pt[1].price || '
 check('pricingTable Standard is priced ($6.70)', /6\.70/.test(pt[0].price || ''));
 check('pricingTable carries hasTestCases per edition', pt[0].hasTestCases === false && pt[1].hasTestCases === true);
 
+// 12. v6.1: the Capacity-Sheet Planner is Advanced-only too — hasPlanner MIRRORS hasTestCases on every tier.
+// (Standard must NOT get the planner; Advanced must; an unknown/inactive set must default to no-planner.)
+check('Advanced.hasPlanner === true', adv.hasPlanner === true);
+check('Standard.hasPlanner === false (feature paywall)', std.hasPlanner === false);
+check('unknown set ⇒ hasPlanner false (no accidental premium)', unknown.hasPlanner === false);
+check('absent capabilitySet ⇒ hasPlanner false', noset.hasPlanner === false);
+check('inactive/unlicensed ⇒ hasPlanner false', inactive.hasPlanner === false);
+check('exactly ONE live tier has hasPlanner', liveTiers.filter((t) => t.hasPlanner).length === 1);
+check('hasPlanner mirrors hasTestCases on every LIVE tier', liveTiers.every((t) => t.hasPlanner === t.hasTestCases));
+check('pricingTable carries hasPlanner per edition', pt[0].hasPlanner === false && pt[1].hasPlanner === true);
+check('dormant managedPro.hasPlanner === true (mirrors hasTestCases)', TIERS.managedPro.hasPlanner === true);
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

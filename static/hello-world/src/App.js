@@ -2850,7 +2850,8 @@ function ReadyScreen({
                 {usage.tierLabel} plan
               </strong>{" "}
               · unlimited breakdowns
-              {usage.hasTestCases && " · includes test cases"}
+              {(usage.hasTestCases || usage.hasPlanner) &&
+                ` · includes ${[usage.hasTestCases && "test cases", usage.hasPlanner && "capacity planner"].filter(Boolean).join(" + ")}`}
             </span>
           ) : usage.tier === "managedPro" ? (
             // DORMANT under v6 — resolveTier never returns managedPro for a live customer
@@ -3233,6 +3234,11 @@ function ConfirmScreen({
   // (back-compat: a cached pre-v6 getUsage payload has no hasTestCases → treat as no-access,
   // never leak the premium feature). The backend remains the authority (fail-closed gate).
   const hasTestCases = usage?.hasTestCases === true;
+  // v6.1 value-split: the Capacity-Sheet Planner is an Advanced-edition feature too (bundled with
+  // test-cases). Same capability-driven gate (usage.hasPlanner), default-FALSE on an absent field
+  // (back-compat / never leak). The backend startPlan/repackPlan/startPlanPush gates are the authority;
+  // this only hides the entry button + shows a conversion-driving "Advanced" teaser for Standard users.
+  const hasPlanner = usage?.hasPlanner === true;
   // v6 cost-transparency: pre-flight Anthropic-usage estimate for a test-case run. Fetched
   // (read-only resolver, NO spend) only when test-cases are offered and not already fresh-generated;
   // re-fetched when the breakdown goes stale (edited ACs → new estimate). Best-effort: on any error
@@ -3682,35 +3688,40 @@ function ConfirmScreen({
         >
           <div style={{ minWidth: 0 }}>
             <p className="text-xs font-medium" style={{ color: "var(--s2j-text)", display: "inline-flex", alignItems: "center", gap: 6 }}>
-              <IconCalendar size={13} /> Capacity plan from your team
+              <IconCalendar size={13} /> {hasPlanner ? "Capacity plan from your team" : "Capacity plan from your team — Advanced"}
             </p>
             <p className="text-xs" style={{ color: "var(--s2j-text-muted)" }}>
-              Turn these stories into a plan from your team's capacity — Scrum sprints or a Kanban Now /
-              Next / Later backlog. Claude orders the work; the math is deterministic. Review-only; nothing is written to Jira.
+              {hasPlanner
+                ? "Turn these stories into a plan from your team's capacity — Scrum sprints or a Kanban Now / Next / Later backlog. Claude orders the work; the math is deterministic. Review-only; nothing is written to Jira."
+                : "Turn your stories into a plan from your team's capacity — Scrum sprints or a Kanban Now / Next / Later backlog, pushed to Jira. Available on the Advanced edition."}
             </p>
           </div>
-          <button
-            type="button"
-            onClick={() => onOpenPlan()}
-            disabled={isPushing}
-            className="shrink-0"
-            style={{
-              background: "var(--s2j-blue)",
-              border: "none",
-              color: "#fff",
-              padding: "7px 14px",
-              borderRadius: "6px",
-              fontSize: "13px",
-              fontWeight: 500,
-              cursor: isPushing ? "not-allowed" : "pointer",
-              whiteSpace: "nowrap",
-              display: "inline-flex",
-              alignItems: "center",
-              gap: 6,
-            }}
-          >
-            <IconCalendar size={14} /> Plan capacity
-          </button>
+          {hasPlanner ? (
+            <button
+              type="button"
+              onClick={() => onOpenPlan()}
+              disabled={isPushing}
+              className="shrink-0"
+              style={{
+                background: "var(--s2j-blue)",
+                border: "none",
+                color: "#fff",
+                padding: "7px 14px",
+                borderRadius: "6px",
+                fontSize: "13px",
+                fontWeight: 500,
+                cursor: isPushing ? "not-allowed" : "pointer",
+                whiteSpace: "nowrap",
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 6,
+              }}
+            >
+              <IconCalendar size={14} /> Plan capacity
+            </button>
+          ) : (
+            <span className="shrink-0 text-xs font-medium" title="The Capacity-Sheet Planner is included in the Advanced edition. Upgrade in your Atlassian site admin to plan your backlog." style={{ color: "var(--s2j-blue)", whiteSpace: "nowrap", padding: "7px 10px" }}>Advanced</span>
+          )}
         </div>
       )}
 
@@ -4824,7 +4835,7 @@ function LimitReachedScreen({ quota, onBack, backToReview = false }) {
       ? "Subscription required"
       : "You've used this month's breakdowns";
   const fallbackBody = isEditionRequired
-    ? "Test-case generation is included in the Advanced edition. Upgrade to generate BA-grade acceptance test cases for every story."
+    ? "The Advanced edition includes test-case generation and the Capacity-Sheet Planner. Upgrade to generate BA-grade acceptance test cases and turn your backlog into a Scrum or Kanban delivery plan."
     : isLicenseRequired
       ? "An active subscription is required to use Spec2Tickets. Manage your subscription from your Atlassian site admin."
       : limit
@@ -4892,7 +4903,7 @@ function LimitReachedScreen({ quota, onBack, backToReview = false }) {
             <EditionRow
               name="Advanced"
               price={advancedPrice}
-              blurb="+ test-case generation"
+              blurb="+ test-case generation + capacity planner"
             />
           ) : isFairUse ? (
             <EditionRow
@@ -4910,7 +4921,7 @@ function LimitReachedScreen({ quota, onBack, backToReview = false }) {
               <EditionRow
                 name="Advanced"
                 price={advancedPrice}
-                blurb="+ test-case generation"
+                blurb="+ test-case generation + capacity planner"
               />
             </>
           )}

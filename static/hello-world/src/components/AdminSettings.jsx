@@ -1065,6 +1065,54 @@ function DiagnosticsTab({ refFilter = "", onRefFilterChange }) {
         )}
       </div>
 
+      {/* Vendor sweep heartbeat — admin-only (the backend returns it only when isAdmin). The "did the
+          daily orphan-sweep fire" signal (strategy §4.1): a PULL status, no push alert. Counts + a
+          timestamp only — no page/document content. */}
+      {data?.sweepHeartbeat && (
+        <div
+          className="rounded-md p-3 mb-3 flex items-center gap-2 text-xs"
+          style={{
+            background: "var(--s2j-bg-section)",
+            border: "1px solid var(--s2j-border)",
+            color: "var(--s2j-text)",
+          }}
+          title="Vendor maintenance: the daily background job that removes never-pushed breakdowns 7 days after last access. Counts only — no page or document content."
+        >
+          {!data.sweepHeartbeat.present ? (
+            <>
+              <SignalIcon kind="info" size={14} />
+              <span style={{ color: "var(--s2j-text-muted)" }}>
+                Orphan sweep: no run recorded yet (runs daily).
+              </span>
+            </>
+          ) : data.sweepHeartbeat.stale ||
+            data.sweepHeartbeat.ok === false ||
+            data.sweepHeartbeat.degraded > 0 ? (
+            <>
+              {/* Amber for ANY unhealthy state — stale (didn't fire), errored, or degraded. The icon color
+                  must NOT read green/"healthy" on a failed-or-degraded run (the signal this surface exists for). */}
+              <SignalIcon kind="warning" size={14} />
+              <span>
+                {data.sweepHeartbeat.stale
+                  ? `Orphan sweep last ran ${relTime(data.sweepHeartbeat.at)} — expected daily.`
+                  : `Orphan sweep ran ${relTime(data.sweepHeartbeat.at)}.`}{" "}
+                scanned {data.sweepHeartbeat.scanned} · deleted {data.sweepHeartbeat.deleted}
+                {data.sweepHeartbeat.degraded ? ` · ${data.sweepHeartbeat.degraded} degraded` : ""}
+                {data.sweepHeartbeat.ok === false ? " · last run errored" : ""}
+              </span>
+            </>
+          ) : (
+            <>
+              <SignalIcon kind="success" size={14} />
+              <span>
+                Orphan sweep ran {relTime(data.sweepHeartbeat.at)} · scanned{" "}
+                {data.sweepHeartbeat.scanned} · deleted {data.sweepHeartbeat.deleted}
+              </span>
+            </>
+          )}
+        </div>
+      )}
+
       {/* The list — loading / error / records / empty. Never a blank surface. */}
       {diagLoading ? (
         <div

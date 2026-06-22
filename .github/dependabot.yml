@@ -1,0 +1,41 @@
+# Dependabot — dependency hygiene (docs/MONITORING-CICD-STRATEGY.md §3.1/§7/§8).
+#
+# Primary protection = Dependabot SECURITY updates (GitHub Advisory DB), enabled in
+# repo Settings → Code security → Dependabot security updates (NOT configured here).
+# This manifest schedules low-noise WEEKLY GROUPED version-update PRs as a backstop.
+#
+# Discipline (binding): NEVER auto-merge any of these PRs. Review every bump.
+#  - @forge/resolver is pinned to EXACTLY 1.7.1 — do not bump (ignored below).
+#  - react-scripts (CRA) is fragile — never bump blindly, never `npm audit fix --force` (ignored below).
+version: 2
+updates:
+  # Backend / root (Forge resolvers)
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      minor-and-patch:
+        update-types: ["minor", "patch"]
+    ignore:
+      - dependency-name: "@forge/resolver" # pinned exactly 1.7.1 — review any bump manually
+
+  # Custom UI (Create-React-App)
+  - package-ecosystem: npm
+    directory: "/static/hello-world"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      minor-and-patch:
+        update-types: ["minor", "patch"]
+    ignore:
+      - dependency-name: "react-scripts" # CRA is fragile — never auto-bump
+
+  # GitHub Actions (keep the CI actions current; SHA-pinning is the hardening goal)
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
