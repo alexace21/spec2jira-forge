@@ -171,7 +171,7 @@ in phase-1" literally true.
 | **Dev-console invocation metrics** | Success rate, count, error types (timeout/OOM/throw), P50/90/95 latency — **aggregated across all installs**, per-function, per-site, per-env | free | 1 (no code) |
 | **Dev-console Alert rules (GA)** | Up to 5 rules (success-rate / errors / API count) → **email** (to `support@`/`security@spec2jira.com`); severity tiers + 24h re-notify = solo on-call | free | 1 (no code) |
 | **Native KVS heartbeat for the sweep** | Persist `last_swept_at` + `{scanned,deleted,degraded}` to app KVS; surface on the existing admin diagnostics/health view; "missed" computed at read-time | free | 1 (tiny code) |
-| **`@forge/metrics` counters (GA, 10 max)** | Content-free aggregate counters (`sweep_runs`, `push_succeeded`, `push_partial_207`, `anthropic_call_failed_5xx` vs `_keyrejected`) visible across installs | free | 2 |
+| **`@forge/metrics` counters** | ❌ **SKIPPED** (Phase-2 #2 decision, 5/5 persona vote): NOT alert-sourceable (alert rules source only the 4 built-in metrics — web-confirmed) → dashboard-only; the 3 genuinely-new signals (push_partial_207, anthropic 5xx-vs-keyrejected) are ALREADY in the diagnostics-ledger aggregate (just per-install); a pre-1.0 dep + noisier (sampled/no-backfill). Cross-install rollup deferred to the App-Logs poller. | free | ❌ SKIP |
 | **Marketplace Reporting API v2** | Installs, active users by edition, eval→paid conversion, churn — **vendor-side script, not Forge-callable** | free | 2 |
 | **App Logs/Metrics API (OTLP)** | Programmatic vendor-side pull (14-day window, ~15min/call, rate-limited); a thin scheduled poller could confirm `[sweep]` across installs | free (Atlassian side) | 2/3 |
 | **In-product diagnostics ledger (exists)** | Per-customer failure depth, consent-exported support trace | done | — |
@@ -215,9 +215,9 @@ distinct from a single customer's bad key. The backend already separates these c
 mirrored in `classifyDiagGenerationError`, `src/diagnostics.js`) — note 5xx is the `anthropic_<status>`
 family (status carried as data), not a standalone 'overloaded' class. So: a **cross-install spike in the
 `anthropic_<5xx>` class** is a separate "dependency-down" signal — kept **out of** the auto-alert
-vendor-fault threshold (to avoid fatigue) but **named and watched** (phase-1: a manual check of the
-dev-console error-type breakdown; phase-2: its own `@forge/metrics` counter). Don't let it get silently
-lumped into "not our problem".
+vendor-fault threshold (to avoid fatigue) but **named and watched** (a manual check of the dev-console
+error-type breakdown; the cross-install rollup is deferred to the App-Logs poller — NOT a custom-metric
+alert, which Forge does not support). Don't let it get silently lumped into "not our problem".
 
 Skip multi-burn-rate windows, on-call rotation, PagerDuty, formal postmortems.
 
@@ -344,7 +344,7 @@ incident runbook (§8) must cover **deploy-recovery**, not just alert-response.
 | **Dependabot** (security-only, weekly, grouped, no auto-merge; respect `@forge/resolver` 1.7.1 pin) | Dep updates | Free | **ADOPT** phase-1 |
 | **Forge dev-console metrics + Alerts** | Vendor-side health + email on-call | Free | **ADOPT** phase-1 |
 | **version-drift-guard** (`tools/version-drift-guard.mjs`, in `npm run check`) | Version-lockstep assert (fails merge on drift) | Free | **ADOPT** (Phase-2 #1, DONE — replaced release-please per a 5/5 persona vote: strictly stronger at the §11 goal, ~5% of the surface) |
-| **`@forge/metrics`** | Cross-install counters | Free | **PHASE 2** (verify it installs clean vs the pinned set / `--no-verify` first) |
+| **`@forge/metrics`** | Cross-install counters | Free | ❌ **SKIP** (Phase-2 #2, 5/5 vote: not alert-sourceable + redundant with the ledger aggregate + noisier; cross-install rollup deferred to the App-Logs poller) |
 | **Marketplace Reporting API v2** | Business health | Free | **PHASE 2** (vendor-side script, token hygiene §4.1) |
 | **`forge lint`** | Manifest/code lint | Free (needs token) | **PHASE 2** deploy job + local — NOT phase-1 gates (§3.4) |
 | **a9-forge-gh-action** (community) | Forge deploy Action | Free | **AVOID for prod path** — low-adoption 3rd party in the token path; hand-write ~30 lines |
@@ -405,8 +405,10 @@ incident runbook (§8) must cover **deploy-recovery**, not just alert-response.
   Changelog DROPPED (no in-repo consumer; portal notes cover it). `static/hello-world/package.json` (CRA bundle)
   intentionally NOT synced. ⚠ The repo version ≠ the forge-assigned Marketplace version — see the CLAUDE.md
   production-rollout note (a green check proves two-string lockstep, NOT a match to the live Marketplace number).
-- `@forge/metrics` counters (after verifying clean install vs the pinned set), incl. an
-  Anthropic-outage `5xx` counter (§4.3).
+- ~~`@forge/metrics` counters~~ — ❌ **SKIPPED** (Phase-2 #2, 5/5 persona vote): NOT alert-sourceable
+  (web-verified — alert rules source only the 4 built-in metrics) + redundant with the ledger aggregate +
+  noisier (a pre-1.0 dep). The cross-install Anthropic-outage + 207-partial rollup is deferred to the
+  **App-Logs poller** (Phase 3); per-install both are already classified in the diagnostics ledger.
 - Marketplace Reporting API script (installs / conversion / churn) with bot-account token hygiene (§4.1).
 
 **Phase 3 — deferred / earn-it-first:**
@@ -440,9 +442,10 @@ on-call/PagerDuty, coverage-% gate, browser E2E in CI, **any external ping from 
   way, but confirm before any future attempt to run it token-free.)
 - Do `forge logs` / the App-Logs-API reliably capture **scheduledTrigger** (system-invocation) logs the
   same as resolver logs? (Confirm `[sweep]` lines appear before relying on log-scrape.)
-- Can a `@forge/metrics` counter be the **source of an Alert rule**? (If yes, a flat-lining `sweep_runs`
-  could alert on the sweep *not* firing.)
-- Does `@forge/metrics` install clean against the pinned set on node24/arm64 **without** `--no-verify`?
+- ~~Can a `@forge/metrics` counter source an Alert rule?~~ **ANSWERED: NO** (web-verified 2026-06-22 — Forge
+  alert rules source ONLY the 4 built-in invocation/API metrics). → `@forge/metrics` SKIPPED (Phase-2 #2);
+  custom-metric alerting is not possible, so no flat-line/absence alert on a `sweep_runs`-style counter.
+- ~~Does `@forge/metrics` install clean vs the pinned set…~~ moot — SKIPPED (no compat-verify needed; not adopting).
 - Confirm the CRA build succeeds in a clean CI checkout with only `npm ci` (no build-time env vars).
 - Forge log retention is reported inconsistently (30 vs 60 days; API export window firmly 14 days) —
   confirm the authoritative number.
