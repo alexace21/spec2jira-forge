@@ -4,6 +4,13 @@
   "main": "index.js",
   "license": "MIT",
   "private": true,
+  "scripts": {
+    "check": "node tools/check-syntax.mjs",
+    "test": "node tools/run-tests.mjs",
+    "build:ui": "npm --prefix static/hello-world ci && npm --prefix static/hello-world run build",
+    "audit": "npm audit --omit=dev --audit-level=high",
+    "ci": "npm run check && npm test && npm run build:ui"
+  },
   "devDependencies": {
     "eslint": "^8.56.0",
     "eslint-plugin-react-hooks": "^4.6.0"

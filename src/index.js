@@ -332,6 +332,32 @@ const ORPHAN_INACTIVITY_MS = 7 * 24 * 60 * 60 * 1000; // 7 calendar days — the
 const ORPHAN_RENEW_THROTTLE_MS = 60 * 60 * 1000;      // 1h — skip re-writing jobmeta on a frequent poll (write-amplification guard)
 const SWEEP_PAGE_LIMIT = 50;                           // jobmeta keys per query page
 const SWEEP_MAX_DELETES = 50;                          // cap deletions per daily run; the daily cadence clears any backlog over a few days
+const SWEEP_HEARTBEAT_KEY = 'spec2jira_sweep:last';    // app-scoped (install-wide) — the vendor's "did the daily orphan-sweep fire" signal; counts + ts ONLY, no content, no egress
+const SWEEP_STALE_MS = 36 * 60 * 60 * 1000;            // a daily trigger silent >36h reads as "missed" (computed at READ time; no push alert — a missed daily hygiene run is low-severity)
+
+// readSweepHeartbeat — the vendor-side "did the daily orphan-sweep fire" read (strategy §4.1, docs/MONITORING-CICD-STRATEGY.md).
+// Reads the app-scoped heartbeat the sweep writes; computes "stale" at READ time (no push alert — a PULL signal
+// on the admin Diagnostics view). Admin-gated by the caller. Fail-open: any read fault → { present:false }.
+async function readSweepHeartbeat() {
+  try {
+    const hb = await kvs.get(SWEEP_HEARTBEAT_KEY);
+    if (!hb || typeof hb !== 'object' || !Number.isFinite(hb.at)) return { present: false };
+    const ageMs = Math.max(0, Date.now() - hb.at);
+    return {
+      present: true,
+      at: hb.at,
+      ageMs,
+      stale: ageMs > SWEEP_STALE_MS,
+      scanned: Number(hb.scanned) || 0,
+      deleted: Number(hb.deleted) || 0,
+      degraded: Number(hb.degraded) || 0,
+      ok: hb.ok !== false,
+    };
+  } catch (e) {
+    console.warn(`[sweep] heartbeat read failed (fail-open): ${String(e?.message || e)}`);
+    return { present: false };
+  }
+}
 
 // Renew a job's inactivity timer (lean jobmeta write, throttled). Called on review /
 // reconnect access so an actively-used breakdown is preserved. Best-effort: a miss only
@@ -5138,16 +5164,19 @@ resolver.define('getDiagnostics', async ({ payload, context }) => {
     const isAdmin = await checkJiraAdminister();
     const scope = requested === 'all' && isAdmin ? 'all' : 'mine';
     const aggregate = sanitizeAggregate(await readAggregate());
+    // Vendor sweep heartbeat — admin-only, ADDITIVE (null for non-admins): the "did the daily orphan-sweep
+    // fire" read (strategy §4.1). Surfaced read-only on the Diagnostics tab; no egress, counts + ts only.
+    const sweepHeartbeat = isAdmin ? await readSweepHeartbeat() : null;
     if (scope === 'all') {
       const buckets = (await readAllDiagnostics()).map((b) => ({
         accountId: b.accountId,
         records: validateRing(b.records),
       }));
-      return { isAdmin, scope, buckets, aggregate };
+      return { isAdmin, scope, buckets, aggregate, sweepHeartbeat };
     }
     const accountId = (context && typeof context.accountId === 'string' && context.accountId) || null;
     const records = accountId ? validateRing(await readDiagnostics({ accountId })) : [];
-    return { isAdmin, scope, records, aggregate };
+    return { isAdmin, scope, records, aggregate, sweepHeartbeat };
   } catch (e) {
     console.warn(`[diag] getDiagnostics failed (fail-open): ${String(e?.message || e)}`);
     return { isAdmin: false, scope: 'mine', records: [], aggregate: {} };
@@ -5474,6 +5503,7 @@ export async function sweepHandler() {
   let deleted = 0;
   let degraded = 0;
   let cursor;
+  let sweepOk = true;
   try {
     const maxPages = 500; // hard loop bound on the cursor pagination
     for (let page = 0; page < maxPages && deleted < SWEEP_MAX_DELETES; page++) {
@@ -5512,7 +5542,17 @@ export async function sweepHandler() {
     }
     console.log(`[sweep] orphan sweep: scanned=${scanned} deleted=${deleted} degraded=${degraded}`);
   } catch (e) {
+    sweepOk = false;
     console.error(`[sweep] orphan sweep failed (non-fatal): ${String(e?.message || e)}`);
+  }
+  // ⭐ Native vendor heartbeat (strategy §4.1): persist last-ran + the counts so the vendor can confirm the
+  // daily sweep FIRED (surfaced read-only on the admin Diagnostics view; "missed" computed at read-time).
+  // NO egress, NO content — app-scoped counts + a timestamp only → the no-egress / "Log End-User Data: No"
+  // posture is untouched. Fail-safe: a heartbeat write error NEVER affects the sweep (its work + return are done).
+  try {
+    await kvs.set(SWEEP_HEARTBEAT_KEY, { at: Date.now(), scanned, deleted, degraded, ok: sweepOk });
+  } catch (hbErr) {
+    console.warn(`[sweep] heartbeat write failed (non-fatal): ${String(hbErr?.message || hbErr)}`);
   }
   return { scanned, deleted, degraded };
 }

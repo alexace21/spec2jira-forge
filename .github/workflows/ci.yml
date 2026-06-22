@@ -1,0 +1,72 @@
+name: CI
+
+# Phase-1 gates-only pipeline (docs/MONITORING-CICD-STRATEGY.md §8).
+# DELIBERATELY ZERO-SECRET: no FORGE_API_TOKEN, no `forge` commands, no deploy. CI gates the MERGE;
+# a human gates the PUBLISH (deploy automation is phase-2). This keeps the production blast radius
+# (a leaked Forge token) out of the PR-triggered job entirely — and lets Dependabot PRs pass the same
+# gates (Dependabot PRs are fork-PRs that cannot read repo secrets).
+# `pull_request` (NOT pull_request_target) so fork PRs never receive secrets.
+
+on:
+  pull_request:
+  push:
+    branches: [main, "release/**"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15 # backstop: a hung step can't burn GitHub's 360-min default (compounds the runner's per-suite timeout)
+    steps:
+      - name: Checkout (full history — the scope-diff guard needs the base commit)
+        uses: actions/checkout@v4 # TODO(hardening): SHA-pin (strategy §3.1/§7)
+        with:
+          fetch-depth: 0
+
+      - name: Use Node 24 (match the Forge nodejs24.x runtime)
+        uses: actions/setup-node@v4 # TODO(hardening): SHA-pin
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            static/hello-world/package-lock.json
+
+      - name: Assert Node 24
+        run: node -e "if(!process.version.startsWith('v24')){console.error('Node '+process.version+' != v24');process.exit(1)}"
+
+      - name: Install root deps
+        run: npm ci
+
+      - name: Syntax gate (per-file node --check over src/*.js)
+        run: npm run check
+
+      - name: Offline test suites (excludes the live Anthropic harness)
+        run: npm test
+
+      - name: Custom UI build (CRA compile gate)
+        run: npm run build:ui
+
+      # ADVISORY (not blocking): the runtime tree carries one UNREMEDIABLE high advisory — undici, pulled
+      # transitively by the pinned @forge/api → @forge/manifest → cheerio → undici (can't be fixed without
+      # bumping @forge/api, which is forbidden). So audit SURFACES vulns (incl. any new one) but must not
+      # red-wall every PR on a vuln we cannot fix. Dependabot security updates are the remediation path.
+      # Re-evaluate (make blocking, or allowlist the GHSA) if a CRITICAL ever appears.
+      - name: Supply-chain audit (runtime deps, high+) — ADVISORY
+        run: npm run audit
+        continue-on-error: true
+
+      # BLOCKING: a future CRITICAL runtime vuln must NOT ship. --audit-level=critical exits 0 on the known
+      # undici HIGH (verified today) but red-walls any critical → reconciles "don't block on the unfixable
+      # undici high" (advisory step above keeps highs visible) with "a critical must not ship".
+      - name: Supply-chain audit (CRITICAL — blocking)
+        run: npm audit --omit=dev --audit-level=critical
+
+      - name: Manifest scope/egress diff guard (MAJOR-version / re-consent visibility)
+        run: node tools/scope-diff-guard.mjs "${{ github.event.pull_request.base.sha || github.event.before }}"
