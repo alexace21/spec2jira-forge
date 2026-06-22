@@ -408,6 +408,25 @@ async function createSingleIssue(payload) {
  * Parses defensively: any malformed body falls back to a generic HTTP-status line.
  */
 /**
+ * Classify an Atlassian Agile WRITE response by HTTP status — the pure success/partial decision shared by
+ * the sprint-move and Kanban-rank paths (extracted for offline coverage; the inline form shipped the
+ * recurring 207 bugs 5fef67e/d8c86a6). LOAD-BEARING INVARIANT (§11): a 207 Multi-Status is ALWAYS a
+ * PARTIAL outcome — NEVER a clean full success — even when the body shape is unrecognized (failedCount 0).
+ *   - 207            → { outcome:'partial', count: max(0,total-failedCount), partial:true, failedCount }
+ *   - 200/204 (or any 2xx when okFlag, the sprint-move path) → { outcome:'success', count:total, partial:false, failedCount:0 }
+ *   - anything else  → { outcome:'other' } (caller owns the 403/generic-HTTP branch, which needs the body)
+ * 207 is checked FIRST (res.ok / okFlag is true for 207, so 207 must win). Callers: moveIssuesToSprint
+ * passes okFlag:res.ok (any 2xx = success) + no failedCount (no per-issue body shape → moved:total on a 207);
+ * rankIssuesInOrder omits okFlag (only 200/204 = success) + passes the failedCount parsed from the 207 body.
+ */
+export function classifyAgileWriteStatus(status, total, { okFlag = false, failedCount = 0 } = {}) {
+  const n = Number.isFinite(total) ? Math.max(0, total) : 0;
+  const f = Number.isFinite(failedCount) ? Math.max(0, failedCount) : 0;
+  if (status === 207) return { outcome: 'partial', count: Math.max(0, n - f), partial: true, failedCount: f };
+  if (status === 204 || status === 200 || okFlag) return { outcome: 'success', count: n, partial: false, failedCount: 0 };
+  return { outcome: 'other' };
+}
+/**
  * Walk a Jira error body of ANY shape and pull out human reasons + the rejected
  * FIELD IDs (content-free keys only — never numeric element indices). Jira's
  * bulk endpoint returns at least three shapes, all handled here (Live-E2E found
@@ -1479,11 +1498,13 @@ export async function moveIssuesToSprint(sprintId, keys) {
   let res;
   try { res = await api.asUser().requestJira(route`/rest/agile/1.0/sprint/${sprintId}/issue`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ issues: list }) }); }
   catch (e) { return { ok: false, error: 'move_failed', detail: String(e?.message || e) }; }
-  // 207 Multi-Status = Jira reported a PARTIAL move → never a clean full assign on a WRITE path. The sprint-move
-  // body has no documented per-issue shape, so surface it as partial-unverified (mirrors the rank path's §11/gate-G3
-  // stance: a 207 means "verify", even on an unrecognized body). MUST precede the res.ok line — res.ok is true for 207.
-  if (res.status === 207) return { ok: true, moved: list.length, partial: true };
-  if (res.status === 204 || res.ok) return { ok: true, moved: list.length };
+  // 207 Multi-Status = a PARTIAL move (never a clean full assign on a WRITE path). The sprint-move body has
+  // no documented per-issue shape, so failedCount is unknown → moved:list.length but partial:true. The
+  // "207 is always partial" invariant + the 207-before-okFlag ordering live in classifyAgileWriteStatus
+  // (offline-tested); okFlag:res.ok keeps the any-2xx success behavior this path always had.
+  const cls = classifyAgileWriteStatus(res.status, list.length, { okFlag: res.ok });
+  if (cls.outcome === 'partial') return { ok: true, moved: cls.count, partial: true };
+  if (cls.outcome === 'success') return { ok: true, moved: cls.count };
   const t = await res.text().catch(() => '');
   console.error(`[plan-push] move-to-sprint HTTP ${res.status}: ${t.slice(0, 200)}`);
   return { ok: false, error: `move_http_${res.status}`, detail: t.slice(0, 160) };
@@ -1642,15 +1663,17 @@ export async function rankIssuesInOrder({ issues, rankAfterIssue, rankBeforeIssu
   let res;
   try { res = await api.asUser().requestJira(route`/rest/agile/1.0/issue/rank`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }); }
   catch (e) { return { ok: false, error: 'rank_failed', detail: String(e?.message || e) }; }
-  if (res.status === 204 || res.status === 200) return { ok: true, ranked: list.length };
+  // 200/204 = full success. (rankIssuesInOrder counts ONLY 200/204 as success — NOT any 2xx — so no okFlag.)
+  const succ = classifyAgileWriteStatus(res.status, list.length);
+  if (succ.outcome === 'success') return { ok: true, ranked: succ.count };
   if (res.status === 207) {
+    // 207 = a PARTIAL rank (the "always partial, even on an unrecognized body" §11 invariant lives in
+    // classifyAgileWriteStatus). Parse the per-issue failures from the body to report failedCount.
     let data; try { data = await res.json(); } catch (_) { data = {}; }
     const entries = Array.isArray(data.entries) ? data.entries : [];
-    const failed = entries.filter((e) => e && Number(e.status) >= 400);
-    // 207 Multi-Status = Jira reported a PARTIAL outcome → NEVER a clean full success, even if the body shape is
-    // unrecognized (failed.length===0): surface it as partial so the user verifies the order (§11, gate G3 — the
-    // optimistic full-success-on-unknown-207-shape was the riskier direction on a WRITE path).
-    return { ok: true, ranked: Math.max(0, list.length - failed.length), partial: true, failedCount: failed.length };
+    const failedCount = entries.filter((e) => e && Number(e.status) >= 400).length;
+    const cls = classifyAgileWriteStatus(207, list.length, { failedCount });
+    return { ok: true, ranked: cls.count, partial: true, failedCount: cls.failedCount };
   }
   if (res.status === 403) return { ok: false, error: 'rank_permission', detail: 'You can view but not reorder this board — ask your Jira admin for the schedule/rank permission.' };
   const t = await res.text().catch(() => '');

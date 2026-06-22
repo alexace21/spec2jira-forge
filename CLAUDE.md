@@ -354,6 +354,26 @@ package names de-scaffolded (→ `spec2tickets`). Build green (bundle ≈ −1.4
 
 ---
 
+## ⚡ HANDOVER NOTE (2026-06-22 — ⭐⭐⭐ Capacity-Sheet Planner arc LIVE ON PRODUCTION (Marketplace v6.0.0) + a pre-prod gate caught 2 §11 fixes; agent-conducted)
+
+> ⚠ Branch-independent record: **`memory/capacity-sheet-planner.md`** (the LIVE-on-prod block at top) · [[deep-audit-vs-per-change-gate]]. Durable in-repo: `docs/PLANNER-LIVE-ACCEPTANCE.md` + `docs/PLANNER-KANBAN-LIVE-ACCEPTANCE.md`.
+
+**THE WHOLE Capacity-Sheet Planner arc is LIVE on the public Atlassian Marketplace** — app `1475765564`, **Forge version 6.0.0**, release date **Jun 22 2026**. spec → backlog → **PLAN → Jira**, both **Scrum** (native Agile sprints) and **Kanban** (backlog rank Now→Next→Later + `plan-now/next/later` tier labels), on **team-managed AND company-managed** boards. Shipped from **`release/v6.1.0`**: partner `git push` + `forge deploy -e production` (auto-creates the Marketplace version) + portal publish. ⚠ **NO `forge install` on prod** (licensed → `LICENSED_APP_INSTALL_NOT_PERMITTED`); the post-deploy CLI hint "run forge install --upgrade / restart tunnel" is generic boilerplate for DEV — on a licensed app the scopes take effect via Marketplace + customer re-consent, NOT forge install.
+
+**⚠ Re-consent is LIVE now.** This release adds **5 jira-software scopes** (`read:board-scope:jira-software`, `read:project:jira`, `read:sprint:jira-software`, `write:sprint:jira-software`, `write:issue:jira-software`) → every existing customer's site admin is prompted to re-approve in **Manage Apps**. Until approved: the legacy breakdown→push path keeps working; the new plan-to-Jira features are dormant for that customer (graceful, by design). The release summary/notes were written to surface this (the ≤80/≤1000 Marketplace copy is published).
+
+**⭐ Pre-prod adversarial gate (BEFORE the deploy) — the headline rigor win.** A 9-agent Workflow (3 lenses: SP-fix regression · Kanban-push integrity · prod-deploy safety → verify-per-finding) returned **0 prod-blockers, 6 confirmed findings**, AND caught **2 real §11 silent-success gaps on the Jira WRITE paths that EVERY per-change §13 gate + the full 9-phase live acceptance MISSED** ([[deep-audit-vs-per-change-gate]] vindicated at the prod gate): a Jira **207 (Multi-Status = partial)** was read as a clean full success on BOTH push paths. Fixed: **Kanban rank `5fef67e`** (FE-only) + **Scrum sprint-move `d8c86a6`** (3-layer mirror `moveIssuesToSprint`→step→`AssignSprintsPanel`) — now a 207 surfaces a "Verify the …" nudge. Both additive (200/204 happy path byte-identical; only the mishandled 207 changes), §13-gated SHIP, build green. **LESSON (fold into the deep-audit memory): even after a clean 9-phase live acceptance, a fresh adversarial pass at the prod gate finds load-bearing §11 residue on the un-live-testable error branches — run a pre-prod gate before any outward-facing WRITE-path prod deploy.**
+
+**Final commit chain (`release/v6.1.0`):** `82ea249` Scrum planner (Tier 1+2) → `b928704` Kanban v1 → `99f8759` Kanban push → `47ffc0b` SP-field team-managed fix (resolve Story-Points from the project's create screen via createmeta, not the global field list — gotcha #7 mixed-instance class) → `5fef67e` Kanban 207 §11 → `d8c86a6` Scrum 207 §11. Mechanical pre-prod gate all green (node --check 11/11 · tests 290+36+uid ✓ · build exit 0 · clean tree).
+
+**Post-launch tracked (all minor, non-blocking):** ① **diagnostics version string stale** — `src/diagnostics.js:56` `DIAG_APP_VERSION` + `package.json:3` are `3.0.0` while Marketplace = 6.0.0 → bump BOTH on the NEXT release (the live diagnostics export currently shows 3.0.0; the comment says "BUMP ON RELEASE"; don't deploy just for a string). ② gate low-residuals: `createmeta` field pagination / SP global-fallback (only on >50-field Story create screens), rank anchor advancing past a failed tail key on a 207-partial, unsized features getting no post-push rank reminder. ③ dependency `name_unknown` paraphrase residual ([[layer1-name-uid-tasks]] deferred). ④ optional 1-min company-managed (SDKY) smoke re-verify.
+
+**Branch hygiene (partner-executed, from session start):** delete merged `feature/product-improvements` + `feature/v3-pivot`; retire `feature/capacity-sheet-planner`; decide `main` = trunk.
+
+С усмивка ✨ — целият spec → backlog → **PLAN → Jira** arc е жив на production: risk-aware sequencing, what-if, defensible brief, skill-aware capacity, goal-directed re-rank, и Push-to-Jira (native sprints + Kanban rank), на team- и company-managed бордове. Pre-prod gate-ът хвана 2 §11 пропуска точно преди прода — затова го пускаме. Продуктът е на друго ниво.
+
+---
+
 ## ⚡ HANDOVER NOTE (2026-06-21 — ⭐⭐⭐ Capacity-Sheet Planner arc LIVE E2E ACCEPTED on dev (all 9 phases green) + 8 live-only bugs found & fixed; agent-conducted)
 
 > ⚠ Branch `feature/capacity-sheet-planner` (off `release/v6.0.0`). **NOT committed/deployed to prod — dev-only; partner commits.** Branch-independent record: **`memory/capacity-sheet-planner.md`** (the full LIVE-acceptance record + the 8 fixes + what's next) · [[deep-audit-vs-per-change-gate]]. Durable in-repo: **`docs/PLANNER-LIVE-ACCEPTANCE.md`** (the filled 9-phase sign-off) + **`docs/PLANNER-MR1-TEST-SPEC.md`** (the crafted MR-1 test spec + rubric).
