@@ -203,9 +203,9 @@ on an app sold on "no egress."** Even though a heartbeat carries no customer dat
 One SLO: **"generation + push + plan success rate ≥ ~99%"**, read off the console success-rate metric,
 with **2–3 alert rules**. Critical nuance (BYOK): per-customer failures (bad/expired key,
 out-of-credit, rate-limit, pending Jira re-consent, missing permissions) count as "invocation errors"
-but are **NOT the vendor's fault** → scope the SLO/alerts to **vendor-fault classes only** (prefer
-`@forge/metrics` counters incremented only on vendor-fault paths, mirroring the ledger's closed
-error-class registry), and **start alerts in observe-mode for ~a week** before arming.
+but are **NOT the vendor's fault** → scope the SLO/alerts to **vendor-fault classes only**, read off the
+dev-console's built-in invocation/success-rate metrics (NOT custom counters — `@forge/metrics` was **SKIPPED**
+in Phase-2 #2: not alert-sourceable; see §4.1), and **start alerts in observe-mode for ~a week** before arming.
 
 **But carve out the Anthropic-platform outage as its own observable** (the audit's catch). The app's
 only egress dependency is `api.anthropic.com`; if it is down platform-wide, *every* call fails for
@@ -215,9 +215,12 @@ distinct from a single customer's bad key. The backend already separates these c
 mirrored in `classifyDiagGenerationError`, `src/diagnostics.js`) — note 5xx is the `anthropic_<status>`
 family (status carried as data), not a standalone 'overloaded' class. So: a **cross-install spike in the
 `anthropic_<5xx>` class** is a separate "dependency-down" signal — kept **out of** the auto-alert
-vendor-fault threshold (to avoid fatigue) but **named and watched** (a manual check of the dev-console
-error-type breakdown; the cross-install rollup is deferred to the App-Logs poller — NOT a custom-metric
-alert, which Forge does not support). Don't let it get silently lumped into "not our problem".
+vendor-fault threshold (to avoid fatigue) but **named and watched**. ⚠ **Interim state (until Phase 3) — a
+CONSCIOUS gap, not "already solved":** this vendor-critical signal (it drives support load) has **no
+automated cross-install alert or dashboard today** — custom counters can't source a Forge alert, so it is
+a **manual** check of the dev-console error-type breakdown only; the cross-install rollup is a deliberate
+deferral to the Phase-3 App-Logs poller (per-install, the diagnostics ledger already classifies it). Don't
+let it get silently lumped into "not our problem".
 
 Skip multi-burn-rate windows, on-call rotation, PagerDuty, formal postmortems.
 
@@ -429,8 +432,9 @@ on-call/PagerDuty, coverage-% gate, browser E2E in CI, **any external ping from 
    a deliberate later call. ✅ confirmed
 3. **Staging Forge environment?** → Phase-2 (only env where `install --upgrade` rehearses scope-consent).
    ✅ confirmed
-4. **Sweep confirmation: KVS heartbeat or `@forge/metrics`?** → Heartbeat first (zero new dep);
-   `@forge/metrics` in phase-2. ✅ confirmed
+4. **Sweep confirmation: KVS heartbeat or custom `@forge/metrics`?** → **Heartbeat ONLY** (zero new dep;
+   `@forge/metrics` **SKIPPED** in Phase-2 #2 per a 5/5 vote: not alert-sourceable, redundant with the
+   ledger aggregate, noisier). ✅ decided & implemented (commit `cf62707`)
 5. **Email-only alerting?** → Yes — to `support@`/`security@spec2jira.com` (paid domain). Forward
    email→Slack via a free inbox rule if wanted. ✅ confirmed
 
