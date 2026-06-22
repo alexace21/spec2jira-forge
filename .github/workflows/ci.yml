@@ -25,7 +25,7 @@ jobs:
     timeout-minutes: 15 # backstop: a hung step can't burn GitHub's 360-min default (compounds the runner's per-suite timeout)
     steps:
       - name: Checkout (full history — the scope-diff guard needs the base commit)
-        uses: actions/checkout@v4 # TODO(hardening): SHA-pin (strategy §3.1/§7)
+        uses: actions/checkout@v7 # TODO(hardening): SHA-pin (strategy §3.1/§7)
         with:
           fetch-depth: 0
 
