@@ -5,7 +5,7 @@
   "license": "MIT",
   "private": true,
   "scripts": {
-    "check": "node tools/check-syntax.mjs",
+    "check": "node tools/check-syntax.mjs && node tools/version-drift-guard.mjs",
     "test": "node tools/run-tests.mjs",
     "build:ui": "npm --prefix static/hello-world ci && npm --prefix static/hello-world run build",
     "audit": "npm audit --omit=dev --audit-level=high",

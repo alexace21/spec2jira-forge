@@ -115,7 +115,7 @@ maintainable by one person.
 | Env promotion dev→(staging)→prod, manual prod gate | **PHASE 2** | High value but needs a deploy token in CI — defer until the gates land. |
 | Secrets in CI (FORGE_EMAIL/FORGE_API_TOKEN) | **PHASE 2** (Environment-scoped) | Phase-1 has **no token in CI at all** (see 3.2). |
 | `forge lint` | **PHASE 2** (deploy job) + local pre-deploy | **Needs a Forge token** → cannot be in the zero-secret phase-1 gates (§3.4). Its main check is the globalPage false-positive anyway; the auth-free **scope-diff guard** covers the high-stakes manifest case in phase-1. |
-| Conventional commits + changelog (release-please) | **PHASE 2** | Already commit-style; release-please can lockstep `package.json`↔`DIAG_APP_VERSION`. |
+| Conventional commits + **version-lockstep guard** (NOT release-please) | **ADOPT** (Phase-2 #1, DONE) | A 5/5 persona vote dropped release-please as gold-plating → a CI drift-assert (`tools/version-drift-guard.mjs` in `npm run check`) fails the merge if `package.json` ≠ `DIAG_APP_VERSION`. Changelog deferred (no in-repo consumer). |
 | SHA-pin third-party actions; pin `@forge/cli` major | **ADOPT** | 5-min defense vs the 2025/26 action-compromise class. |
 | Canary / blue-green / % code rollout | **SKIP — N/A** | Not available to a Marketplace app. The Forge **MINOR-version auto-update** (progressive over ≤120h) is a de-facto canary **for routine code-only deploys ONLY** — a scope/egress (MAJOR) deploy does NOT get it (it rolls per-admin on re-consent, §3.3), so the scope-diff guard + staging rehearsal are the only safety net there. A pre-placed **kill-switch feature flag** is the closest thing to rollback for a risky feature (§6.5). |
 | SBOM, commitlint, semantic-release, OIDC keyless | **SKIP** | Overkill / inapplicable (Forge has no OIDC; semantic-release can't drive the portal). |
@@ -343,7 +343,7 @@ incident runbook (§8) must cover **deploy-recovery**, not just alert-response.
 | **`npm audit --omit=dev`** | Supply-chain gate (advisory — §5.2) | Free | **ADOPT** phase-1 |
 | **Dependabot** (security-only, weekly, grouped, no auto-merge; respect `@forge/resolver` 1.7.1 pin) | Dep updates | Free | **ADOPT** phase-1 |
 | **Forge dev-console metrics + Alerts** | Vendor-side health + email on-call | Free | **ADOPT** phase-1 |
-| **release-please** (lockstep `package.json`↔`DIAG_APP_VERSION`) | Version + changelog | Free | **PHASE 2** (fixes the version-drift class) |
+| **version-drift-guard** (`tools/version-drift-guard.mjs`, in `npm run check`) | Version-lockstep assert (fails merge on drift) | Free | **ADOPT** (Phase-2 #1, DONE — replaced release-please per a 5/5 persona vote: strictly stronger at the §11 goal, ~5% of the surface) |
 | **`@forge/metrics`** | Cross-install counters | Free | **PHASE 2** (verify it installs clean vs the pinned set / `--no-verify` first) |
 | **Marketplace Reporting API v2** | Business health | Free | **PHASE 2** (vendor-side script, token hygiene §4.1) |
 | **`forge lint`** | Manifest/code lint | Free (needs token) | **PHASE 2** deploy job + local — NOT phase-1 gates (§3.4) |
@@ -397,7 +397,14 @@ incident runbook (§8) must cover **deploy-recovery**, not just alert-response.
 - Manual-approval **`production` GitHub Environment** job: `forge deploy -e production` + `forge lint`,
   Environment-scoped token, MFA + rotation. Add a **staging** Forge environment as the
   `install --upgrade --confirm-scopes` rehearsal.
-- release-please version-sync (`package.json`↔`DIAG_APP_VERSION`).
+- **version-drift-guard** (`tools/version-drift-guard.mjs`, wired into `npm run check` → BLOCKING in CI) — asserts
+  `package.json` version === `src/diagnostics.js` `DIAG_APP_VERSION`; **fails the merge on drift** (the §11 backstop;
+  kills the 67a6ea1 class). ⭐ Replaced **release-please** after a **5/5 persona vote** (release-please's two reasons —
+  commit-driven semver + a published changelog — are BOTH absent here; the assert is strictly stronger at the actual
+  goal, ~5% of the surface, zero new deps/secrets). NOT an auto-sync — the partner consciously bumps both at release.
+  Changelog DROPPED (no in-repo consumer; portal notes cover it). `static/hello-world/package.json` (CRA bundle)
+  intentionally NOT synced. ⚠ The repo version ≠ the forge-assigned Marketplace version — see the CLAUDE.md
+  production-rollout note (a green check proves two-string lockstep, NOT a match to the live Marketplace number).
 - `@forge/metrics` counters (after verifying clean install vs the pinned set), incl. an
   Anthropic-outage `5xx` counter (§4.3).
 - Marketplace Reporting API script (installs / conversion / churn) with bot-account token hygiene (§4.1).

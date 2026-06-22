@@ -252,6 +252,13 @@ forge deploy -e production             # deploy code to production (auto-creates
 # ⚠ do NOT `forge install` on prod — see below (licensed app → Marketplace-only)
 ```
 
+- ⭐ **Version bump (in the release commit, BEFORE the prod deploy):** set BOTH repo version strings — root
+  `package.json` `"version"` AND `src/diagnostics.js` `DIAG_APP_VERSION` — to the number you intend
+  `forge deploy -e production` to stamp as the Marketplace version. CI's `tools/version-drift-guard.mjs` (in
+  `npm run check`) **fails the merge if the two disagree** (the §11 backstop; kills the 67a6ea1 drift class).
+  ⚠ The guard proves the two REPO strings equal each other — it does NOT/CANNOT prove they equal the LIVE
+  Marketplace version (Forge auto-assigns that; it is absent from `manifest.yml`). Aligning the repo strings to
+  the intended Marketplace number IS this conscious human bump — a green pipeline ≠ "version matches Marketplace".
 - ⚠ **NO `forge install` on production.** This is a **licensed (Paid-via-Atlassian)** app →
   `forge install` on prod fails `LICENSED_APP_INSTALL_NOT_PERMITTED` (and `--license` is
   dev-only). Production distribution is **Marketplace ONLY** — customers subscribe/install via
