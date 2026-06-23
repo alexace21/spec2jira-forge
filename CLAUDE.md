@@ -372,6 +372,29 @@ package names de-scaffolded (→ `spec2tickets`). Build green (bundle ≈ −1.4
 
 ---
 
+## ⚡ HANDOVER NOTE (2026-06-23 — LATER session — Monitoring + CI/CD **Phase-3 = §13 Analyze → DEFER-WITH-TRIGGERS**; volume MEASURED = ZERO; #3 poller first-live-validated; agent-conducted)
+
+> ⚠ Branch `feature/monitoring-ci-cd` (clean before this session). Branch-independent record: **`memory/mvp-monitoring-cicd.md`** (Phase-3 decision block at top) · [[deep-audit-vs-per-change-gate]] (confidence-vote-SPREAD-as-signal data point). Durable in-repo: **`docs/MONITORING-CICD-STRATEGY.md §15`** (full per-piece verdict + triggers + the measured-zero). ⚠ **Uncommitted before this closure = this note + §15** (committed in the closure commit).
+
+Clean-context continuation. Loaded POLICY + CLAUDE.md + all 19 memory files; verified repo state (branch clean; `package.json` + `DIAG_APP_VERSION` both **`6.1.0`** in lockstep — but LIVE Marketplace = **6.2.0**, so ⚠ **the NEXT prod deploy must bump BOTH repo strings PAST 6.2.0 → ≥6.3.0**; the version-drift-guard can't see the Marketplace number). Took the partner's chosen **Phase-3 (direction A)** through a fresh §13 Analyze arc — **Analyze→Design ONLY, no Solve** (the "fresh §13 arc per piece" rule).
+
+**§13 Analyze army (4 read-only `Explore` lenses — Forge-testing-landscape · App-Logs-API · code-feasibility-scout · adversarial-go/no-go → conductor synthesis).** The confidence SPREAD was the signal ([[deep-audit-vs-per-change-gate]]): the code-scout said BUILD a jest+@forge mock harness; landscape + adversarial said AVOID jest-mocks (false-green + maintenance) → DEFER. Adjudicated (skeptic-the-skeptic): the adversarial lens slightly over-claimed "no branching" — the scout found real deterministic session logic; honest resolution = the per-piece triggers.
+
+**DECISION (partner-confirmed "accept defer + measure volume"): DEFER all three with NAMED triggers — a triggered backlog, NOT active work (strategy §15):**
+- **@forge mock harness** — DEFER; if EVER built, **NOT jest+@forge mocks** (the real bug class is the IO/response-shape boundary — the 8 live-only planner bugs — a hand-mock can't capture it; it'd cover the lowest-bug-rate deterministic core + manufacture the exact false-green our history warns of). Right shape = targeted **PURE-EXTRACTION** (207/`plan_push_util`/`sweep_util` pattern, §3.5/§4). Trigger = a NAMED recurring session-state regress the runbook misses (none today). Scout: 47 resolvers (~33 IO-heavy); `index.js` NOT node-importable (`new Resolver()` throws → extract-to-sibling mandatory).
+- **App-Logs poller** — DEFER until volume (~10+ installs / >5-min-day triage) **AND** a scheduledTrigger-log-capture live probe (UNCONFIRMED whether the `[sweep]` line is even retrievable — mirrors the #3 probe-first gate). Signal-#2 (`anthropic_<5xx>`) is a 60-sec manual check at this volume.
+- **CodeQL** — not engineering; a **repo-public BUSINESS decision** (the repo IS the product). Trigger = the partner makes the public call → ~30-min free CI add.
+
+**⭐ Volume MEASURED, not assumed (POLICY §9):** partner ran `node tools/marketplace-report.mjs` → **ZERO across all 6 metrics** (0 license records/transactions/conversion/churn/active-users; all HTTP 200 + empty → honest "no data yet"). Every trigger far from firing → defer DATA-grounded. **Bonus = the #3 poller's FIRST real live-validation** (was pending): devId resolution + 6/6 endpoints + Basic auth + empty-data honesty all GREEN; the time-series chronological-ordering residual (§13.7) STILL unconfirmable with empty arrays → re-check on the first non-empty run.
+
+**Honest read (§10):** zero license records ~6 days post-launch on a fresh, unmarketed MVP is NORMAL (slow Marketplace discovery + reporting lag + Advanced edition still pending). The monitoring/CI-CD stack is comfortably AHEAD of demand → the binding constraint now is **acquisition, not tooling** (the partner's lever — flagged, not pursued; outside the engineering lane).
+
+**STATUS:** Phase 3 = triggered backlog (no active work). The sufficient stack at this volume is LIVE: manual live-acceptance runbook (proof) + diagnostics ledger (per-install) + dev-console + alerts (vendor dashboard). **NEXT: nothing in Phase 3 until a named trigger fires; the real next lever is acquisition (partner-owned).** Parked: test-case validation on ~9 real Confluence pages. ⚠ Standing deploy reminder: bump repo version ≥6.3.0 before the next prod deploy.
+
+С усмивка ✨ — направихме честния §13 Analyze, армията потвърди defer-with-triggers (spread-ът хвана разнобоя между лещите), и измерихме volume вместо да го допускаме: нула. Инфраструктурата изпревари търсенето — следва acquisition, не още tooling.
+
+---
+
 ## ⚡ HANDOVER NOTE (2026-06-23 EOD — ⭐⭐⭐ Monitoring + CI/CD **Phase-2 COMPLETE**: #3 Reporting poller + #4 prod-deploy DELIVERED, deep-audited, and **LIVE end-to-end** (shipped Marketplace v6.2.0 to customers); agent-conducted)
 
 > ⚠ Branch `feature/monitoring-ci-cd`. Branch-independent record: **`memory/mvp-monitoring-cicd.md`** (top status block, now "Phase-2 COMPLETE") · [[deep-audit-vs-per-change-gate]] (2 new data points) · [[conductor-agent-model]] (worktree-isolation sharpened). Durable in-repo: **`docs/MONITORING-CICD-STRATEGY.md`** (§13 reporting + §14 prod-deploy, both with gate+deep-audit+live records) · **`docs/PROD-DEPLOY-SETUP.md`** · **`docs/MARKETPLACE-REPORTING-SETUP.md`**.

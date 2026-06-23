@@ -891,4 +891,87 @@ Two confirmed truths corrected the docs:
   a fresh CLI.
 
 **Phase-2 #4 = DONE + LIVE. Phase-2 is COMPLETE (#1 done · #2 skipped · #3 live-validated · #4 live). Remaining:
-Phase 3 (deferred — @forge mock harness, App-Logs poller, CodeQL-if-public) + closing the 3 Dependabot PRs.**
+Phase 3 — see §15: a §13 Analyze (2026-06-23) decided DEFER all three with NAMED triggers (not active work) + closing the 3 Dependabot PRs.**
+
+---
+
+## 15. Phase-3 — Analyze→Design decision: DEFER all three with named triggers (2026-06-23)
+
+> Conducted via §13: a 4-lens read-only `Explore` Analyze army (Forge-testing landscape · App-Logs API
+> capability · code-feasibility scout · adversarial go/no-go) → conductor synthesis. **ANALYZE ONLY — no
+> code.** Partner verdict (2026-06-23): **accept the defer + measure install volume.**
+
+### 15.1 The decision — defer all three, but with NAMED triggers (not "someday")
+
+The army CONFIRMED the strategy's own §8 posture ("Phase 3 — deferred / earn-it-first") and sharpened it from
+a vague deferral into a *triggered* backlog. The confidence-vote SPREAD was itself the signal
+([[deep-audit-vs-per-change-gate]]): the **code-feasibility scout** (closest to the code) recommended BUILD a
+jest+@forge mock harness for the 6 chunked-push orchestrators; the **testing-landscape** + **adversarial**
+lenses both said AVOID jest-mocks (false-green + maintenance) and the adversarial lens said DEFER all three.
+**Adjudication (skeptic-the-skeptic):** the adversarial lens slightly OVER-claimed "the orchestrators have no
+branching" — the scout correctly found real deterministic logic (partial-success `createdIssues` gaps,
+progress calc, cursor advance). The honest resolution sits between the two and is recorded as the per-piece
+triggers below.
+
+### 15.2 Per-piece verdict + trigger
+
+1. **@forge mock harness — DEFER; and if ever built, NOT jest+@forge mocks.**
+   - **Why defer:** the project's whole history (the 207-body `{"0":{...}}` shape, team-managed board type
+     `'simple'`, granular jira-software scopes, the <30-char sprint-name cap — the 8 live-only planner bugs)
+     proves the real bug class lives at the **IO / response-shape boundary**, which a hand-mock CANNOT capture
+     (it asserts the shape you *imagined*). A jest mock would cover the LOWEST-historical-bug-rate slice (the
+     deterministic session core) while manufacturing exactly the false-green [[deep-audit-vs-per-change-gate]]
+     warns about. The 207 *decision* logic is already pure + tested (Phase-1).
+   - **The right SHAPE if a gap ever bites:** targeted **pure-function extraction** of the specific
+     session-orchestration decision logic (the proven 207 / `plan_push_util` / `sweep_util` pattern — POLICY
+     §3.5 "extend the proven pattern, don't introduce a new tooling shape"; §4 dispatch), NOT jest+@forge mocks.
+     Zero false-green, zero mock-drift maintenance.
+   - **Trigger:** a NAMED, recurring session-state regression that a pure test would catch and the
+     live-acceptance runbook misses (none exists today). Until then the runbook is the proof (POLICY §9).
+   - **Scout inventory (for whoever picks it up):** 47 resolvers (~33 IO-heavy); the 6 chunked orchestrators
+     (startPush/pushStep · startPlanPush/planPushStep · startKanbanRank/kanbanRankStep) hold ~200-300 lines of
+     deterministic session logic; `src/index.js` is NOT node-importable (`new Resolver()` throws) → the
+     extract-to-sibling-module pattern (like `sweep_util.js` / `plan_push_util.js`) is mandatory.
+
+2. **Vendor-side App-Logs poller — DEFER until volume + a probe-first gate.**
+   - The App Logs/Metrics export API is feasible (OTLP; cross-install up to ~50 sites/call; 14-day window,
+     1-hour max span/call; 30 calls/min; Basic auth + bot account — same hygiene as `marketplace-report.mjs`)
+     and is NOT app egress (a vendor-side read of Atlassian's own gateway; no re-consent, no customer data).
+   - ⚠ **BLOCKER (probe-first, mirroring #3 §13.3): scheduledTrigger / system-invocation log capture is
+     UNCONFIRMED in the docs** — the poller's #1 signal (confirm the daily `[sweep] scanned=…` line across
+     installs) may not even be retrievable, and whether `moduleType` distinguishes scheduledTrigger logs is
+     open. A ~1-hr live probe (partner-run; Claude has no creds) must resolve this BEFORE any build.
+   - Signal #2 (cross-install `anthropic_<5xx>` outage rollup) IS reliably pollable — but at near-zero installs
+     it's a 60-sec manual `forge logs --filter anthropic` / dev-console error-type check; the per-install half
+     is already in the diagnostics ledger + the KVS sweep heartbeat.
+   - **Trigger:** install volume earning it (army threshold ~10+ paying installs / >5-min-a-day triage) **AND**
+     a green scheduledTrigger-capture probe.
+
+3. **CodeQL — NOT an engineering task; gated on a business decision.**
+   - Free only on a PUBLIC repo (private = paid GHAS). The repo *is* the product (closed-source licensed
+     Marketplace app). Whether to open-source is a **business/risk call** (source exposure vs. free SAST + free
+     unlimited Actions + community trust), not a §13 design arc.
+   - **Trigger:** the partner makes the repo-public decision; then CodeQL is a ~30-min free CI add.
+
+### 15.3 ⭐ The load-bearing input — MEASURE volume, don't assume it (POLICY §9)
+
+Every "defer" above rests on "near-zero paying installs." That is **measurable, not an assumption**:
+`tools/marketplace-report.mjs` (the Phase-2 #3 poller) reports installs / active-by-edition / conversion /
+churn. **Action (partner): run it** to ground the trigger thresholds in real numbers. v6.2.0 + the
+Capacity-Planner re-consent are mid-rollout, so the count is expected low — but the decision should track the
+DATA, not a guess.
+
+⭐ **MEASURED 2026-06-23 (partner ran `node tools/marketplace-report.mjs`): ZERO across all six metrics** —
+0 license records (paid+eval), 0 transactions, 0 conversion, 0 churn, 0 active-users (all endpoints returned
+HTTP 200 with empty arrays, rendered as the honest "no data yet"). So **every Phase-3 trigger is as far from
+firing as it can be** — the defer is DATA-grounded, not assumed. Honest read of the zero: it is a freshly-published
+MVP with no paid/trial traction *yet* (and possible Marketplace reporting lag; the Advanced edition is still
+pending approval) — either way the binding constraint right now is **acquisition, not more infra/tooling**.
+**Bonus — this run was also the #3 poller's FIRST real live-validation** (§13.6/§13.7 left it pending): devId
+resolution + all six endpoints + Basic auth + empty-data honesty all confirmed GREEN; the one residual (the
+time-series chronological ordering, §13.7) STILL cannot be confirmed with empty arrays → re-check on the first
+run that returns non-empty data.
+
+**Verdict: Phase 3 = a triggered backlog, not active work.** The manual live-acceptance runbook (the proof),
+the diagnostics ledger (per-install signal), and the dev-console + alert rules (the vendor dashboard) are the
+sufficient stack for a solo vendor at this volume. Revisit a piece only when its named trigger fires.
