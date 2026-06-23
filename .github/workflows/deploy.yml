@@ -96,8 +96,13 @@ jobs:
       - name: Full gate (check + offline tests + CRA build) — identical to the merge gate
         run: npm run ci # check (version-drift + per-file ESM) → test → build:ui (builds the Custom UI forge bundles)
 
-      - name: Install Forge CLI (pinned major — ⚠ set to YOUR local `forge --version` major for parity; strategy §3.2b)
-        run: npm install -g @forge/cli@12
+      - name: Install + configure Forge CLI (pinned major — ⚠ match your local `forge --version`; strategy §3.2b)
+        run: |
+          npm install -g @forge/cli@12
+          # A FRESH CLI in CI has no usage-analytics preference, and `--non-interactive` (used at deploy) REFUSES
+          # to run until one is set. false = opt out of CLI telemetry (consistent with the no-egress posture;
+          # this is the CLI's own telemetry, NOT app/customer data). Caught live by the §6 test (strategy §14.6).
+          forge settings set usage-analytics false
 
       - name: forge lint (ADVISORY — visibility only; the globalPage resolver flag is a known false-positive, gotcha #13)
         continue-on-error: true
