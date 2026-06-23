@@ -850,3 +850,25 @@ Environment-secret scoping, no-injection — all verified correct). The audit's 
 **Verdict: SHIP (hardened) — no code defect; the fixes were documentation-accuracy + completeness + one cheap
 grep hardening. The implementation's security architecture (workflow_dispatch-only + Environment-scoped token +
 no-injection) was verified correct by multiple independent lenses.**
+
+### 14.7 §6 live test (2026-06-23, partner-executed go-live) — gate ENFORCES + one CI-only fix
+
+The partner set up the `production` Environment (required reviewer = self; "Allow admins to bypass" UNCHECKED so
+the pause is non-skippable; "Deployment branches" restricted to `main`; FORGE_API_TOKEN + FORGE_EMAIL as
+Environment secrets; MFA on BOTH the GitHub + Atlassian accounts), merged to main, and ran the §6 test.
+- ⭐ **The required-reviewer gate ENFORCES** — run #1 sat at "production · waiting for review" with ZERO steps
+  executed until approval. This RESOLVES the open "does a free-private-repo enforce required reviewers?" question
+  (§14.6) empirically: on this repo/plan it DOES. The whole pipeline then ran green through `forge lint`.
+- ⭐ **The test caught a CI-ONLY failure no other check could:** `forge deploy --non-interactive` errored
+  `--non-interactive requires an analytics setting. Use forge settings set usage-analytics <value>` — a FRESH
+  CLI in CI has no usage-analytics preference and `--non-interactive` refuses to run until one is set (the
+  partner's local CLI already had it, masking this). **Fix:** the Install-Forge-CLI step now runs
+  `forge settings set usage-analytics false` (CLI telemetry off — privacy-consistent; CLI-only, not app data).
+  This is "green CI ≠ proven app" + live-is-authority ([[deep-audit-vs-per-change-gate]] / §0) vindicated again:
+  only a real CI run on a fresh CLI surfaced it. (The "Node-20-actions forced to Node-24" annotation is a
+  harmless deprecation notice on v4.3.1/v4.4.0; Dependabot will bump them.)
+- Everything else verified green LIVE: SHA-pin assertion ✅, version-bump guard (6.1.0) ✅, `npm run ci` ✅
+  (check + offline tests + CRA build, ~19s), forge lint advisory ✅, the failure-summary path rendered correctly.
+
+**Status: deploy.yml + setup live-validated end-to-end except the final forge-deploy auth, which the
+usage-analytics fix unblocks → partner re-runs §6 to confirm the staged-version creation, then #4 is fully live.**
