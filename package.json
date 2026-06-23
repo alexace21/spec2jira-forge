@@ -17,7 +17,7 @@
   },
   "dependencies": {
     "@forge/api": "^8.0.0",
-    "@forge/kvs": "^1.6.4",
+    "@forge/kvs": "^2.0.0",
     "@forge/resolver": "1.7.1"
   }
 }
