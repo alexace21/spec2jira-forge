@@ -115,7 +115,7 @@ maintainable by one person.
 | Env promotion dev→(staging)→prod, manual prod gate | **PHASE 2** | High value but needs a deploy token in CI — defer until the gates land. |
 | Secrets in CI (FORGE_EMAIL/FORGE_API_TOKEN) | **PHASE 2** (Environment-scoped) | Phase-1 has **no token in CI at all** (see 3.2). |
 | `forge lint` | **PHASE 2** (deploy job) + local pre-deploy | **Needs a Forge token** → cannot be in the zero-secret phase-1 gates (§3.4). Its main check is the globalPage false-positive anyway; the auth-free **scope-diff guard** covers the high-stakes manifest case in phase-1. |
-| Conventional commits + changelog (release-please) | **PHASE 2** | Already commit-style; release-please can lockstep `package.json`↔`DIAG_APP_VERSION`. |
+| Conventional commits + **version-lockstep guard** (NOT release-please) | **ADOPT** (Phase-2 #1, DONE) | A 5/5 persona vote dropped release-please as gold-plating → a CI drift-assert (`tools/version-drift-guard.mjs` in `npm run check`) fails the merge if `package.json` ≠ `DIAG_APP_VERSION`. Changelog deferred (no in-repo consumer). |
 | SHA-pin third-party actions; pin `@forge/cli` major | **ADOPT** | 5-min defense vs the 2025/26 action-compromise class. |
 | Canary / blue-green / % code rollout | **SKIP — N/A** | Not available to a Marketplace app. The Forge **MINOR-version auto-update** (progressive over ≤120h) is a de-facto canary **for routine code-only deploys ONLY** — a scope/egress (MAJOR) deploy does NOT get it (it rolls per-admin on re-consent, §3.3), so the scope-diff guard + staging rehearsal are the only safety net there. A pre-placed **kill-switch feature flag** is the closest thing to rollback for a risky feature (§6.5). |
 | SBOM, commitlint, semantic-release, OIDC keyless | **SKIP** | Overkill / inapplicable (Forge has no OIDC; semantic-release can't drive the portal). |
@@ -171,7 +171,7 @@ in phase-1" literally true.
 | **Dev-console invocation metrics** | Success rate, count, error types (timeout/OOM/throw), P50/90/95 latency — **aggregated across all installs**, per-function, per-site, per-env | free | 1 (no code) |
 | **Dev-console Alert rules (GA)** | Up to 5 rules (success-rate / errors / API count) → **email** (to `support@`/`security@spec2jira.com`); severity tiers + 24h re-notify = solo on-call | free | 1 (no code) |
 | **Native KVS heartbeat for the sweep** | Persist `last_swept_at` + `{scanned,deleted,degraded}` to app KVS; surface on the existing admin diagnostics/health view; "missed" computed at read-time | free | 1 (tiny code) |
-| **`@forge/metrics` counters (GA, 10 max)** | Content-free aggregate counters (`sweep_runs`, `push_succeeded`, `push_partial_207`, `anthropic_call_failed_5xx` vs `_keyrejected`) visible across installs | free | 2 |
+| **`@forge/metrics` counters** | ❌ **SKIPPED** (Phase-2 #2 decision, 5/5 persona vote): NOT alert-sourceable (alert rules source only the 4 built-in metrics — web-confirmed) → dashboard-only; the 3 genuinely-new signals (push_partial_207, anthropic 5xx-vs-keyrejected) are ALREADY in the diagnostics-ledger aggregate (just per-install); a pre-1.0 dep + noisier (sampled/no-backfill). Cross-install rollup deferred to the App-Logs poller. | free | ❌ SKIP |
 | **Marketplace Reporting API v2** | Installs, active users by edition, eval→paid conversion, churn — **vendor-side script, not Forge-callable** | free | 2 |
 | **App Logs/Metrics API (OTLP)** | Programmatic vendor-side pull (14-day window, ~15min/call, rate-limited); a thin scheduled poller could confirm `[sweep]` across installs | free (Atlassian side) | 2/3 |
 | **In-product diagnostics ledger (exists)** | Per-customer failure depth, consent-exported support trace | done | — |
@@ -203,9 +203,9 @@ on an app sold on "no egress."** Even though a heartbeat carries no customer dat
 One SLO: **"generation + push + plan success rate ≥ ~99%"**, read off the console success-rate metric,
 with **2–3 alert rules**. Critical nuance (BYOK): per-customer failures (bad/expired key,
 out-of-credit, rate-limit, pending Jira re-consent, missing permissions) count as "invocation errors"
-but are **NOT the vendor's fault** → scope the SLO/alerts to **vendor-fault classes only** (prefer
-`@forge/metrics` counters incremented only on vendor-fault paths, mirroring the ledger's closed
-error-class registry), and **start alerts in observe-mode for ~a week** before arming.
+but are **NOT the vendor's fault** → scope the SLO/alerts to **vendor-fault classes only**, read off the
+dev-console's built-in invocation/success-rate metrics (NOT custom counters — `@forge/metrics` was **SKIPPED**
+in Phase-2 #2: not alert-sourceable; see §4.1), and **start alerts in observe-mode for ~a week** before arming.
 
 **But carve out the Anthropic-platform outage as its own observable** (the audit's catch). The app's
 only egress dependency is `api.anthropic.com`; if it is down platform-wide, *every* call fails for
@@ -215,9 +215,12 @@ distinct from a single customer's bad key. The backend already separates these c
 mirrored in `classifyDiagGenerationError`, `src/diagnostics.js`) — note 5xx is the `anthropic_<status>`
 family (status carried as data), not a standalone 'overloaded' class. So: a **cross-install spike in the
 `anthropic_<5xx>` class** is a separate "dependency-down" signal — kept **out of** the auto-alert
-vendor-fault threshold (to avoid fatigue) but **named and watched** (phase-1: a manual check of the
-dev-console error-type breakdown; phase-2: its own `@forge/metrics` counter). Don't let it get silently
-lumped into "not our problem".
+vendor-fault threshold (to avoid fatigue) but **named and watched**. ⚠ **Interim state (until Phase 3) — a
+CONSCIOUS gap, not "already solved":** this vendor-critical signal (it drives support load) has **no
+automated cross-install alert or dashboard today** — custom counters can't source a Forge alert, so it is
+a **manual** check of the dev-console error-type breakdown only; the cross-install rollup is a deliberate
+deferral to the Phase-3 App-Logs poller (per-install, the diagnostics ledger already classifies it). Don't
+let it get silently lumped into "not our problem".
 
 Skip multi-burn-rate windows, on-call rotation, PagerDuty, formal postmortems.
 
@@ -343,8 +346,8 @@ incident runbook (§8) must cover **deploy-recovery**, not just alert-response.
 | **`npm audit --omit=dev`** | Supply-chain gate (advisory — §5.2) | Free | **ADOPT** phase-1 |
 | **Dependabot** (security-only, weekly, grouped, no auto-merge; respect `@forge/resolver` 1.7.1 pin) | Dep updates | Free | **ADOPT** phase-1 |
 | **Forge dev-console metrics + Alerts** | Vendor-side health + email on-call | Free | **ADOPT** phase-1 |
-| **release-please** (lockstep `package.json`↔`DIAG_APP_VERSION`) | Version + changelog | Free | **PHASE 2** (fixes the version-drift class) |
-| **`@forge/metrics`** | Cross-install counters | Free | **PHASE 2** (verify it installs clean vs the pinned set / `--no-verify` first) |
+| **version-drift-guard** (`tools/version-drift-guard.mjs`, in `npm run check`) | Version-lockstep assert (fails merge on drift) | Free | **ADOPT** (Phase-2 #1, DONE — replaced release-please per a 5/5 persona vote: strictly stronger at the §11 goal, ~5% of the surface) |
+| **`@forge/metrics`** | Cross-install counters | Free | ❌ **SKIP** (Phase-2 #2, 5/5 vote: not alert-sourceable + redundant with the ledger aggregate + noisier; cross-install rollup deferred to the App-Logs poller) |
 | **Marketplace Reporting API v2** | Business health | Free | **PHASE 2** (vendor-side script, token hygiene §4.1) |
 | **`forge lint`** | Manifest/code lint | Free (needs token) | **PHASE 2** deploy job + local — NOT phase-1 gates (§3.4) |
 | **a9-forge-gh-action** (community) | Forge deploy Action | Free | **AVOID for prod path** — low-adoption 3rd party in the token path; hand-write ~30 lines |
@@ -397,10 +400,23 @@ incident runbook (§8) must cover **deploy-recovery**, not just alert-response.
 - Manual-approval **`production` GitHub Environment** job: `forge deploy -e production` + `forge lint`,
   Environment-scoped token, MFA + rotation. Add a **staging** Forge environment as the
   `install --upgrade --confirm-scopes` rehearsal.
-- release-please version-sync (`package.json`↔`DIAG_APP_VERSION`).
-- `@forge/metrics` counters (after verifying clean install vs the pinned set), incl. an
-  Anthropic-outage `5xx` counter (§4.3).
+- **version-drift-guard** (`tools/version-drift-guard.mjs`, wired into `npm run check` → BLOCKING in CI) — asserts
+  `package.json` version === `src/diagnostics.js` `DIAG_APP_VERSION`; **fails the merge on drift** (the §11 backstop;
+  kills the 67a6ea1 class). ⭐ Replaced **release-please** after a **5/5 persona vote** (release-please's two reasons —
+  commit-driven semver + a published changelog — are BOTH absent here; the assert is strictly stronger at the actual
+  goal, ~5% of the surface, zero new deps/secrets). NOT an auto-sync — the partner consciously bumps both at release.
+  Changelog DROPPED (no in-repo consumer; portal notes cover it). `static/hello-world/package.json` (CRA bundle)
+  intentionally NOT synced. ⚠ The repo version ≠ the forge-assigned Marketplace version — see the CLAUDE.md
+  production-rollout note (a green check proves two-string lockstep, NOT a match to the live Marketplace number).
+- ~~`@forge/metrics` counters~~ — ❌ **SKIPPED** (Phase-2 #2, 5/5 persona vote): NOT alert-sourceable
+  (web-verified — alert rules source only the 4 built-in metrics) + redundant with the ledger aggregate +
+  noisier (a pre-1.0 dep). The cross-install Anthropic-outage + 207-partial rollup is deferred to the
+  **App-Logs poller** (Phase 3); per-install both are already classified in the diagnostics ledger.
 - Marketplace Reporting API script (installs / conversion / churn) with bot-account token hygiene (§4.1).
+  **→ DESIGN FINAL 2026-06-23 (§13 + live probe §13.5): a "minimal DIRECT poller" — all 4 metrics are DIRECT
+  from `https://api.atlassian.com/marketplace/rest/3/reporting/developer-space/{developerId}/...` (Basic auth
+  confirmed; developerId via `/developer-space/vendor/{vendorId}`); NO snapshot store needed.
+  **IMPLEMENTED + §13-gated SHIP (§13.6): `tools/marketplace-report.mjs` + offline test; pending partner creds-wiring + live validation + commit.**
 
 **Phase 3 — deferred / earn-it-first:**
 - The **full `@forge/kvs`+`@forge/api` mock harness** for resolver/session-orchestration integration
@@ -420,8 +436,9 @@ on-call/PagerDuty, coverage-% gate, browser E2E in CI, **any external ping from 
    a deliberate later call. ✅ confirmed
 3. **Staging Forge environment?** → Phase-2 (only env where `install --upgrade` rehearses scope-consent).
    ✅ confirmed
-4. **Sweep confirmation: KVS heartbeat or `@forge/metrics`?** → Heartbeat first (zero new dep);
-   `@forge/metrics` in phase-2. ✅ confirmed
+4. **Sweep confirmation: KVS heartbeat or custom `@forge/metrics`?** → **Heartbeat ONLY** (zero new dep;
+   `@forge/metrics` **SKIPPED** in Phase-2 #2 per a 5/5 vote: not alert-sourceable, redundant with the
+   ledger aggregate, noisier). ✅ decided & implemented (commit `cf62707`)
 5. **Email-only alerting?** → Yes — to `support@`/`security@spec2jira.com` (paid domain). Forward
    email→Slack via a free inbox rule if wanted. ✅ confirmed
 
@@ -433,9 +450,10 @@ on-call/PagerDuty, coverage-% gate, browser E2E in CI, **any external ping from 
   way, but confirm before any future attempt to run it token-free.)
 - Do `forge logs` / the App-Logs-API reliably capture **scheduledTrigger** (system-invocation) logs the
   same as resolver logs? (Confirm `[sweep]` lines appear before relying on log-scrape.)
-- Can a `@forge/metrics` counter be the **source of an Alert rule**? (If yes, a flat-lining `sweep_runs`
-  could alert on the sweep *not* firing.)
-- Does `@forge/metrics` install clean against the pinned set on node24/arm64 **without** `--no-verify`?
+- ~~Can a `@forge/metrics` counter source an Alert rule?~~ **ANSWERED: NO** (web-verified 2026-06-22 — Forge
+  alert rules source ONLY the 4 built-in invocation/API metrics). → `@forge/metrics` SKIPPED (Phase-2 #2);
+  custom-metric alerting is not possible, so no flat-line/absence alert on a `sweep_runs`-style counter.
+- ~~Does `@forge/metrics` install clean vs the pinned set…~~ moot — SKIPPED (no compat-verify needed; not adopting).
 - Confirm the CRA build succeeds in a clean CI checkout with only `npm ci` (no build-time env vars).
 - Forge log retention is reported inconsistently (30 vs 60 days; API export window firmly 14 days) —
   confirm the authoritative number.
@@ -522,3 +540,195 @@ Node 24 to pre-see CI behavior. **LESSON: the flagship gate I wrote (check-synta
 a per-change gate validates a tool's stated mechanic (glob-vs-single-file), an army re-tests whether the tool
 actually WORKS on the real input (ESM goal). Re-verified after fixes: `npm run check` now CATCHES a real ESM
 error; `npm test` 12/12; `npm run build:ui` green.**
+
+---
+
+## 13. Phase-2 #3 — Marketplace Reporting API script: Analyze→Design decision (2026-06-23)
+
+> Conducted via §13: a **14-agent Analyze→Design army** (4 web-verified research lenses → 3-angle
+> design panel → 4-judge confidence vote → 3-lens adversarial pre-mortem; ALL read-only `Explore`,
+> per the review-army-isolation lesson). Conductor synthesis below. **DESIGN ONLY — no code; the
+> implementation is GATED on a partner live-probe (§13.3).**
+
+### 13.1 The decision — P2 "concise poller" synthesis
+
+A **vendor-side, zero-dependency Node `.mjs` script under `tools/`** (idiomatic to `version-drift-guard.mjs`:
+ESM, pure exported helpers, conditional `main()`), run **vendor-side ONLY** (Windows Task Scheduler / cron —
+NEVER in CI, NEVER Forge-callable), that pulls the 4 business-health metrics (installs/active-installs ·
+active users by edition · eval→paid conversion · churn) over **HTTP Basic auth**, persists timestamped
+snapshots to a **gitignored `tools/data/`** (JSON Lines), and computes time-series deltas. Credentials =
+a **dedicated non-admin/bot Atlassian account + API token**, stored OUTSIDE the repo, MFA, rotation.
+
+Vote spread (4 judges × 3 proposals): P1 "Script" **7.53** · **P2 "Poller" 7.95** (tightest spread 7.8–8.1,
+unanimous *low* over-built) · P3 "Metrics-Poller MVP" **7.03** (widest spread 5.9–8.5 — the over-built
+smell-signal per [[deep-audit-vs-per-change-gate]]). All three converged on the SAME shape; the only real
+differentiator was P3's `report`/multi-mode CLI, which all judges flagged as Phase-3 scope creep (§3.5).
+**Winner = P2's architecture + grafts:** P1's concrete Windows-credential playbook + honest "whatItSkips"
+gaps list + delta-math pseudocode; **DEFER the report/multi-mode CLI to Phase-3.**
+
+### 13.2 Auth verification (partner-requested, web-verified 2026-06-23)
+
+- ✅ **HTTP Basic auth (Atlassian account email + API token) is the CORRECT, CURRENT, non-deprecated
+  method** for the Marketplace REST API — confirmed in the v2 AND v3/v4 intros ("The Marketplace API uses
+  HTTP basic authentication. The username is your Atlassian Account email and the password is a generated
+  API token."). Nothing "more serious" (OAuth 2.0/3LO) is offered or required for the **vendor reporting
+  API** — 3LO is for user-facing app authorization, not vendor-side server scripts. The "stop using Basic
+  auth" advice circulating online targets (a) Basic auth with **passwords** (deprecated 2019) and (b)
+  Jira/Confluence **data** APIs where OAuth/scoped tokens are preferred — NOT the vendor Marketplace API.
+- ⚠ **NEW fact the research army got WRONG:** Atlassian API tokens NO LONGER live forever. Since
+  **2024-12-15** new tokens carry a **mandatory expiry, default + max 1 year**; pre-2024-12-15 tokens were
+  force-expired Mar–May 2026. → the design's "tokens never auto-expire; 90-day rotation is pure discipline"
+  is **superseded**: rotation is now partly FORCED (≤1 yr) and the script MUST handle **401 token-expired
+  LOUDLY** (it WILL hit it).
+- 🔎 **Scoped API tokens** are now Atlassian's recommended, more-secure token type. **Probe-time open
+  question:** does the Marketplace API accept a *scoped* token (and which scope), or does it need a
+  *classic/unscoped* token? Verify before relying on a scoped token.
+- ⚠ **API-version drift:** the army mapped endpoints on **v2** (`marketplace.atlassian.com/rest/2`), but the
+  live intro now states **"Version 3 is the latest"** (base `…/rest/3`), with v4 doc paths in transition.
+  → the probe MUST confirm the current version + base URL + exact reporting endpoint paths; the v2 paths
+  are likely stale.
+
+### 13.3 ⭐ The probe-first gate (resolve BEFORE implementing — POLICY §9 live-is-authority + §3.5 simplicity)
+
+Two research lenses **CONTRADICT** on the load-bearing question — are conversion + churn **DIRECT**
+(ready-made from `/sales/metrics/*` + `/customer-insights/editions`) or must they be **DERIVED** from local
+snapshots + delta math? Both were MEDIUM confidence (no example payloads in the docs). This is THE design fork:
+- **Direct** → the snapshot-store + delta machinery (and its whole silent-miss class) is UNNECESSARY →
+  collapse toward the minimal design.
+- **Derived** → P2's snapshot+delta design is required.
+
+A **~1-hour live API probe with the vendor's real credentials** (partner-only — Claude has no creds and must
+not) settles: (1) current version + base URL + reporting endpoint paths; (2) exact response field names;
+(3) whether conversion/churn/edition come ready-made or need derivation; (4) whether a scoped token works;
+(5) pagination/rate-limit behavior. **Implementation is gated on this result.**
+
+### 13.4 Hard gate criteria for the eventual implementation (from the adversarial pre-mortem — silent-miss is the worst failure, POLICY §8/§11)
+
+1. **Fail-LOUD on missing/renamed fields** — never silently default a metric to 0 (the #1 silent miss:
+   a schema change → plausible-but-garbage numbers).
+2. **Window-aware deltas** — store the prior snapshot's timestamp; compute the ACTUAL elapsed window;
+   annotate/flag if the gap ≠ expected cadence (a missed run silently rates the wrong window).
+3. **Idempotent same-day runs** — delta always vs the most-recent DISTINCT snapshot (a double-run must
+   not double/zero the delta).
+4. **Net-change honesty** — naive `prev.active − curr.active` conflates new installs with churn; either
+   per-install state diffing or label it "net change", not "churn rate".
+5. **Credential source fails LOUD, never silently downgrades** (e.g. Cred-Manager-missing → silent
+   plaintext `.env.local` fallback the vendor doesn't notice).
+6. **401 token-expired handled explicitly** (mandatory ≤1-yr expiry, §13.2) + `.gitignore` the data dir
+   AND the credential file.
+
+**Status: superseded by §13.5 below — the probe is DONE; the design is FINAL.**
+
+### 13.5 ⭐ Probe RESULTS — live-confirmed surface + FINAL design (2026-06-23, partner-run throwaway token)
+
+The live probe settled everything and CORRECTED the army's v2-based research (the whole §13.1 endpoint
+map was v2 and is being sunset). The decisive facts:
+
+**The ONLY correct combination (live-confirmed 200s):**
+- **Base host = `https://api.atlassian.com/marketplace/rest/3`** — NOT `marketplace.atlassian.com/rest/3`
+  (that host 404s/403s these). The earlier `marketplace.atlassian.com/rest/2/vendors` **410** was only the
+  deprecated v2 *collection* for token apps; the portal's own v2 calls go through a session+gateway, not us.
+- **Auth = HTTP Basic (email + API token) — CONFIRMED WORKING (200), existing token, NO scope change.** The
+  string of `403 poco` rejections were purely wrong-host / wrong-path-order / numeric-vs-UUID id — NOT a
+  token-scope problem. (Doc also states "Forge and OAuth2 apps cannot access this REST resource" → Basic is
+  the only method. The partner's auth question is definitively closed.)
+- **developerId resolution:** `GET /developer-space/vendor/{vendorId}` → `{ "developerId": "<UUID>" }`. The
+  numeric **vendorId (820262725) ≠ the UUID developerId** — that mismatch caused every earlier 400/403.
+- **Reporting (path order A, this host):** `GET /reporting/developer-space/{developerId}/{report}` → **200** on:
+  `licenses` (+ `/licenses/export?accept=csv|json`) · `sales/transactions` (+ export; full dated New/Renewal/
+  Upgrade/Refund history) · `sales/metrics/churn?aggregation=week&startDate&endDate` (**pre-computed churn
+  time-series**, `total.datasets`) · `sales/metrics/conversion` (**pre-computed conversion time-series**,
+  `total.series`) · `customer-insights/editions` (**active users by edition**, `usersDistributionPerMonth`) ·
+  `customer-insights/active-users`. (`evaluations` 404 at that exact path — the trial count is under a
+  different sub-path, e.g. `evaluations/hosting` per the portal; minor, resolve at implementation.)
+  Path order B (`/developer-space/{id}/reporting/...`) → 403; `marketplace.atlassian.com` host → 404/403.
+  **Order A on api.atlassian.com is definitive.** (Arrays/datasets are currently EMPTY — new app, no paid
+  data yet; the endpoints themselves all work.)
+
+**⭐ direct-vs-derived = RESOLVED: ALL FOUR core metrics (+ transactions + active-users; 6 endpoints) are DIRECT.** churn + conversion are pre-computed
+time-series; editions/active-users from `customer-insights`; installs from `licenses`; transactions = full
+dated history. → **the local snapshot store + delta math (P2's central machinery, §13.1) is UNNECESSARY.**
+
+**FINAL DESIGN = "minimal direct poller" (SUPERSEDES the P2 snapshot+delta synthesis of §13.1):**
+a zero-dep Node `.mjs` in `tools/` that (1) reads creds from outside the repo; (2) resolves developerId via
+`/developer-space/vendor/{vendorId}` (cache it); (3) GETs the dedicated metric/report endpoints above;
+(4) formats a human-readable summary (or `--json`). [Built: stdout only — there is NO file/CSV export in
+this version; the `tools/data/` gitignore entry is forward-prep, currently unused. See §13.7.]
+**No snapshot store, no delta math** → this deletes the snapshot/delta silent-miss class §13.4 worried about
+(window / idempotency / net-change / schema-default-zero). [Residual flagged by the deep audit (§13.7): the
+time-series ORDER is an unverified assumption — handled by honest labelling ("last in API order"), not a
+chronological-latest claim.] This is the §3.5 simplicity win the probe-first
+gate (§13.3) existed to surface — confirmed by live data, not assumed. The §13 army's value held: it picked
+the right SHAPE (vendor-side zero-dep tools/ poller, Basic auth, bot-account hygiene) and flagged the
+direct-vs-derived fork; the probe then collapsed it to the simpler branch.
+
+**Surviving gate criteria for implementation (the rest of §13.4 are MOOT — no derivation):**
+1. Fail-LOUD on a missing/renamed top-level field — never silent-zero a metric.
+2. Handle **401 token-expired** explicitly (mandatory ≤1-yr token expiry, §13.2) + `.gitignore` the creds.
+3. **Empty-data honesty:** arrays/datasets are currently empty (new app) — render "0 / no data yet"
+   honestly; don't crash or imply failure.
+4. Resolve the exact `evaluations` sub-path at implementation (minor).
+
+**Status: design FINAL (minimal direct poller); surface live-confirmed.**
+
+### 13.6 IMPLEMENTED + §13-gated (2026-06-23)
+
+Built the minimal direct poller. Files:
+- **`tools/marketplace-report.mjs`** — zero-dep Node 24 ESM, idiomatic to `version-drift-guard.mjs` (shebang,
+  dense header, exported pure helpers `summarize`/`latest`, `main()` only on direct invoke). Creds from
+  env (`MKT_EMAIL`/`MKT_TOKEN`/`MKT_VENDOR`) or a gitignored `tools/.marketplace-creds.local.json`; Basic
+  auth; resolves developerId via `/developer-space/vendor/{vendorId}`; GETs the 6 confirmed report endpoints;
+  prints a human summary (or `--json`). Fails LOUD on 401-expired / 403 / non-200 / non-JSON / missing
+  top-level key (never silent-zeros); renders empty data as "no data yet". No snapshot store, no deltas.
+- **`prototype/test_marketplace_report.mjs`** — 21 offline assertions over the pure helpers (empty-data
+  honesty, populated counts, page-1 pagination symmetry, "last in API order" labelling, partial-payload
+  no-throw); picked up by the runner (offline suites 13→14).
+- **`.gitignore`** — explicit patterns for the creds file + `tools/data/` (the global `*.local` does NOT
+  match `*.local.json`).
+
+**§13 gate = SHIP** (2 read-only `Explore` lenses: code-review + audit-review). Both clean — 0 HIGH/MED,
+only NITs; design-faithful, GENERAL (not a patch). Gate criteria 1-3 + 5 met; **criterion 4 (evaluations
+sub-path) is consciously DEFERRED, not "met"** — corrected in §13.7 (the per-change gate's "all 5 met"
+phrasing was inaccurate). One NIT tightened (a 0-count-with-next-link could print a contradictory
+"0+ … no data yet" — `morePages` gated on `count>0`). Verified: `npm test` green.
+
+**PENDING (partner):** wire creds (bot account + API token, gitignored file or env), run live to validate
+against the real surface (arrays will be empty until paid data exists — see the runbook), commit + push (the
+5 files: the script + test + `.gitignore` + `docs/MARKETPLACE-REPORTING-SETUP.md` + this strategy doc),
+optionally schedule via Windows Task Scheduler. Then revoke the throwaway probe token + delete the
+out-of-repo probe.
+
+### 13.7 Deep adversarial audit (2026-06-23) — partner-requested, post-SHIP
+
+A **32-agent deep audit** (5 diverse read-only `Explore` lenses — correctness / security / audit-policy+
+metric-semantics / completeness / doc-accuracy → a per-finding skeptic verify, default-refuted) ran AFTER
+the per-change §13 gate said SHIP. **27 findings → 22 confirmed/partial, 5 refuted; 0 HIGH, 0 real MED code
+defect.** The value (per the [deep-audit-vs-per-change-gate] discipline) was catching what the per-change
+gate is structurally blind to — including **its own over-claims**:
+
+- ⭐ **The headline:** the per-change gate said "all 5 gate criteria met" — but that statement was itself
+  inaccurate (criterion 4, the evaluations sub-path, was DEFERRED not met), AND the design (§13.5) had
+  claimed the minimal poller "deletes the whole silent-miss class" while a **time-series ORDERING assumption
+  was unverified** (the probe arrays were empty, so `latest()` returning the last element was never exercised
+  — if the API is descending, it would show the OLDEST point as "latest"). Both are the write-time-optimism /
+  unverified-assumption class a per-delta gate cannot see. **Fixed:** the output now labels the shown point
+  "last in API order" (not "latest") + carries an ordering caveat + a live-validation note + a contract test;
+  the docs/gate-claims are corrected (this section).
+
+**Fixes applied (verdict-taker, all verified — `npm test` green, this suite 21 assertions):**
+1. Ordering honesty (`tsLine` "last in API order" + caveat note + `latest()` contract test). 
+2. `res.text()` moved inside the `try` (a stream-read error now fails loud like everything else).
+3. Pagination honesty + symmetry — licenses AND transactions both labelled "page 1" and both flag "more
+   pages" (transactions previously didn't); full count via `--json`/export.
+4. Doc corrections — "all 5 criteria met" → 4 met + evaluations deferred; "ALL FOUR DIRECT" → 4 core + 2;
+   the promised-but-unbuilt CSV/file export clarified as stdout-only (`tools/data/` is forward-prep).
+5. Setup runbook written (`docs/MARKETPLACE-REPORTING-SETUP.md`) — the operational-completeness gap.
+6. Cheap hardening — `.gitignore` broadened to typo-proof creds patterns (`git check-ignore`-verified on 4
+   variants incl. the no-leading-dot typo), numeric-`vendorId` early check, Node-24+ runtime guard.
+7. `installs` relabelled "license records" (paid+eval entitlements, page 1) — honest about the metric.
+
+**Refuted (5, the skeptic kept the army honest):** scope-creep 4-vs-6 endpoints (intentional, design-
+authorized), Promise.all "crash" (fail()/process.exit fires before any rejection — by design), date-window-
+not-stated (dropped from the surviving gate criteria when the design went minimal-direct; a default-window
+note was still added), active-vs-total-installs ambiguity (the labels are explicit + separate lines), and a
+query-param doc "inconsistency" (a misread of a narrative annotation). **Verdict: SHIP (hardened).**

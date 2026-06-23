@@ -252,6 +252,13 @@ forge deploy -e production             # deploy code to production (auto-creates
 # ⚠ do NOT `forge install` on prod — see below (licensed app → Marketplace-only)
 ```
 
+- ⭐ **Version bump (in the release commit, BEFORE the prod deploy):** set BOTH repo version strings — root
+  `package.json` `"version"` AND `src/diagnostics.js` `DIAG_APP_VERSION` — to the number you intend
+  `forge deploy -e production` to stamp as the Marketplace version. CI's `tools/version-drift-guard.mjs` (in
+  `npm run check`) **fails the merge if the two disagree** (the §11 backstop; kills the 67a6ea1 drift class).
+  ⚠ The guard proves the two REPO strings equal each other — it does NOT/CANNOT prove they equal the LIVE
+  Marketplace version (Forge auto-assigns that; it is absent from `manifest.yml`). Aligning the repo strings to
+  the intended Marketplace number IS this conscious human bump — a green pipeline ≠ "version matches Marketplace".
 - ⚠ **NO `forge install` on production.** This is a **licensed (Paid-via-Atlassian)** app →
   `forge install` on prod fails `LICENSED_APP_INSTALL_NOT_PERMITTED` (and `--license` is
   dev-only). Production distribution is **Marketplace ONLY** — customers subscribe/install via
@@ -351,6 +358,56 @@ package names de-scaffolded (→ `spec2tickets`). Build green (bundle ≈ −1.4
   Needs a proven Forge resize/scroll approach, or accept for MVP (minor UX).
 - KVS value-size limit: push session stores full features array — very large specs
   (200+ features) may approach the ~240KB KVS limit. Monitor.
+
+---
+
+## ⚡ HANDOVER NOTE (2026-06-23 — ⭐ Monitoring + CI/CD Phase 2 STARTED: #1 version-drift-guard DONE+hardened · #2 @forge/metrics SKIPPED; both army-decided; agent-conducted)
+
+> ⚠ Branch `feature/monitoring-ci-cd` (off `release/v6.1.0`). Branch-independent record: **`memory/mvp-monitoring-cicd.md`** (Phase-2 progress block at top) · [[deep-audit-vs-per-change-gate]] (the vote-before-build + the post-ship-guard data points). Durable in-repo: **`docs/MONITORING-CICD-STRATEGY.md`**.
+
+Phase 2 opened (low-risk-wins-first; the high-blast-radius prod-deploy is LAST). **Both pieces decided by a full §13 persona-army + confidence-vote BEFORE coding** — the partner's standing directive ("армия от персони, confidence vote, наточи брадвата; не ме карай отново да те обучавам"). Commits this session (partner pushes): `44bf6af` (#1) → `cf62707` (#2 skip + doc) → `6a50dce` (post-ship army fixes). Tree clean.
+
+**#1 — version-lockstep guard DONE `44bf6af`, then HARDENED `6a50dce`.** A 5/5 persona vote (confidence [4,3,3,4,3]) OVERTURNED the conductor's release-please design as gold-plating → a ~40-line CI assert (`tools/version-drift-guard.mjs`, in `npm run check`) that FAILS the merge if `package.json` "version" ≠ `src/diagnostics.js` `DIAG_APP_VERSION` (kills the 67a6ea1 drift class). release-please's two reasons (commit-driven semver + a published changelog) were both absent; the repo version is bookkeeping-only. ⚠ The guard proves the two REPO strings match — it does NOT/CANNOT prove they equal the LIVE forge-auto-assigned Marketplace version (aligning them to the intended number is the conscious human bump AT deploy; see the §13 production-rollout runbook bullet).
+
+**#2 — @forge/metrics counters ❌ SKIPPED `cf62707`.** A 5/5 vote (confidence [2,2,2,2,2.5]) + WEB-VERIFICATION: Forge alert rules source ONLY the 4 built-in invocation/API metrics → custom counters are **NOT alert-sourceable** → dashboard-only + redundant with the diagnostics-ledger aggregate (already classifies the 207-partial + the Anthropic 5xx-vs-keyrejected split per-install) + noisier (sampled/no-backfill). The cross-install rollup is deferred to the Phase-3 App-Logs poller. ⭐ The army turned "build piece 2" into "SKIP it — redundant" (the §3 highest-value call: not building a redundant surface). Strategy doc §4.1/§4.3/§7/§8/§9/§10 corrected.
+
+**⭐ Post-ship READ-ONLY army (4 lenses + adversarial verify, 14 agents → `6a50dce`):** caught **1 HIGH the per-change §13 gate was blind to + 3 doc residuals**. The HIGH = a **§11 silent-miss IN the version guard whose whole job is §11** — the unanchored `.match()` took the FIRST `DIAG_APP_VERSION='…'` occurrence, so a stale value in a COMMENT before the real `export const` could be read and SILENTLY pass a real drift; the gate only ever tested the no-comment happy path (write-time optimism). Fixed: anchored to a line-start `export const` statement (`m` flag) + a backreference quote-match + extracted pure `extractDiagVersion`/`driftError` + a NEW **14-case regression test** (`prototype/test_version_drift_guard.mjs` — the guard had NONE; #3/#4 = the stale-comment regression). 3 doc fixes: §4.3 "prefer @forge/metrics" leftover → built-in metrics; §9 decision-4 "in phase-2" → SKIPPED; Anthropic-outage cross-install named as a CONSCIOUS manual-only gap until Phase 3 (honesty). 1 finding REFUTED by the verify pass (a "conflation" claim — the doc already distinguished per-install vs cross-install). ⚠ Review army run **READ-ONLY (Explore agentType)** per the Phase-1 node_modules-mutation lesson — zero working-tree mutation this time. **Verified GREEN: `npm run check` 11/11 · offline suites 13/13** (the new guard suite, 12→13).
+
+**NEXT (tomorrow) — Phase-2 #3 then #4 (run a FRESH §13 Analyze→Design army on each; do NOT jump to Solve):**
+- **#3 Marketplace Reporting API script** — a vendor-side (local/cron) read-only script pulling install/license/eval counts via the Marketplace REST API (no app code; the cross-install vendor-visibility half the in-product ledger lacks).
+- **#4 prod-deploy automation — THE high-blast-radius step.** Introduces `FORGE_API_TOKEN` to CI (one token deploys to EVERY paying customer). MUST be: a manual-approval GitHub **Environment**, MFA, token rotation, `pull_request` (NOT `_target`), least-scope. Deserves its own careful arc; pairs with the staging Forge env.
+- ⚠ **dependabot VERSION updates activate only once `dependabot.yml` is on the DEFAULT branch (`main`)** → merge PR #8 to start them. Partner is handling the 13 open Dependabot PRs (close reds, merge greens).
+- **Phase 3 (later):** @forge KVS/API mock harness for resolver/IO integration tests (the honest #1 coverage gap) + the App-Logs poller (delivers the cross-install rollup #2 deferred) + CodeQL-if-public.
+
+С усмивка ✨ — Phase 2 започна силно: едно army-решение уби gold-plating (release-please), друго уби излишна telemetry повърхност (@forge/metrics), а post-ship армията хвана §11 дупка в самия version guard. Утре #3 + #4.
+
+---
+
+## ⚡ HANDOVER NOTE (2026-06-22 PM — ⭐ Monitoring + CI/CD strategy DELIVERED + Phase 0+1 BUILT / ARMY-REVIEWED / COMMITTED `0ce9f4a` / LIVE-ACCEPTED on dev; agent-conducted)
+
+> ⚠ Branch-independent record: **`memory/mvp-monitoring-cicd.md`** (now "IN BUILD") · [[deep-audit-vs-per-change-gate]] · [[conductor-agent-model]]. Durable in-repo: **`docs/MONITORING-CICD-STRATEGY.md`** (accepted v2.1) + **`docs/INCIDENT-RUNBOOK.md`**.
+
+New chapter on branch **`feature/monitoring-ci-cd`** (off `release/v6.1.0`): the long-pending **Monitoring + CI/CD** topic, taken Analyze→Design THROUGH to a built + double-reviewed Phase 0+1. §13 throughout (research → 6-lens deep audit → re-audit → implement → per-change gate → 7-lens post-ship army).
+
+**Strategy ACCEPTED v2.1 (`docs/MONITORING-CICD-STRATEGY.md`):** whole stack FREE on GitHub-native + Forge-native — no backend, no egress, no new SaaS. Three load-bearing calls: (1) **CI gates the MERGE; a human gates the PUBLISH** → phase-1 is gates-only + ZERO-SECRET (forge deploy auto-publishes to all customers + a licensed prod app can't be smoke-tested → no Forge token in CI yet); (2) **observability stays Forge-native/vendor-side — the app NEVER pings out** (external monitor = new egress domain → MAJOR version → re-consent → privacy-moat damage); (3) **green CI ≠ proven app** (resolver/IO untested; the manual live-acceptance runbook stays the proof). NO Forge rollback (fix-forward; minor auto-rolls ≤120h, scope-change = re-consent = days).
+
+**Phase 0 + Phase 1 BUILT + COMMITTED `0ce9f4a` (partner pushes):** Phase 0 = root npm scripts + cross-platform Node runners (`tools/run-tests.mjs`, `tools/check-syntax.mjs`). Phase 1 spine = `.github/workflows/ci.yml` (Node 24 · npm ci · check · test · CRA build · advisory high+ audit + BLOCKING critical-only · scope-diff guard · 15-min timeout; zero-secret) + `.github/dependabot.yml` (security-only) + `tools/scope-diff-guard.mjs`. Coverage = pure `classifyAgileWriteStatus` (207-always-partial invariant) + offline `test_agile_write_status.mjs` (behavior-preserving extract from push_handler.js). Observability = native NO-EGRESS KVS **sweep heartbeat** (`src/index.js` + admin-gated callout in `AdminSettings.jsx`) → vendor confirms the daily orphan-sweep fired; + `docs/INCIDENT-RUNBOOK.md`.
+
+**Reviewed TWICE.** Per-change §13 gate (6 fixed: audit BLOCK→ADVISORY for the unremediable @forge/api→undici HIGH; static lockfile reconcile typescript 6.0.3→4.9.5; +4). Then a partner-requested **7-lens post-ship ARMY: 1 HIGH + ~9 LOW, all fixed** — the HIGH = my flagship **`check-syntax` was a FALSE-GREEN wall** (`node --check <file.js>` under the CJS-default root swallows ESM syntax errors → fixed to `--input-type=module` STDIN; now catches a real error). ⚠ A review-army agent's Bash mutated local `node_modules` (gitignored, restored) → run review armies READ-ONLY/worktree-isolated.
+
+**HARD-WON (eventually fold into the gotchas list):** `node --check <file.js>` on an ESM file under a no-`type:module` root SILENTLY swallows syntax errors (exit 0) → check the ESM goal via `--input-type=module` STDIN (a file arg throws on Node 24; do NOT add `type:module` to root — unverifiable Forge-bundler impact on a LIVE app). `npm audit` exits 0 on a HIGH under npm 9.x but non-zero on npm ≥10 (local npm 9.6.4 ≠ CI's Node-24 npm 11 → local audit understates CI). @forge/api transitively pulls an unremediable undici HIGH → audit ADVISORY + a separate BLOCKING critical-only gate. Static lockfile had a corrupt `typescript@6.0.3` (nonexistent) → `npm ci` hard-failed → reconciled to 4.9.5.
+
+**Verified GREEN:** `npm run ci` (check 11/11 · test 12/12 · CRA build); check-syntax now catches a real ESM error.
+
+**✅ LIVE-ACCEPTED on dev (2026-06-22, partner-executed, conductor-guided).** PR **#8** (`feature/monitoring-ci-cd` → `main`) opened →
+- **Track A (CI) GREEN** — all gates ran + behaved as designed: **npm-11 parity HELD** (`npm ci` clean under CI's Node-24 npm 11 — my local npm 9.6.4 had MASKED both the audit-exit + ci-strictness), the fixed **`check-syntax` ran ESM-aware (11/11)**, the 207-invariant test ran, the advisory high+ audit surfaced the undici HIGH as a NON-blocking annotation (the "1 error" annotation on a green job = by design), the **BLOCKING critical-only audit passed**, scope-diff guard "unchanged".
+- **Track B1** — 2 Forge dev-console alert rules created (success-rate Major@90 / Critical@70 + error-spike Critical@25; 30-min window; **observe-mode**; responder = the Aleks contributor → email). Honest BYOK caveat baked into the descriptions.
+- **Track B2** (the one resolver/IO piece NOT offline-tested) — native KVS **sweep heartbeat LIVE-CONFIRMED**: temporarily set `interval: hour` on dev → two hourly `[sweep] scanned=4 deleted=0 degraded=0` fires in `forge logs` + the admin Diagnostics callout flipped to the GREEN "ran 15m ago · scanned 4 · deleted 0" (the **honest icon**: green only on a clean run; amber on stale/errored/degraded). Reverted `interval` → `day` + redeployed. Also confirmed the "no run recorded yet" info-state renders pre-fire (admin-gated `getDiagnostics` field works).
+- **⚠ Branch-protection ruleset is FORWARD-CONFIG only — NOT enforced on a free private repo** (GitHub's own warning: needs Team org or public). The real guard meanwhile = `npm run ci` green locally before merge (the strategy's documented owner-discipline). Make-repo-public would unlock real enforcement + free CodeQL + unlimited Actions (the deferred Phase-3 call).
+
+**NEXT = Phase 2** (own branch/PR + a fresh §13 Analyze→Design→implement arc — do NOT jump to Solve; it touches the LIVE prod path): manual-approval **prod-deploy Environment** + staging env + release-please version-sync + `@forge/metrics` counters + Marketplace Reporting API script. **⚠ Phase 2 introduces `FORGE_API_TOKEN` to CI — the high-blast-radius step (one token deploys to every paying customer); Environment-scoped, MFA, rotation, `pull_request` not `_target`.** **Phase 3:** full `@forge` KVS/API mock harness for resolver/IO integration tests (the honest #1 coverage gap) + App-Logs poller + CodeQL-if-public. ⚠ **dependabot.yml VERSION updates activate only once the file is on the DEFAULT branch (`main`)** — so merge PR #8 to main to start them (alerts + security updates already work). Deferred/known: SHA-pin actions (Dependabot github-actions surfaces bumps); local npm 9.6.4 ≠ CI npm 11.
+
+С усмивка ✨ — мониторинг+CI/CD е доставен, приет, Phase 0+1 построен + двойно-ревюиран (армията хвана собствения ми false-green gate) + commit-нат; следва твоят push + live acceptance заедно.
 
 ---
 

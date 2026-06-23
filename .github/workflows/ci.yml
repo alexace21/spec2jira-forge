@@ -44,7 +44,7 @@ jobs:
       - name: Install root deps
         run: npm ci
 
-      - name: Syntax gate (per-file node --check over src/*.js)
+      - name: Static gates (per-file ESM node --check + version-lockstep)
         run: npm run check
 
       - name: Offline test suites (excludes the live Anthropic harness)

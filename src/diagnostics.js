@@ -50,9 +50,9 @@ export const DETAIL_TTL_MS = 30 * 24 * 3600 * 1000; // ~30 days
 const DETAIL_TTL_DAYS = 30; // native @forge/kvs TTL ({ value, unit: 'DAYS' })
 
 // App version stamped into the export envelope ({app_version, exported_at, tier} —
-// design §2.8). Mirrors package.json "version" — BUMP ON RELEASE. A mirrored const
-// (not a JSON import) keeps this module import-free-adjacent and bundler-simple;
-// the envelope tolerates drift (it is a support label, never logic).
+// design §2.8). MUST equal package.json "version" — CI's tools/version-drift-guard.mjs FAILS the merge on
+// drift (the §11 backstop; bump BOTH at release). Still a support LABEL, never logic — and NOTE it is repo
+// BOOKKEEPING only: it does NOT equal the live Marketplace version (forge-auto-assigned at deploy).
 export const DIAG_APP_VERSION = '6.1.0';
 
 // Defensive ceiling for the admin "All users" enumeration (§2.10): a runaway
