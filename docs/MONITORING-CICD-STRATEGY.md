@@ -732,3 +732,121 @@ authorized), Promise.all "crash" (fail()/process.exit fires before any rejection
 not-stated (dropped from the surviving gate criteria when the design went minimal-direct; a default-window
 note was still added), active-vs-total-installs ambiguity (the labels are explicit + separate lines), and a
 query-param doc "inconsistency" (a misread of a narrative annotation). **Verdict: SHIP (hardened).**
+
+---
+
+## 14. Phase-2 #4 — production-deploy automation: Analyze→Design decision (2026-06-23)
+
+> §13 army: 14 agents (4 web-verified research lenses → 3 design angles → 4-judge confidence vote → 3-lens
+> adversarial pre-mortem; all read-only `Explore`). **DESIGN ONLY — no token, no GitHub Environment, no
+> deploy created this run.** Implementation is a SEPARATE step (own §13 gate); the token + GitHub Environment
+> + staging Forge env setup is **PARTNER-ONLY** (secrets / console UI / Atlassian account).
+
+### 14.1 The decision — manual `workflow_dispatch` + Environment-gated deploy (all 3 designs CONVERGED)
+
+All three design angles (manual-dispatch / version-tag / release-branch) independently recommended
+**`workflow_dispatch` (a manual "Run workflow" button)** and rejected tag-push + release-branch as more
+ceremony/coupling for a solo vendor (POLICY §3.5). Vote: all 3 write-ups scored 7.5–9.5 (converge on the
+same shape); the tightest ~9.1 avg. The differences are presentation depth, not substance. **This is the
+recommended design.**
+
+### 14.2 The pipeline (synthesized)
+- **Trigger:** `workflow_dispatch`. The partner consciously bumps `package.json` + `src/diagnostics.js`
+  `DIAG_APP_VERSION` on a release commit, then clicks **Run workflow → Deploy to production**. The click IS
+  the human release decision (decoupled from git history; no tag/branch ritual).
+- **Approval gate:** a **`production` GitHub Environment** with a required-reviewers protection rule. The
+  deploy job declares `environment: production`, so GitHub blocks it until approval. ⚠ Solo = **self-approval**
+  (a deliberate PAUSE, not a true second pair of eyes — honest limitation, §14.4).
+- **Token isolation (THE load-bearing decision):** `FORGE_API_TOKEN` lives **ONLY in that Environment's
+  secret**, never a repo secret. Only the job targeting `environment: production` can read it. A **NEW
+  `.github/workflows/deploy.yml`** (token-bearing, manual) stays **separate from the zero-secret `ci.yml`**
+  (PR gates). Trigger is `pull_request` semantics — **never `pull_request_target`** (fork-exfil hole).
+- **Deploy job sequence:** `npm ci` → `npm run ci` (= version-drift + per-file ESM + offline tests +
+  CRA build:ui) → **`forge lint`** (now legitimately holds the token, §3.4) → `forge deploy -e production`
+  (auto-creates the Marketplace version) → portal publish. ⭐ **Scope check at deploy-time is a CONSCIOUS
+  manual `scope_ack` input, NOT a re-run of `scope-diff-guard.mjs`** (corrected at the §13 gate, §14.5): a
+  `workflow_dispatch` has no meaningful base SHA to diff, and the auto guard already ran at PR-time in
+  `ci.yml` — forcing the human to type "rehearsed on staging" IS the §3.3 goal (make re-consent visible,
+  never auto-decide it). Plus a version-bump guard (typed version must equal `package.json`) and a
+  **pre-flight SHA-pin assertion** that FAILS the deploy while the actions are still `@v`-tags.
+- **Staging rehearsal:** a Forge **`staging` environment** for the **procedural** scope dry-run
+  (`forge install --upgrade --confirm-scopes`) whenever scope-diff-guard flags a change — BEFORE prod (the
+  no-rollback asymmetry makes this load-bearing, not optional).
+- **Token hygiene:** dedicated/bot Atlassian account + **MFA** + ≤90-day rotation (Atlassian enforces ≤1-yr
+  expiry); revoke-on-leak runbook.
+- **Recovery:** **fix-forward** (no rollback). MINOR auto-rolls ≤120h (de-facto canary); MAJOR/scope =
+  per-admin re-consent (days). **Pre-place a kill-switch feature flag** for risky features (~60s to 0%).
+
+### 14.3 Top risks → implementation MUST-HAVES (from the 3-lens pre-mortem; several HIGH converged)
+1. **`pull_request` NOT `pull_request_target`** + token in the **Environment** secret only + `deploy.yml`
+   separate from `ci.yml` (the #1 risk: token exfil via a fork PR / repo-secret blast radius).
+2. **SHA-pin every third-party action in the deploy job** (a malicious/compromised action runs WITH the
+   token). **ENFORCED (§14.5):** `deploy.yml` ships with a pre-flight assertion step that FAILS the deploy
+   while `actions/checkout`/`actions/setup-node` are still `@v`-tags — so the token cannot run a deploy until
+   the partner SHA-pins them (a hard gate, not just a checklist line).
+3. **Never echo the token**; set least-privilege `permissions:` on the workflow/job.
+4. **Staging-vs-prod naming guard** — avoid deploying to prod thinking it's staging (wrong-env-targeted).
+5. **MFA on BOTH** the GitHub account AND the Atlassian token account (the approval gate is only as strong
+   as the account that clicks it).
+6. **scope-diff guard → procedural staging gate** before any scope-touching prod deploy (multi-day re-consent
+   recovery otherwise).
+
+### 14.4 Honest limitations (§10)
+- **Solo self-approval ≠ a second reviewer** — the real protection is the Environment token-isolation + the
+  deliberate manual pause + local `npm run ci` green, NOT a second human.
+- **Staging rehearsal + token rotation are procedural discipline**, not automated gates (Forge offers no
+  scope-consent automation; rotation is a calendar reminder).
+- **No rollback** — fix-forward only; a scope-touching bug is a days-long recovery.
+
+**Status: DESIGN FINAL + IMPLEMENTED + §13-gated (§14.5). `.github/workflows/deploy.yml` + `docs/PROD-DEPLOY-SETUP.md`
+written, INERT until the partner-only setup (FORGE_API_TOKEN on a bot account, the `production` GitHub
+Environment, the `staging` Forge env, SHA-pinning the actions) — the workflow self-enforces SHA-pinning and
+runs only on a manual click. No token/secret created this arc.**
+
+### 14.5 §13 gate (2026-06-23)
+
+`deploy.yml` + `PROD-DEPLOY-SETUP.md` built, then a 3-lens read-only `Explore` gate: **correctness = SHIP**
+(⭐ verified the Forge CLI flags `--non-interactive` / `--no-verify` / `forge lint` are REAL via
+`forge deploy --help`; `@forge/cli@12` valid), **security + audit = SHIP-WITH-FIXES**. Fixes applied
+(verdict-taker):
+- ⭐ **SHA-pin turned from a checklist item into a HARD gate** — a pre-flight assertion FAILS the deploy while
+  the actions are `@v`-tags (the security lens's "make the checklist a code assertion"; closes the
+  add-token-before-pinning race).
+- **Post-deploy summary split** `if: success()` vs `if: failure()` (no more "deployed ✅" text on a failed run).
+- **Documented the scope-diff swap** (manual `scope_ack` at deploy-time vs the PR-time auto guard — the audit's
+  design-vs-impl honesty catch; §14.2 corrected).
+- `@forge/cli@12` flagged to be matched to the partner's local CLI major; minor doc clarifications.
+- **REFUTED (skeptic): the `::add-mask::` finding** — GitHub auto-redacts values sourced from `secrets.*` in
+  all logs, so an explicit mask step would be redundant cargo-cult; added a clarifying comment instead.
+**Verified:** `npm test` unaffected (14/14; deploy.yml is a workflow, not in the test glob). YAML is
+visually + gate-reviewed (no local YAML parser; GitHub validates on push).
+
+### 14.6 Deep adversarial audit (2026-06-23) — partner-requested, post-gate
+
+A **57-agent deep audit** (5 read-only `Explore` lenses — security-threat-model / correctness-actions-semantics
+/ audit-design-overclaims / completeness-operational / platform-reality-web → per-finding skeptic verify, some
+running the grep/`forge --help` live) ran AFTER the §14.5 per-change gate. **52 findings → 47 confirmed/partial,
+5 refuted; 0 real HIGH defect.** The HIGH-severity *confirmed* items were POSITIVE (trigger isolation,
+Environment-secret scoping, no-injection — all verified correct). The audit's value (per
+[deep-audit-vs-per-change-gate]) was auditing the CLAIMS — and it caught real over-claims, all fixed:
+
+- ⭐ **"auto-publishes to every customer" was imprecise** — `forge deploy -e production` auto-CREATES a
+  Marketplace version (STAGED); making it live is a separate MANUAL portal publish (this app uses "control when
+  published"). Corrected the framing in deploy.yml + PROD-DEPLOY-SETUP + the post-deploy summary (the token is
+  still the full blast radius — it could publish via the API — so hygiene is unchanged; only the wording is now precise).
+- **MFA-on-GitHub was missing from the runbook** (must-have #5 = MFA on BOTH accounts; only Atlassian MFA was
+  documented) → added to PROD-DEPLOY-SETUP §2 (the approval gate is only as strong as the approving account).
+- **SHA-pin assertion over-claimed as protection** — it is FAIL-FAST POLICY ENFORCEMENT (fails before any token
+  use); the REAL token protection is Environment-secret scoping (the token isn't injected into checkout/setup-node).
+  Comments clarified. Also hardened the grep to `^[[:space:]]*uses:` so a `# uses:…@v` comment can't false-trigger.
+- **"Free private repo may not enforce required reviewers"** → reframed: the §6 TEST is the authority (confirm a
+  "Waiting for approval" prompt appears); if not enforced, the manual click is the only gate (token isolation +
+  local `npm run ci` remain the real protection). The agents themselves DISAGREED on the exact plan-gating, so
+  "verify by test" is the honest call.
+- **@forge/cli@12 parity** → added a §6 checklist item (confirm `forge --version` major matches the pin).
+- **forge-lint advisory + partial-deploy + scope-caught-at-deploy** → success-summary now notes the lint
+  advisory; troubleshooting covers don't-re-trigger-on-partial-publish + revert-don't-deploy-on-unexpected-scope.
+- **REFUTED again (skeptic, ×5): `::add-mask::`** — correctly redundant (GitHub auto-redacts `secrets.*`).
+**Verdict: SHIP (hardened) — no code defect; the fixes were documentation-accuracy + completeness + one cheap
+grep hardening. The implementation's security architecture (workflow_dispatch-only + Environment-scoped token +
+no-injection) was verified correct by multiple independent lenses.**

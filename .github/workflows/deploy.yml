@@ -1,0 +1,161 @@
+name: Deploy to production
+
+# Phase-2 #4 — the ONE token-bearing workflow (docs/MONITORING-CICD-STRATEGY.md §14; setup: docs/PROD-DEPLOY-SETUP.md).
+# HIGHEST BLAST RADIUS: FORGE_API_TOKEN is the vendor's full Atlassian credential. `forge deploy -e production`
+# auto-CREATES a Marketplace version (staged); making it LIVE to customers is a separate MANUAL portal publish
+# (this app uses "control when published"). The token can reach every paying customer, so treat it accordingly.
+# The safety model:
+#  - workflow_dispatch ONLY (a human clicks Run) — NEVER on push/pull_request, so a fork/PR can never reach
+#    the token. (The zero-secret merge gates live in ci.yml; this file is the only place the token appears.)
+#  - the job declares `environment: production` → GitHub blocks it on the required-reviewers gate AND scopes
+#    the FORGE_* secrets to THIS job only (they are Environment secrets, never repo secrets).
+#  - inputs are passed to shell via env (never interpolated into run: directly) — no script injection.
+#  - the FORGE_* values come from `secrets.*`, which GitHub auto-redacts from ALL logs (no ::add-mask:: needed).
+#  - ⚠ SHA-PIN the two actions below — an assertion step FAILS the deploy (fail-fast, BEFORE any token use)
+#    while they are still @v-tags (go-live step — PROD-DEPLOY-SETUP.md §5). This is POLICY enforcement; the
+#    token itself is protected by Environment-secret scoping (not injected into the checkout/setup-node steps)
+#    regardless. Dependabot (github-actions) surfaces the pins.
+#  - NO Forge rollback: recovery is fix-forward (MINOR auto-rolls <=120h; a scope change = per-admin
+#    re-consent, days). A scope-touching release MUST be rehearsed on the staging Forge env first.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version you intend to ship — MUST equal package.json + DIAG_APP_VERSION (e.g. 6.2.0)"
+        required: true
+        type: string
+      scope_ack:
+        description: "Does this release change manifest scopes / egress?"
+        required: true
+        type: choice
+        default: "no scope change"
+        options:
+          - "no scope change"
+          - "yes — rehearsed on the staging Forge env"
+      no_verify:
+        description: "Pass --no-verify? Only if the known globalPage resolver lint false-positive blocks deploy (gotcha #13)"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read # least-privilege: this job only reads the repo; it needs no write scopes
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false # NEVER interrupt an in-flight publish
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production # ← required-reviewers approval gate + scopes the FORGE_* secrets to THIS job only
+    timeout-minutes: 20
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4 # ⚠ SHA-PIN before wiring the token (token-bearing job — strategy §14.3 #2)
+        with:
+          fetch-depth: 0
+
+      - name: Use Node 24 (match the Forge nodejs24.x runtime)
+        uses: actions/setup-node@v4 # ⚠ SHA-PIN before wiring the token
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            static/hello-world/package-lock.json
+
+      - name: Assert Node 24
+        run: node -e "if(!process.version.startsWith('v24')){console.error('Node '+process.version+' != v24');process.exit(1)}"
+
+      - name: Assert deploy actions are SHA-pinned (fail-fast policy enforcement — §14.3 #2; runs before any token use)
+        run: |
+          # ^[[:space:]]*uses: anchors to a real step line — so a `# uses: ...@v` COMMENT or this grep's own
+          # command line cannot false-trigger; only the actual `uses: actions/checkout@v` / `setup-node@v` match.
+          if grep -nE '^[[:space:]]*uses:[[:space:]]*actions/(checkout|setup-node)@v' .github/workflows/deploy.yml; then
+            echo "::error::deploy.yml still references @v-tag actions (shown above). SHA-pin actions/checkout + actions/setup-node to full commit SHAs before deploying with the prod token (PROD-DEPLOY-SETUP.md §5)."
+            exit 1
+          fi
+          echo "Deploy actions are SHA-pinned — OK."
+
+      - name: Conscious-version-bump guard (typed version must equal package.json — catches a forgotten bump)
+        env:
+          TYPED_VERSION: ${{ inputs.version }} # via env (not direct interpolation) → no shell injection
+        run: |
+          PKG=$(node -p "require('./package.json').version")
+          if [ "$TYPED_VERSION" != "$PKG" ]; then
+            echo "::error::Typed version '$TYPED_VERSION' != package.json '$PKG'. Bump package.json + src/diagnostics.js DIAG_APP_VERSION together (npm run check enforces the pair) or type the correct version."
+            exit 1
+          fi
+          echo "Deploying version $PKG."
+
+      - name: Install root deps
+        run: npm ci
+
+      - name: Full gate (check + offline tests + CRA build) — identical to the merge gate
+        run: npm run ci # check (version-drift + per-file ESM) → test → build:ui (builds the Custom UI forge bundles)
+
+      - name: Install Forge CLI (pinned major — ⚠ set to YOUR local `forge --version` major for parity; strategy §3.2b)
+        run: npm install -g @forge/cli@12
+
+      - name: forge lint (ADVISORY — visibility only; the globalPage resolver flag is a known false-positive, gotcha #13)
+        continue-on-error: true
+        env:
+          FORGE_EMAIL: ${{ secrets.FORGE_EMAIL }}
+          FORGE_API_TOKEN: ${{ secrets.FORGE_API_TOKEN }}
+        run: forge lint
+
+      # Deploy-time scope gate = this CONSCIOUS manual ack, NOT a re-run of tools/scope-diff-guard.mjs: on a
+      # workflow_dispatch there is no meaningful base SHA to diff against, and the auto guard already ran at PR
+      # time in ci.yml. Forcing the human to type "rehearsed on staging" IS the §3.3 goal (make re-consent
+      # visible, never auto-decide it). See strategy §14.2.
+      - name: Scope / re-consent acknowledgment
+        env:
+          SCOPE_ACK: ${{ inputs.scope_ack }}
+        run: |
+          echo "Scope acknowledgment: $SCOPE_ACK"
+          if [ "$SCOPE_ACK" != "no scope change" ]; then
+            echo "::warning::Scope/egress change → every customer admin RE-CONSENTS in Manage Apps; recovery is per-admin (days), not the <=120h MINOR auto-roll. Confirm the staging rehearsal + Marketplace release notes."
+          fi
+
+      - name: forge deploy -e production (auto-creates the Marketplace version)
+        env:
+          FORGE_EMAIL: ${{ secrets.FORGE_EMAIL }}
+          FORGE_API_TOKEN: ${{ secrets.FORGE_API_TOKEN }}
+          NO_VERIFY: ${{ inputs.no_verify }}
+        run: |
+          if [ "$NO_VERIFY" = "true" ]; then
+            echo "Deploying with --no-verify (globalPage resolver false-positive workaround, gotcha #13)."
+            forge deploy -e production --non-interactive --no-verify
+          else
+            forge deploy -e production --non-interactive
+          fi
+
+      - name: Post-deploy reminders (job summary) — on SUCCESS only
+        if: success()
+        env:
+          VERSION: ${{ inputs.version }}
+          SCOPE_ACK: ${{ inputs.scope_ack }}
+        run: |
+          {
+            echo "### ✅ Production deploy — v${VERSION}"
+            echo ""
+            echo "- Scope: **${SCOPE_ACK}**"
+            echo "- The version is now CREATED in the Marketplace (staged). It is NOT live to customers yet."
+            echo "- forge lint ran advisory — if its step shows a ⚠, check it (the globalPage resolver flag is a known false-positive, gotcha #13)."
+            echo "- ⚠ **No rollback** — recovery is fix-forward. Once published, a code-only (MINOR) fix auto-rolls to all sites within ≤120h; a scope-touching (MAJOR) fix needs per-admin re-consent (days)."
+            echo "- **Next (manual portal step):** publish/release the new version in the Marketplace vendor portal to make it live, then watch the dev-console Invocation metrics (production) error rate."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Deploy FAILED — recovery note (job summary) — on FAILURE only
+        if: failure()
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          {
+            echo "### ❌ Production deploy FAILED — v${VERSION}"
+            echo ""
+            echo "- Nothing was published if forge deploy did not run; check the failing step above."
+            echo "- Fix locally, run \`npm run ci\` green, then re-trigger: Actions → Deploy to production → Run workflow."
+          } >> "$GITHUB_STEP_SUMMARY"
