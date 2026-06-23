@@ -413,6 +413,10 @@ incident runbook (§8) must cover **deploy-recovery**, not just alert-response.
   noisier (a pre-1.0 dep). The cross-install Anthropic-outage + 207-partial rollup is deferred to the
   **App-Logs poller** (Phase 3); per-install both are already classified in the diagnostics ledger.
 - Marketplace Reporting API script (installs / conversion / churn) with bot-account token hygiene (§4.1).
+  **→ DESIGN FINAL 2026-06-23 (§13 + live probe §13.5): a "minimal DIRECT poller" — all 4 metrics are DIRECT
+  from `https://api.atlassian.com/marketplace/rest/3/reporting/developer-space/{developerId}/...` (Basic auth
+  confirmed; developerId via `/developer-space/vendor/{vendorId}`); NO snapshot store needed.
+  **IMPLEMENTED + §13-gated SHIP (§13.6): `tools/marketplace-report.mjs` + offline test; pending partner creds-wiring + live validation + commit.**
 
 **Phase 3 — deferred / earn-it-first:**
 - The **full `@forge/kvs`+`@forge/api` mock harness** for resolver/session-orchestration integration
@@ -536,3 +540,195 @@ Node 24 to pre-see CI behavior. **LESSON: the flagship gate I wrote (check-synta
 a per-change gate validates a tool's stated mechanic (glob-vs-single-file), an army re-tests whether the tool
 actually WORKS on the real input (ESM goal). Re-verified after fixes: `npm run check` now CATCHES a real ESM
 error; `npm test` 12/12; `npm run build:ui` green.**
+
+---
+
+## 13. Phase-2 #3 — Marketplace Reporting API script: Analyze→Design decision (2026-06-23)
+
+> Conducted via §13: a **14-agent Analyze→Design army** (4 web-verified research lenses → 3-angle
+> design panel → 4-judge confidence vote → 3-lens adversarial pre-mortem; ALL read-only `Explore`,
+> per the review-army-isolation lesson). Conductor synthesis below. **DESIGN ONLY — no code; the
+> implementation is GATED on a partner live-probe (§13.3).**
+
+### 13.1 The decision — P2 "concise poller" synthesis
+
+A **vendor-side, zero-dependency Node `.mjs` script under `tools/`** (idiomatic to `version-drift-guard.mjs`:
+ESM, pure exported helpers, conditional `main()`), run **vendor-side ONLY** (Windows Task Scheduler / cron —
+NEVER in CI, NEVER Forge-callable), that pulls the 4 business-health metrics (installs/active-installs ·
+active users by edition · eval→paid conversion · churn) over **HTTP Basic auth**, persists timestamped
+snapshots to a **gitignored `tools/data/`** (JSON Lines), and computes time-series deltas. Credentials =
+a **dedicated non-admin/bot Atlassian account + API token**, stored OUTSIDE the repo, MFA, rotation.
+
+Vote spread (4 judges × 3 proposals): P1 "Script" **7.53** · **P2 "Poller" 7.95** (tightest spread 7.8–8.1,
+unanimous *low* over-built) · P3 "Metrics-Poller MVP" **7.03** (widest spread 5.9–8.5 — the over-built
+smell-signal per [[deep-audit-vs-per-change-gate]]). All three converged on the SAME shape; the only real
+differentiator was P3's `report`/multi-mode CLI, which all judges flagged as Phase-3 scope creep (§3.5).
+**Winner = P2's architecture + grafts:** P1's concrete Windows-credential playbook + honest "whatItSkips"
+gaps list + delta-math pseudocode; **DEFER the report/multi-mode CLI to Phase-3.**
+
+### 13.2 Auth verification (partner-requested, web-verified 2026-06-23)
+
+- ✅ **HTTP Basic auth (Atlassian account email + API token) is the CORRECT, CURRENT, non-deprecated
+  method** for the Marketplace REST API — confirmed in the v2 AND v3/v4 intros ("The Marketplace API uses
+  HTTP basic authentication. The username is your Atlassian Account email and the password is a generated
+  API token."). Nothing "more serious" (OAuth 2.0/3LO) is offered or required for the **vendor reporting
+  API** — 3LO is for user-facing app authorization, not vendor-side server scripts. The "stop using Basic
+  auth" advice circulating online targets (a) Basic auth with **passwords** (deprecated 2019) and (b)
+  Jira/Confluence **data** APIs where OAuth/scoped tokens are preferred — NOT the vendor Marketplace API.
+- ⚠ **NEW fact the research army got WRONG:** Atlassian API tokens NO LONGER live forever. Since
+  **2024-12-15** new tokens carry a **mandatory expiry, default + max 1 year**; pre-2024-12-15 tokens were
+  force-expired Mar–May 2026. → the design's "tokens never auto-expire; 90-day rotation is pure discipline"
+  is **superseded**: rotation is now partly FORCED (≤1 yr) and the script MUST handle **401 token-expired
+  LOUDLY** (it WILL hit it).
+- 🔎 **Scoped API tokens** are now Atlassian's recommended, more-secure token type. **Probe-time open
+  question:** does the Marketplace API accept a *scoped* token (and which scope), or does it need a
+  *classic/unscoped* token? Verify before relying on a scoped token.
+- ⚠ **API-version drift:** the army mapped endpoints on **v2** (`marketplace.atlassian.com/rest/2`), but the
+  live intro now states **"Version 3 is the latest"** (base `…/rest/3`), with v4 doc paths in transition.
+  → the probe MUST confirm the current version + base URL + exact reporting endpoint paths; the v2 paths
+  are likely stale.
+
+### 13.3 ⭐ The probe-first gate (resolve BEFORE implementing — POLICY §9 live-is-authority + §3.5 simplicity)
+
+Two research lenses **CONTRADICT** on the load-bearing question — are conversion + churn **DIRECT**
+(ready-made from `/sales/metrics/*` + `/customer-insights/editions`) or must they be **DERIVED** from local
+snapshots + delta math? Both were MEDIUM confidence (no example payloads in the docs). This is THE design fork:
+- **Direct** → the snapshot-store + delta machinery (and its whole silent-miss class) is UNNECESSARY →
+  collapse toward the minimal design.
+- **Derived** → P2's snapshot+delta design is required.
+
+A **~1-hour live API probe with the vendor's real credentials** (partner-only — Claude has no creds and must
+not) settles: (1) current version + base URL + reporting endpoint paths; (2) exact response field names;
+(3) whether conversion/churn/edition come ready-made or need derivation; (4) whether a scoped token works;
+(5) pagination/rate-limit behavior. **Implementation is gated on this result.**
+
+### 13.4 Hard gate criteria for the eventual implementation (from the adversarial pre-mortem — silent-miss is the worst failure, POLICY §8/§11)
+
+1. **Fail-LOUD on missing/renamed fields** — never silently default a metric to 0 (the #1 silent miss:
+   a schema change → plausible-but-garbage numbers).
+2. **Window-aware deltas** — store the prior snapshot's timestamp; compute the ACTUAL elapsed window;
+   annotate/flag if the gap ≠ expected cadence (a missed run silently rates the wrong window).
+3. **Idempotent same-day runs** — delta always vs the most-recent DISTINCT snapshot (a double-run must
+   not double/zero the delta).
+4. **Net-change honesty** — naive `prev.active − curr.active` conflates new installs with churn; either
+   per-install state diffing or label it "net change", not "churn rate".
+5. **Credential source fails LOUD, never silently downgrades** (e.g. Cred-Manager-missing → silent
+   plaintext `.env.local` fallback the vendor doesn't notice).
+6. **401 token-expired handled explicitly** (mandatory ≤1-yr expiry, §13.2) + `.gitignore` the data dir
+   AND the credential file.
+
+**Status: superseded by §13.5 below — the probe is DONE; the design is FINAL.**
+
+### 13.5 ⭐ Probe RESULTS — live-confirmed surface + FINAL design (2026-06-23, partner-run throwaway token)
+
+The live probe settled everything and CORRECTED the army's v2-based research (the whole §13.1 endpoint
+map was v2 and is being sunset). The decisive facts:
+
+**The ONLY correct combination (live-confirmed 200s):**
+- **Base host = `https://api.atlassian.com/marketplace/rest/3`** — NOT `marketplace.atlassian.com/rest/3`
+  (that host 404s/403s these). The earlier `marketplace.atlassian.com/rest/2/vendors` **410** was only the
+  deprecated v2 *collection* for token apps; the portal's own v2 calls go through a session+gateway, not us.
+- **Auth = HTTP Basic (email + API token) — CONFIRMED WORKING (200), existing token, NO scope change.** The
+  string of `403 poco` rejections were purely wrong-host / wrong-path-order / numeric-vs-UUID id — NOT a
+  token-scope problem. (Doc also states "Forge and OAuth2 apps cannot access this REST resource" → Basic is
+  the only method. The partner's auth question is definitively closed.)
+- **developerId resolution:** `GET /developer-space/vendor/{vendorId}` → `{ "developerId": "<UUID>" }`. The
+  numeric **vendorId (820262725) ≠ the UUID developerId** — that mismatch caused every earlier 400/403.
+- **Reporting (path order A, this host):** `GET /reporting/developer-space/{developerId}/{report}` → **200** on:
+  `licenses` (+ `/licenses/export?accept=csv|json`) · `sales/transactions` (+ export; full dated New/Renewal/
+  Upgrade/Refund history) · `sales/metrics/churn?aggregation=week&startDate&endDate` (**pre-computed churn
+  time-series**, `total.datasets`) · `sales/metrics/conversion` (**pre-computed conversion time-series**,
+  `total.series`) · `customer-insights/editions` (**active users by edition**, `usersDistributionPerMonth`) ·
+  `customer-insights/active-users`. (`evaluations` 404 at that exact path — the trial count is under a
+  different sub-path, e.g. `evaluations/hosting` per the portal; minor, resolve at implementation.)
+  Path order B (`/developer-space/{id}/reporting/...`) → 403; `marketplace.atlassian.com` host → 404/403.
+  **Order A on api.atlassian.com is definitive.** (Arrays/datasets are currently EMPTY — new app, no paid
+  data yet; the endpoints themselves all work.)
+
+**⭐ direct-vs-derived = RESOLVED: ALL FOUR core metrics (+ transactions + active-users; 6 endpoints) are DIRECT.** churn + conversion are pre-computed
+time-series; editions/active-users from `customer-insights`; installs from `licenses`; transactions = full
+dated history. → **the local snapshot store + delta math (P2's central machinery, §13.1) is UNNECESSARY.**
+
+**FINAL DESIGN = "minimal direct poller" (SUPERSEDES the P2 snapshot+delta synthesis of §13.1):**
+a zero-dep Node `.mjs` in `tools/` that (1) reads creds from outside the repo; (2) resolves developerId via
+`/developer-space/vendor/{vendorId}` (cache it); (3) GETs the dedicated metric/report endpoints above;
+(4) formats a human-readable summary (or `--json`). [Built: stdout only — there is NO file/CSV export in
+this version; the `tools/data/` gitignore entry is forward-prep, currently unused. See §13.7.]
+**No snapshot store, no delta math** → this deletes the snapshot/delta silent-miss class §13.4 worried about
+(window / idempotency / net-change / schema-default-zero). [Residual flagged by the deep audit (§13.7): the
+time-series ORDER is an unverified assumption — handled by honest labelling ("last in API order"), not a
+chronological-latest claim.] This is the §3.5 simplicity win the probe-first
+gate (§13.3) existed to surface — confirmed by live data, not assumed. The §13 army's value held: it picked
+the right SHAPE (vendor-side zero-dep tools/ poller, Basic auth, bot-account hygiene) and flagged the
+direct-vs-derived fork; the probe then collapsed it to the simpler branch.
+
+**Surviving gate criteria for implementation (the rest of §13.4 are MOOT — no derivation):**
+1. Fail-LOUD on a missing/renamed top-level field — never silent-zero a metric.
+2. Handle **401 token-expired** explicitly (mandatory ≤1-yr token expiry, §13.2) + `.gitignore` the creds.
+3. **Empty-data honesty:** arrays/datasets are currently empty (new app) — render "0 / no data yet"
+   honestly; don't crash or imply failure.
+4. Resolve the exact `evaluations` sub-path at implementation (minor).
+
+**Status: design FINAL (minimal direct poller); surface live-confirmed.**
+
+### 13.6 IMPLEMENTED + §13-gated (2026-06-23)
+
+Built the minimal direct poller. Files:
+- **`tools/marketplace-report.mjs`** — zero-dep Node 24 ESM, idiomatic to `version-drift-guard.mjs` (shebang,
+  dense header, exported pure helpers `summarize`/`latest`, `main()` only on direct invoke). Creds from
+  env (`MKT_EMAIL`/`MKT_TOKEN`/`MKT_VENDOR`) or a gitignored `tools/.marketplace-creds.local.json`; Basic
+  auth; resolves developerId via `/developer-space/vendor/{vendorId}`; GETs the 6 confirmed report endpoints;
+  prints a human summary (or `--json`). Fails LOUD on 401-expired / 403 / non-200 / non-JSON / missing
+  top-level key (never silent-zeros); renders empty data as "no data yet". No snapshot store, no deltas.
+- **`prototype/test_marketplace_report.mjs`** — 21 offline assertions over the pure helpers (empty-data
+  honesty, populated counts, page-1 pagination symmetry, "last in API order" labelling, partial-payload
+  no-throw); picked up by the runner (offline suites 13→14).
+- **`.gitignore`** — explicit patterns for the creds file + `tools/data/` (the global `*.local` does NOT
+  match `*.local.json`).
+
+**§13 gate = SHIP** (2 read-only `Explore` lenses: code-review + audit-review). Both clean — 0 HIGH/MED,
+only NITs; design-faithful, GENERAL (not a patch). Gate criteria 1-3 + 5 met; **criterion 4 (evaluations
+sub-path) is consciously DEFERRED, not "met"** — corrected in §13.7 (the per-change gate's "all 5 met"
+phrasing was inaccurate). One NIT tightened (a 0-count-with-next-link could print a contradictory
+"0+ … no data yet" — `morePages` gated on `count>0`). Verified: `npm test` green.
+
+**PENDING (partner):** wire creds (bot account + API token, gitignored file or env), run live to validate
+against the real surface (arrays will be empty until paid data exists — see the runbook), commit + push (the
+5 files: the script + test + `.gitignore` + `docs/MARKETPLACE-REPORTING-SETUP.md` + this strategy doc),
+optionally schedule via Windows Task Scheduler. Then revoke the throwaway probe token + delete the
+out-of-repo probe.
+
+### 13.7 Deep adversarial audit (2026-06-23) — partner-requested, post-SHIP
+
+A **32-agent deep audit** (5 diverse read-only `Explore` lenses — correctness / security / audit-policy+
+metric-semantics / completeness / doc-accuracy → a per-finding skeptic verify, default-refuted) ran AFTER
+the per-change §13 gate said SHIP. **27 findings → 22 confirmed/partial, 5 refuted; 0 HIGH, 0 real MED code
+defect.** The value (per the [deep-audit-vs-per-change-gate] discipline) was catching what the per-change
+gate is structurally blind to — including **its own over-claims**:
+
+- ⭐ **The headline:** the per-change gate said "all 5 gate criteria met" — but that statement was itself
+  inaccurate (criterion 4, the evaluations sub-path, was DEFERRED not met), AND the design (§13.5) had
+  claimed the minimal poller "deletes the whole silent-miss class" while a **time-series ORDERING assumption
+  was unverified** (the probe arrays were empty, so `latest()` returning the last element was never exercised
+  — if the API is descending, it would show the OLDEST point as "latest"). Both are the write-time-optimism /
+  unverified-assumption class a per-delta gate cannot see. **Fixed:** the output now labels the shown point
+  "last in API order" (not "latest") + carries an ordering caveat + a live-validation note + a contract test;
+  the docs/gate-claims are corrected (this section).
+
+**Fixes applied (verdict-taker, all verified — `npm test` green, this suite 21 assertions):**
+1. Ordering honesty (`tsLine` "last in API order" + caveat note + `latest()` contract test). 
+2. `res.text()` moved inside the `try` (a stream-read error now fails loud like everything else).
+3. Pagination honesty + symmetry — licenses AND transactions both labelled "page 1" and both flag "more
+   pages" (transactions previously didn't); full count via `--json`/export.
+4. Doc corrections — "all 5 criteria met" → 4 met + evaluations deferred; "ALL FOUR DIRECT" → 4 core + 2;
+   the promised-but-unbuilt CSV/file export clarified as stdout-only (`tools/data/` is forward-prep).
+5. Setup runbook written (`docs/MARKETPLACE-REPORTING-SETUP.md`) — the operational-completeness gap.
+6. Cheap hardening — `.gitignore` broadened to typo-proof creds patterns (`git check-ignore`-verified on 4
+   variants incl. the no-leading-dot typo), numeric-`vendorId` early check, Node-24+ runtime guard.
+7. `installs` relabelled "license records" (paid+eval entitlements, page 1) — honest about the metric.
+
+**Refuted (5, the skeptic kept the army honest):** scope-creep 4-vs-6 endpoints (intentional, design-
+authorized), Promise.all "crash" (fail()/process.exit fires before any rejection — by design), date-window-
+not-stated (dropped from the surviving gate criteria when the design went minimal-direct; a default-window
+note was still added), active-vs-total-installs ambiguity (the labels are explicit + separate lines), and a
+query-param doc "inconsistency" (a misread of a narrative annotation). **Verdict: SHIP (hardened).**

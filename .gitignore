@@ -64,6 +64,12 @@ coverage/
 !.env.example
 *.local
 
+# ── Marketplace vendor-side reporting script (creds + local data; NEVER commit a token) ──
+tools/.marketplace-creds*.json
+tools/*creds*.json
+tools/*creds*.local
+tools/data/
+
 # ── Editor ─────────────────────────────────────────────────
 .vscode/
 *.swp
