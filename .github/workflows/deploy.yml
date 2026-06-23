@@ -2,9 +2,11 @@ name: Deploy to production
 
 # Phase-2 #4 — the ONE token-bearing workflow (docs/MONITORING-CICD-STRATEGY.md §14; setup: docs/PROD-DEPLOY-SETUP.md).
 # HIGHEST BLAST RADIUS: FORGE_API_TOKEN is the vendor's full Atlassian credential. `forge deploy -e production`
-# auto-CREATES a Marketplace version (staged); making it LIVE to customers is a separate MANUAL portal publish
-# (this app uses "control when published"). The token can reach every paying customer, so treat it accordingly.
-# The safety model:
+# PUBLISHES the new Marketplace version — for a MINOR / no-scope release it goes PUBLIC and auto-rolls to ALL
+# paying customers (progressive, <=120h); a scope-touching MAJOR is gated on per-admin re-consent instead.
+# There is NO "staged, manual-publish-later" step for a routine deploy — THE DEPLOY IS THE RELEASE (live-confirmed
+# 2026-06-23: a deploy created Marketplace v6.2.0 which went live to customers). So the approval gate + token
+# isolation below are the real safety. The safety model:
 #  - workflow_dispatch ONLY (a human clicks Run) — NEVER on push/pull_request, so a fork/PR can never reach
 #    the token. (The zero-secret merge gates live in ci.yml; this file is the only place the token appears.)
 #  - the job declares `environment: production` → GitHub blocks it on the required-reviewers gate AND scopes
@@ -147,10 +149,10 @@ jobs:
             echo "### ✅ Production deploy — v${VERSION}"
             echo ""
             echo "- Scope: **${SCOPE_ACK}**"
-            echo "- The version is now CREATED in the Marketplace (staged). It is NOT live to customers yet."
+            echo "- ⚠ **This version is now PUBLISHED.** For a MINOR / no-scope release it is LIVE and auto-rolls to ALL customers (progressive, ≤120h). (A scope-touching MAJOR instead waits on per-admin re-consent in Manage Apps.) The deploy IS the release — there is no separate manual publish."
             echo "- forge lint ran advisory — if its step shows a ⚠, check it (the globalPage resolver flag is a known false-positive, gotcha #13)."
-            echo "- ⚠ **No rollback** — recovery is fix-forward. Once published, a code-only (MINOR) fix auto-rolls to all sites within ≤120h; a scope-touching (MAJOR) fix needs per-admin re-consent (days)."
-            echo "- **Next (manual portal step):** publish/release the new version in the Marketplace vendor portal to make it live, then watch the dev-console Invocation metrics (production) error rate."
+            echo "- ⚠ **No rollback** — recovery is fix-forward (deploy a corrected higher version). The MINOR auto-roll IS the de-facto canary; a scope-touching fix needs per-admin re-consent (days)."
+            echo "- **Next:** watch the dev-console Invocation metrics (production) error rate. (The Marketplace version number is forge-assigned and runs AHEAD of the repo version — bump package.json + DIAG_APP_VERSION past it before the next deploy.)"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Deploy FAILED — recovery note (job summary) — on FAILURE only
