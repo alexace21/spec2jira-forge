@@ -25,12 +25,12 @@ jobs:
     timeout-minutes: 15 # backstop: a hung step can't burn GitHub's 360-min default (compounds the runner's per-suite timeout)
     steps:
       - name: Checkout (full history — the scope-diff guard needs the base commit)
-        uses: actions/checkout@v4 # TODO(hardening): SHA-pin (strategy §3.1/§7)
+        uses: actions/checkout@v7 # TODO(hardening): SHA-pin (strategy §3.1/§7)
         with:
           fetch-depth: 0
 
       - name: Use Node 24 (match the Forge nodejs24.x runtime)
-        uses: actions/setup-node@v4 # TODO(hardening): SHA-pin
+        uses: actions/setup-node@v6 # TODO(hardening): SHA-pin
         with:
           node-version: 24
           cache: npm
