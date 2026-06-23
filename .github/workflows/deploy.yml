@@ -53,12 +53,12 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Checkout (full history)
-        uses: actions/checkout@v4 # ⚠ SHA-PIN before wiring the token (token-bearing job — strategy §14.3 #2)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1 — SHA-pinned (token-bearing job; bump via Dependabot)
         with:
           fetch-depth: 0
 
       - name: Use Node 24 (match the Forge nodejs24.x runtime)
-        uses: actions/setup-node@v4 # ⚠ SHA-PIN before wiring the token
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0 — SHA-pinned (bump via Dependabot)
         with:
           node-version: 24
           cache: npm
