@@ -252,6 +252,17 @@ forge deploy -e production             # deploy code to production (auto-creates
 # ⚠ do NOT `forge install` on prod — see below (licensed app → Marketplace-only)
 ```
 
+- ⭐ **AUTOMATED prod-deploy now exists (Phase-2 #4, LIVE 2026-06-23):** `.github/workflows/deploy.yml` +
+  setup runbook `docs/PROD-DEPLOY-SETUP.md` (design: `docs/MONITORING-CICD-STRATEGY.md` §14). A manual
+  `workflow_dispatch` behind a `production` GitHub-Environment approval gate runs the full pipeline (conscious-
+  version guard → SHA-pin assertion → `npm run ci` → `forge lint` → `forge deploy -e production`). The manual
+  command above still works; the workflow just human-gates + automates it. ⚠ **LIVE-CONFIRMED: `forge deploy -e
+  production` PUBLISHES** — a MINOR/no-scope version goes **LIVE and auto-rolls to all customers (≤120h); the
+  deploy IS the release**, NOT a "staged → manually publish later" step. (This corrects older "resubmit/publish
+  via the portal" prose for ROUTINE deploys; a portal/re-consent step applies only to MAJOR/scope changes.) ⚠
+  **The Marketplace version runs AHEAD of the repo** — a repo-6.1.0 deploy created Marketplace **6.2.0** → bump
+  the repo (package.json + DIAG_APP_VERSION) PAST the live Marketplace number before the next deploy.
+
 - ⭐ **Version bump (in the release commit, BEFORE the prod deploy):** set BOTH repo version strings — root
   `package.json` `"version"` AND `src/diagnostics.js` `DIAG_APP_VERSION` — to the number you intend
   `forge deploy -e production` to stamp as the Marketplace version. CI's `tools/version-drift-guard.mjs` (in
@@ -358,6 +369,32 @@ package names de-scaffolded (→ `spec2tickets`). Build green (bundle ≈ −1.4
   Needs a proven Forge resize/scroll approach, or accept for MVP (minor UX).
 - KVS value-size limit: push session stores full features array — very large specs
   (200+ features) may approach the ~240KB KVS limit. Monitor.
+
+---
+
+## ⚡ HANDOVER NOTE (2026-06-23 EOD — ⭐⭐⭐ Monitoring + CI/CD **Phase-2 COMPLETE**: #3 Reporting poller + #4 prod-deploy DELIVERED, deep-audited, and **LIVE end-to-end** (shipped Marketplace v6.2.0 to customers); agent-conducted)
+
+> ⚠ Branch `feature/monitoring-ci-cd`. Branch-independent record: **`memory/mvp-monitoring-cicd.md`** (top status block, now "Phase-2 COMPLETE") · [[deep-audit-vs-per-change-gate]] (2 new data points) · [[conductor-agent-model]] (worktree-isolation sharpened). Durable in-repo: **`docs/MONITORING-CICD-STRATEGY.md`** (§13 reporting + §14 prod-deploy, both with gate+deep-audit+live records) · **`docs/PROD-DEPLOY-SETUP.md`** · **`docs/MARKETPLACE-REPORTING-SETUP.md`**.
+
+The whole Monitoring + CI/CD arc is now **delivered + live**. This session opened on "load context, continue fresh" and ran the two remaining Phase-2 pieces through the full §13 + deep-audit + live cycle; the partner executed the go-live with conductor guidance.
+
+**#3 — Marketplace Reporting poller (`tools/marketplace-report.mjs`) — LIVE-VALIDATED.** §13 Analyze→Design army → ⭐ **probe-first** (a live API probe with the partner's vendor creds) which OVERTURNED the army's v2 endpoint map: **v2 is sunsetting; the Data API is `api.atlassian.com/marketplace/rest/3`; ALL 4 metrics are DIRECT** (`/reporting/developer-space/{UUID}/...` after resolving the UUID from the numeric vendorId via `/developer-space/vendor/{vendorId}`) → collapsed the design from P2-snapshot-store to a **minimal zero-dep direct poller** (Basic auth; deletes a whole silent-miss class). Implemented → §13 gate → 32-agent deep audit (caught the per-change gate's own over-claims) → **live-run GREEN** (empty arrays = honest "no data yet" on the new app). Setup: `docs/MARKETPLACE-REPORTING-SETUP.md`.
+
+**#4 — prod-deploy automation (`.github/workflows/deploy.yml`) — LIVE end-to-end.** §13 army (converged on **manual `workflow_dispatch` + a `production` GitHub-Environment approval gate**) → §13 gate → 57-agent deep audit (0 real HIGH; architecture verified correct) → partner go-live (bot token + Environment + 2 Environment secrets + MFA both accounts + staging-already-existed + SHA-pinned the 2 actions) → **live test**: the **required-reviewer gate ENFORCES** (sat "waiting for review", 0 steps until approve), and a fresh run **published Marketplace v6.2.0 — CONFIRMED LIVE to customers**. Pipeline: version guard → SHA-pin assertion (hard gate) → `npm run ci` → `forge lint` (advisory) → `forge deploy -e production`. Token isolation: workflow_dispatch-only + `environment: production`-scoped `FORGE_*` secrets, `deploy.yml` separate from the zero-secret `ci.yml`. Setup runbook: `docs/PROD-DEPLOY-SETUP.md`.
+
+**⭐ HARD-WON this session (fold into gotchas over time; several already in §14/§Production-rollout):**
+- **`forge deploy -e production` PUBLISHES — a MINOR/no-scope version goes LIVE + auto-rolls to all customers (≤120h); the deploy IS the release** (NOT staged-then-manual-publish). The deep audit had me over-correct "auto-publishes" → "staged"; **the live deploy reverted it — live-is-authority beat the deep-audit's wording debate.** (MAJOR/scope still gates on per-admin re-consent.)
+- **The Marketplace version runs AHEAD of the repo** (repo 6.1.0 → forge-assigned 6.2.0) → ⚠ **NEXT deploy: bump package.json + DIAG_APP_VERSION PAST the live Marketplace number (≥6.3.0)** so the in-app diagnostics label isn't behind (the version-drift-guard can't see the Marketplace number).
+- **GitHub "Re-run jobs" replays the ORIGINAL run's commit/workflow — it does NOT pick up a pushed fix.** Use a fresh **"Run workflow"** (cost a confused re-run cycle).
+- **`forge deploy --non-interactive` errors on a FRESH CLI** ("requires an analytics setting") → the workflow runs `forge settings set usage-analytics false` first. Only a real CI run surfaced it (`green CI ≠ proven app`).
+- **Review-armies mutated `node_modules` TWICE** (an Explore agent ran `npm ci`/`install` despite an explicit "do not" — Explore still has Bash) → restored via `npm ci`; sharpened lesson: **worktree-isolate review armies**, an instruction is not a guarantee ([[conductor-agent-model]]).
+- **Dependabot:** added `ignore` rules for the breaking React-16/CRA/Tailwind-3 MAJORs (react/react-dom/@atlaskit/*/tailwindcss) — those 3 PRs are deliberate non-upgrades (a future off-CRA modernization), not merges; partner closed them.
+
+**STATUS:** Phase-2 ALL DONE (#1 version-drift-guard ✅ · #2 @forge/metrics ❌ skipped · #3 Reporting poller ✅ live · #4 prod-deploy ✅ live). Commits this session (partner pushes): #3 poller `86651df` + deep-audit hardening, dependabot `1aedf4e`, #4 `d3ffed1` + SHA-pin `5f5c415` + usage-analytics `b2d2cc1` + doc-corrections `7ae9227`.
+
+**NEXT SESSION = Phase 3 (deferred — run a fresh §13 arc per piece):** full **`@forge` KVS/API mock harness** for resolver/IO integration tests (the honest #1 coverage gap) · **App-Logs-API poller** (the cross-install Anthropic-outage rollup #2 deferred) · **CodeQL** if the repo goes public. Also parked: test-case validation on ~9 real Confluence pages ([[testcase-generation-feature]]).
+
+С усмивка ✨ — целият Monitoring + CI/CD arc е жив: automated merge gates + human-gated token-isolated prod-deploy (един безопасен клик, доказано с реален v6.2.0 release) + vendor-side reporting, всичко GitHub/Forge-native, $0, zero-backend, privacy-moat непокътнат. Два пълни §13 + deep-audit арка, нула реален HIGH, live-validated. Следва Phase 3.
 
 ---
 
