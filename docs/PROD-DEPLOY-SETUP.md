@@ -2,10 +2,11 @@
 
 > Operational guide for `.github/workflows/deploy.yml` (Monitoring + CI/CD Phase-2 #4 — design in
 > `MONITORING-CICD-STRATEGY.md` §14). This is the HIGHEST-blast-radius automation in the repo: a single
-> `FORGE_API_TOKEN` is the vendor's full Atlassian credential. `forge deploy -e production` auto-CREATES a
-> Marketplace version (staged); a separate **manual portal publish** makes it live to **every paying customer**
-> (this app uses "control when published"). The workflow is committed but **inert until you complete the setup
-> below** — it only runs on a manual click, and the token/Environment don't exist yet.
+> `FORGE_API_TOKEN` is the vendor's full Atlassian credential. `forge deploy -e production` **PUBLISHES** the
+> new version — for a MINOR / no-scope release it goes LIVE and auto-rolls to **every paying customer**
+> (progressive, ≤120h); a scope-touching MAJOR instead waits on per-admin re-consent. **The deploy IS the
+> release — there is no separate manual publish** (live-confirmed 2026-06-23: a deploy shipped v6.2.0 live). The
+> workflow runs only on a manual click behind the approval gate — so that click is a real go-to-customers decision.
 
 ## ⚠ Go-live checklist (do ALL of these before the first real deploy)
 
@@ -57,20 +58,26 @@
   doesn't enforce required reviewers (see §2) — decide accordingly before trusting it.
 - **Confirm `forge --version` major matches** the `@forge/cli@N` pinned in `deploy.yml` (parity with your local
   CLI; if it differs, update the pin in the workflow first).
-- Then with a **no-op / trivial change**: approve → the version-bump guard, SHA-pin assertion, `npm run ci`,
-  `forge lint`, and `forge deploy` all run → the new Marketplace version is CREATED (staged) in the portal.
-  Verify the token never appears in the logs.
+- ⚠ **The §6 "test" is a REAL release** — once you approve, `forge deploy` PUBLISHES and (MINOR/no-scope)
+  ships current `main` LIVE to customers. So only run it when you're OK shipping main's app code. Approve →
+  the version-bump guard, SHA-pin assertion, `npm run ci`, `forge lint`, and `forge deploy` all run → a new
+  PUBLIC Marketplace version goes live. Verify the token never appears in the logs.
 
 ## Deploying (the routine)
 1. On a release commit, bump **both** `package.json` `version` AND `src/diagnostics.js` `DIAG_APP_VERSION` to the
-   same number; merge to `main` (CI gates green).
+   same number; merge to `main` (CI gates green). ⚠ **The forge-assigned Marketplace version runs AHEAD of the
+   repo version** (a deploy on repo-6.1.0 created Marketplace **6.2.0**) — bump the repo PAST the current live
+   Marketplace number (e.g. → 6.3.0) so the in-app diagnostics label isn't behind. Check the live number in the
+   portal Versions tab first.
 2. Actions tab → **Deploy to production** → **Run workflow**. Fill the inputs:
    - **version** — the number you just bumped to (the workflow FAILS if it ≠ `package.json`, catching a forgotten bump).
    - **scope change?** — "no scope change" for code-only; "yes — rehearsed on staging" only after §4.
    - **no_verify** — leave `false`; set `true` ONLY if the globalPage resolver lint false-positive blocks the deploy (gotcha #13).
-3. Approve the `production` Environment prompt → the deploy runs (it CREATES a staged Marketplace version).
-4. **Manual after (the version is staged, NOT yet live):** publish/release the new version in the Marketplace
-   vendor portal to make it live to customers; then watch the dev-console Invocation metrics (production) error rate.
+3. Approve the `production` Environment prompt → the deploy runs and **PUBLISHES the version**. ⚠ For a
+   MINOR / no-scope release this is **immediately LIVE** and auto-rolls to all customers (≤120h) — the deploy
+   IS the release. (A scope-touching MAJOR instead waits on per-admin re-consent in Manage Apps.)
+4. Watch the dev-console Invocation metrics (production) error rate as the version rolls out (the ≤120h
+   staggered roll is the de-facto canary). No rollback — fix-forward as a higher version if needed.
 
 ## Recovery (no rollback exists)
 - Forge has **no rollback** — fix forward. A code-only fix ships as a MINOR and auto-rolls to all sites within

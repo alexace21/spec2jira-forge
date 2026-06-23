@@ -763,7 +763,9 @@ recommended design.**
   (PR gates). Trigger is `pull_request` semantics — **never `pull_request_target`** (fork-exfil hole).
 - **Deploy job sequence:** `npm ci` → `npm run ci` (= version-drift + per-file ESM + offline tests +
   CRA build:ui) → **`forge lint`** (now legitimately holds the token, §3.4) → `forge deploy -e production`
-  (auto-creates the Marketplace version) → portal publish. ⭐ **Scope check at deploy-time is a CONSCIOUS
+  (**PUBLISHES the version — MINOR/no-scope goes LIVE + auto-rolls to all customers ≤120h; MAJOR/scope gates
+  on per-admin re-consent. THE DEPLOY IS THE RELEASE — no separate manual publish; live-confirmed §14.7**).
+  ⭐ **Scope check at deploy-time is a CONSCIOUS
   manual `scope_ack` input, NOT a re-run of `scope-diff-guard.mjs`** (corrected at the §13 gate, §14.5): a
   `workflow_dispatch` has no meaningful base SHA to diff, and the auto guard already ran at PR-time in
   `ci.yml` — forcing the human to type "rehearsed on staging" IS the §3.3 goal (make re-consent visible,
@@ -830,10 +832,11 @@ running the grep/`forge --help` live) ran AFTER the §14.5 per-change gate. **52
 Environment-secret scoping, no-injection — all verified correct). The audit's value (per
 [deep-audit-vs-per-change-gate]) was auditing the CLAIMS — and it caught real over-claims, all fixed:
 
-- ⭐ **"auto-publishes to every customer" was imprecise** — `forge deploy -e production` auto-CREATES a
-  Marketplace version (STAGED); making it live is a separate MANUAL portal publish (this app uses "control when
-  published"). Corrected the framing in deploy.yml + PROD-DEPLOY-SETUP + the post-deploy summary (the token is
-  still the full blast radius — it could publish via the API — so hygiene is unchanged; only the wording is now precise).
+- ⭐ **"auto-publishes to every customer" was reframed to "auto-creates a STAGED version + manual publish"** —
+  ⚠ **this correction was itself WRONG and was REVERTED at §14.7 (live test):** `forge deploy -e production`
+  actually PUBLISHES (a MINOR/no-scope version goes LIVE + auto-rolls to all customers; the deploy IS the
+  release — there is no manual-publish step). The ORIGINAL "auto-publishes" framing was right. Lesson: a deep
+  audit can debate wording both ways; only the live deploy settled it (§9). Final wording is in §14.7.
 - **MFA-on-GitHub was missing from the runbook** (must-have #5 = MFA on BOTH accounts; only Atlassian MFA was
   documented) → added to PROD-DEPLOY-SETUP §2 (the approval gate is only as strong as the approving account).
 - **SHA-pin assertion over-claimed as protection** — it is FAIL-FAST POLICY ENFORCEMENT (fails before any token
@@ -870,5 +873,22 @@ Environment secrets; MFA on BOTH the GitHub + Atlassian accounts), merged to mai
 - Everything else verified green LIVE: SHA-pin assertion ✅, version-bump guard (6.1.0) ✅, `npm run ci` ✅
   (check + offline tests + CRA build, ~19s), forge lint advisory ✅, the failure-summary path rendered correctly.
 
-**Status: deploy.yml + setup live-validated end-to-end except the final forge-deploy auth, which the
-usage-analytics fix unblocks → partner re-runs §6 to confirm the staged-version creation, then #4 is fully live.**
+**⭐⭐ #4 FULLY LIVE-VALIDATED (2026-06-23).** After the usage-analytics fix, a FRESH `workflow_dispatch` run
+(NOT a re-run — a re-run replays the OLD commit's workflow, so it kept failing; the fresh run picked up the fixed
+`deploy.yml` from main) went **green end-to-end** and `forge deploy -e production` **published Marketplace
+version 6.2.0, confirmed LIVE to customers** in the portal (partner: "да live за клиентите"; accepted — the
+code is the live 6.1.0 line + the dev-validated Phase-0/1 observability; #3/#4 are repo-tooling, not bundled).
+Two confirmed truths corrected the docs:
+- ⭐ **`forge deploy -e production` PUBLISHES (goes live), it does NOT "stage" for a manual publish** — reverting
+  the §14.6 over-correction; deploy.yml header + summary + PROD-DEPLOY-SETUP all now say "publishes / live".
+  ⚠ Therefore the §6 "test" IS a real customer release — documented as such.
+- 📌 **Marketplace version runs AHEAD of the repo version** (repo 6.1.0 → forge-assigned Marketplace 6.2.0). The
+  in-app diagnostics will read the repo number (6.1.0) until bumped. **NEXT release: bump package.json +
+  DIAG_APP_VERSION PAST the live Marketplace number (→ ≥6.3.0) before deploying** (the documented repo≠Marketplace
+  gap the version-drift-guard cannot close). Noted in PROD-DEPLOY-SETUP §"Deploying" step 1.
+- HARD-WON: **"Re-run jobs" replays the original run's commit/workflow — it does NOT pick up a pushed fix; use a
+  fresh "Run workflow".** And `forge deploy --non-interactive` needs `forge settings set usage-analytics <v>` on
+  a fresh CLI.
+
+**Phase-2 #4 = DONE + LIVE. Phase-2 is COMPLETE (#1 done · #2 skipped · #3 live-validated · #4 live). Remaining:
+Phase 3 (deferred — @forge mock harness, App-Logs poller, CodeQL-if-public) + closing the 3 Dependabot PRs.**
