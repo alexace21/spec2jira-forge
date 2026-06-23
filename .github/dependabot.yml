@@ -32,6 +32,20 @@ updates:
         update-types: ["minor", "patch"]
     ignore:
       - dependency-name: "react-scripts" # CRA is fragile — never auto-bump
+      # The Custom UI runs on React 16 + CRA (react-scripts 5). These MAJORs require a COUPLED
+      # React 16->18/19 migration (atlaskit 8 + react-dom 19 both need React 18+; CRA does not
+      # support React 19) plus a Tailwind v3->v4 config rewrite — a deliberate future project, NOT a
+      # drive-by on a live prod app. Ignore their MAJOR bumps only; safe minor/patch + security still flow.
+      # (This is why Dependabot PRs #16 react-dom, #20 @atlaskit/css-reset, #23 tailwindcss failed CI —
+      # closed deliberately; the stack-modernization is tracked as separate tech debt.)
+      - dependency-name: "react"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "react-dom"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@atlaskit/*"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "tailwindcss"
+        update-types: ["version-update:semver-major"]
 
   # GitHub Actions (keep the CI actions current; SHA-pinning is the hardening goal)
   - package-ecosystem: github-actions
