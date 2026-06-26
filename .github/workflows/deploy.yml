@@ -95,7 +95,14 @@ jobs:
 
       - name: Install + configure Forge CLI (pinned major — ⚠ match your local `forge --version`; strategy §3.2b)
         run: |
-          npm install -g @forge/cli@12
+          # Bumped @12 → @13 (2026-06-26): @forge/cli@12 (12.22.0) CONSISTENTLY failed the deploy
+          # fetching a STALE forge-node-runtime wrapper asset — "Premature close" on 3/3 retries of
+          # the SAME timestamped URL (i.e. NOT transient; the retry couldn't help because the old CLI
+          # re-resolves the same problematic wrapper). The CLI's own warning recommended 12.22.0 → 13.0.0;
+          # @13 resolves the CURRENT runtime wrapper. ⚠ Update your LOCAL `forge` to @13 too for parity
+          # (`npm i -g @forge/cli@13`) — the §3.2b "match local" intent. The deploy-step retry stays as a
+          # defense for genuinely-transient network blips.
+          npm install -g @forge/cli@13
           # A FRESH CLI in CI has no usage-analytics preference, and `--non-interactive` (used at deploy) REFUSES
           # to run until one is set. false = opt out of CLI telemetry (consistent with the no-egress posture;
           # this is the CLI's own telemetry, NOT app/customer data). Caught live by the §6 test (strategy §14.6).
