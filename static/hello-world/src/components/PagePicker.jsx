@@ -278,8 +278,19 @@ function PagePickerScreen({ onSelect, onOpenSettings }) {
         Pick a Confluence page to generate a Jira breakdown.
       </p>
 
-      {/* ── Search input ──────────────────────────────────────── */}
-      <div className="mb-6">
+      {/* ── Find a page (search + manual ID) — the primary action zone ──────────
+          A visually distinct card (tinted bg + border + subtle lift) that sets the
+          two ways to LOCATE a page apart from the white list rows below, and keeps
+          the manual page-ID option right next to search instead of buried at the
+          bottom of the screen (where it was easy to miss). 2026-06-26 UX. */}
+      <div
+        className="rounded-lg p-4 mb-6"
+        style={{
+          background: "var(--s2j-bg-section)",
+          border: "1px solid var(--s2j-border)",
+          boxShadow: "0 1px 2px rgba(0,0,0,0.04)",
+        }}
+      >
         <label
           className="block text-sm font-medium mb-2"
           style={{ color: "var(--s2j-text)" }}
@@ -321,6 +332,69 @@ function PagePickerScreen({ onSelect, onOpenSettings }) {
             {searchError}
           </div>
         )}
+
+        {/* Manual page-ID — the second way to find a page, kept right next to search. */}
+        <div
+          className="mt-3 pt-3"
+          style={{ borderTop: "1px solid var(--s2j-border)" }}
+        >
+          {!showManual ? (
+            <button
+              onClick={() => setShowManual(true)}
+              className="text-xs"
+              style={{
+                color: "var(--s2j-blue)",
+                background: "none",
+                border: "none",
+                padding: 0,
+                cursor: "pointer",
+                textDecoration: "underline",
+              }}
+            >
+              Or enter a page ID manually
+            </button>
+          ) : (
+            <form onSubmit={handleManualSubmit}>
+              <label
+                className="block text-sm font-medium mb-1"
+                style={{ color: "var(--s2j-text)" }}
+              >
+                Manual page ID
+              </label>
+              <p
+                className="text-xs mb-2"
+                style={{ color: "var(--s2j-text-muted)" }}
+              >
+                Find the numeric ID in the page URL (e.g., 123456789).
+              </p>
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  value={manualId}
+                  onChange={(e) => setManualId(e.target.value)}
+                  placeholder="123456789"
+                  className="flex-1 px-3 py-2 rounded text-sm"
+                  style={{
+                    background: "var(--s2j-bg)",
+                    border: "1px solid var(--s2j-border)",
+                    color: "var(--s2j-text)",
+                    outline: "none",
+                  }}
+                />
+                {/* btn-nav (blue) — follows the "blue = open/navigate to a page"
+                    convention shared with the row Open buttons + the Back button. */}
+                <button type="submit" className="btn-nav">
+                  Open
+                </button>
+              </div>
+              {manualError && (
+                <p className="text-xs mt-2" style={{ color: "var(--s2j-red)" }}>
+                  {manualError}
+                </p>
+              )}
+            </form>
+          )}
+        </div>
       </div>
 
       {/* ── Search results ───────────────────────────────────── */}
@@ -415,11 +489,11 @@ function PagePickerScreen({ onSelect, onOpenSettings }) {
             {renderGroup("Ready for review", "var(--s2j-blue)", ready, "r", () => "Completed — not yet pushed")}
             {renderGroup("Needs attention", "var(--s2j-red)", failed, "f", () => "Generation failed — reopen to retry")}
             {(inProgress.length > 0 || ready.length > 0 || failed.length > 0) && (
-              <SignalCallout kind="info" fontSize={11} style={{ marginBottom: 16 }}>
+              <SignalCallout kind="error" fontSize={12} style={{ marginBottom: 16 }}>
                 {/* Task #13: honest cleanup notice — matches the scheduled orphan sweep
-                    (7-day inactivity) + the privacy/DPA disclosure (no over-claim). v6: a
-                    SignalCallout (info) so it reads as a proper legible notice — the bare
-                    ⓘ + muted gray was easy to miss (partner UX note 2026-06-18). */}
+                    (7-day inactivity) + the privacy/DPA disclosure (no over-claim). RED
+                    (kind="error", partner UX 2026-06-26): this warns of irreversible
+                    auto-removal, so it must read as IMPORTANT, not neutral info. */}
                 Generated breakdowns you don't push to Jira are automatically removed after
                 7 days of inactivity. Opening one resets its timer.
               </SignalCallout>
@@ -452,69 +526,8 @@ function PagePickerScreen({ onSelect, onOpenSettings }) {
         </div>
       )}
 
-      {/* ── Manual fallback ──────────────────────────────────── */}
-      <div
-        className="rounded-lg p-4"
-        style={{
-          background: "var(--s2j-bg-section)",
-          border: "1px solid var(--s2j-border)",
-        }}
-      >
-        {!showManual ? (
-          <button
-            onClick={() => setShowManual(true)}
-            className="text-xs"
-            style={{
-              color: "var(--s2j-blue)",
-              background: "none",
-              border: "none",
-              padding: 0,
-              cursor: "pointer",
-              textDecoration: "underline",
-            }}
-          >
-            Or enter a page ID manually
-          </button>
-        ) : (
-          <form onSubmit={handleManualSubmit}>
-            <label
-              className="block text-sm font-medium mb-1"
-              style={{ color: "var(--s2j-text)" }}
-            >
-              Manual page ID
-            </label>
-            <p
-              className="text-xs mb-2"
-              style={{ color: "var(--s2j-text-muted)" }}
-            >
-              Find the numeric ID in the page URL (e.g., 123456789).
-            </p>
-            <div className="flex gap-2">
-              <input
-                type="text"
-                value={manualId}
-                onChange={(e) => setManualId(e.target.value)}
-                placeholder="123456789"
-                className="flex-1 px-3 py-2 rounded text-sm"
-                style={{
-                  background: "var(--s2j-bg)",
-                  border: "1px solid var(--s2j-border)",
-                  color: "var(--s2j-text)",
-                  outline: "none",
-                }}
-              />
-              <button type="submit" className="btn-primary">
-                Open
-              </button>
-            </div>
-            {manualError && (
-              <p className="text-xs mt-2" style={{ color: "var(--s2j-red)" }}>
-                {manualError}
-              </p>
-            )}
-          </form>
-        )}
-      </div>
+      {/* ── Manual page-ID fallback moved UP into the "Find a page" card (2026-06-26 UX);
+          it used to sit here at the bottom where users lost it. ── */}
 
       {/* ── First-run hint (no recent + no search) ───────────── */}
       {showInitialHint && (
@@ -531,13 +544,14 @@ function PagePickerScreen({ onSelect, onOpenSettings }) {
           — drives the feedback loop + adoption (reviews lift the listing). The review
           link is wired post-approval (the public listing isn't live yet). */}
       <div
-        className="mt-10 pt-4 text-xs leading-relaxed"
+        className="mt-10 rounded-lg p-4 text-sm leading-relaxed"
         style={{
-          borderTop: "1px solid var(--s2j-border)",
-          color: "var(--s2j-text-muted)",
+          background: "var(--s2j-bg-section)",
+          border: "1px solid var(--s2j-border)",
+          color: "var(--s2j-text-light)",
         }}
       >
-        <span className="font-medium" style={{ color: "var(--s2j-text-light)" }}>
+        <span className="font-semibold" style={{ color: "var(--s2j-text)" }}>
           Help us keep improving Spec2Tickets.
         </span>{" "}
         Found a bug or have an idea? Email{" "}
@@ -590,6 +604,8 @@ function PageRow({ page, onPick }) {
             outline: "none",
             minWidth: 0,
           }}
+          onMouseEnter={(e) => (e.currentTarget.style.background = "var(--s2j-bg-section)")}
+          onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
           title="Open this page to create or resume a breakdown"
         >
           <div className="font-medium leading-tight">{page.title}</div>
@@ -601,6 +617,27 @@ function PageRow({ page, onPick }) {
               {page.spaceName}
             </div>
           )}
+        </button>
+        {/* Explicit "Open" CTA (2026-06-26 UX) — a blue block on the right of every row
+            (search results, dashboard groups, recent) so the open affordance is obvious,
+            not implied by a clickable row. Same action as the title button (onPick). Blue
+            reuses --s2j-blue (the "Ready for review" header colour). */}
+        <button
+          onClick={() => onPick(page)}
+          className="shrink-0 flex items-center justify-center px-4 text-sm font-semibold"
+          style={{
+            background: "var(--s2j-blue)",
+            color: "#fff",
+            border: "none",
+            cursor: "pointer",
+            outline: "none",
+          }}
+          onMouseEnter={(e) => (e.currentTarget.style.background = "var(--s2j-blue-dark)")}
+          onMouseLeave={(e) => (e.currentTarget.style.background = "var(--s2j-blue)")}
+          title="Open this page"
+          aria-label={`Open ${page.title}`}
+        >
+          Open
         </button>
       </div>
     </li>

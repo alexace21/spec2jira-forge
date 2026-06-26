@@ -8,9 +8,10 @@ import React from "react";
  * в App.js (ready / generating / previewing / reviewing) + Dashboard's
  * own divergent BackButton (was blue underline style).
  *
- * Unified style: muted text → on hover (text + subtle border background
- * highlight). Left-aligned via negative margin so the visual left edge
- * sits flush with content edge, despite button padding.
+ * Unified style: BLUE text (the "blue = navigation / go-to-a-screen" convention,
+ * 2026-06-26 — back navigation is wayfinding) → on hover a subtle blue-tint
+ * background + darker blue. Left-aligned via negative margin so the visual left
+ * edge sits flush with content edge, despite button padding.
  *
  * Skipped intentionally on:
  *   - Pushed (terminal — explicit context-specific nav buttons cover this)
@@ -37,7 +38,7 @@ function BackButton({
       style={{
         background: "none",
         border: "none",
-        color: "var(--s2j-text-muted)",
+        color: "var(--s2j-blue)",
         cursor: "pointer",
         padding: "4px 8px",
         borderRadius: "4px",
@@ -45,12 +46,12 @@ function BackButton({
         marginLeft: "-8px",
       }}
       onMouseEnter={(e) => {
-        e.currentTarget.style.background = "var(--s2j-border)";
-        e.currentTarget.style.color = "var(--s2j-text)";
+        e.currentTarget.style.background = "var(--s2j-blue-bg)";
+        e.currentTarget.style.color = "var(--s2j-blue-dark)";
       }}
       onMouseLeave={(e) => {
         e.currentTarget.style.background = "none";
-        e.currentTarget.style.color = "var(--s2j-text-muted)";
+        e.currentTarget.style.color = "var(--s2j-blue)";
       }}
       title={title}
     >

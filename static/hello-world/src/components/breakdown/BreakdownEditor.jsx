@@ -5,12 +5,20 @@ import CapabilityCard from './CapabilityCard.jsx';
 import SharedACPanel from './SharedACPanel.jsx';
 import LabelsEditor from './LabelsEditor.jsx';
 
-export default function BreakdownEditor({ initialBreakdown, onPush, isPushing = false }) {
+export default function BreakdownEditor({ initialBreakdown, onPush, isPushing = false, breakdownRef }) {
   const [breakdown, setBreakdown] = useState(() => JSON.parse(JSON.stringify(initialBreakdown)));
 
   useEffect(() => {
     setBreakdown(JSON.parse(JSON.stringify(initialBreakdown)));
   }, [initialBreakdown]);
+
+  // Mirror the current working copy up to App via the ref (2026-06-26) so the reviewing
+  // top-bar "Back to AI insights" can lift these unsaved edits to pendingBreakdown before
+  // navigating away (the key="screen-reviewing" remount would otherwise drop them). A
+  // ref-write, not state — no re-render cost on every edit.
+  useEffect(() => {
+    if (breakdownRef) breakdownRef.current = breakdown;
+  }, [breakdown, breakdownRef]);
 
   const stats = useMemo(() => {
     const caps = breakdown.capabilities || [];
@@ -103,8 +111,13 @@ export default function BreakdownEditor({ initialBreakdown, onPush, isPushing = 
     });
   }
 
+  // 2026-06-26 UX (live-validated): content-flow, NOT a bounded flex-fill. The editor
+  // page-scrolls with the host page like every other screen — the reviewing wrapper has
+  // no height pin, so there is no definite height for a flex-1/overflow-y-auto pane to
+  // resolve against (that combination collapsed the editor to ~0 live). `flex flex-col`
+  // just stacks the three zones (stats bar · content · push bar) at natural height.
   return (
-    <div className="flex h-full flex-col" style={{ background: 'var(--s2j-bg)' }}>
+    <div className="flex flex-col" style={{ background: 'var(--s2j-bg)' }}>
       {/* Stats bar */}
       <div className="shrink-0 px-4 py-2.5" style={{
         borderBottom: '1px solid var(--s2j-border)',
@@ -120,6 +133,9 @@ export default function BreakdownEditor({ initialBreakdown, onPush, isPushing = 
               {stats.totalItems} Jira items
             </span>
           </div>
+          {/* Re-reading AI insights mid-edit lives on the reviewing top-bar's "Back to AI
+              insights" button now (2026-06-26) — the natural top-left back position; it
+              lifts edits via editorBreakdownRef so nothing is lost. */}
           <button onClick={resetBreakdown}
             className="rounded px-2 py-1 text-[11px] transition-colors"
             style={{ color: 'var(--s2j-text-muted)' }}
@@ -130,8 +146,10 @@ export default function BreakdownEditor({ initialBreakdown, onPush, isPushing = 
         </div>
       </div>
 
-      {/* Scrollable content */}
-      <div className="flex-1 overflow-y-auto px-4 py-4 space-y-4">
+      {/* Content — flows naturally (the host page scrolls; see the root comment). No
+          flex-1/overflow-y-auto: with a content-driven (no-vh) reviewing wrapper, an
+          internal scroll pane has no definite height and collapses to ~0. */}
+      <div className="px-4 py-4 space-y-4">
         {/* Epic metadata */}
         {breakdown.epic && (
           <div className="rounded-lg p-4 space-y-3" style={{
