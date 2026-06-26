@@ -125,20 +125,49 @@ jobs:
         env:
           FORGE_EMAIL: ${{ secrets.FORGE_EMAIL }}
           FORGE_API_TOKEN: ${{ secrets.FORGE_API_TOKEN }}
-        # ALWAYS --no-verify (2026-06-26 — recurring-failure fix). Without it, `forge deploy`
-        # runs `forge lint` INTERNALLY, which fetches the external Jira swagger
-        # (developer.atlassian.com/cloud/jira/software/swagger.v3.json) — an Atlassian-side
-        # endpoint that INTERMITTENTLY fails the whole deploy with
-        # "Invalid response body … Premature close" (a transient network error on THEIR side,
-        # not our code; it has recurred across deploys). --no-verify skips that internal lint
-        # so the deploy never depends on the flaky fetch. We lose nothing:
-        #   • the lint still runs as the ADVISORY `forge lint` step above (continue-on-error)
-        #     for visibility;
-        #   • --no-verify also sidesteps the known globalPage-resolver lint false-positive
-        #     (gotcha #13 — the documented reason to deploy with --no-verify);
-        #   • the bundle is still validated by `npm run ci` (build + offline tests) and again
-        #     server-side at deploy.
-        run: forge deploy -e production --non-interactive --no-verify
+        # TWO defenses against Atlassian-side TRANSIENT network flakiness during deploy — both
+        # surface as "Invalid response body … Premature close" fetching an Atlassian endpoint
+        # (NOT our code; recurring on the GitHub-runner ↔ Atlassian-CDN link):
+        #  1. --no-verify — `forge deploy` otherwise runs `forge lint` INTERNALLY, which fetches
+        #     the external Jira swagger (developer.atlassian.com/.../swagger.v3.json), flaky.
+        #     --no-verify skips that internal lint (lint still runs as the ADVISORY step above;
+        #     it also sidesteps the globalPage-resolver lint false-positive, gotcha #13).
+        #  2. RETRY — the deploy ALSO fetches CDN assets during PACKAGING (e.g. the forge-node-
+        #     runtime wrapper.js) which "Premature close" too. We retry ONLY that transient
+        #     network class. ⭐ SAFE re: duplicate versions: these fetches fail during packaging,
+        #     BEFORE any Marketplace version is created, so a retry cannot create a duplicate. A
+        #     NON-transient failure (real manifest/auth/version error, or a post-upload failure)
+        #     is NOT retried — fail fast. The bundle is still validated by `npm run ci` + server-side.
+        run: |
+          max=3
+          attempt=1
+          while true; do
+            echo "::group::forge deploy — attempt ${attempt}/${max}"
+            set +e
+            forge deploy -e production --non-interactive --no-verify 2>&1 | tee /tmp/forge_deploy.log
+            rc=${PIPESTATUS[0]}
+            set -e
+            echo "::endgroup::"
+            if [ "$rc" -eq 0 ]; then
+              echo "forge deploy succeeded on attempt ${attempt}."
+              if [ "$attempt" -gt 1 ]; then
+                echo "::warning::Deploy succeeded after ${attempt} attempts (transient-network retries). The retried (failed) attempts hit PRE-version packaging fetches and should not have created a version — but confirm the portal Versions tab shows exactly ONE new version."
+              fi
+              break
+            fi
+            if ! grep -qiE 'Premature close|socket hang up|ECONNRESET|ETIMEDOUT|EAI_AGAIN' /tmp/forge_deploy.log; then
+              echo "::error::forge deploy failed with a NON-transient error (no known network signature) — NOT retrying. It is a real failure (manifest/auth/version), or a post-upload error where a retry could create a DUPLICATE version. Inspect the log above."
+              exit "$rc"
+            fi
+            if [ "$attempt" -ge "$max" ]; then
+              echo "::error::forge deploy still hit a transient 'Premature close' fetch after ${max} attempts (Atlassian-CDN flakiness). Nothing was published (these fetches fail during packaging, before version creation). Re-run: Actions → Deploy to production → Run workflow."
+              exit "$rc"
+            fi
+            wait_s=$(( attempt * 20 ))
+            echo "Transient network error on attempt ${attempt} — retrying in ${wait_s}s…"
+            sleep "${wait_s}"
+            attempt=$(( attempt + 1 ))
+          done
 
       - name: Post-deploy reminders (job summary) — on SUCCESS only
         if: success()
