@@ -72,7 +72,7 @@
 2. Actions tab → **Deploy to production** → **Run workflow**. Fill the inputs:
    - **version** — the number you just bumped to (the workflow FAILS if it ≠ `package.json`, catching a forgotten bump).
    - **scope change?** — "no scope change" for code-only; "yes — rehearsed on staging" only after §4.
-   - **no_verify** — leave `false`; set `true` ONLY if the globalPage resolver lint false-positive blocks the deploy (gotcha #13).
+   (The deploy step ALWAYS runs `forge deploy … --no-verify` now — see §Troubleshooting — so there is no lint toggle to set.)
 3. Approve the `production` Environment prompt → the deploy runs and **PUBLISHES the version**. ⚠ For a
    MINOR / no-scope release this is **immediately LIVE** and auto-rolls to all customers (≤120h) — the deploy
    IS the release. (A scope-touching MAJOR instead waits on per-admin re-consent in Manage Apps.)
@@ -87,8 +87,12 @@
 
 ## Troubleshooting
 - **`401` on `forge deploy`** → the token expired/was revoked → mint a new one (§1), update the Environment secret (§3).
-- **`forge lint` shows the globalPage `resolver:` error** → known false-positive (gotcha #13); it is ADVISORY (won't
-  block). If `forge deploy` itself blocks on it, re-run with `no_verify: true`.
+- **`forge deploy` fails on `Invalid response body … Premature close` fetching `swagger.v3.json`** → SOLVED 2026-06-26:
+  the deploy step now ALWAYS runs `--no-verify`, so `forge deploy` no longer runs the internal `forge lint` that fetched
+  that flaky Atlassian swagger endpoint (the recurring transient failure). The bundle is still validated by `npm run ci`
+  + server-side at deploy. If this ever recurs, confirm the deploy command still carries `--no-verify`.
+- **`forge lint` (the separate ADVISORY step) shows the globalPage `resolver:` error** → known false-positive
+  (gotcha #13); that step is `continue-on-error` and never blocks the deploy.
 - **Version-bump guard fails** → your typed version ≠ `package.json`; bump both repo strings or type the right number.
 - **Deploy to the wrong environment** → the workflow is hard-wired to `-e production`; staging is a manual local step (§4).
 - **`forge deploy` failed but the version appears in the portal anyway** (transient/network) → do NOT blindly
