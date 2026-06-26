@@ -1,12 +1,12 @@
 /**
  * Spec2Tickets — Forge Custom UI
  *
- * Flow: loading → ready → generating → reviewing → confirming → pushed
+ * Flow: loading → ready → generating → insights → reviewing → confirming → pushed
  * Includes: reconnect on mount, non-blocking generation, confirmation step.
  *
  * Palette: Swagger/OpenAPI-inspired (#3b4151, #61affe, #49cc90, #fca130, #f93e3e)
  */
-import React, { useEffect, useState, useRef, useCallback } from "react";
+import React, { useEffect, useState, useRef, useCallback, useMemo } from "react";
 import { invoke, view, router } from "@forge/bridge";
 import BreakdownEditor from "./components/breakdown";
 import AdminSettings from "./components/AdminSettings";
@@ -567,6 +567,11 @@ function App() {
   const pollRef = useRef(null);
   const timerRef = useRef(null);
   const pushPollRef = useRef(null);
+  // Mirrors the BreakdownEditor's current (unsaved) working copy so the reviewing
+  // top-bar "Back to AI insights" can lift it to pendingBreakdown before navigating —
+  // the editor's local edits would otherwise be dropped on its key="screen-reviewing"
+  // remount. The editor writes to this ref on every change (2026-06-26).
+  const editorBreakdownRef = useRef(null);
 
   // Test-case generation state (P5)
   const [tcJobStatus, setTcJobStatus] = useState(null);
@@ -876,7 +881,9 @@ function App() {
               setStaleBreakdown(null);
               setPersistFailed(true);
               setResults(v3AdaptResultPayload(st));
-              setScreen("reviewing");
+              // 2026-06-26: land on the AI-insights screen first (it carries the
+              // persistFailed banner too, so the tab-only warning is shown immediately).
+              setScreen("insights");
             } else {
               const full = await invoke("getResults", { jobId: jid });
               if (full.error) {
@@ -889,7 +896,8 @@ function App() {
                 setStaleBreakdown(null);
                 setPersistFailed(false);
                 setResults(v3AdaptResultPayload(full));
-                setScreen("reviewing");
+                // 2026-06-26: AI-insights screen first (signals before the editor).
+                setScreen("insights");
               }
             }
           }
@@ -1056,7 +1064,9 @@ function App() {
           // user sees the review screen immediately. Test cases feed the P5 screen, not
           // the review screen — they must not block the transition. The rehydrate is
           // still non-fatal: a failure here must never block the reviewing screen.
-          setScreen("reviewing");
+          // 2026-06-26: reopening a completed breakdown also lands on the AI-insights
+          // screen first (signals before the editor), same as a fresh generation.
+          setScreen("insights");
           // P4 reconnect rehydration: if test cases were completed for this job,
           // load them back into state so the Test Cases screen can restore without
           // re-generating. Non-fatal. full.tcStatus forwarded by getResults.
@@ -1311,6 +1321,18 @@ function App() {
     setScreen("confirming");
   }, []);
 
+  // "Back to AI insights" — the editor's BACK navigation (top-left) AND the
+  // non-destructive way to re-read the AI's document-level insights mid-edit (UX-2).
+  // Lifts the editor's CURRENT working copy (from editorBreakdownRef) to pendingBreakdown
+  // BEFORE navigating, so returning via "Edit the breakdown →" restores the edits — the
+  // editor's key="screen-reviewing" remount would otherwise drop unsaved local edits. The
+  // doc-level aggregate (overall quality, spec_concerns, ambiguity) reads from the frozen
+  // _v3_original, so it is edit-independent. 2026-06-26.
+  const handleBackToInsights = useCallback(() => {
+    if (editorBreakdownRef.current) setPendingBreakdown(editorBreakdownRef.current);
+    setScreen("insights");
+  }, []);
+
   // ── Review-screen dependency editing ─────────────────────────
   // Remove / restore a cross-feature dependency at the push-decision point. The
   // change is applied to the breakdown JSON the push reads (startPush sends
@@ -1328,6 +1350,18 @@ function App() {
     setDryRunResult((dr) =>
       dr ? { ...dr, dependency_links: (dr.dependency_links || 0) + 1 } : dr,
     );
+  }, []);
+  // Add a NEW cross-feature dependency the AI didn't infer (partner 2026-06-26). Opens a
+  // dedicated screen (large selectors) from the Review screen's DependencyStructure. Same
+  // mutation as restore (addFeatureDependency is idempotent); the AddDependencyScreen
+  // guards self / duplicate / cycle, so the +1 link count is always a real new edge.
+  const handleOpenAddDependency = useCallback(() => setScreen("addDependency"), []);
+  const handleAddDependency = useCallback((source, target) => {
+    setPendingBreakdown((prev) => addFeatureDependency(prev, source, target));
+    setDryRunResult((dr) =>
+      dr ? { ...dr, dependency_links: (dr.dependency_links || 0) + 1 } : dr,
+    );
+    setScreen("confirming");
   }, []);
 
   // ── Push: Step 2 — confirmed → chunked create in JIRA ────────
@@ -2235,9 +2269,10 @@ function App() {
               inside a flex-row top-bar (margin would push page-title span
               out of vertical alignment). */}
           <BackButton
-            onClick={handleNewPage}
+            onClick={handleBackToInsights}
+            label="Back to AI insights"
             className=""
-            title="Return to the page picker (this breakdown stays cached ~1h — re-click the page to resume it). To generate fresh from the current page instead, use the Regenerate button."
+            title="Re-read the AI insights (self-check, concerns, ambiguity) — your edits are kept. From there you can return to the editor, or to the page picker."
           />
           <span
             className="ml-3 text-[11px]"
@@ -2347,6 +2382,7 @@ function App() {
             initialBreakdown={pendingBreakdown || results.breakdown}
             onPush={handlePush}
             isPushing={isPushing}
+            breakdownRef={editorBreakdownRef}
           />
         </div>
       </div>
@@ -2500,6 +2536,22 @@ function App() {
           hasTestCases={usage?.hasTestCases === true}
         />
       );
+    case "insights":
+      // The first screen after a breakdown is generated (or reopened): the AI's
+      // self-check + flagged concerns, BEFORE the editor (2026-06-26). breakdown is
+      // present at every entry point (poll-complete / persistFailed / reconnect) —
+      // passed explicitly. onProceed → the editor (reviewing). No back-to-insights path.
+      return (
+        <InsightsScreen
+          breakdown={pendingBreakdown || results?.breakdown}
+          pageTitle={pageData?.title}
+          truncationNote={results?.truncation_note}
+          persistFailed={persistFailed}
+          staleBreakdown={staleBreakdown}
+          onProceed={() => setScreen("reviewing")}
+          onBack={handleNewPage}
+        />
+      );
     case "confirming":
       return (
         <ConfirmScreen
@@ -2521,6 +2573,18 @@ function App() {
           usage={usage}
           jobId={jobId}
           onOpenPlan={handleOpenPlan}
+          onOpenAddDependency={handleOpenAddDependency}
+        />
+      );
+    case "addDependency":
+      // Add a cross-feature dependency the AI didn't infer (2026-06-26). Reads the CURRENT
+      // edited breakdown (pendingBreakdown) for the feature list; onAdd mutates it + returns
+      // to Review. Reached only from the Review screen, where pendingBreakdown is always set.
+      return (
+        <AddDependencyScreen
+          breakdown={pendingBreakdown}
+          onAdd={handleAddDependency}
+          onBack={() => setScreen("confirming")}
         />
       );
     case "plan":
@@ -3194,6 +3258,395 @@ function GeneratingTestsScreen({ pageTitle, tcElapsed, onBack }) {
   );
 }
 
+// ── AI Insights — the FIRST landing after a breakdown is generated (or reopened),
+// BEFORE the editor (2026-06-26, partner). Surfaces the AI's self-assessment + the
+// concerns it flagged so the BA knows where to focus while editing. These AI-judgment
+// sections were MOVED here out of ConfirmScreen (now the slim "Review and Push" step),
+// removing a 3-way duplicate of the spec summary (it was also the Epic description).
+// Reads breakdown = pendingBreakdown || results.breakdown — present at all 3 entry
+// points (poll-complete, persistFailed-inline, reconnect). One-way forward: there is
+// NO back-to-insights path — it is a generation snapshot, not live-updated; the
+// editor's Regenerate produces fresh analysis. Reuses the App.js helpers
+// (ConfidenceBadge, ConcernRow) via function-declaration hoisting.
+function InsightsScreen({
+  breakdown,
+  pageTitle,
+  truncationNote,
+  persistFailed,
+  staleBreakdown,
+  onProceed,
+  onBack,
+}) {
+  const signals = extractV3Signals(breakdown || {});
+  const sortedSpecConcerns = sortConcernsBySeverity(signals.parsedSpecConcerns);
+  const qualityPalette = signals.overallQuality
+    ? QUALITY_PALETTE[signals.overallQuality]
+    : null;
+  const fc = signals.parsedFeatureConcerns;
+  const featHigh = fc.filter((c) => c.severity === "high").length;
+  const featMed = fc.filter((c) => c.severity === "medium").length;
+  const featLow = fc.filter((c) => c.severity === "low").length;
+  // Nothing flagged → a positive empty-state instead of a near-blank screen. The
+  // TrustCard still renders the confidence summary; this just adds reassuring closure.
+  const nothingFlagged =
+    sortedSpecConcerns.length === 0 &&
+    fc.length === 0 &&
+    !signals.ambiguityNote &&
+    (signals.confidence.flagged?.length || 0) === 0;
+
+  return (
+    <div className="p-6" style={SCREEN_MAX_WIDTH_STYLE}>
+      <BackButton
+        onClick={onBack}
+        title="Discard this breakdown and return to the page picker"
+      />
+      <h2 className="text-lg font-semibold mb-1" style={{ color: "var(--s2j-text)" }}>
+        AI insights
+      </h2>
+      {pageTitle && (
+        <p className="text-xs mb-1" style={{ color: "var(--s2j-text-muted)" }}>
+          {pageTitle}
+        </p>
+      )}
+      <p className="text-sm mb-5" style={{ color: "var(--s2j-text-light)" }}>
+        The AI has completed the breakdown and flagged areas to review before you edit.
+      </p>
+
+      {/* (Spec summary intentionally NOT shown here — 2026-06-26 partner: it is the
+          Epic description, edited in the BreakdownEditor's Epic block, the single
+          source. The intro line above frames this screen; the signals carry the value.) */}
+
+      {/* Partial-breakdown + tab-only warnings — surfaced on the FIRST screen so the
+          user knows the data is incomplete / unsaved before investing time editing. */}
+      {truncationNote && (
+        <div
+          className="rounded-lg p-3 mb-4 flex items-start gap-2"
+          style={{ background: "var(--s2j-orange-bg)", border: "1px solid var(--s2j-orange-border)" }}
+        >
+          <SignalIcon kind="warning" size={16} style={{ marginTop: 1 }} />
+          <div>
+            <p className="text-sm font-medium" style={{ color: "var(--s2j-text)" }}>
+              Partial breakdown — some features may be missing
+            </p>
+            <p className="text-xs mt-0.5" style={{ color: "var(--s2j-text-light)" }}>
+              {truncationNote}
+            </p>
+          </div>
+        </div>
+      )}
+      {persistFailed && (
+        <div
+          className="rounded-lg p-3 mb-4 flex items-start gap-2"
+          style={{ background: "var(--s2j-orange-bg)", border: "1px solid var(--s2j-orange-border)" }}
+        >
+          <SignalIcon kind="warning" size={16} style={{ marginTop: 1 }} />
+          <div>
+            <p className="text-sm font-medium" style={{ color: "var(--s2j-text)" }}>
+              This breakdown could not be saved to storage (too large).
+            </p>
+            <p className="text-xs mt-0.5" style={{ color: "var(--s2j-text-light)" }}>
+              It is loaded in this tab only — edit and push it now, or it will be lost
+              when you leave. Consider splitting very large pages.
+            </p>
+          </div>
+        </div>
+      )}
+      {/* Stale-page warning (forwarded like truncation/persistFailed — UX-1 deep-audit
+          fix): the page changed in Confluence since this breakdown was generated. Shown
+          here for consistency with the other data-quality banners; the actionable
+          Regenerate lives in the editor, one click forward via "Edit the breakdown →". */}
+      {staleBreakdown && (
+        <div
+          className="rounded-lg p-3 mb-4 flex items-start gap-2"
+          style={{ background: "var(--s2j-orange-bg)", border: "1px solid var(--s2j-orange-border)" }}
+        >
+          <SignalIcon kind="warning" size={16} style={{ marginTop: 1 }} />
+          <div>
+            <p className="text-sm font-medium" style={{ color: "var(--s2j-text)" }}>
+              This page was edited since this breakdown was generated
+            </p>
+            <p className="text-xs mt-0.5" style={{ color: "var(--s2j-text-light)" }}>
+              Page version {staleBreakdown.generatedAt} → {staleBreakdown.current}. Open the
+              editor and use Regenerate to include your changes.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* AI self-check (overall quality + confidence + where to focus) */}
+      {(qualityPalette || signals.confidence.total > 0) && (
+        <div
+          className="rounded-lg p-4 mb-4"
+          style={{ background: "var(--s2j-bg-section)", border: "1px solid var(--s2j-border)" }}
+        >
+          <div className="flex items-center justify-between gap-4">
+            <div>
+              <p className="text-xs font-medium uppercase tracking-wider mb-1" style={{ color: "var(--s2j-text-muted)" }}>
+                AI self-check
+              </p>
+              {qualityPalette && (
+                <p className="text-base font-semibold" style={{ color: qualityPalette.text }}>
+                  {qualityPalette.label}
+                </p>
+              )}
+              <p className="text-xs mt-1" style={{ color: "var(--s2j-text-muted)", maxWidth: "34ch" }}>
+                The AI's own confidence in this breakdown — a guide for where to look, not a guarantee.
+              </p>
+              {signals.confidence.averageScore !== null && (
+                <p className="text-xs mt-1" style={{ color: "var(--s2j-text-muted)" }}>
+                  Average self-rated confidence: {signals.confidence.averageScore}/100
+                </p>
+              )}
+            </div>
+            <div className="flex gap-4 text-sm">
+              <ConfidenceBadge indicator="✓" count={signals.confidence["✓"]} color="var(--s2j-green)" label="Confident" />
+              <ConfidenceBadge indicator="⚠" count={signals.confidence["⚠"]} color="var(--s2j-orange)" label="Unsure" />
+              <ConfidenceBadge indicator="✗" count={signals.confidence["✗"]} color="var(--s2j-red)" label="Low confidence" />
+            </div>
+          </div>
+          {signals.confidence.flagged?.length > 0 && (
+            <div className="mt-3 pt-3" style={{ borderTop: "1px solid var(--s2j-border)" }}>
+              <p className="text-xs font-medium uppercase tracking-wider mb-2" style={{ color: "var(--s2j-text-muted)" }}>
+                Needs your attention
+              </p>
+              <ul className="space-y-1" style={{ listStyle: "none", margin: 0, padding: 0 }}>
+                {signals.confidence.flagged.slice(0, 6).map((f, i) => (
+                  <li key={i} className="flex items-center gap-2 text-xs">
+                    <span style={{ color: f.indicator === "✗" ? "var(--s2j-red)" : "var(--s2j-orange)", flexShrink: 0 }}>
+                      {f.indicator}
+                    </span>
+                    <span className="truncate" style={{ color: "var(--s2j-text)" }}>{f.name}</span>
+                    {typeof f.score === "number" && (
+                      <span style={{ color: "var(--s2j-text-muted)", flexShrink: 0 }}>{f.score}/100</span>
+                    )}
+                  </li>
+                ))}
+              </ul>
+              {signals.confidence.flagged.length > 6 && (
+                <p className="text-xs mt-1" style={{ color: "var(--s2j-text-muted)" }}>
+                  +{signals.confidence.flagged.length - 6} more — find them in the editor
+                </p>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Document-level concerns — risks / compliance / ambiguity ranked by severity */}
+      {sortedSpecConcerns.length > 0 && (
+        <div className="mb-4">
+          <h3 className="text-sm font-semibold mb-2 flex items-center gap-2" style={{ color: "var(--s2j-text)" }}>
+            <SignalIcon kind="warning" size={14} />
+            <span>Document-level concerns ({sortedSpecConcerns.length})</span>
+          </h3>
+          <p className="text-xs mb-3" style={{ color: "var(--s2j-text-muted)" }}>
+            Potential risks, ambiguities, or compliance gaps surfaced by AI analysis. Address high-severity items as you edit.
+          </p>
+          <div className="space-y-2">
+            {sortedSpecConcerns.map((concern, idx) => (
+              <ConcernRow key={idx} concern={concern} />
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Feature-level concerns summary (the detail lives on each feature in the editor) */}
+      {fc.length > 0 && (
+        <div
+          className="rounded-lg p-3 mb-4 text-xs"
+          style={{ background: "var(--s2j-bg-section)", border: "1px solid var(--s2j-border)", color: "var(--s2j-text-muted)" }}
+        >
+          <strong style={{ color: "var(--s2j-text)" }}>
+            +{fc.length} feature-level concerns
+          </strong>{" "}
+          attached to individual features (review in the editor). High-severity {featHigh} · Medium {featMed} · Low {featLow}
+        </div>
+      )}
+
+      {/* AI ambiguity note — Sonnet self-disclosed assumption boundary */}
+      {signals.ambiguityNote && (
+        <details
+          className="mb-4 rounded-lg"
+          style={{ border: "1px solid var(--s2j-border)", background: "var(--s2j-bg-section)" }}
+        >
+          <summary className="cursor-pointer text-xs font-medium uppercase tracking-wider p-3" style={{ color: "var(--s2j-text-muted)" }}>
+            AI ambiguity note
+          </summary>
+          <div className="p-3 pt-0 text-xs" style={{ color: "var(--s2j-text)", borderTop: "1px solid var(--s2j-border)" }}>
+            {signals.ambiguityNote}
+          </div>
+        </details>
+      )}
+
+      {/* Nothing flagged → positive closure (manages the "why so little guidance?" gap). */}
+      {nothingFlagged && (
+        <SignalCallout kind="success" fontSize={12} style={{ marginBottom: 16 }}>
+          No concerns flagged — the AI is confident in this breakdown. Open the editor to refine and push.
+        </SignalCallout>
+      )}
+
+      {/* Forward CTA → the editor. Green (btn-primary), matching the flow's other
+          forward step "Continue to Review →". */}
+      <div className="mt-2 flex justify-end">
+        <button onClick={onProceed} className="btn-primary">
+          Edit the breakdown →
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── Add a cross-feature dependency (2026-06-26, partner) ─────────────────────────
+// A dedicated, comfortable screen to add a Story-blocks-Story link the AI didn't infer
+// (the Review screen already lets the user REMOVE/restore edges — this adds the missing
+// ADD). Opened from DependencyStructure's "+ Add dependency"; mutates pendingBreakdown via
+// handleAddDependency, returns to Review. Guards: source≠target, no duplicate, and BLOCKS a
+// cycle (a dependency loop can't push as clean Jira blocks-links). Features come from the
+// CURRENT (edited) breakdown.
+function AddDependencyScreen({ breakdown, onAdd, onBack }) {
+  const caps = breakdown?.capabilities || [];
+  const byCategory = useMemo(() => {
+    const m = new Map();
+    caps.forEach((cap) => {
+      (cap.features || []).forEach((f) => {
+        if (!f || !f.name) return;
+        if (!m.has(cap.name)) m.set(cap.name, []);
+        m.get(cap.name).push(f.name);
+      });
+    });
+    return Array.from(m.entries());
+  }, [breakdown]);
+  // source name → Set(target names) it already depends on (duplicate + cycle checks).
+  const depMap = useMemo(() => {
+    const m = new Map();
+    caps.forEach((cap) => {
+      (cap.features || []).forEach((f) => {
+        if (f && f.name) m.set(f.name, new Set(f.dependencies || []));
+      });
+    });
+    return m;
+  }, [breakdown]);
+
+  const [source, setSource] = useState("");
+  const [target, setTarget] = useState("");
+
+  const sameFeature = !!source && source === target;
+  const alreadyExists = !!source && !!target && (depMap.get(source)?.has(target) || false);
+  // Would source → target create a cycle? (target already reaches source via deps.)
+  const createsCycle = useMemo(() => {
+    if (!source || !target || sameFeature) return false;
+    const seen = new Set();
+    const stack = [target];
+    while (stack.length) {
+      const cur = stack.pop();
+      if (cur === source) return true;
+      if (seen.has(cur)) continue;
+      seen.add(cur);
+      for (const d of depMap.get(cur) || []) stack.push(d);
+    }
+    return false;
+  }, [source, target, sameFeature, depMap]);
+
+  const canAdd = !!source && !!target && !sameFeature && !alreadyExists && !createsCycle;
+
+  const selectStyle = {
+    width: "100%",
+    padding: "12px 14px",
+    fontSize: "15px",
+    borderRadius: "8px",
+    border: "1px solid var(--s2j-border)",
+    background: "var(--s2j-bg)",
+    color: "var(--s2j-text)",
+    outline: "none",
+    cursor: "pointer",
+  };
+  const options = byCategory.map(([cat, names]) => (
+    <optgroup key={cat} label={cat}>
+      {names.map((n) => (
+        <option key={n} value={n}>{n}</option>
+      ))}
+    </optgroup>
+  ));
+
+  return (
+    <div className="p-6" style={SCREEN_MAX_WIDTH_STYLE}>
+      <BackButton
+        onClick={onBack}
+        label="Back to Review"
+        title="Return to the Review & Push screen without adding"
+      />
+      <h2 className="text-lg font-semibold mb-1" style={{ color: "var(--s2j-text)" }}>
+        Add a cross-feature dependency
+      </h2>
+      <p className="text-sm mb-6" style={{ color: "var(--s2j-text-light)" }}>
+        Link two features so one is blocked by another. It becomes a Story-blocks-Story link
+        in Jira — the feature it depends on must be completed first.
+      </p>
+
+      <div
+        className="rounded-lg p-5 mb-4"
+        style={{ background: "var(--s2j-bg-section)", border: "1px solid var(--s2j-border)" }}
+      >
+        <label className="block text-sm font-semibold mb-2" style={{ color: "var(--s2j-text)" }}>
+          This feature…
+        </label>
+        <select style={selectStyle} value={source} onChange={(e) => setSource(e.target.value)}>
+          <option value="">Select a feature…</option>
+          {options}
+        </select>
+
+        <div
+          className="flex items-center gap-2 my-4 text-sm font-medium"
+          style={{ color: "var(--s2j-blue)" }}
+        >
+          <IconLink size={16} /> depends on / is blocked by ↓
+        </div>
+
+        <label className="block text-sm font-semibold mb-2" style={{ color: "var(--s2j-text)" }}>
+          …this feature
+        </label>
+        <select style={selectStyle} value={target} onChange={(e) => setTarget(e.target.value)}>
+          <option value="">Select a feature…</option>
+          {options}
+        </select>
+      </div>
+
+      {sameFeature && (
+        <SignalCallout kind="warning" style={{ marginBottom: 16 }}>
+          Pick two different features — a feature can't depend on itself.
+        </SignalCallout>
+      )}
+      {alreadyExists && (
+        <SignalCallout kind="info" style={{ marginBottom: 16 }}>
+          This dependency already exists in the breakdown.
+        </SignalCallout>
+      )}
+      {createsCycle && (
+        <SignalCallout kind="error" style={{ marginBottom: 16 }}>
+          This would create a circular dependency — “{target}” already depends (directly or
+          indirectly) on “{source}”. Jira blocks-links can't form a loop, so this can't be added.
+        </SignalCallout>
+      )}
+      {canAdd && (
+        <SignalCallout kind="info" style={{ marginBottom: 16 }}>
+          <strong style={{ color: "var(--s2j-text)" }}>{source}</strong> will depend on{" "}
+          <strong style={{ color: "var(--s2j-text)" }}>{target}</strong> — “{target}” must be
+          completed first.
+        </SignalCallout>
+      )}
+
+      <div className="flex items-center gap-3">
+        <button onClick={() => onAdd(source, target)} disabled={!canAdd} className="btn-primary">
+          Add dependency
+        </button>
+        <button onClick={onBack} className="btn-secondary">
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
+}
+
 // ── Confirm Push ────────────────────────────────────────────────
 // v3.0.0 ConfirmScreen — embeds Dashboard signals at the push decision point.
 //
@@ -3226,6 +3679,7 @@ function ConfirmScreen({
   onGenerateTestCases,
   onOpenTestCases,
   onOpenPlan,
+  onOpenAddDependency,
   tcGenerating,
   tcStale,
   usage,
@@ -3278,11 +3732,11 @@ function ConfirmScreen({
   // Extract v3 native signals от breakdown's _v3_original (preserved by
   // v3AdaptResultPayload at result-load time). Falls back gracefully когато
   // legacy-only shape (no _v3_original) — empty signals + counts still render.
+  // `signals` is kept here ONLY for the push-essential bits below (counts.sharedACs,
+  // categories, dependencyEdges). The AI-judgment signals (spec summary, self-check
+  // confidence + flagged worklist, spec/feature concerns, ambiguity) MOVED to
+  // InsightsScreen — the first screen after generation — 2026-06-26.
   const signals = extractV3Signals(breakdown || {});
-  const sortedSpecConcerns = sortConcernsBySeverity(signals.parsedSpecConcerns);
-  const qualityPalette = signals.overallQuality
-    ? QUALITY_PALETTE[signals.overallQuality]
-    : null;
 
   return (
     <div className="p-6" style={SCREEN_MAX_WIDTH_STYLE}>
@@ -3298,14 +3752,9 @@ function ConfirmScreen({
       >
         Review and Push to Jira
       </h2>
-      {signals.specSummary && (
-        <p
-          className="text-sm mb-5"
-          style={{ color: "var(--s2j-text-muted)" }}
-        >
-          {signals.specSummary}
-        </p>
-      )}
+      {/* (Spec summary + AI self-check + concerns + ambiguity moved to InsightsScreen,
+          the first screen after generation — 2026-06-26. ConfirmScreen is now the slim
+          push-decision step: what-will-be-created, dependencies, capacity, test cases.) */}
 
       {/* Partial-breakdown warning — generation output hit the token cap and was
           salvaged, so later features may be missing. Surfaced at the push
@@ -3356,126 +3805,9 @@ function ConfirmScreen({
         </div>
       )}
 
-      {/* TrustCard — overall quality + confidence + average score */}
-      {(qualityPalette || signals.confidence.total > 0) && (
-        <div
-          className="rounded-lg p-4 mb-4"
-          style={{
-            background: "var(--s2j-bg-section)",
-            border: "1px solid var(--s2j-border)",
-          }}
-        >
-          <div className="flex items-center justify-between gap-4">
-            <div>
-              <p
-                className="text-xs font-medium uppercase tracking-wider mb-1"
-                style={{ color: "var(--s2j-text-muted)" }}
-              >
-                AI self-check
-              </p>
-              {qualityPalette && (
-                <p
-                  className="text-base font-semibold"
-                  style={{ color: qualityPalette.text }}
-                >
-                  {qualityPalette.label}
-                </p>
-              )}
-              <p
-                className="text-xs mt-1"
-                style={{ color: "var(--s2j-text-muted)", maxWidth: "34ch" }}
-              >
-                The AI's own confidence in this breakdown — a guide for where to
-                look, not a guarantee.
-              </p>
-              {signals.confidence.averageScore !== null && (
-                <p className="text-xs mt-1" style={{ color: "var(--s2j-text-muted)" }}>
-                  Average self-rated confidence: {signals.confidence.averageScore}/100
-                </p>
-              )}
-            </div>
-            <div className="flex gap-4 text-sm">
-              <ConfidenceBadge
-                indicator="✓"
-                count={signals.confidence["✓"]}
-                color="var(--s2j-green)"
-                label="Confident"
-              />
-              <ConfidenceBadge
-                indicator="⚠"
-                count={signals.confidence["⚠"]}
-                color="var(--s2j-orange)"
-                label="Unsure"
-              />
-              <ConfidenceBadge
-                indicator="✗"
-                count={signals.confidence["✗"]}
-                color="var(--s2j-red)"
-                label="Low confidence"
-              />
-            </div>
-          </div>
-
-          {/* Traceability worklist — names the ⚠/✗ features behind the counts so
-              a "1 low-confidence" count is findable (✗ first). Without this the
-              counts were a dead end (partner feedback 2026-05-31). */}
-          {signals.confidence.flagged?.length > 0 && (
-            <div
-              className="mt-3 pt-3"
-              style={{ borderTop: "1px solid var(--s2j-border)" }}
-            >
-              <p
-                className="text-xs font-medium uppercase tracking-wider mb-2"
-                style={{ color: "var(--s2j-text-muted)" }}
-              >
-                Needs your attention before push
-              </p>
-              <ul
-                className="space-y-1"
-                style={{ listStyle: "none", margin: 0, padding: 0 }}
-              >
-                {signals.confidence.flagged.slice(0, 6).map((f, i) => (
-                  <li key={i} className="flex items-center gap-2 text-xs">
-                    <span
-                      style={{
-                        color:
-                          f.indicator === "✗"
-                            ? "var(--s2j-red)"
-                            : "var(--s2j-orange)",
-                        flexShrink: 0,
-                      }}
-                    >
-                      {f.indicator}
-                    </span>
-                    <span
-                      className="truncate"
-                      style={{ color: "var(--s2j-text)" }}
-                    >
-                      {f.name}
-                    </span>
-                    {typeof f.score === "number" && (
-                      <span
-                        style={{ color: "var(--s2j-text-muted)", flexShrink: 0 }}
-                      >
-                        {f.score}/100
-                      </span>
-                    )}
-                  </li>
-                ))}
-              </ul>
-              {signals.confidence.flagged.length > 6 && (
-                <p
-                  className="text-xs mt-1"
-                  style={{ color: "var(--s2j-text-muted)" }}
-                >
-                  +{signals.confidence.flagged.length - 6} more — find them in the
-                  breakdown below
-                </p>
-              )}
-            </div>
-          )}
-        </div>
-      )}
+      {/* (AI self-check — overall quality + ✓/⚠/✗ confidence + the "Needs your
+          attention" worklist — moved to InsightsScreen, the first screen after
+          generation — 2026-06-26.) */}
 
       {/* Count summary — what will be created в JIRA */}
       <div
@@ -3595,89 +3927,12 @@ function ConfirmScreen({
         edges={signals.dependencyEdges}
         onRemove={onRemoveDependency}
         onRestore={onRestoreDependency}
+        onOpenAdd={onOpenAddDependency}
       />
 
-      {/* Spec-level concerns — risks/ambiguity/compliance ranked by severity */}
-      {sortedSpecConcerns.length > 0 && (
-        <div className="mb-4">
-          <h3
-            className="text-sm font-semibold mb-2 flex items-center gap-2"
-            style={{ color: "var(--s2j-text)" }}
-          >
-            <SignalIcon kind="warning" size={14} />
-            <span>Review before push ({sortedSpecConcerns.length})</span>
-          </h3>
-          <p
-            className="text-xs mb-3"
-            style={{ color: "var(--s2j-text-muted)" }}
-          >
-            Document-level concerns surfaced by AI analysis. Address before push when severity is high.
-          </p>
-          <div className="space-y-2">
-            {sortedSpecConcerns.map((concern, idx) => (
-              <ConcernRow key={idx} concern={concern} />
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* Feature-level concerns summary (count only — detail в editor) */}
-      {signals.parsedFeatureConcerns.length > 0 && (
-        <div
-          className="rounded-lg p-3 mb-4 text-xs"
-          style={{
-            background: "var(--s2j-bg-section)",
-            border: "1px solid var(--s2j-border)",
-            color: "var(--s2j-text-muted)",
-          }}
-        >
-          <strong style={{ color: "var(--s2j-text)" }}>
-            +{signals.parsedFeatureConcerns.length} feature-level concerns
-          </strong>{" "}
-          attached to individual features (review in the editor). High-severity{" "}
-          {
-            signals.parsedFeatureConcerns.filter((c) => c.severity === "high")
-              .length
-          }{" "}
-          · Medium{" "}
-          {
-            signals.parsedFeatureConcerns.filter((c) => c.severity === "medium")
-              .length
-          }{" "}
-          · Low{" "}
-          {
-            signals.parsedFeatureConcerns.filter((c) => c.severity === "low")
-              .length
-          }
-        </div>
-      )}
-
-      {/* Ambiguity note — Sonnet self-disclosed assumption boundary */}
-      {signals.ambiguityNote && (
-        <details
-          className="mb-4 rounded-lg"
-          style={{
-            border: "1px solid var(--s2j-border)",
-            background: "var(--s2j-bg-section)",
-          }}
-        >
-          <summary
-            className="cursor-pointer text-xs font-medium uppercase tracking-wider p-3"
-            style={{ color: "var(--s2j-text-muted)" }}
-          >
-            AI ambiguity note
-          </summary>
-          <div
-            className="p-3 pt-0 text-xs"
-            style={{
-              color: "var(--s2j-text)",
-              borderTop: "1px solid var(--s2j-border)",
-            }}
-          >
-            {signals.ambiguityNote}
-          </div>
-        </details>
-      )}
+      {/* (Document-level concerns, the feature-level concerns summary, and the AI
+          ambiguity note moved to InsightsScreen — the first screen after generation —
+          2026-06-26.) */}
 
       {/* Capacity-Sheet Planner — its OWN dedicated section (partner: it deserves a section, not a
           button crammed into the test-case action row). Review-only; consumes the EDITED breakdown
@@ -3964,7 +4219,7 @@ function ConfirmScreen({
 // breakdown JSON the push reads — NOT just this view — so a removed edge is not
 // recreated in JIRA. `removed` is local UI state only: it drives the restore
 // affordance and resets when the screen remounts (a fresh review session).
-function DependencyStructure({ edges, onRemove, onRestore }) {
+function DependencyStructure({ edges, onRemove, onRestore, onOpenAdd }) {
   const [removed, setRemoved] = useState([]);
 
   // Task #4: the target string is the FROZEN dep name (the depended-on feature's
@@ -4005,28 +4260,41 @@ function DependencyStructure({ edges, onRemove, onRestore }) {
   }
   const groups = Array.from(bySource.entries());
 
-  // Nothing active AND nothing removed → render nothing.
-  if (groups.length === 0 && removed.length === 0) return null;
+  // Nothing active AND nothing removed AND no add affordance → render nothing. With
+  // onOpenAdd present we ALWAYS render (header + "+ Add dependency") so the user can add
+  // the FIRST cross-feature dependency even when the AI inferred none (2026-06-26).
+  if (groups.length === 0 && removed.length === 0 && !onOpenAdd) return null;
 
   return (
     <div className="mb-4">
-      {groups.length > 0 && (
-        <>
-          <h3
-            className="text-sm font-semibold mb-1 flex items-center gap-2"
-            style={{ color: "var(--s2j-text)" }}
+      <div className="flex items-center justify-between gap-2 mb-1">
+        <h3
+          className="text-sm font-semibold flex items-center gap-2"
+          style={{ color: "var(--s2j-text)" }}
+        >
+          <IconLink size={16} style={{ marginRight: 6 }} />
+          <span>Cross-feature dependencies ({edges?.length || 0})</span>
+        </h3>
+        {onOpenAdd && (
+          <button
+            type="button"
+            onClick={onOpenAdd}
+            className="text-xs font-medium rounded px-2 py-1 transition-colors shrink-0"
+            style={{ color: "var(--s2j-blue)", background: "transparent", border: "1px solid var(--s2j-blue-border)", cursor: "pointer" }}
+            onMouseEnter={(e) => { e.currentTarget.style.background = "var(--s2j-blue-bg)"; }}
+            onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; }}
+            title="Add a cross-feature dependency the AI didn't infer"
           >
-            <IconLink size={16} style={{ marginRight: 6 }} />
-            <span>Cross-feature dependencies ({edges.length})</span>
-          </h3>
-          <p className="text-xs mb-3" style={{ color: "var(--s2j-text-muted)" }}>
-            Each becomes a Story-blocks-Story link in Jira — the feature it depends on
-            must be completed first. Remove any that don't belong before pushing.
-          </p>
-        </>
-      )}
+            + Add dependency
+          </button>
+        )}
+      </div>
+      <p className="text-xs mb-3" style={{ color: "var(--s2j-text-muted)" }}>
+        Each becomes a Story-blocks-Story link in Jira — the feature it depends on must be
+        completed first. Remove any that don't belong, or add one the AI missed.
+      </p>
 
-      {groups.length > 0 && (
+      {groups.length > 0 ? (
         <div
           className="rounded-lg p-3"
           style={{
@@ -4099,6 +4367,13 @@ function DependencyStructure({ edges, onRemove, onRestore }) {
               );
             })}
           </ul>
+        </div>
+      ) : (
+        <div
+          className="rounded-lg p-3 text-xs"
+          style={{ background: "var(--s2j-bg-section)", border: "1px dashed var(--s2j-border)", color: "var(--s2j-text-muted)" }}
+        >
+          No cross-feature dependencies yet.{onOpenAdd ? ' Use "+ Add dependency" above to link two features.' : ""}
         </div>
       )}
 

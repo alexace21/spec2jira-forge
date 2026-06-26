@@ -5,12 +5,20 @@ import CapabilityCard from './CapabilityCard.jsx';
 import SharedACPanel from './SharedACPanel.jsx';
 import LabelsEditor from './LabelsEditor.jsx';
 
-export default function BreakdownEditor({ initialBreakdown, onPush, isPushing = false }) {
+export default function BreakdownEditor({ initialBreakdown, onPush, isPushing = false, breakdownRef }) {
   const [breakdown, setBreakdown] = useState(() => JSON.parse(JSON.stringify(initialBreakdown)));
 
   useEffect(() => {
     setBreakdown(JSON.parse(JSON.stringify(initialBreakdown)));
   }, [initialBreakdown]);
+
+  // Mirror the current working copy up to App via the ref (2026-06-26) so the reviewing
+  // top-bar "Back to AI insights" can lift these unsaved edits to pendingBreakdown before
+  // navigating away (the key="screen-reviewing" remount would otherwise drop them). A
+  // ref-write, not state — no re-render cost on every edit.
+  useEffect(() => {
+    if (breakdownRef) breakdownRef.current = breakdown;
+  }, [breakdown, breakdownRef]);
 
   const stats = useMemo(() => {
     const caps = breakdown.capabilities || [];
@@ -125,6 +133,9 @@ export default function BreakdownEditor({ initialBreakdown, onPush, isPushing = 
               {stats.totalItems} Jira items
             </span>
           </div>
+          {/* Re-reading AI insights mid-edit lives on the reviewing top-bar's "Back to AI
+              insights" button now (2026-06-26) — the natural top-left back position; it
+              lifts edits via editorBreakdownRef so nothing is lost. */}
           <button onClick={resetBreakdown}
             className="rounded px-2 py-1 text-[11px] transition-colors"
             style={{ color: 'var(--s2j-text-muted)' }}
