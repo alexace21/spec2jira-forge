@@ -17,6 +17,7 @@
   --s2j-border:       #e2e2e2;
 
   --s2j-blue:         #61affe;
+  --s2j-blue-dark:    #4a9fe8;
   --s2j-blue-bg:      #ebf3fb;
   --s2j-blue-border:  #c5ddf5;
 
@@ -55,6 +56,21 @@
   }
   .btn-secondary:hover {
     background: var(--s2j-bg-section);
+  }
+
+  /* btn-nav — the BLUE convention (2026-06-26, partner): blue = navigation /
+     "open / go to a page". Mirrors btn-primary's shape but carries --s2j-blue so
+     it reads as a wayfinding action (like the Back button), distinct from
+     btn-primary (green = commit/submit a change, e.g. Generate, Push). */
+  .btn-nav {
+    @apply inline-flex items-center gap-2 rounded-md px-4 py-2
+      text-sm font-semibold text-white shadow-sm
+      disabled:opacity-50 disabled:cursor-not-allowed
+      transition-colors;
+    background-color: var(--s2j-blue);
+  }
+  .btn-nav:hover:not(:disabled) {
+    background-color: var(--s2j-blue-dark);
   }
 
   .btn-danger {
