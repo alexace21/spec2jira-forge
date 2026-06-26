@@ -400,19 +400,30 @@ function App() {
     }
   }, []);
 
-  // Reset scroll to top on every screen change (UX, 2026-05-30). Without this,
+  // Reset scroll + focus to the top on every screen change (UX). Without this,
   // navigating away from a screen scrolled to the bottom (e.g. BreakdownEditor)
   // lands the next screen at the bottom on blank space, forcing a scroll-up.
   // Also refresh the usage badge whenever the user returns to the Ready screen.
   useEffect(() => {
-    // Best-effort scroll-to-top on screen change. NOTE: Forge auto-resizes the
-    // Custom UI iframe, so on a tall screen the PARENT product page scrolls and a
-    // sandboxed iframe cannot reset the parent's scroll — so this only helps if
-    // the iframe itself scrolls. The #root-internal-scroll approach was reverted
-    // (2026-05-30): forcing #root to 100vh broke short screens (huge empty area
-    // on the picker). Scroll-to-top remains an open, Forge-specific UX item.
+    // 2026-06-26 UX: now that html/body/#root are no longer pinned to 100vh, the
+    // iframe shrinks to content on every screen — so navigating to a SHORTER screen
+    // self-corrects (no empty band to be stranded in). window.scrollTo(0,0) resets
+    // the iframe's OWN scroll. The PARENT product-page scroll is cross-origin and
+    // CANNOT be reset from a sandboxed Custom UI iframe (no @forge/bridge view API
+    // exists) — so the tall->tall land-at-bottom case is a documented Forge residual.
+    // Moving focus to #root (a -1 skip-target, outline suppressed in index.css) resets
+    // keyboard/screen-reader position to the top of the new screen — an accessibility
+    // win and the strongest in-iframe lever available — with preventScroll so it never
+    // fights the scrollTo above.
     try {
       window.scrollTo(0, 0);
+    } catch (_) {}
+    try {
+      const root = document.getElementById("root");
+      if (root) {
+        root.setAttribute("tabindex", "-1");
+        root.focus({ preventScroll: true });
+      }
     } catch (_) {}
     if (screen === "ready") loadUsage();
   }, [screen, loadUsage]);
@@ -813,29 +824,14 @@ function App() {
     }
   }, [screen, tcStartTime]);
 
-  // ── Bug F1 fix (2026-05-10 part 44) — reviewing screen layout reflow ─
-  // Symptom: in-flight generation→reviewing transition rendered breakdown
-  // editor vertically-compressed (full width, but content squeezed).
-  // Workaround partner found: close+reopen → fresh load → reviewing
-  // renders correctly. Diagnosis: reviewing wrapper uses `height: 100vh`
-  // which references iframe viewport at layout time. After а long
-  // GeneratingScreen render (5-30 min с small centered content), iframe
-  // viewport context settled to that smaller content size; subsequent
-  // reviewing render computed 100vh against stale value. React's reuse
-  // of outer <div> DOM node между screens (both wrappers са plain divs)
-  // skipped fresh layout pass.
-  // Fix: dispatch synthetic resize event on entering reviewing screen —
-  // nudges browser/iframe к recompute viewport context для the new
-  // wrapper's height. Belt-and-suspenders: companion change в the
-  // reviewing wrapper itself (height → minHeight) allows natural growth.
-  useEffect(() => {
-    if (screen === "reviewing") {
-      const id = requestAnimationFrame(() => {
-        window.dispatchEvent(new Event("resize"));
-      });
-      return () => cancelAnimationFrame(id);
-    }
-  }, [screen]);
+  // ── 2026-06-26 UX — reviewing is now content-driven (page-scroll), like every other
+  // screen: NO vh height pin anywhere on it. The old Bug-F1 synthetic-resize guard
+  // existed only to re-sync the vh-based wrapper after a stale-small GeneratingScreen;
+  // with no vh it is obsolete and was removed. The maxHeight:vh CEILING that briefly
+  // replaced the minHeight FLOOR broke the editor LIVE (the flex-1 overflow-y-auto pane
+  // collapsed to ~0 — a vh ceiling gives the flex chain no DEFINITE height to distribute),
+  // so reviewing was switched to plain content flow. The Forge auto-resizer measures the
+  // editor's natural height directly; `key="screen-reviewing"` still forces a fresh mount.
 
   // ── Polling ───────────────────────────────────────────────────
   const startPolling = useCallback((jid) => {
@@ -2200,17 +2196,20 @@ function App() {
   if (screen === "reviewing") {
     return (
       <div
-        // Bug F1 fix (2026-05-10 part 44) — `key` forces React к unmount
-        // any prior screen's wrapper и mount а fresh DOM node для
-        // reviewing. Without this, React reuses the outer <div> across
-        // screens (both wrappers са plain divs), preserving stale layout
-        // context от GeneratingScreen's small content size. Companion
-        // change: useEffect-dispatched window.resize on screen=reviewing
-        // entry (see App component top); minHeight (was height) allows
-        // natural growth if content needs more than viewport.
+        // Bug F1 fix (2026-05-10 part 44) — `key` forces React to unmount any prior
+        // screen's wrapper and mount a fresh DOM node for reviewing, so it never reuses
+        // a stale layout context.
+        // 2026-06-26 UX (live-validated): NO height pin — reviewing is content-driven and
+        // page-scrolls like every other screen. The earlier maxHeight:vh CEILING broke the
+        // editor live (its flex-1 overflow-y-auto pane collapsed to ~0 because a vh ceiling
+        // gives the flex chain no DEFINITE height to distribute), and vh is self-referential
+        // under the Forge auto-resizer. Dropping the cap lets the resizer measure the editor's
+        // natural content height: short breakdowns → small iframe (no empty band), long ones →
+        // the host page scrolls. The "Continue to Review" CTA sits at the editor's natural
+        // bottom (consistent with Confirm/Plan/Pushed). display:flex column just stacks the
+        // top bar above the content.
         key="screen-reviewing"
         style={{
-          minHeight: "100vh",
           display: "flex",
           flexDirection: "column",
           // BE1 part 29 (2026-05-09) — globalPage migration left BreakdownEditor
@@ -2281,7 +2280,10 @@ function App() {
             <IconRefresh size={14} /> Regenerate
           </button>
         </div>
-        <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
+        {/* 2026-06-26 UX: plain content-flow block (was flex:1/minHeight:0). Holds the
+            optional shrink-0 banners + the BreakdownEditor, all flowing to natural height
+            so the Forge resizer fits the iframe to content. */}
+        <div>
           {/* Stale-page banner (2026-06-02) — the page's Confluence version advanced
               since this breakdown was generated (set in routeByPageStatus). Non-blocking,
               orange warning style matching the truncation banner (ConfirmScreen). Makes
@@ -2290,7 +2292,7 @@ function App() {
               data). */}
           {staleBreakdown && (
             <div
-              className="shrink-0 mx-3 mt-3 rounded-lg p-3 flex items-start gap-2"
+              className="mx-3 mt-3 rounded-lg p-3 flex items-start gap-2"
               style={{
                 background: "var(--s2j-orange-bg)",
                 border: "1px solid var(--s2j-orange-border)",
@@ -2323,7 +2325,7 @@ function App() {
               style); no existing copy changed. */}
           {persistFailed && (
             <div
-              className="shrink-0 mx-3 mt-3 rounded-lg p-3 flex items-start gap-2"
+              className="mx-3 mt-3 rounded-lg p-3 flex items-start gap-2"
               style={{
                 background: "var(--s2j-orange-bg)",
                 border: "1px solid var(--s2j-orange-border)",

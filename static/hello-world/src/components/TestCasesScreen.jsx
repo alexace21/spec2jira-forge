@@ -605,8 +605,11 @@ function TestCasesScreen({
 
   return (
     <div
+      // 2026-06-26 UX: no minHeight:100vh — TestCases has no internal overflow pane
+      // (its body is a plain flex-1 p-4), so it flows naturally and the Forge resizer
+      // fits the iframe to content (no empty scroll band below short results). Kept as
+      // a flex column purely to keep the shrink-0 top bar layout consistent.
       style={{
-        minHeight: "100vh",
         display: "flex",
         flexDirection: "column",
         ...SCREEN_MAX_WIDTH_STYLE,

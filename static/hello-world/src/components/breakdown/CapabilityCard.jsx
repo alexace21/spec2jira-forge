@@ -7,7 +7,11 @@ import { newStoryUid } from '../../lib/v3Schema';
  * Light theme (Swagger palette).
  */
 export default function CapabilityCard({ capability, index, onUpdate, onDelete }) {
-  const [expanded, setExpanded] = useState(true);
+  // Collapsed by default (2026-06-26 UX): every entry to the Review/editor screen opens
+  // with all categories collapsed for a scannable overview; the user expands what they
+  // want. BreakdownEditor remounts per reviewing entry (key="screen-reviewing"), so this
+  // resets to collapsed on each navigation / auto-load. addFeature re-expands on demand.
+  const [expanded, setExpanded] = useState(false);
 
   const featureCount = capability.features?.length || 0;
   const taskCount = (capability.features || []).reduce(

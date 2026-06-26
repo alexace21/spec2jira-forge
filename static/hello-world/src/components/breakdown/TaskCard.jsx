@@ -48,8 +48,9 @@ function SelectBadge({ value, options, colorMap, labelMap, onChange }) {
 
   // Measure synchronously before paint so the menu never flashes at (0,0), and
   // keep it pinned to the trigger while open as the user scrolls/resizes. The
-  // scroll listener is on the capture phase so it also fires for the editor's
-  // inner overflow-y-auto scroll container, not just the window.
+  // scroll listener uses the capture phase to catch scroll at any level. (The
+  // editor now page-scrolls — its old inner overflow-y-auto pane was removed
+  // 2026-06-26 — so this fires on iframe/window scroll + resize.)
   useLayoutEffect(() => {
     if (!open) return undefined;
     reposition();

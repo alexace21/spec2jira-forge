@@ -69,10 +69,22 @@
   }
 }
 
-/* Forge iframe: fill the panel */
+/* Forge iframe: let CONTENT drive height so the Atlassian auto-resizer fits the
+ * iframe to actual content — no empty scroll band below short screens. Do NOT pin
+ * html/body/#root to height/min-height:100vh: that forces the measured document to
+ * the full parent viewport, so the resizer grows the iframe and leaves empty space
+ * (the exact symptom behind the 2026-05-30 #root:100vh revert). Height is
+ * content-driven; viewportSize is omitted in the manifest so auto-resize is on. */
 html, body, #root {
-  height: 100vh;
   margin: 0;
+}
+
+/* Programmatic scroll/focus-reset target for the App.js screen-change effect:
+ * focusing #root (a -1 skip-target) on navigation resets keyboard/screen-reader
+ * position to the top of the freshly-rendered screen. Suppress the outline since
+ * this is a programmatic skip-target focus, not a user tab-stop. */
+#root:focus {
+  outline: none;
 }
 
 /* Base text color for Forge iframe */

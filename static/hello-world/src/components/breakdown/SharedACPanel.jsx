@@ -19,7 +19,10 @@ export default function SharedACPanel({
   onRemove,
   onRestore,
 }) {
-  const [collapsed, setCollapsed] = useState(false);
+  // Collapsed by default (2026-06-26 UX): the Shared-AC panel opens collapsed on every
+  // entry to the editor (BreakdownEditor remounts per reviewing entry), keeping the
+  // initial view scannable; one click expands the assign-flow.
+  const [collapsed, setCollapsed] = useState(true);
   // Removed subsection defaults collapsed — keeps the panel scannable for the
   // primary assign-flow; removed items are one click away.
   const [removedCollapsed, setRemovedCollapsed] = useState(true);
