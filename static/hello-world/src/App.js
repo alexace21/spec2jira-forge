@@ -15,7 +15,7 @@ import BackButton from "./components/BackButton";
 import TestCasesScreen from "./components/TestCasesScreen";
 import PlanScreen from "./components/PlanScreen";
 import { SignalCallout, SignalIcon } from "./components/Signal";
-import { ScreenHeader, MoodCard, TYPE, MOOD } from "./components/moodboard";
+import { ScreenHeader, MoodCard, TYPE, MOOD, glassSurface } from "./components/moodboard";
 import {
   IconRefresh,
   IconClock,
@@ -3218,19 +3218,15 @@ function InsightsScreen({
 
   return (
     <div className="p-6" style={SCREEN_MAX_WIDTH_STYLE}>
-      <BackButton
-        onClick={onBack}
-        title="Discard this breakdown and return to the page picker"
+      {/* moodboard (Phase 2) — navy "AI insights" title + the page name as subtitle. */}
+      <ScreenHeader
+        title="AI insights"
+        subtitle={pageTitle || undefined}
+        onBack={onBack}
+        backLabel="Back to pages"
+        backTitle="Discard this breakdown and return to the page picker"
       />
-      <h2 className="text-lg font-semibold mb-1" style={{ color: "var(--s2j-text)" }}>
-        AI insights
-      </h2>
-      {pageTitle && (
-        <p className="text-xs mb-1" style={{ color: "var(--s2j-text-muted)" }}>
-          {pageTitle}
-        </p>
-      )}
-      <p className="text-sm mb-5" style={{ color: "var(--s2j-text-light)" }}>
+      <p style={{ ...TYPE.sub, marginTop: -6, marginBottom: 20 }}>
         The AI has completed the breakdown and flagged areas to review before you edit.
       </p>
 
@@ -3240,67 +3236,44 @@ function InsightsScreen({
 
       {/* Partial-breakdown + tab-only warnings — surfaced on the FIRST screen so the
           user knows the data is incomplete / unsaved before investing time editing. */}
+      {/* moodboard (Phase 2) — the data-quality banners share the warning vocabulary. */}
       {truncationNote && (
-        <div
-          className="rounded-lg p-3 mb-4 flex items-start gap-2"
-          style={{ background: "var(--s2j-orange-bg)", border: "1px solid var(--s2j-orange-border)" }}
+        <SignalCallout
+          kind="warning"
+          title="Partial breakdown — some features may be missing"
+          style={{ marginBottom: 16 }}
         >
-          <SignalIcon kind="warning" size={16} style={{ marginTop: 1 }} />
-          <div>
-            <p className="text-sm font-medium" style={{ color: "var(--s2j-text)" }}>
-              Partial breakdown — some features may be missing
-            </p>
-            <p className="text-xs mt-0.5" style={{ color: "var(--s2j-text-light)" }}>
-              {truncationNote}
-            </p>
-          </div>
-        </div>
+          {truncationNote}
+        </SignalCallout>
       )}
       {persistFailed && (
-        <div
-          className="rounded-lg p-3 mb-4 flex items-start gap-2"
-          style={{ background: "var(--s2j-orange-bg)", border: "1px solid var(--s2j-orange-border)" }}
+        <SignalCallout
+          kind="warning"
+          title="This breakdown could not be saved to storage (too large)."
+          style={{ marginBottom: 16 }}
         >
-          <SignalIcon kind="warning" size={16} style={{ marginTop: 1 }} />
-          <div>
-            <p className="text-sm font-medium" style={{ color: "var(--s2j-text)" }}>
-              This breakdown could not be saved to storage (too large).
-            </p>
-            <p className="text-xs mt-0.5" style={{ color: "var(--s2j-text-light)" }}>
-              It is loaded in this tab only — edit and push it now, or it will be lost
-              when you leave. Consider splitting very large pages.
-            </p>
-          </div>
-        </div>
+          It is loaded in this tab only — edit and push it now, or it will be lost
+          when you leave. Consider splitting very large pages.
+        </SignalCallout>
       )}
       {/* Stale-page warning (forwarded like truncation/persistFailed — UX-1 deep-audit
           fix): the page changed in Confluence since this breakdown was generated. Shown
           here for consistency with the other data-quality banners; the actionable
           Regenerate lives in the editor, one click forward via "Edit the breakdown →". */}
       {staleBreakdown && (
-        <div
-          className="rounded-lg p-3 mb-4 flex items-start gap-2"
-          style={{ background: "var(--s2j-orange-bg)", border: "1px solid var(--s2j-orange-border)" }}
+        <SignalCallout
+          kind="warning"
+          title="This page was edited since this breakdown was generated"
+          style={{ marginBottom: 16 }}
         >
-          <SignalIcon kind="warning" size={16} style={{ marginTop: 1 }} />
-          <div>
-            <p className="text-sm font-medium" style={{ color: "var(--s2j-text)" }}>
-              This page was edited since this breakdown was generated
-            </p>
-            <p className="text-xs mt-0.5" style={{ color: "var(--s2j-text-light)" }}>
-              Page version {staleBreakdown.generatedAt} → {staleBreakdown.current}. Open the
-              editor and use Regenerate to include your changes.
-            </p>
-          </div>
-        </div>
+          Page version {staleBreakdown.generatedAt} → {staleBreakdown.current}. Open the
+          editor and use Regenerate to include your changes.
+        </SignalCallout>
       )}
 
       {/* AI self-check (overall quality + confidence + where to focus) */}
       {(qualityPalette || signals.confidence.total > 0) && (
-        <div
-          className="rounded-lg p-4 mb-4"
-          style={{ background: "var(--s2j-bg-section)", border: "1px solid var(--s2j-border)" }}
-        >
+        <MoodCard density="minor" style={{ marginBottom: 16 }}>
           <div className="flex items-center justify-between gap-4">
             <div>
               <p className="text-xs font-medium uppercase tracking-wider mb-1" style={{ color: "var(--s2j-text-muted)" }}>
@@ -3351,7 +3324,7 @@ function InsightsScreen({
               )}
             </div>
           )}
-        </div>
+        </MoodCard>
       )}
 
       {/* Document-level concerns — risks / compliance / ambiguity ranked by severity */}
@@ -3475,7 +3448,7 @@ function AddDependencyScreen({ breakdown, onAdd, onBack }) {
     width: "100%",
     padding: "12px 14px",
     fontSize: "15px",
-    borderRadius: "8px",
+    borderRadius: "10px",
     border: "1px solid var(--s2j-border)",
     background: "var(--s2j-bg)",
     color: "var(--s2j-text)",
@@ -3492,27 +3465,21 @@ function AddDependencyScreen({ breakdown, onAdd, onBack }) {
 
   return (
     <div className="p-6" style={SCREEN_MAX_WIDTH_STYLE}>
-      <BackButton
-        onClick={onBack}
-        label="Back to Review"
-        title="Return to the Review & Push screen without adding"
+      {/* moodboard (Phase 2) — navy header + a glass form card; the SignalCallout
+          guard messages below already speak the moodboard severity vocabulary. */}
+      <ScreenHeader
+        title="Add a cross-feature dependency"
+        subtitle="Link two features so one is blocked by another. It becomes a Story-blocks-Story link in Jira — the feature it depends on must be completed first."
+        onBack={onBack}
+        backLabel="Back to Review"
+        backTitle="Return to the Review & Push screen without adding"
       />
-      <h2 className="text-lg font-semibold mb-1" style={{ color: "var(--s2j-text)" }}>
-        Add a cross-feature dependency
-      </h2>
-      <p className="text-sm mb-6" style={{ color: "var(--s2j-text-light)" }}>
-        Link two features so one is blocked by another. It becomes a Story-blocks-Story link
-        in Jira — the feature it depends on must be completed first.
-      </p>
 
-      <div
-        className="rounded-lg p-5 mb-4"
-        style={{ background: "var(--s2j-bg-section)", border: "1px solid var(--s2j-border)" }}
-      >
+      <MoodCard density="minor" style={{ marginBottom: 16 }}>
         <label className="block text-sm font-semibold mb-2" style={{ color: "var(--s2j-text)" }}>
           This feature…
         </label>
-        <select style={selectStyle} value={source} onChange={(e) => setSource(e.target.value)}>
+        <select className="s2j-field" style={selectStyle} value={source} onChange={(e) => setSource(e.target.value)}>
           <option value="">Select a feature…</option>
           {options}
         </select>
@@ -3527,11 +3494,11 @@ function AddDependencyScreen({ breakdown, onAdd, onBack }) {
         <label className="block text-sm font-semibold mb-2" style={{ color: "var(--s2j-text)" }}>
           …this feature
         </label>
-        <select style={selectStyle} value={target} onChange={(e) => setTarget(e.target.value)}>
+        <select className="s2j-field" style={selectStyle} value={target} onChange={(e) => setTarget(e.target.value)}>
           <option value="">Select a feature…</option>
           {options}
         </select>
-      </div>
+      </MoodCard>
 
       {sameFeature && (
         <SignalCallout kind="warning" style={{ marginBottom: 16 }}>
@@ -3662,18 +3629,15 @@ function ConfirmScreen({
 
   return (
     <div className="p-6" style={SCREEN_MAX_WIDTH_STYLE}>
-      {onBackToPicker && (
-        <BackButton
-          onClick={onBackToPicker}
-          title="Discard edits and return to page picker (use 'Back to Editor' below to keep edits)"
-        />
-      )}
-      <h2
-        className="text-lg font-semibold mb-2"
-        style={{ color: "var(--s2j-text)" }}
-      >
-        Review and Push to Jira
-      </h2>
+      {/* moodboard (Phase 2) — navy push-decision header; the stateful planner /
+          test-case action rows below keep their tinted state-colours (they signal
+          available / done / stale), and the green/secondary push buttons are untouched. */}
+      <ScreenHeader
+        title="Review and Push to Jira"
+        onBack={onBackToPicker || undefined}
+        backLabel="Back to pages"
+        backTitle="Discard edits and return to page picker (use 'Back to Editor' below to keep edits)"
+      />
       {/* (Spec summary + AI self-check + concerns + ambiguity moved to InsightsScreen,
           the first screen after generation — 2026-06-26. ConfirmScreen is now the slim
           push-decision step: what-will-be-created, dependencies, capacity, test cases.) */}
@@ -3683,23 +3647,13 @@ function ConfirmScreen({
           decision point so the user doesn't create an incomplete JIRA set
           unknowingly (truncation_note forwarded by getResults). */}
       {truncationNote && (
-        <div
-          className="rounded-lg p-3 mb-4 flex items-start gap-2"
-          style={{
-            background: "var(--s2j-orange-bg)",
-            border: "1px solid var(--s2j-orange-border)",
-          }}
+        <SignalCallout
+          kind="warning"
+          title="Partial breakdown — some features may be missing"
+          style={{ marginBottom: 16 }}
         >
-          <SignalIcon kind="warning" size={16} style={{ marginTop: 1 }} />
-          <div>
-            <p className="text-sm font-medium" style={{ color: "var(--s2j-text)" }}>
-              Partial breakdown — some features may be missing
-            </p>
-            <p className="text-xs mt-0.5" style={{ color: "var(--s2j-text-light)" }}>
-              {truncationNote}
-            </p>
-          </div>
-        </div>
+          {truncationNote}
+        </SignalCallout>
       )}
 
       {/* Persist-failed warning (diagnostics Phase 0, §3.1) — the breakdown exists ONLY in
@@ -3707,24 +3661,14 @@ function ConfirmScreen({
           point because pushing now is the way to keep it. ADDITIVE sibling of the truncation
           banner above (same pattern); no existing copy changed. */}
       {persistFailed && (
-        <div
-          className="rounded-lg p-3 mb-4 flex items-start gap-2"
-          style={{
-            background: "var(--s2j-orange-bg)",
-            border: "1px solid var(--s2j-orange-border)",
-          }}
+        <SignalCallout
+          kind="warning"
+          title="This breakdown could not be saved to storage (too large)."
+          style={{ marginBottom: 16 }}
         >
-          <SignalIcon kind="warning" size={16} style={{ marginTop: 1 }} />
-          <div>
-            <p className="text-sm font-medium" style={{ color: "var(--s2j-text)" }}>
-              This breakdown could not be saved to storage (too large).
-            </p>
-            <p className="text-xs mt-0.5" style={{ color: "var(--s2j-text-light)" }}>
-              It is loaded in this tab only — review and push it now, or it will be
-              lost when you leave. Consider splitting very large pages.
-            </p>
-          </div>
-        </div>
+          It is loaded in this tab only — review and push it now, or it will be
+          lost when you leave. Consider splitting very large pages.
+        </SignalCallout>
       )}
 
       {/* (AI self-check — overall quality + ✓/⚠/✗ confidence + the "Needs your
@@ -3732,13 +3676,7 @@ function ConfirmScreen({
           generation — 2026-06-26.) */}
 
       {/* Count summary — what will be created в JIRA */}
-      <div
-        className="rounded-lg p-4 mb-4"
-        style={{
-          background: "var(--s2j-bg-section)",
-          border: "1px solid var(--s2j-border)",
-        }}
-      >
+      <MoodCard density="minor" style={{ marginBottom: 16 }}>
         <p
           className="text-xs font-medium uppercase tracking-wider mb-3"
           style={{ color: "var(--s2j-text-muted)" }}
@@ -3821,7 +3759,7 @@ function ConfirmScreen({
             </div>
           )}
         </div>
-      </div>
+      </MoodCard>
 
       {/* Test-case summary line — shown when test cases have been generated */}
       {testCaseResults && typeof testCaseResults.total === "number" && (
@@ -4079,18 +4017,10 @@ function ConfirmScreen({
         </div>
       </div>
 
-      {/* Final action */}
-      <div
-        className="rounded-lg p-3 mb-4"
-        style={{
-          background: "var(--s2j-orange-bg)",
-          border: "1px solid var(--s2j-orange-border)",
-        }}
-      >
-        <p className="text-xs" style={{ color: "var(--s2j-text)" }}>
-          This will create real Jira issues. The action cannot be undone from within Spec2Tickets.
-        </p>
-      </div>
+      {/* Final action — irreversible-write caution in the moodboard warning vocabulary. */}
+      <SignalCallout kind="warning" style={{ marginBottom: 16 }} fontSize={13}>
+        This will create real Jira issues. The action cannot be undone from within Spec2Tickets.
+      </SignalCallout>
 
       {/* [seams-audit HIGH (b)] honest consent: pushing now PURGES the in-flight
           TC batch (post-push purge deletes the tcjob) — the user must know the
@@ -4566,10 +4496,10 @@ function AssignSprintsPanel({ planPush, onAssignSprints, planStale = false }) {
   // it — surface the backend's "verify" nudge on its own channel (mirrors RankBacklogPanel's unverifiedPartial).
   const unverifiedPartial = (planPush?.result?.failureDetails || []).find((f) => f && f.error === "partial_assign_unverified") || null;
   return (
-    <div style={{ border: "1px solid var(--s2j-border)", borderRadius: 10, padding: 16, marginBottom: 16, background: "var(--s2j-bg-section)" }}>
+    <div style={{ ...glassSurface("minor"), padding: 16, marginBottom: 16 }}>
       <div className="flex items-center gap-2" style={{ marginBottom: 6 }}>
         <span style={{ color: "var(--s2j-blue)" }}><IconCalendar size={16} /></span>
-        <strong style={{ fontSize: 14, color: "var(--s2j-text)" }}>Assign sprints in Jira</strong>
+        <strong style={{ fontSize: 14, color: MOOD.navy }}>Assign sprints in Jira</strong>
       </div>
       <p style={{ fontSize: 12.5, color: "var(--s2j-text-muted)", margin: "0 0 10px", lineHeight: 1.5 }}>
         Create the planned sprints on your Scrum board and move each Story into its sprint, per your plan.
@@ -4643,10 +4573,10 @@ function RankBacklogPanel({ kanbanRank, onRankBacklog, planStale = false }) {
   // Additive: never hides a count; the success line still renders alongside as a separate, disjoint signal.
   const unverifiedPartial = failureDetails.find((f) => f && f.error === "partial_rank_unverified") || null;
   return (
-    <div style={{ border: "1px solid var(--s2j-border)", borderRadius: 10, padding: 16, marginBottom: 16, background: "var(--s2j-bg-section)" }}>
+    <div style={{ ...glassSurface("minor"), padding: 16, marginBottom: 16 }}>
       <div className="flex items-center gap-2" style={{ marginBottom: 6 }}>
         <span style={{ color: "var(--s2j-blue)" }}><IconList size={16} /></span>
-        <strong style={{ fontSize: 14, color: "var(--s2j-text)" }}>Rank backlog in Jira</strong>
+        <strong style={{ fontSize: 14, color: MOOD.navy }}>Rank backlog in Jira</strong>
       </div>
       <p style={{ fontSize: 12.5, color: "var(--s2j-text-muted)", margin: "0 0 10px", lineHeight: 1.5 }}>
         Order this project’s backlog Now → Next → Later to match the plan, and tag each issue with a
@@ -4706,35 +4636,18 @@ function PushedScreen({ result, onNew, jobId = null, onOpenDiagnostics, tcDiscar
   };
   return (
     <div className="p-6" style={SCREEN_MAX_WIDTH_STYLE}>
-      <div
-        className="rounded-lg p-4 mb-4"
-        style={{
-          background: "var(--s2j-green-bg)",
-          border: "1px solid var(--s2j-green-border)",
-        }}
-      >
-        <div className="flex items-center gap-2 mb-2">
-          <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
-            <circle cx="10" cy="10" r="10" fill="var(--s2j-green)" />
-            <path
-              d="M6 10l3 3 5-6"
-              stroke="#fff"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            />
-          </svg>
-          <h2
-            className="text-lg font-semibold"
-            style={{ color: "var(--s2j-text)" }}
-          >
-            Pushed to Jira
-          </h2>
-        </div>
-        <p className="text-sm mb-1" style={{ color: "var(--s2j-text)" }}>
+      {/* moodboard (Phase 2) — the terminal success climax in the green success
+          vocabulary (green check + navy headline + counts). */}
+      <SignalCallout kind="success" style={{ marginBottom: 16 }} fontSize={14}>
+        {/* keep the success climax as a real <h2> — it is the screen's primary
+            statement, so it must hold heading semantics for the document outline. */}
+        <h2 style={{ ...TYPE.heading, color: MOOD.navy, fontSize: 16, marginBottom: 4 }}>
+          Pushed to Jira
+        </h2>
+        <p style={{ color: "var(--s2j-text)", marginBottom: 2 }}>
           {total} items created in project {result?.project_key || "unknown"}
         </p>
-        <p className="text-xs" style={{ color: "var(--s2j-text-light)" }}>
+        <p style={{ ...TYPE.micro }}>
           {result?.total_epics || 0} Epics · {result?.total_stories || 0}{" "}
           Stories ·{" "}
           {result?.subtasks_embedded
@@ -4745,7 +4658,7 @@ function PushedScreen({ result, onNew, jobId = null, onOpenDiagnostics, tcDiscar
             : ""}
         </p>
         {(result?.tc_embedded > 0 || result?.tc_skipped > 0) && (
-          <p className="text-xs mt-1" style={{ color: "var(--s2j-text-light)" }}>
+          <p style={{ ...TYPE.micro, marginTop: 4 }}>
             {result.tc_embedded > 0
               ? `Test cases summarized in ${result.tc_embedded} Stor${result.tc_embedded === 1 ? "y" : "ies"}`
               : "Test cases were not attached to any Story"}
@@ -4758,21 +4671,15 @@ function PushedScreen({ result, onNew, jobId = null, onOpenDiagnostics, tcDiscar
             discarded (the Create-button warning consented to this). Confirm it here
             so they don't have to open Diagnostics to learn what happened. */}
         {tcDiscarded && (
-          <p className="text-xs mt-1" style={{ color: "var(--s2j-orange)" }}>
+          <p style={{ ...TYPE.micro, marginTop: 4, color: "var(--s2j-orange)" }}>
             <SignalIcon kind="warning" size={12} /> The in-progress test-case generation was discarded — regenerate from the
             editor after the push if you want them embedded.
           </p>
         )}
-      </div>
+      </SignalCallout>
 
       {(result?.epic_key || stories.length > 0) && (
-        <div
-          className="rounded-lg p-4 mb-4"
-          style={{
-            background: "var(--s2j-bg-section)",
-            border: "1px solid var(--s2j-border)",
-          }}
-        >
+        <MoodCard density="minor" style={{ marginBottom: 16 }}>
           <p
             className="text-xs font-medium mb-2"
             style={{ color: "var(--s2j-text-light)" }}
@@ -4822,37 +4729,30 @@ function PushedScreen({ result, onNew, jobId = null, onOpenDiagnostics, tcDiscar
               ))}
             </ul>
           )}
-        </div>
+        </MoodCard>
       )}
 
       {/* Graceful-fallback note — project has no subtask type, tasks embedded
           as checklists in Story descriptions. Explains "0 Subtasks" honestly. */}
       {result?.subtasks_embedded && (result?.tasks_embedded || 0) > 0 && (
-        <div
-          className="rounded-lg p-3 mb-4 text-xs"
-          style={{
-            background: "var(--s2j-blue-bg)",
-            border: "1px solid var(--s2j-blue-border)",
-            color: "var(--s2j-text)",
-          }}
+        <SignalCallout
+          kind="info"
+          title={`Tasks added as checklists (${result.tasks_embedded})`}
+          style={{ marginBottom: 16 }}
+          fontSize={12}
         >
-          <p className="font-medium mb-1">
-            Tasks added as checklists ({result.tasks_embedded})
-          </p>
-          <p style={{ color: "var(--s2j-text-muted)" }}>
-            This Jira project has no Subtask issue type, so the task breakdown
-            was embedded into each Story description as a checklist. To create
-            them as separate Subtask issues, enable the Subtask type in project
-            settings — or contact{" "}
-            <a
-              href="mailto:support@spec2jira.com"
-              style={{ color: "var(--s2j-blue)", textDecoration: "underline" }}
-            >
-              support@spec2jira.com
-            </a>
-            .
-          </p>
-        </div>
+          This Jira project has no Subtask issue type, so the task breakdown
+          was embedded into each Story description as a checklist. To create
+          them as separate Subtask issues, enable the Subtask type in project
+          settings — or contact{" "}
+          <a
+            href="mailto:support@spec2jira.com"
+            style={{ color: "var(--s2j-blue)", textDecoration: "underline" }}
+          >
+            support@spec2jira.com
+          </a>
+          .
+        </SignalCallout>
       )}
 
       {/* Partial-failure surfacing — the push result returns failures: {stories,
@@ -4894,25 +4794,18 @@ function PushedScreen({ result, onNew, jobId = null, onOpenDiagnostics, tcDiscar
           return (sp > 160 ? cut.slice(0, sp) : cut) + "…";
         })();
         return (
-          <div
-            className="rounded-lg p-3 mb-4"
-            style={{
-              background: "var(--s2j-orange-bg)",
-              border: "1px solid var(--s2j-orange-border)",
-            }}
+          <SignalCallout
+            kind="warning"
+            title={`${parts.join(" · ")} could not be created`}
+            style={{ marginBottom: 16 }}
+            fontSize={12}
           >
-            <p
-              className="text-xs font-medium mb-1"
-              style={{ color: "var(--s2j-text)" }}
-            >
-              {parts.join(" · ")} could not be created
-            </p>
             {firstDetail && (
-              <p className="text-xs mb-1" style={{ color: "var(--s2j-text-muted)" }}>
+              <p style={{ ...TYPE.micro, marginBottom: 4 }}>
                 Reason: {reasonText}
               </p>
             )}
-            <p className="text-xs" style={{ color: "var(--s2j-text-muted)" }}>
+            <p style={{ ...TYPE.micro }}>
               Need help?{" "}
               <a
                 href="mailto:support@spec2jira.com"
@@ -4925,7 +4818,7 @@ function PushedScreen({ result, onNew, jobId = null, onOpenDiagnostics, tcDiscar
                 case) is the feature's highest-value diagnostics class — give the banner
                 the ref + the in-app path to the pre-filtered Diagnostics tab. */}
             <DiagnosticRefLine refId={jobId} onOpenDiagnostics={onOpenDiagnostics} />
-          </div>
+          </SignalCallout>
         );
       })()}
 
