@@ -65,7 +65,7 @@ export default function LabelsEditor({ labels = [], onChange, placeholder = 'Add
         }}
         onBlur={() => addLabel(draft)}
         placeholder={placeholder}
-        className="text-[11px] rounded px-1.5 py-0.5"
+        className="text-[11px] rounded px-1.5 py-0.5 s2j-field"
         style={{
           background: 'var(--s2j-bg)',
           color: 'var(--s2j-text)',

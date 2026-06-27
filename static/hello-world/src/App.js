@@ -5059,20 +5059,17 @@ function ErrorScreen({ error, jobId = null, onRetry, onBackToPicker, onOpenDiagn
           When user reached error без pageData (e.g., picker manual ID
           entry → fetchPage 404), handleRetry already routes to picker
           defensively — separate top button is redundant. */}
-      {onBackToPicker && (
-        <BackButton
-          onClick={onBackToPicker}
-          title="Abandon this page and return to picker (use 'Try again' below to retry the same page)"
-        />
-      )}
-      {/* moodboard (Phase 1) — a crisis screen earns clarity, not glass: the error tone
-          is carried by SignalCallout (red icon + border, dark readable body). */}
-      <SignalCallout
-        kind="error"
+      {/* moodboard (Phase 1; deep-audit fix) — a crisis screen earns clarity, not glass.
+          ScreenHeader gives the screen a real navy <h2> (consistent with every other
+          screen + the document outline); the SignalCallout below carries the error tone
+          (red icon + border, dark readable body) and the verbatim detail. */}
+      <ScreenHeader
         title="Something went wrong"
-        style={{ marginBottom: 16 }}
-        fontSize={13}
-      >
+        onBack={onBackToPicker || undefined}
+        backLabel="Back to pages"
+        backTitle="Abandon this page and return to picker (use 'Try again' below to retry the same page)"
+      />
+      <SignalCallout kind="error" style={{ marginBottom: 16 }} fontSize={13}>
         <div>{displayError}</div>
         {/* [diag Phase 3, design §5] ADDITIVE diagnostic ref under the verbatim error
             text — the existing message above is never shortened or replaced. Renders
