@@ -33,6 +33,14 @@
   --s2j-red:          #f93e3e;
   --s2j-red-bg:       #fdeaea;
   --s2j-red-border:   #f5b4b4;
+
+  /* Moodboard accent/surface palette (2026-06-27) — see docs/DESIGN-SYSTEM-MOODBOARD.md. Mirrors the MOOD
+     JS constants in WizardKit.jsx so a component may use either var(--s2j-*) or the JS token. */
+  --s2j-navy:         #021024;
+  --s2j-blue-deep:    #052659;
+  --s2j-steel:        #5483B3;
+  --s2j-skySteel:     #7DA0CA;
+  --s2j-ice:          #C1E8FF;
 }
 
 @layer components {

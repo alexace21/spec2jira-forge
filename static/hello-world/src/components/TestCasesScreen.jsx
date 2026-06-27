@@ -1,7 +1,7 @@
 import React, { useState, useCallback, useEffect, useRef } from "react";
 import { invoke } from "@forge/bridge";
 import BackButton from "./BackButton";
-import StoryTestCaseCard from "./StoryTestCaseCard";
+import StoryWizard, { StoryRow } from "./StoryWizard";
 import { IconCheck, IconRefresh, IconCost } from "./Icon";
 import { SignalIcon } from "./Signal";
 
@@ -465,6 +465,10 @@ function TestCasesScreen({
   // cards) so a card re-render / accordion collapse never drops in-progress edits. Edits reach
   // export + push ONLY after Save persists them to KVS (handleSave → onSaveTestCase → resolver).
   const [drafts, setDrafts] = useState({});
+  // Drill-in: null ⇒ the triage OVERVIEW (compact story rows); a storyIdx ⇒ the per-story type-phase WIZARD.
+  // Local state (NOT App.js) so drafts/save/coverage stay parent-held and survive the overview↔wizard hop.
+  const [openStoryIdx, setOpenStoryIdx] = useState(null);
+  const wizardFocusRef = useRef(null);
   const [saveStates, setSaveStates] = useState({}); // storyIdx → 'idle'|'saving'|'saved'|'error'
   const [saveErrors, setSaveErrors] = useState({});
   // Work B: true for a story whose draft had a SAVED case deleted since last save. A delete shifts
@@ -502,10 +506,13 @@ function TestCasesScreen({
     setSaveStates((prev) => ({ ...prev, [storyIdx]: "idle" }));
   }, [perStory]);
 
-  const handleAddCase = useCallback((storyIdx) => {
+  const handleAddCase = useCallback((storyIdx, typeOverride) => {
     setDrafts((prev) => {
       const base = prev[storyIdx] || (perStory.find((e) => e && e.storyIdx === storyIdx)?.result) || { test_cases: [], no_acs: false, story_name: "" };
-      return { ...prev, [storyIdx]: { ...base, test_cases: [...(base.test_cases || []), { ...BLANK_CASE }] } };
+      // "+ Add {type} case" from a type-phase pre-sets the new case's type so it lands in that phase.
+      const newCase = { ...BLANK_CASE };
+      if (typeOverride && ["happy-path", "edge", "negative"].includes(typeOverride)) newCase.type = typeOverride;
+      return { ...prev, [storyIdx]: { ...base, test_cases: [...(base.test_cases || []), newCase] } };
     });
     setSaveStates((prev) => ({ ...prev, [storyIdx]: "idle" }));
   }, [perStory]);
@@ -588,6 +595,20 @@ function TestCasesScreen({
 
   const dirtyCount = Object.keys(drafts).length;
 
+  // The story being drilled into (null ⇒ overview). Guarded: a stale openStoryIdx with no matching entry
+  // falls back to the overview render.
+  const openEntry = openStoryIdx != null && testCaseResults
+    ? perStory.find((e) => e && e.storyIdx === openStoryIdx)
+    : null;
+
+  // a11y: focus the wizard on drill-in so keyboard / screen-reader users land on it (mirrors PlanScreen's
+  // step-focus). preventScroll keeps the iframe still.
+  useEffect(() => {
+    if (openStoryIdx != null && wizardFocusRef.current) {
+      try { wizardFocusRef.current.focus({ preventScroll: true }); } catch (_) { wizardFocusRef.current.focus(); }
+    }
+  }, [openStoryIdx]);
+
   // Back-to-Review dirty guard — TestCasesScreen unmounts on navigation, which would destroy
   // unsaved drafts. Two-step confirm so a BA never loses unsaved edits silently.
   const handleBackClick = useCallback(() => {
@@ -665,97 +686,97 @@ function TestCasesScreen({
 
       {/* Body */}
       <div className="flex-1 p-4">
-        <h2
-          className="text-base font-semibold mb-1"
-          style={{ color: "var(--s2j-text)" }}
-        >
-          Test Cases
-        </h2>
-        <p className="text-xs mb-4" style={{ color: "var(--s2j-text-muted)" }}>
-          Acceptance scenarios for every story — export to Gherkin (BDD tools) or CSV (ADO, Jama, TestRail…).
-        </p>
-
-        {/* Defensive fallback: post-#1-redesign this screen opens only WITH results (the
-            Review/Confirm screen generates directly), so this branch is normally unreachable —
-            kept so a BA who somehow lands here without results still has a generate path. */}
-        {!testCaseResults ? (
-          <GeneratePrompt storyCount={storyCount} onGenerate={onGenerate} />
+        {openEntry ? (
+          // ── DRILL-IN: the per-story type-phase wizard. Drafts/save/coverage are parent-held (above), so
+          // entering/leaving the wizard never drops edits. Callbacks pass the ABSOLUTE caseIdx (the wizard
+          // filters by type for display only). key={openStoryIdx} remounts (resets the phase to 1) when the
+          // open story changes; the wrapper is the a11y focus target on drill-in. ──
+          <div ref={wizardFocusRef} tabIndex={-1} style={{ outline: "none" }}>
+          <StoryWizard
+            key={openStoryIdx}
+            entry={openEntry}
+            jobId={jobId}
+            hasTestCases={hasTestCases}
+            isStale={tcStaleStoryIdxs.includes(openStoryIdx)}
+            isRemoved={tcRemovedStoryIdxs.includes(openStoryIdx)}
+            regenState={regenStates[openStoryIdx] || "idle"}
+            onRegenerate={handleRegenerate}
+            draftResult={drafts[openStoryIdx] || null}
+            isDirty={drafts[openStoryIdx] !== undefined}
+            structurallyShifted={!!shiftedStories[openStoryIdx]}
+            saveState={saveStates[openStoryIdx] || "idle"}
+            saveError={saveErrors[openStoryIdx] || null}
+            onCaseChange={(caseIdx, next) => handleCaseChange(openStoryIdx, caseIdx, next)}
+            onAddCase={(type) => handleAddCase(openStoryIdx, type)}
+            onDeleteCase={(caseIdx) => handleDeleteCase(openStoryIdx, caseIdx)}
+            onSave={() => handleSave(openStoryIdx)}
+            onRevert={() => handleRevert(openStoryIdx)}
+            onBackToList={() => setOpenStoryIdx(null)}
+          />
+          </div>
         ) : (
           <>
-            {/* v6 value-split: a downgraded user (Advanced→Standard) keeps READ/EXPORT of
-                retained cases, but edit/regenerate are Advanced-only (backend fail-closed →
-                routed to the upgrade screen if attempted). Tell them so up front. */}
-            {!hasTestCases && (
-              <div
-                className="rounded-lg p-3 mb-4 text-xs"
-                style={{
-                  background: "var(--s2j-blue-bg)",
-                  border: "1px solid var(--s2j-blue-border)",
-                  color: "var(--s2j-text)",
-                }}
-              >
-                <strong>Viewing your existing test cases.</strong> Editing and
-                regenerating test cases is an Advanced-edition feature — your saved
-                cases stay viewable and exportable here. Upgrade to Advanced to edit
-                or regenerate.
-              </div>
+            <h2 className="text-base font-semibold mb-1" style={{ color: "var(--s2j-text)" }}>Test Cases</h2>
+            <p className="text-xs mb-4" style={{ color: "var(--s2j-text-muted)" }}>
+              Acceptance scenarios for every story — open a story to review its cases by type, or export to Gherkin (BDD tools) / CSV (ADO, Jama, TestRail…).
+            </p>
+
+            {/* Defensive fallback: post-#1-redesign this screen opens only WITH results (the Review/Confirm
+                screen generates directly), so this branch is normally unreachable — kept so a BA who somehow
+                lands here without results still has a generate path. */}
+            {!testCaseResults ? (
+              <GeneratePrompt storyCount={storyCount} onGenerate={onGenerate} />
+            ) : (
+              <>
+                {/* v6 value-split: a downgraded user (Advanced→Standard) keeps READ/EXPORT of retained cases,
+                    but edit/regenerate are Advanced-only (backend fail-closed). Tell them so up front. */}
+                {!hasTestCases && (
+                  <div className="rounded-lg p-3 mb-4 text-xs" style={{ background: "var(--s2j-blue-bg)", border: "1px solid var(--s2j-blue-border)", color: "var(--s2j-text)" }}>
+                    <strong>Viewing your existing test cases.</strong> Editing and regenerating test cases is an Advanced-edition feature — your saved cases stay viewable and exportable here. Upgrade to Advanced to edit or regenerate.
+                  </div>
+                )}
+                {isStale && <StaleBanner />}
+                {tcStale && <EditStaleBanner count={tcStaleStoryIdxs.length} />}
+                {/* ⭐ [deep-audit E-#6] the bulk "Refresh N affected" is a paid regenerate → gate it on
+                    hasTestCases so a downgraded user gets the read-only experience the banner promises. */}
+                {hasTestCases && tcStale && tcStaleStoryIdxs.length >= 2 && (() => {
+                  const bulkBusy = tcStaleStoryIdxs.some((idx) => regenStates[idx] === "pending" || regenStates[idx] === "polling");
+                  return (
+                    <button
+                      type="button"
+                      onClick={handleRefreshAffected}
+                      disabled={bulkBusy}
+                      className="mb-4 text-xs px-3 py-1.5 rounded"
+                      style={{ background: "var(--s2j-orange-bg)", border: "1px solid var(--s2j-orange-border)", color: bulkBusy ? "var(--s2j-text-muted)" : "var(--s2j-orange)", cursor: bulkBusy ? "not-allowed" : "pointer", whiteSpace: "nowrap" }}
+                      title="Regenerate every story whose acceptance criteria changed — each is a paid generation (a few minutes each)"
+                    >
+                      {bulkBusy
+                        ? `Regenerating ${tcStaleStoryIdxs.length} stories…`
+                        : refreshArmed
+                        ? `Re-runs ${tcStaleStoryIdxs.length} affected stories (uses compute) — confirm?`
+                        : `Refresh ${tcStaleStoryIdxs.length} affected stories`}
+                    </button>
+                  );
+                })()}
+                <SummaryBar testCaseResults={testCaseResults} onRegenerate={handleRegenerate} hasTestCases={hasTestCases} />
+                <div>
+                  {perStory.map((entry) => (
+                    <StoryRow
+                      key={entry.storyIdx}
+                      entry={entry}
+                      jobId={jobId}
+                      hasTestCases={hasTestCases}
+                      isStale={tcStaleStoryIdxs.includes(entry.storyIdx)}
+                      isRemoved={tcRemovedStoryIdxs.includes(entry.storyIdx)}
+                      isDirty={drafts[entry.storyIdx] !== undefined}
+                      regenState={regenStates[entry.storyIdx] || "idle"}
+                      onRegenerate={handleRegenerate}
+                      onOpen={setOpenStoryIdx}
+                    />
+                  ))}
+                </div>
+              </>
             )}
-            {isStale && <StaleBanner />}
-            {tcStale && <EditStaleBanner count={tcStaleStoryIdxs.length} />}
-            {/* ⭐ [deep-audit E-#6] the bulk "Refresh N affected" is a paid regenerate → gate it on
-                hasTestCases so a downgraded user gets the read-only experience the banner promises. */}
-            {hasTestCases && tcStale && tcStaleStoryIdxs.length >= 2 && (() => {
-              // T2 fix: while any affected story is regenerating, DISABLE + show progress (the button used
-              // to stay live + give no feedback while the cards quietly flipped to "Generating…").
-              const bulkBusy = tcStaleStoryIdxs.some((idx) => regenStates[idx] === "pending" || regenStates[idx] === "polling");
-              return (
-                <button
-                  type="button"
-                  onClick={handleRefreshAffected}
-                  disabled={bulkBusy}
-                  className="mb-4 text-xs px-3 py-1.5 rounded"
-                  style={{
-                    background: "var(--s2j-orange-bg)",
-                    border: "1px solid var(--s2j-orange-border)",
-                    color: bulkBusy ? "var(--s2j-text-muted)" : "var(--s2j-orange)",
-                    cursor: bulkBusy ? "not-allowed" : "pointer",
-                    whiteSpace: "nowrap",
-                  }}
-                  title="Regenerate every story whose acceptance criteria changed — each is a paid generation (a few minutes each)"
-                >
-                  {bulkBusy
-                    ? `Regenerating ${tcStaleStoryIdxs.length} stories…`
-                    : refreshArmed
-                    ? `Re-runs ${tcStaleStoryIdxs.length} affected stories (uses compute) — confirm?`
-                    : `Refresh ${tcStaleStoryIdxs.length} affected stories`}
-                </button>
-              );
-            })()}
-            <SummaryBar testCaseResults={testCaseResults} onRegenerate={handleRegenerate} hasTestCases={hasTestCases} />
-            <div>
-              {perStory.map((entry) => (
-                <StoryTestCaseCard
-                  key={entry.storyIdx}
-                  entry={entry}
-                  jobId={jobId}
-                  hasTestCases={hasTestCases}
-                  isStale={tcStaleStoryIdxs.includes(entry.storyIdx)}
-                  isRemoved={tcRemovedStoryIdxs.includes(entry.storyIdx)}
-                  regenState={regenStates[entry.storyIdx] || "idle"}
-                  onRegenerate={handleRegenerate}
-                  draftResult={drafts[entry.storyIdx] || null}
-                  isDirty={drafts[entry.storyIdx] !== undefined}
-                  structurallyShifted={!!shiftedStories[entry.storyIdx]}
-                  saveState={saveStates[entry.storyIdx] || "idle"}
-                  saveError={saveErrors[entry.storyIdx] || null}
-                  onCaseChange={(caseIdx, next) => handleCaseChange(entry.storyIdx, caseIdx, next)}
-                  onAddCase={() => handleAddCase(entry.storyIdx)}
-                  onDeleteCase={(caseIdx) => handleDeleteCase(entry.storyIdx, caseIdx)}
-                  onSave={() => handleSave(entry.storyIdx)}
-                  onRevert={() => handleRevert(entry.storyIdx)}
-                />
-              ))}
-            </div>
           </>
         )}
       </div>
