@@ -3,7 +3,7 @@ import { invoke } from "@forge/bridge";
 import { classText, opLabel, levelColor, relTime } from "../lib/diagnosticsView";
 import { IconCheck, IconX, IconMaximize, IconChevronRight } from "./Icon";
 import { SignalIcon, SignalCallout } from "./Signal";
-import { MoodCard, TYPE, MOOD } from "./moodboard";
+import { MoodCard, TYPE, MOOD, glassSurface } from "./moodboard";
 
 /**
  * AdminSettings — v3.0.0 BYOK configuration page.
@@ -995,10 +995,8 @@ function DiagnosticsTab({ refFilter = "", onRefFilterChange }) {
 
   return (
     <div className="p-8" style={{ maxWidth: "640px" }}>
-      <h1
-        className="text-xl font-semibold mb-1"
-        style={{ color: "var(--s2j-text)" }}
-      >
+      {/* moodboard (Phase 5) — navy diagnostics title. */}
+      <h1 className="mb-1" style={{ ...TYPE.title, fontSize: 22, color: MOOD.navy }}>
         Diagnostics
       </h1>
       <p className="text-sm mb-5" style={{ color: "var(--s2j-text-muted)" }}>
@@ -1012,6 +1010,7 @@ function DiagnosticsTab({ refFilter = "", onRefFilterChange }) {
           value={refFilter}
           onChange={(e) => onRefFilterChange && onRefFilterChange(e.target.value)}
           placeholder="Filter by diagnostic ref…"
+          className="s2j-field"
           style={{
             ...inputStyle,
             maxWidth: "280px",
@@ -1044,10 +1043,10 @@ function DiagnosticsTab({ refFilter = "", onRefFilterChange }) {
           timestamp only — no page/document content. */}
       {data?.sweepHeartbeat && (
         <div
-          className="rounded-md p-3 mb-3 flex items-center gap-2 text-xs"
+          className="mb-3 flex items-center gap-2 text-xs"
           style={{
-            background: "var(--s2j-bg-section)",
-            border: "1px solid var(--s2j-border)",
+            ...glassSurface("utility"),
+            padding: 12,
             color: "var(--s2j-text)",
           }}
           title="Vendor maintenance: the daily background job that removes never-pushed breakdowns 7 days after last access. Counts only — no page or document content."
