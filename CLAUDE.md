@@ -404,10 +404,19 @@ race · label 11→12 · ChoiceCard opacity); test-cases: **18 confirmed (4 HIGH
 focus-on-drill-in. All fixed + fix-verified (0 new). **The cadence build → §13 → deep-audit → fix-verify is
 the standing rhythm for substantive UI work** — the per-change gate alone is NOT enough.
 
-ALSO this session (earlier, already committed/pushed): the recurring **prod-deploy CDN-flakiness** — ALWAYS
-`forge deploy --no-verify` + retry-on-transient in `deploy.yml` (`3671630`/`835e642`/CLI@13); v6.4.0 shipped
-from LOCAL. Other UI/UX shipped: iframe content-sizing, PagePicker rows, the post-generate AI-insights
-screen, navigation completeness (blue BackButton convention), add-cross-feature-dependency.
+⭐ **The recurring prod-deploy "Premature close" — ROOT-CAUSED + FIXED (`8e66a04`):** it was NOT
+CDN/runner-network flakiness (the earlier guess, now retracted) but the **Node 24.17.0 × node-fetch@2
+regression** — 24.17.0's CVE-2026-48931 http.Agent fix added a `'data'` listener to idle keep-alive sockets →
+node-fetch@2 (bundled by @forge/cli) throws a FALSE `ERR_STREAM_PREMATURE_CLOSE` during `forge deploy`
+packaging. LOCAL worked only because the laptop ran a different 24.x; a floating `node-version: 24` runner
+served the broken 24.17.0; the retry couldn't help (whole run on the bad Node). **Fix = pin the deploy
+runner's Node to `24.18.0`** (Node's fix release, PR #64004; fallback 24.16.0). Atlassian confirmed it's Node,
+not the CLI/CDN (community .../101420) + committed to dropping node-fetch (loosen the pin then). `--no-verify`
++ the transient retry (`3671630`/`835e642`/CLI@13) stay as belt-and-suspenders. v6.4.0 shipped from LOCAL
+(local Node fine); CI deploy now works once `8e66a04` reaches `main`. ⚠ Found by a research-army deep-dive
+(web-sourced, Atlassian-staff-confirmed) — the "ship-from-local / runner-network" memory was CORRECTED.
+ALSO this session: iframe content-sizing, PagePicker rows, the post-generate AI-insights screen, navigation
+completeness (blue BackButton convention), add-cross-feature-dependency.
 
 **NEXT:** partner pushes `feature/UI-UX-improvements` + merges. Then the **moodboard design system can roll
 out across the rest of the app** — a SEPARATE deliberate screen-by-screen task (per [[moodboard-design-system]];
