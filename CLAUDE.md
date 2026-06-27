@@ -361,6 +361,63 @@ package names de-scaffolded (→ `spec2tickets`). Build green (bundle ≈ −1.4
 
 ---
 
+## ⚡ HANDOVER NOTE (2026-06-27 — ⭐⭐ UI/UX MOODBOARD WIZARDS: Capacity-Planner + Test-Cases redesigned; design-army → §13 → deep-audit → fix-verify cadence; agent-conducted; branch `feature/UI-UX-improvements`)
+
+> ⚠ Branch `feature/UI-UX-improvements` — DEV-deployed + partner live-accepted; **partner pushes**. Two feature
+> commits this session: **`9ab0a4d`** (planner wizard) + **`5b2d3f2`** (test-cases redesign). Durable in-repo:
+> **`docs/DESIGN-SYSTEM-MOODBOARD.md`** (the visual north star). Memory: [[moodboard-design-system]] (NEW) ·
+> [[testcase-generation-feature]] · [[capacity-sheet-planner]] · [[deep-audit-vs-per-change-gate]].
+
+A long UI/UX session on the **moodboard** look (from the partner's `Spec2Tickets_MoodboardWebDesign.pdf`):
+blue-on-white monochrome + glassmorphism, navy headings, ~12–14px type, as an **ACCENT/SURFACE layer OVER**
+the Swagger buttons (NOT repainting them — green=commit / blue=nav / red=danger stays; AKONY/Surgena EVOKED,
+not imported — no paid fonts in the Forge iframe). Per feature: Analyze → **design-army** (4 proposals →
+3-judge confidence vote) → build → §13 gate → the partner's **explicit deep-audit** → fix-verify. §13 §13
+throughout (conduct ISOLATED agents; the conductor synthesizes).
+
+⭐ **Capacity-Sheet Planner → 5-step wizard (`9ab0a4d`):** the overloaded single screen → Planning mode
+(Scrum/Kanban choice-cards) → Team capacity → Review & generate (recap + objective + cost + armed Generate)
+→ **Your plan (PLAN-FIRST)** → **Plan health**. Step 4 leads with the sprint columns / Now-Next-Later band +
+What-if; a warning-tinted **"Plan health" teaser** (counts + magnitude, single-sourced from the same vars)
+routes to step 5 (doesn't-fit / shortfall / risk register / diagnostics). Honest re-pack copy (never "Claude
+is planning… minutes" for a FREE re-pack); green **"Continue to review →"** terminal CTA; a11y
+focus-on-step-change; Stepper locked during generate. NEW **`WizardKit.jsx`** = the shared moodboard wizard
+primitives (Stepper with **additive `{count,warn}` dots**, glassy `stepSurface`, MOOD palette), extracted
+from PlanScreen behaviour-neutrally (string-label path byte-identical).
+
+⭐ **Test Cases → triage board + per-story type wizard (`5b2d3f2`):** the long per-story accordion scroll →
+a compact **triage overview** (glass rows + chips + type-distribution + per-row Regenerate/Copy + Open →)
+that **DRILLS INTO** a per-story wizard whose phases are the test-case **TYPES** (Happy-path/Negative/Edge) +
+a **"Coverage & trust"** step. One story now shows 3–6 cases of ONE type, not all 16. **MERGE-BUG FIXED:** a
+shared **`FieldBlock`** block-label kills the "EXPECTED RESULTA valid…" label/value merge (Concern / Expected
+result / Test data). Fonts 10/11 → 12/13/14; glass cards; "Scenario (BDD)" grouping. ⚠ **THE #1 RISK
+HANDLED:** the type-phase is a FILTERED RENDER — every callback uses the **ABSOLUTE** case index (no
+edit/delete corruption); 3 review rounds verified it. Type-switch (incl. via **Revert**) auto-navigates + a
+"moved to {type}" note. The **draft/Save/Revert/coverage/export/push model is UNCHANGED**.
+`StoryTestCaseCard.jsx` tombstoned (logic split into `StoryRow` + `StoryWizard`).
+
+⭐ **Method win (vindicates [[deep-audit-vs-per-change-gate]] AGAIN, twice):** on BOTH features the §13
+per-change gate returned ~0 confirmed, but the **explicit deep audit** (7 lenses, skeptical verify) caught
+real HIGHs the gate missed — planner: 11 confirmed (silent What-if §11 loss · auto-advance-vs-manual-nav
+race · label 11→12 · ChoiceCard opacity); test-cases: **18 confirmed (4 HIGH)** — dropped `React.memo` ·
+**revert-type-switch silent move** · **phase-state persists without `key={openStoryIdx}`** · no
+focus-on-drill-in. All fixed + fix-verified (0 new). **The cadence build → §13 → deep-audit → fix-verify is
+the standing rhythm for substantive UI work** — the per-change gate alone is NOT enough.
+
+ALSO this session (earlier, already committed/pushed): the recurring **prod-deploy CDN-flakiness** — ALWAYS
+`forge deploy --no-verify` + retry-on-transient in `deploy.yml` (`3671630`/`835e642`/CLI@13); v6.4.0 shipped
+from LOCAL. Other UI/UX shipped: iframe content-sizing, PagePicker rows, the post-generate AI-insights
+screen, navigation completeness (blue BackButton convention), add-cross-feature-dependency.
+
+**NEXT:** partner pushes `feature/UI-UX-improvements` + merges. Then the **moodboard design system can roll
+out across the rest of the app** — a SEPARATE deliberate screen-by-screen task (per [[moodboard-design-system]];
+`WizardKit` + the `:root` moodboard tokens are the reusable base).
+
+С усмивка ✨ — two overloaded screens became focused moodboard wizards; the army-then-deep-audit cadence
+caught what the per-change gate didn't, twice.
+
+---
+
 ## ⚡ HANDOVER NOTE (2026-06-23 — ⭐ Monitoring + CI/CD Phase 2 STARTED: #1 version-drift-guard DONE+hardened · #2 @forge/metrics SKIPPED; both army-decided; agent-conducted)
 
 > ⚠ Branch `feature/monitoring-ci-cd` (off `release/v6.1.0`). Branch-independent record: **`memory/mvp-monitoring-cicd.md`** (Phase-2 progress block at top) · [[deep-audit-vs-per-change-gate]] (the vote-before-build + the post-ship-guard data points). Durable in-repo: **`docs/MONITORING-CICD-STRATEGY.md`**.
