@@ -15,6 +15,7 @@ import BackButton from "./components/BackButton";
 import TestCasesScreen from "./components/TestCasesScreen";
 import PlanScreen from "./components/PlanScreen";
 import { SignalCallout, SignalIcon } from "./components/Signal";
+import { ScreenHeader, MoodCard, TYPE, MOOD } from "./components/moodboard";
 import {
   IconRefresh,
   IconClock,
@@ -2823,82 +2824,67 @@ function ReadyScreen({
   const byokProPrice = findPrice(usage, "byokPro");
   return (
     <div className="p-6" style={SCREEN_MAX_WIDTH_STYLE}>
-      <div className="flex items-center justify-between">
-        {onBack ? (
-          <BackButton
-            onClick={onBack}
-            title="Return to page picker (clears page selection; you can pick a different page)"
-          />
-        ) : (
-          <span />
-        )}
-        {/* In-app Settings access — the centralized admin has no Configure link, so the
-            app surfaces its own entry point here (manage Anthropic key, JIRA project,
-            Project Context profiles). */}
-        {onOpenSettings && (
-          <button
-            type="button"
-            onClick={onOpenSettings}
-            className="text-xs"
-            style={{
-              background: "none",
-              border: "none",
-              color: "var(--s2j-text-muted)",
-              cursor: "pointer",
-              padding: "4px 8px",
-              borderRadius: "4px",
-            }}
-            title="Open Spec2Tickets settings"
-          >
-            <IconSettings size={14} /> Settings
-          </button>
-        )}
-      </div>
-      <h2
-        className="text-lg font-semibold mb-1"
-        style={{ color: "var(--s2j-text)" }}
-      >
-        {pageData.title}
-      </h2>
-      <p className="text-sm mb-4" style={{ color: "var(--s2j-text-light)" }}>
-        {(pageData.body_length || 0).toLocaleString()} characters
-      </p>
+      {/* moodboard (Phase 1) — the Ready header is the app's primary landing surface:
+          navy page title + char-count subtitle, blue Back affordance, Settings as the
+          right-aligned utility action. The centralized admin has no Configure link, so
+          the app surfaces its own Settings entry here (Anthropic key, JIRA project,
+          Project Context profiles). */}
+      <ScreenHeader
+        title={pageData.title}
+        subtitle={`${(pageData.body_length || 0).toLocaleString()} characters`}
+        onBack={onBack || undefined}
+        backLabel="Back to pages"
+        backTitle="Return to page picker (clears page selection; you can pick a different page)"
+        action={
+          onOpenSettings ? (
+            <button
+              type="button"
+              onClick={onOpenSettings}
+              className="text-xs"
+              style={{
+                background: "none",
+                border: "none",
+                color: "var(--s2j-text-muted)",
+                cursor: "pointer",
+                padding: "4px 8px",
+                borderRadius: "4px",
+              }}
+              title="Open Spec2Tickets settings"
+            >
+              <IconSettings size={14} /> Settings
+            </button>
+          ) : null
+        }
+      />
 
       {/* [diag Phase 3, S4] Last-generation-failed card — the dashboard ⚠ "Needs
           attention" click / failed-job reconnect lands HERE instead of a context-free
           Ready screen. ADDITIVE: everything below (usage badge, context picker,
           Generate) is unchanged; the Generate button doubles as the retry. */}
       {genFailureNotice && (
-        <div
-          className="rounded-lg p-4 mb-4"
-          style={{
-            background: "var(--s2j-red-bg)",
-            border: "1px solid var(--s2j-red-border)",
-          }}
+        <SignalCallout
+          kind="error"
+          title="The last generation for this page failed"
+          style={{ marginBottom: 16 }}
+          fontSize={13}
         >
-          <p
-            className="text-sm font-medium mb-1"
-            style={{ color: "var(--s2j-red)" }}
-          >
-            <SignalIcon kind="error" size={14} /> The last generation for this page failed
-          </p>
-          <p className="text-xs" style={{ color: "var(--s2j-text)" }}>
-            {/* [diag Phase 5] When the stored user-facing detail is absent, humanize the
-                stored error CODE via the diagnosticsView map (Phase-3 stored it un-rendered);
-                the original generic sentence remains the final fallback when neither exists. */}
+          {/* [diag Phase 5] When the stored user-facing detail is absent, humanize the
+              stored error CODE via the diagnosticsView map (Phase-3 stored it un-rendered);
+              the original generic sentence remains the final fallback when neither exists. */}
+          <div>
             {genFailureNotice.detail ||
               (genFailureNotice.code
                 ? classText(genFailureNotice.code).title
                 : "The generation could not complete. You can generate again below.")}
-          </p>
-          <p className="text-xs mt-1" style={{ color: "var(--s2j-text-light)" }}>
+          </div>
+          <div style={{ ...TYPE.micro, marginTop: 4 }}>
             Generating again will start a fresh run.
-          </p>
+          </div>
           <DiagnosticRefLine
             refId={genFailureNotice.refId}
             onOpenDiagnostics={onOpenDiagnostics}
           />
-        </div>
+        </SignalCallout>
       )}
 
       {usage && (
@@ -2950,19 +2936,17 @@ function ReadyScreen({
           - Preview (CG-7 pre-flight) was а ~30-90 sec sanity check на
             v2.x's ~10-30 min full pipeline. v3.0.0 full run е already
             60-150 sec total — preview adds no value. */}
-      <div
-        className="rounded-lg p-4 mb-4 text-sm"
-        style={{
-          background: "var(--s2j-blue-bg)",
-          border: "1px solid var(--s2j-blue-border)",
-          color: "var(--s2j-text)",
-        }}
+      <SignalCallout
+        kind="info"
+        title="Ready to generate"
+        style={{ marginBottom: 16 }}
+        fontSize={14}
       >
-        <strong>Ready to generate.</strong> Claude Sonnet 4.6 will analyze
-        this Confluence page and produce a structured Jira breakdown —
-        Stories, Subtasks, cross-feature dependencies, and quality signals.
-        Typical runtime: a few minutes, depending on the size of your page.
-      </div>
+        Claude Sonnet 4.6 will analyze this Confluence page and produce a
+        structured Jira breakdown — Stories, Subtasks, cross-feature
+        dependencies, and quality signals. Typical runtime: a few minutes,
+        depending on the size of your page.
+      </SignalCallout>
 
       {/* Project Context selector — pick which named context applies to THIS spec, so
           a multi-project workspace never gets the wrong project's context injected. */}
@@ -2975,13 +2959,14 @@ function ReadyScreen({
             Project Context
           </label>
           <select
+            className="s2j-field"
             value={selectedContextProfileId}
             onChange={(e) => onSelectContextProfile?.(e.target.value)}
             style={{
               width: "100%",
               padding: "8px 12px",
               fontSize: "0.875rem",
-              borderRadius: "6px",
+              borderRadius: "10px",
               border: "1px solid var(--s2j-border)",
               background: "var(--s2j-bg)",
               color: "var(--s2j-text)",
@@ -3060,10 +3045,7 @@ function GeneratingScreen({ pageTitle, elapsed, onBack, onStartOver }) {
             </span>
           </div>
         </div>
-        <h2
-          className="text-base font-semibold"
-          style={{ color: "var(--s2j-text)" }}
-        >
+        <h2 style={{ fontSize: 18, fontWeight: 700, color: MOOD.navy, letterSpacing: "-0.01em" }}>
           Your Confluence page is being analyzed
         </h2>
         {pageTitle && (
@@ -3072,8 +3054,8 @@ function GeneratingScreen({ pageTitle, elapsed, onBack, onStartOver }) {
           </p>
         )}
         <p
-          className="text-xs mt-2.5"
-          style={{ color: "var(--s2j-text-muted)", maxWidth: "26rem" }}
+          className="mt-2.5"
+          style={{ fontSize: 13, lineHeight: 1.55, color: "var(--s2j-text-muted)", maxWidth: "26rem" }}
         >
           Building a structured Jira breakdown — Stories, Subtasks, cross-feature
           dependencies, and quality signals. This usually takes a few minutes; large
@@ -3088,49 +3070,20 @@ function GeneratingScreen({ pageTitle, elapsed, onBack, onStartOver }) {
           reassurance appears only once we're past the usual window, so a slow
           batch reads as "still working", not "stuck". elapsed is in seconds. */}
       {elapsed >= 600 && (
-        <div
-          className="rounded-lg p-3 mb-4 flex items-start gap-2"
-          style={{
-            background: "var(--s2j-orange-bg)",
-            border: "1px solid var(--s2j-orange-border)",
-          }}
-        >
-          <IconClock size={16} style={{ marginTop: 1 }} />
-          <div>
-            <p
-              className="text-xs font-medium mb-1"
-              style={{ color: "var(--s2j-text)" }}
-            >
-              Taking longer than usual — this is normal, nothing is broken
-            </p>
-            <p className="text-xs" style={{ color: "var(--s2j-text-light)" }}>
-              Generation runs on Anthropic's Batch API, which can slow down when
-              Claude is under heavy load. Your request is still processing and your
-              breakdown will finish on its own — it is not lost.
-            </p>
-          </div>
-        </div>
+        <SignalCallout kind="warning" title="Taking longer than usual — this is normal, nothing is broken" style={{ marginBottom: 16 }} fontSize={13}>
+          <span style={{ color: "var(--s2j-text-light)" }}>
+            Generation runs on Anthropic's Batch API, which can slow down when Claude is under heavy load.
+            Your request is still processing and your breakdown will finish on its own — it is not lost.
+          </span>
+        </SignalCallout>
       )}
 
-      <div
-        className="rounded-lg p-3"
-        style={{
-          background: "var(--s2j-blue-bg)",
-          border: "1px solid var(--s2j-blue-border)",
-        }}
-      >
-        <p
-          className="text-xs font-medium mb-1"
-          style={{ color: "var(--s2j-text)" }}
-        >
-          You can safely leave — we'll keep working
-        </p>
-        <p className="text-xs" style={{ color: "var(--s2j-text-light)" }}>
-          Close this tab, switch tasks, or come back tomorrow — your breakdown keeps
-          generating. Reopen this page (Apps → Spec2Tickets) and it will be waiting
-          for you, even if it took a while.
-        </p>
-      </div>
+      <SignalCallout kind="info" title="You can safely leave — we'll keep working" fontSize={13}>
+        <span style={{ color: "var(--s2j-text-light)" }}>
+          Close this tab, switch tasks, or come back tomorrow — your breakdown keeps generating.
+          Reopen this page (Apps → Spec2Tickets) and it will be waiting for you, even if it took a while.
+        </span>
+      </SignalCallout>
       {onStartOver && (
         <button
           type="button"
@@ -3191,10 +3144,7 @@ function GeneratingTestsScreen({ pageTitle, tcElapsed, onBack }) {
             </span>
           </div>
         </div>
-        <h2
-          className="text-base font-semibold"
-          style={{ color: "var(--s2j-text)" }}
-        >
+        <h2 style={{ fontSize: 18, fontWeight: 700, color: MOOD.navy, letterSpacing: "-0.01em" }}>
           Generating test cases…
         </h2>
         {pageTitle && (
@@ -3203,8 +3153,8 @@ function GeneratingTestsScreen({ pageTitle, tcElapsed, onBack }) {
           </p>
         )}
         <p
-          className="text-xs mt-2.5"
-          style={{ color: "var(--s2j-text-muted)", maxWidth: "26rem" }}
+          className="mt-2.5"
+          style={{ fontSize: 13, lineHeight: 1.55, color: "var(--s2j-text-muted)", maxWidth: "26rem" }}
         >
           Building BA-grade acceptance scenarios for every story — Gherkin and CSV
           export included. Typically a few minutes; large breakdowns take longer.
@@ -3212,48 +3162,20 @@ function GeneratingTestsScreen({ pageTitle, tcElapsed, onBack }) {
       </div>
 
       {tcElapsed >= 600 && (
-        <div
-          className="rounded-lg p-3 mb-4 flex items-start gap-2"
-          style={{
-            background: "var(--s2j-orange-bg)",
-            border: "1px solid var(--s2j-orange-border)",
-          }}
-        >
-          <IconClock size={16} style={{ marginTop: 1 }} />
-          <div>
-            <p
-              className="text-xs font-medium mb-1"
-              style={{ color: "var(--s2j-text)" }}
-            >
-              Taking longer than usual — this is normal, nothing is broken
-            </p>
-            <p className="text-xs" style={{ color: "var(--s2j-text-light)" }}>
-              Test-case generation runs on Anthropic's Batch API; it can slow down under
-              heavy load. Your request is still processing.
-            </p>
-          </div>
-        </div>
+        <SignalCallout kind="warning" title="Taking longer than usual — this is normal, nothing is broken" style={{ marginBottom: 16 }} fontSize={13}>
+          <span style={{ color: "var(--s2j-text-light)" }}>
+            Test-case generation runs on Anthropic's Batch API; it can slow down under heavy load.
+            Your request is still processing.
+          </span>
+        </SignalCallout>
       )}
 
-      <div
-        className="rounded-lg p-3"
-        style={{
-          background: "var(--s2j-blue-bg)",
-          border: "1px solid var(--s2j-blue-border)",
-        }}
-      >
-        <p
-          className="text-xs font-medium mb-1"
-          style={{ color: "var(--s2j-text)" }}
-        >
-          You can safely leave — we'll keep working
-        </p>
-        <p className="text-xs" style={{ color: "var(--s2j-text-light)" }}>
-          Close this tab or switch tasks — test-case generation continues in the
-          background. Reopen the breakdown (Apps → Spec2Tickets) and the results
-          will be waiting for you.
-        </p>
-      </div>
+      <SignalCallout kind="info" title="You can safely leave — we'll keep working" fontSize={13}>
+        <span style={{ color: "var(--s2j-text-light)" }}>
+          Close this tab or switch tasks — test-case generation continues in the background.
+          Reopen the breakdown (Apps → Spec2Tickets) and the results will be waiting for you.
+        </span>
+      </SignalCallout>
     </div>
   );
 }
@@ -4524,7 +4446,10 @@ function PushingScreen({ progress, phase }) {
     <div className="p-6" style={SCREEN_MAX_WIDTH_STYLE}>
       <div className="flex items-center gap-2 mb-3">
         <Spinner size={18} />
-        <h2 className="text-lg font-semibold" style={{ color: "var(--s2j-text)" }}>
+        <h2
+          className="font-semibold"
+          style={{ fontSize: 18, color: MOOD.navy, letterSpacing: "-0.01em" }}
+        >
           Creating issues in Jira
         </h2>
       </div>
@@ -5132,32 +5057,27 @@ function LimitReachedScreen({ quota, onBack, backToReview = false }) {
 
   return (
     <div className="p-6" style={SCREEN_MAX_WIDTH_STYLE}>
-      {onBack && (
-        <BackButton onClick={onBack} title={backTitle} />
-      )}
+      {/* moodboard (Phase 1) — navy headline + a light accented MoodCard (clarity, not
+          premium glass: this is an upsell/limit moment, keep it calm and legible). The
+          green subscription card below is deliberately left in the commit-colour. */}
+      <ScreenHeader
+        title={heading}
+        onBack={onBack || undefined}
+        backLabel={backToReview ? "Back to your breakdown" : "Back to pages"}
+        backTitle={backTitle}
+      />
 
-      <div
-        className="rounded-lg p-4 mb-4"
-        style={{
-          background: "var(--s2j-blue-bg)",
-          border: "1px solid var(--s2j-blue-border)",
-        }}
-      >
-        <h2 className="text-lg font-semibold mb-1" style={{ color: "var(--s2j-text)" }}>
-          {heading}
-        </h2>
-        <p className="text-sm" style={{ color: "var(--s2j-text)" }}>
-          {quota?.detail || fallbackBody}
-        </p>
+      <MoodCard density="minor" accent="var(--s2j-blue)" style={{ marginBottom: 16 }}>
+        <p style={TYPE.body}>{quota?.detail || fallbackBody}</p>
         {/* Reset date is the actionable info for a Managed user waiting out the
             fair-use month rather than switching to BYOK. license_required has no
             monthly reset (it's an account/subscription state, not a quota). */}
         {isFairUse && !quota?.detail && resetsAt && (
-          <p className="text-sm mt-1" style={{ color: "var(--s2j-text-light)" }}>
+          <p style={{ ...TYPE.sub, marginTop: 6 }}>
             Your monthly breakdowns reset on <strong>{resetsAt}</strong>.
           </p>
         )}
-      </div>
+      </MoodCard>
 
       {/* Subscription card (v6 value framing). edition_required → upsell Advanced;
           license_required (no plan) → both editions; fair-use (dormant Managed) → Standard. */}
@@ -5252,27 +5172,20 @@ function ErrorScreen({ error, jobId = null, onRetry, onBackToPicker, onOpenDiagn
           title="Abandon this page and return to picker (use 'Try again' below to retry the same page)"
         />
       )}
-      <div
-        className="rounded-lg p-4 mb-4"
-        style={{
-          background: "var(--s2j-red-bg)",
-          border: "1px solid var(--s2j-red-border)",
-        }}
+      {/* moodboard (Phase 1) — a crisis screen earns clarity, not glass: the error tone
+          is carried by SignalCallout (red icon + border, dark readable body). */}
+      <SignalCallout
+        kind="error"
+        title="Something went wrong"
+        style={{ marginBottom: 16 }}
+        fontSize={13}
       >
-        <p
-          className="text-sm font-medium mb-1"
-          style={{ color: "var(--s2j-red)" }}
-        >
-          Something went wrong
-        </p>
-        <p className="text-xs" style={{ color: "var(--s2j-text)" }}>
-          {displayError}
-        </p>
+        <div>{displayError}</div>
         {/* [diag Phase 3, design §5] ADDITIVE diagnostic ref under the verbatim error
             text — the existing message above is never shortened or replaced. Renders
             nothing when no jobId is in scope for this failure (jobId null). */}
         <DiagnosticRefLine refId={jobId} onOpenDiagnostics={onOpenDiagnostics} />
-      </div>
+      </SignalCallout>
 
       <button onClick={onRetry} className="btn-secondary">
         ← Try again
@@ -5314,59 +5227,49 @@ function ErrorScreen({ error, jobId = null, onRetry, onBackToPicker, onOpenDiagn
 function SetupScreen({ message, onOpenSettings }) {
   return (
     <div className="p-6" style={SCREEN_MAX_WIDTH_STYLE}>
-      <div
-        className="rounded-lg p-5 mb-4"
-        style={{
-          background: "var(--s2j-blue-bg)",
-          border: "1px solid var(--s2j-blue-border)",
-        }}
-      >
-        <div className="flex items-center gap-2 mb-3">
-          <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
-            <circle
-              cx="10"
-              cy="10"
-              r="9"
-              stroke="var(--s2j-blue)"
-              strokeWidth="2"
-            />
+      {/* moodboard (Phase 1) — onboarding earns clarity: navy header + a light glass
+          prerequisites card with the green "Open Settings" commit CTA, then a quieter
+          utility card for the secondary admin-route steps. */}
+      <ScreenHeader
+        title="Setup required"
+        subtitle="Spec2Tickets needs to be configured before first use."
+        icon={
+          <svg width="18" height="18" viewBox="0 0 20 20" fill="none">
+            <circle cx="10" cy="10" r="9" stroke="currentColor" strokeWidth="2" />
             <path
               d="M10 6v5M10 13.5v.5"
-              stroke="var(--s2j-blue)"
+              stroke="currentColor"
               strokeWidth="2"
               strokeLinecap="round"
             />
           </svg>
-          <h2
-            className="text-base font-semibold"
-            style={{ color: "var(--s2j-text)" }}
-          >
-            Setup Required
-          </h2>
-        </div>
+        }
+      />
 
-        <p className="text-sm mb-3" style={{ color: "var(--s2j-text)" }}>
-          Spec2Tickets needs to be configured before first use.
+      {/* v6 value-split: both editions are BYOK → always show the Anthropic-key
+          prerequisite (the old "no key needed" Managed branch was removed). */}
+      <MoodCard density="minor" style={{ marginBottom: 16 }}>
+        <p style={{ ...TYPE.body, fontWeight: 600, marginBottom: 8 }}>
+          You will need:
         </p>
-
-        {/* v6 value-split: both editions are BYOK → always show the Anthropic-key
-            prerequisite (the old "no key needed" Managed branch was removed). */}
-        <p className="text-sm mb-3" style={{ color: "var(--s2j-text)" }}>
-          <strong>You will need:</strong>
-          <br />
-          • An Anthropic API key (sign up at{" "}
-          <a
-            href="https://console.anthropic.com/settings/keys"
-            target="_blank"
-            rel="noopener noreferrer"
-            style={{ color: "var(--s2j-blue)", textDecoration: "underline" }}
-          >
-            console.anthropic.com → API Keys
-          </a>
-          ; billed pay-as-you-go to your own Anthropic account)
-          <br />• A Jira project key where the breakdown will be created
-        </p>
-        <p className="text-sm mb-3" style={{ color: "var(--s2j-text-light)" }}>
+        <ul
+          style={{ ...TYPE.body, margin: 0, paddingLeft: 18, listStyle: "disc" }}
+        >
+          <li style={{ marginBottom: 6 }}>
+            An Anthropic API key (sign up at{" "}
+            <a
+              href="https://console.anthropic.com/settings/keys"
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{ color: "var(--s2j-blue)", textDecoration: "underline" }}
+            >
+              console.anthropic.com → API Keys
+            </a>
+            ; billed pay-as-you-go to your own Anthropic account)
+          </li>
+          <li>A Jira project key where the breakdown will be created</li>
+        </ul>
+        <p style={{ ...TYPE.sub, marginTop: 10 }}>
           New to API keys? Our plain-English walkthrough (no technical background
           needed) covers it step by step:{" "}
           <a
@@ -5386,41 +5289,38 @@ function SetupScreen({ message, onOpenSettings }) {
         {onOpenSettings && (
           <button
             onClick={onOpenSettings}
-            className="btn-primary justify-center mb-3"
+            className="btn-primary justify-center"
+            style={{ marginTop: 14 }}
           >
             Open Settings
           </button>
         )}
+      </MoodCard>
 
-        <div
-          className="rounded p-3 text-xs leading-relaxed"
-          style={{
-            background: "var(--s2j-bg)",
-            color: "var(--s2j-text-light)",
-          }}
-        >
-          <p className="font-medium mb-1" style={{ color: "var(--s2j-text)" }}>
-            How to configure:
-          </p>
-          <p>
-            1. Go to <strong>Confluence Settings</strong> (gear icon, top right)
-          </p>
-          <p>
-            2. Click <strong>Apps → Manage Apps</strong>
-          </p>
-          <p>
-            3. Find <strong>Spec2Tickets Settings</strong> in the left sidebar
-          </p>
-          <p>
-            4. Paste your Anthropic API key + Jira Project Key, then Test & Save
-          </p>
-          <p style={{ marginTop: "6px", fontStyle: "italic" }}>
-            Powered by Claude Sonnet 4.6 — your page content flows directly from
-            Forge to the Anthropic API using your own key. No data on Spec2Tickets
-            servers.
-          </p>
-        </div>
-      </div>
+      <MoodCard density="utility">
+        <p style={{ ...TYPE.label, color: "var(--s2j-text)", marginBottom: 6 }}>
+          How to configure:
+        </p>
+        <ol style={{ ...TYPE.sub, margin: 0, paddingLeft: 18 }}>
+          <li>
+            Go to <strong>Confluence Settings</strong> (gear icon, top right)
+          </li>
+          <li>
+            Click <strong>Apps → Manage Apps</strong>
+          </li>
+          <li>
+            Find <strong>Spec2Tickets Settings</strong> in the left sidebar
+          </li>
+          <li>
+            Paste your Anthropic API key + Jira Project Key, then Test &amp; Save
+          </li>
+        </ol>
+        <p style={{ ...TYPE.micro, marginTop: 8, fontStyle: "italic" }}>
+          Powered by Claude Sonnet 4.6 — your page content flows directly from
+          Forge to the Anthropic API using your own key. No data on Spec2Tickets
+          servers.
+        </p>
+      </MoodCard>
     </div>
   );
 }
