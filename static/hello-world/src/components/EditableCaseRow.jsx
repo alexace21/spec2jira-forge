@@ -14,8 +14,32 @@ const TYPE_BADGE = {
   negative: { fg: "var(--s2j-red)", bg: "var(--s2j-red-bg)", border: "var(--s2j-red-border)" },
 };
 
-// ── StringListEditor — the FeatureCard "+Add / hover-✕ / EditableField-row" list,
-// generalized for given / when / then / test_data. ───────────────────────────────
+// ── FieldBlock — a BLOCK label sitting on its OWN line above its control. THE fix for the partner's
+// "EXPECTED RESULTA valid session…" / "CONCERN (OPTIONAL)e.g…" merge bug: the old code used an INLINE
+// <span> label that the value ran straight onto. One shared block-label vehicle, applied everywhere, so a
+// field label can never hug its value again. Label size bumped 10→12px (readability). ───────────────────
+const fieldLabelStyle = {
+  display: "block", fontSize: 12, fontWeight: 600, color: "var(--s2j-text-muted)",
+  textTransform: "uppercase", letterSpacing: "0.04em", marginBottom: 4,
+};
+function FieldBlock({ label, action, children }) {
+  return (
+    <div style={{ marginBottom: 12 }}>
+      {action ? (
+        <div className="flex items-center justify-between" style={{ marginBottom: 4 }}>
+          <span style={{ ...fieldLabelStyle, marginBottom: 0 }}>{label}</span>
+          {action}
+        </div>
+      ) : (
+        <span style={fieldLabelStyle}>{label}</span>
+      )}
+      {children}
+    </div>
+  );
+}
+
+// ── StringListEditor — the "+Add / hover-✕ / EditableField-row" list, for given / when / then / test_data.
+// Label is a FieldBlock action-row (block label + "+ Add" on the right); items bumped to 13px / 1.55. ─────
 function StringListEditor({ label, items, onChange, addLabel = "+ Add", placeholder }) {
   const list = Array.isArray(items) ? items : [];
   function update(i, val) {
@@ -24,53 +48,58 @@ function StringListEditor({ label, items, onChange, addLabel = "+ Add", placehol
     onChange(next);
   }
   return (
-    <div className="space-y-1">
-      <div className="flex items-center justify-between">
-        <span className="text-[10px] font-semibold uppercase tracking-wider" style={{ color: "var(--s2j-text-muted)" }}>
-          {label}
-        </span>
-        <button type="button" onClick={() => onChange([...list, ""])} className="text-[11px]" style={{ color: "var(--s2j-blue)" }}>
+    <FieldBlock
+      label={label}
+      action={
+        <button type="button" onClick={() => onChange([...list, ""])} className="text-[12px]" style={{ color: "var(--s2j-blue)" }}>
           {addLabel}
         </button>
-      </div>
-      {list.map((item, i) => (
-        <div key={i} className="group/li flex items-start gap-1.5">
-          <span className="mt-1 text-[9px]" style={{ color: "var(--s2j-text-muted)" }}>•</span>
-          <div className="flex-1 min-w-0">
-            <EditableField
-              value={item}
-              multiline
-              placeholder={placeholder}
-              className="text-[11px] leading-relaxed"
-              onChange={(val) => update(i, val)}
-            />
+      }
+    >
+      <div className="space-y-1">
+        {list.map((item, i) => (
+          <div key={i} className="group/li flex items-start gap-2">
+            <span className="mt-1.5 text-[10px]" style={{ color: "var(--s2j-skySteel, #7DA0CA)" }}>•</span>
+            <div className="flex-1 min-w-0">
+              <EditableField
+                value={item}
+                multiline
+                placeholder={placeholder}
+                className="text-[13px] leading-relaxed"
+                onChange={(val) => update(i, val)}
+              />
+            </div>
+            <button
+              type="button"
+              onClick={() => onChange(list.filter((_, idx) => idx !== i))}
+              className="mt-1 opacity-0 group-hover/li:opacity-100 transition-all text-[12px] px-1"
+              style={{ color: "var(--s2j-red)" }}
+              title="Remove"
+            >
+              <IconX size={12} title="Remove" />
+            </button>
           </div>
-          <button
-            type="button"
-            onClick={() => onChange(list.filter((_, idx) => idx !== i))}
-            className="mt-0.5 opacity-0 group-hover/li:opacity-100 transition-all text-[11px] px-1"
-            style={{ color: "var(--s2j-red)" }}
-            title="Remove"
-          >
-            <IconX size={11} title="Remove" />
-          </button>
-        </div>
-      ))}
-    </div>
+        ))}
+        {list.length === 0 && (
+          <span className="text-[12px] italic" style={{ color: "var(--s2j-text-light)" }}>none — “+ Add” to add one</span>
+        )}
+      </div>
+    </FieldBlock>
   );
 }
 
 /**
- * EditableCaseRow — the editable replacement for the read-only CaseRow.
+ * EditableCaseRow — the editable card for one test case.
  *
- * Always inline-editable (click-to-edit, like FeatureCard) so at rest it reads like the view,
- * and edits commit to the parent draft via onChange(nextCase). ac_trace is edited through the
- * coverage-safe AcTraceEditor (AC-checklist, never free-text). Delete is a two-step inline
- * confirm (window.confirm is blocked in the Forge iframe).
+ * Always inline-editable (click-to-edit, like FeatureCard) so at rest it reads like the view, and edits
+ * commit to the parent draft via onChange(nextCase). ac_trace is edited through the coverage-safe
+ * AcTraceEditor (AC-checklist, never free-text). Delete is a two-step inline confirm (window.confirm is
+ * blocked in the Forge iframe). 2026-06-27 redesign: moodboard glass surface, 12/13/14px type scale (up
+ * from 10/11), and FieldBlock block-labels (the merge-bug fix). Props + behavior are UNCHANGED.
  *
  * Props:
  *   tc                  — the test case object
- *   caseNumber          — 1-based display index
+ *   caseNumber          — 1-based display index (the ABSOLUTE index in the story's test_cases + 1)
  *   acceptanceCriteria  — string[] the story's live ACs (drives the AcTraceEditor checklist)
  *   onChange            — fn(nextCase)
  *   onDelete            — fn()
@@ -122,22 +151,29 @@ export default function EditableCaseRow({
   }, [armed, onDelete]);
 
   return (
-    // [deep-audit E-#6] read-only (downgraded user): a disabled fieldset NATIVELY disables every
-    // nested input/select/button (edit fields, add/delete, the per-case Save/Revert footer) → a true
-    // read-only card matching the banner, with no dead/clickable controls. minInlineSize resets the
-    // fieldset's default min-content sizing so layout is unchanged.
+    // [deep-audit E-#6] read-only (downgraded user): a disabled fieldset NATIVELY disables every nested
+    // input/select/button → a true read-only card matching the banner, with no dead/clickable controls.
+    // minInlineSize resets the fieldset's default min-content sizing so layout is unchanged.
+    // Moodboard glass surface: near-opaque white fill (legibility never depends on backdrop-filter) + a
+    // sky-steel hairline + a soft deep-blue shadow. An INVALID case keeps its orange border (§11 signal).
     <fieldset
       disabled={readOnly}
-      className="rounded-lg border p-3 mb-2 text-xs"
-      style={{ background: "var(--s2j-bg)", border: `1px solid ${invalid ? "var(--s2j-orange-border)" : "var(--s2j-border)"}`, minInlineSize: "auto" }}
+      className="p-4 mb-3 text-xs"
+      style={{
+        background: "rgba(255,255,255,0.72)",
+        border: `1px solid ${invalid ? "var(--s2j-orange-border)" : "rgba(125,160,202,0.30)"}`,
+        borderRadius: 14,
+        boxShadow: "0 6px 22px rgba(5,38,89,0.07)",
+        minInlineSize: "auto",
+      }}
     >
       {/* Header: # · type · priority · title · delete */}
-      <div className="flex items-start gap-2 mb-2 flex-wrap">
-        <span className="text-[10px] mt-1 shrink-0" style={{ color: "var(--s2j-text-muted)" }}>#{caseNumber}</span>
+      <div className="flex items-start gap-2 mb-3 flex-wrap">
+        <span className="text-[12px] mt-1.5 shrink-0 font-medium" style={{ color: "var(--s2j-text-muted)" }}>#{caseNumber}</span>
         <select
           value={type}
           onChange={(e) => set("type", e.target.value)}
-          className="text-[10px] rounded px-1 py-0.5 font-medium shrink-0"
+          className="text-[12px] rounded px-1.5 py-1 font-medium shrink-0"
           style={{ background: badge.bg, border: `1px solid ${badge.border}`, color: badge.fg }}
           title="Coverage type"
         >
@@ -148,7 +184,7 @@ export default function EditableCaseRow({
         <select
           value={c.priority || ""}
           onChange={(e) => set("priority", e.target.value || undefined)}
-          className="text-[10px] rounded px-1 py-0.5 shrink-0"
+          className="text-[12px] rounded px-1.5 py-1 shrink-0"
           style={{ background: "var(--s2j-bg-section)", border: "1px solid var(--s2j-border)", color: "var(--s2j-text-light)" }}
           title="Test-case priority (optional)"
         >
@@ -157,13 +193,13 @@ export default function EditableCaseRow({
             <option key={p} value={p}>{p}</option>
           ))}
         </select>
-        <div className="flex-1 min-w-[120px] font-medium" style={{ color: "var(--s2j-text)" }}>
+        <div className="flex-1 min-w-[140px] font-semibold text-[14px]" style={{ color: "var(--s2j-text)" }}>
           <EditableField value={c.title} placeholder="Scenario title…" maxLength={200} onChange={(val) => set("title", val)} />
         </div>
         <button
           type="button"
           onClick={onDeleteClick}
-          className="text-[10px] px-1.5 py-0.5 rounded shrink-0"
+          className="text-[11px] px-1.5 py-0.5 rounded shrink-0"
           style={{
             background: armed ? "var(--s2j-red-bg)" : "none",
             border: `1px solid ${armed ? "var(--s2j-red-border)" : "var(--s2j-border)"}`,
@@ -171,71 +207,69 @@ export default function EditableCaseRow({
           }}
           title={armed ? "Click again to confirm — delete this case" : "Delete this case"}
         >
-          {armed ? "Confirm — delete?" : <IconX size={11} title="Delete this case" />}
+          {armed ? "Confirm — delete?" : <IconX size={12} title="Delete this case" />}
         </button>
       </div>
 
       {invalid && (
-        <div className="text-[10px] mb-2" style={{ color: "var(--s2j-orange)" }}>
+        <div className="text-[12px] mb-3 flex items-center gap-1.5" style={{ color: "var(--s2j-orange)" }}>
           <SignalIcon kind="warning" size={14} /> A case needs at least one When and one Then, or it is dropped on save.
         </div>
       )}
 
       {/* concern (clearable) */}
-      <div className="mb-2">
-        <span className="text-[10px] font-semibold uppercase tracking-wider" style={{ color: "var(--s2j-text-muted)" }}>
-          Concern (optional)
-        </span>
+      <FieldBlock label="Concern (optional)">
         <EditableField
           value={c.concern || ""}
           multiline
           placeholder="e.g. [ASSUMPTION|medium] …"
-          className="text-[11px]"
+          className="text-[13px] leading-relaxed"
           onChange={(val) => set("concern", val || undefined)}
         />
-      </div>
+      </FieldBlock>
 
-      {/* Given / When / Then */}
-      <div className="space-y-2">
+      {/* Scenario (BDD): Given / When / Then grouped under one labeled subsection for readability */}
+      <div
+        className="mb-2 pt-1"
+        style={{ borderTop: "1px solid rgba(125,160,202,0.22)" }}
+      >
+        <span style={{ display: "block", fontSize: 11.5, fontWeight: 700, color: "var(--s2j-text-light)", textTransform: "uppercase", letterSpacing: "0.06em", margin: "8px 0 8px" }}>
+          Scenario (BDD)
+        </span>
         <StringListEditor label="Given (preconditions)" items={c.given} onChange={(v) => set("given", v)} placeholder="a precondition…" />
         <StringListEditor label="When (action)" items={c.when} onChange={(v) => set("when", v)} placeholder="an observable action…" />
         <StringListEditor label="Then (outcome)" items={c.then} onChange={(v) => set("then", v)} placeholder="an observable outcome…" />
       </div>
 
       {/* Expected result */}
-      <div className="mt-2">
-        <span className="text-[10px] font-semibold uppercase tracking-wider" style={{ color: "var(--s2j-text-muted)" }}>
-          Expected result
-        </span>
+      <FieldBlock label="Expected result">
         <EditableField
           value={c.expected_result || ""}
           multiline
           placeholder="the single falsifiable pass/fail assertion…"
-          className="text-[11px]"
+          className="text-[13px] leading-relaxed"
           onChange={(val) => set("expected_result", val)}
         />
-      </div>
+      </FieldBlock>
 
       {/* Test data */}
-      <div className="mt-2">
-        <StringListEditor label="Test data (optional)" items={c.test_data} onChange={(v) => set("test_data", v)} placeholder="a concrete value…" />
-      </div>
+      <StringListEditor label="Test data (optional)" items={c.test_data} onChange={(v) => set("test_data", v)} placeholder="a concrete value…" />
 
       {/* ac_trace — coverage-safe checklist */}
-      <div className="mt-2 pt-2" style={{ borderTop: "1px dashed var(--s2j-border)" }}>
+      <div className="mt-2 pt-3" style={{ borderTop: "1px dashed rgba(125,160,202,0.30)" }}>
         <AcTraceEditor acTrace={c.ac_trace} acceptanceCriteria={acceptanceCriteria} onChange={(next) => set("ac_trace", next)} />
       </div>
 
-      {/* Per-case Save/Revert footer (Work B) — under THIS case when it has unsaved edits, so the
-          controls are always where you're editing. Save persists the WHOLE story (KVS is per-story —
-          the tooltip is explicit); Revert is genuinely per-case (or "Remove" for a never-saved case). */}
+      {/* Per-case Save/Revert footer (Work B) — under THIS case when it has unsaved edits, so the controls
+          are always where you're editing. Save persists the WHOLE story (KVS is per-story — the tooltip is
+          explicit); Revert is genuinely per-case (or "Remove" for a never-saved case). */}
       {showSaveBar && (
         <div
-          className="mt-3 pt-2 flex items-center gap-2 flex-wrap"
+          className="mt-3 pt-3 flex items-center gap-2 flex-wrap"
           style={{ borderTop: "1px dashed var(--s2j-blue-border)" }}
         >
           <span
-            className="text-[10px] flex-1 min-w-[110px] font-medium"
+            className="text-[12px] flex-1 min-w-[120px] font-medium"
             style={{ color: saveState === "error" ? "var(--s2j-red)" : "var(--s2j-blue)" }}
           >
             {saveState === "error"
@@ -248,7 +282,7 @@ export default function EditableCaseRow({
             type="button"
             onClick={() => onRevertCase && onRevertCase()}
             disabled={saving}
-            className="text-[10px] px-2 py-0.5 rounded shrink-0"
+            className="text-[12px] px-2.5 py-1 rounded shrink-0"
             style={{
               background: "none",
               border: "1px solid var(--s2j-border)",
@@ -263,7 +297,7 @@ export default function EditableCaseRow({
             type="button"
             onClick={() => onSaveStory && onSaveStory()}
             disabled={saving}
-            className="text-[10px] px-3 py-0.5 rounded font-medium shrink-0"
+            className="text-[12px] px-3.5 py-1 rounded font-medium shrink-0"
             style={{
               background: "var(--s2j-blue)",
               border: "1px solid var(--s2j-blue)",

@@ -2,7 +2,7 @@ import React, { useMemo, useState, useRef, useEffect } from "react";
 import { invoke } from "@forge/bridge";
 import { SignalIcon, SignalCallout } from "./Signal";
 import {
-  IconCalendar, IconUsers, IconRefresh, IconCost, IconPlus, IconTrash, IconArrowLeft, IconBan, IconLink, IconList,
+  IconCalendar, IconUsers, IconRefresh, IconCost, IconPlus, IconTrash, IconList,
 } from "./Icon";
 // Shared pure view-derivations — the SINGLE source of truth so PlanScreen + the Plan Brief can never
 // tell two different stories (§13 gate "BRIEF-DRIFT"). See static/hello-world/src/lib/planView.js.
@@ -13,6 +13,8 @@ import {
 
 const SKILL_METER_ORDER = ["BE", "FE", "QA", "GEN"]; // Tier-2: per-bucket meter order
 import { renderPlanBrief } from "../lib/planBrief";
+import BackButton from "./BackButton";
+import { MOOD, WIZARD_WRAP, stepSurface, stepTitleStyle, stepSubStyle, Stepper, Accordion, WizardNext } from "./WizardKit";
 
 // Clipboard + data-URI download fallback (Forge iframe blocks blob:; never a silent no-op). Tiny, so
 // duplicated here rather than importing from App.js (same call the test-case export uses).
@@ -70,7 +72,7 @@ const fieldStyle = {
   color: "var(--s2j-text)",
   boxSizing: "border-box",
 };
-const labelStyle = { fontSize: 11, fontWeight: 600, color: "var(--s2j-text-muted)", marginBottom: 3, display: "block" };
+const labelStyle = { fontSize: 12, fontWeight: 600, color: "var(--s2j-text-muted)", marginBottom: 3, display: "block" };
 
 // A clickable info marker — click the ⓘ to open a small static popover the user closes manually (× or
 // click-outside). Partner-preferred over a hover tooltip (more deliberate + readable; 2026-06-20). Each
@@ -185,7 +187,8 @@ function MethodologyToggle({ value, onChange, disabled }) {
 }
 
 // ── Capacity form (controlled; the backend validates every field fail-loud) ─────────
-function CapacityForm({ form, onChange, disabled }) {
+// hideMethodology: when the wizard's Step 1 already owns the planning mode, suppress the in-form toggle.
+function CapacityForm({ form, onChange, disabled, hideMethodology }) {
   const f = form || {};
   const isKanban = f.methodology === "kanban";
   const people = Array.isArray(f.people) ? f.people : [];
@@ -201,14 +204,15 @@ function CapacityForm({ form, onChange, disabled }) {
 
   return (
     <div style={{ border: "1px solid var(--s2j-border)", borderRadius: 10, padding: 16, background: "var(--s2j-bg-section)" }}>
-      {/* methodology selector — top of the form (task-1) */}
-      <MethodologyToggle value={f.methodology} onChange={set} disabled={disabled} />
+      {/* methodology selector — top of the form (task-1). Suppressed when the wizard's Step 1 already
+          owns the planning mode (hideMethodology), so the mode isn't asked for twice. */}
+      {hideMethodology ? null : <MethodologyToggle value={f.methodology} onChange={set} disabled={disabled} />}
 
       <div className="flex items-center gap-2" style={{ marginBottom: 4 }}>
         <span style={{ color: "var(--s2j-blue)" }}><IconUsers size={16} /></span>
         <h3 style={{ fontSize: 14, fontWeight: 600, color: "var(--s2j-text)", margin: 0 }}>Team capacity</h3>
       </div>
-      <p style={{ fontSize: 11, color: "var(--s2j-text-muted)", margin: "0 0 12px", lineHeight: 1.5 }}>
+      <p style={{ fontSize: 12.5, color: "var(--s2j-text-muted)", margin: "0 0 12px", lineHeight: 1.5 }}>
         {isKanban
           ? <>Expected throughput this quarter is computed from each person's available days. Click the&nbsp;<SignalIcon kind="info" size={11} style={{ verticalAlign: "-0.1em" }} />&nbsp;icons for what each field means; every multiplier (and its default) is also listed in <strong>Assumptions</strong> after you generate.</>
           : <>Capacity per sprint is computed from each person's available days. Click the&nbsp;<SignalIcon kind="info" size={11} style={{ verticalAlign: "-0.1em" }} />&nbsp;icons for what each field means; every multiplier (and its default) is also listed in <strong>Assumptions</strong> after you generate.</>}
@@ -450,10 +454,23 @@ function FeatureChip({ feat, id, oversized, risk }) {
 
 // Async-batch wait state — the ranking runs on Anthropic's Batch API (minutes), so we show a spinner +
 // live timer + "you can leave" reassurance, mirroring the breakdown GeneratingScreen.
-function PlanningState({ elapsed, kanban }) {
+function PlanningState({ elapsed, kanban, repacking }) {
   const e = Number(elapsed) || 0;
   const mins = Math.floor(e / 60);
   const secs = e % 60;
+  if (repacking) {
+    // Free, instant, deterministic re-pack (no Claude / no Batch API) — distinct honest copy so the billed
+    // generation messaging ("runs on the Batch API, takes a few minutes") is never shown for a free re-pack.
+    return (
+      <div style={{ border: "1px dashed var(--s2j-border)", borderRadius: 10, padding: 32, textAlign: "center" }}>
+        <div className="animate-spin" style={{ width: 40, height: 40, margin: "0 auto 14px", borderRadius: "50%", border: "3px solid var(--s2j-border)", borderTopColor: "var(--s2j-blue)" }} />
+        <p style={{ fontSize: 14, fontWeight: 600, color: "var(--s2j-text)", margin: "0 0 4px" }}>{kanban ? "Re-packing your backlog…" : "Re-packing your sprints…"}</p>
+        <p style={{ fontSize: 12.5, color: "var(--s2j-text-muted)", margin: 0, lineHeight: 1.5 }}>
+          Re-applying your capacity to the same Claude ordering — instant and free, no Claude call.
+        </p>
+      </div>
+    );
+  }
   return (
     <div style={{ border: "1px dashed var(--s2j-border)", borderRadius: 10, padding: 32, textAlign: "center" }}>
       <div className="animate-spin" style={{ width: 48, height: 48, margin: "0 auto 14px", borderRadius: "50%", border: "3px solid var(--s2j-border)", borderTopColor: "var(--s2j-blue)" }} />
@@ -540,7 +557,7 @@ function KanbanCapacityPreview({ preview, form }) {
 }
 
 // ── Spec-wide concerns band (SN-3) — plan-LEVEL risk/compliance posture, never attributed to a feature ──
-function SpecConcernsBand({ summary }) {
+function SpecConcernsBand({ summary, max = 6 }) {
   if (!summary || !summary.total) return null;
   const items = Array.isArray(summary.items) ? summary.items : [];
   const hasCompliance = summary.complianceCount > 0;
@@ -556,12 +573,12 @@ function SpecConcernsBand({ summary }) {
       </div>
       {items.length ? (
         <ul style={{ margin: 0, paddingLeft: 18 }}>
-          {items.slice(0, 6).map((c, i) => (
+          {items.slice(0, max).map((c, i) => (
             <li key={i} style={{ marginBottom: 2, fontSize: 12 }}>
               {c.type && c.type !== "NOTE" ? <span style={{ fontWeight: 600 }}>[{c.type}]</span> : null} {c.text}
             </li>
           ))}
-          {items.length > 6 ? <li style={{ fontSize: 11.5, color: "var(--s2j-text-light)", listStyle: "none", marginLeft: -18 }}>…and {items.length - 6} more in the breakdown.</li> : null}
+          {items.length > max ? <li style={{ fontSize: 11.5, color: "var(--s2j-text-light)", listStyle: "none", marginLeft: -18 }}>…and {items.length - max} more in the breakdown.</li> : null}
         </ul>
       ) : null}
     </SignalCallout>
@@ -747,7 +764,7 @@ function PlanBriefExport({ brief }) {
         </span>
       </div>
       <div style={{ fontSize: 10.5, color: "var(--s2j-text-light)", marginTop: 6, lineHeight: 1.5 }}>
-        Every line traces to a number this plan computed — capacity, what fits, what doesn’t & why, risks, assumptions. No AI prose, nothing sent anywhere.
+        Grounded in this plan’s numbers — nothing is sent anywhere.
       </div>
     </div>
   );
@@ -809,18 +826,27 @@ function WhatIfPanel({ jobId, baselineForm, slimFeatures, stale, planBusy, onApp
   const capErr = preview && preview.ok === false && preview.stage === "capacity";
   const canApplyCapacity = (sprintDelta !== 0 || focusChanged) && !planBusy && !stale;
 
+  // Discoverable: a blue-tinted header (the partner's "unnoticeable at the bottom" finding) with an
+  // explanatory ⓘ. The toggle and the InfoTip are SIBLINGS — never an InfoTip <button> inside the
+  // toggle <button> (nested interactive = invalid).
   return (
-    <div style={{ border: "1px solid var(--s2j-border)", borderRadius: 10, background: "var(--s2j-bg)", marginBottom: 12 }}>
-      <button
-        type="button"
-        onClick={() => setOpen((o) => !o)}
-        style={{ width: "100%", textAlign: "left", background: "none", border: "none", cursor: "pointer", padding: "10px 12px", display: "flex", alignItems: "center", justifyContent: "space-between", color: "var(--s2j-text)" }}
-      >
-        <span style={{ fontSize: 13, fontWeight: 600, display: "inline-flex", alignItems: "center", gap: 6 }}>
-          <IconRefresh size={14} /> What if… <span style={{ fontWeight: 400, color: "var(--s2j-text-muted)", fontSize: 11.5 }}>— explore changes free, no re-rank</span>
-        </span>
-        <span style={{ color: "var(--s2j-text-muted)", fontSize: 12 }}>{open ? "▾" : "▸"}</span>
-      </button>
+    <div style={{ border: "1px solid var(--s2j-blue-border)", borderRadius: 10, background: "var(--s2j-blue-bg)", marginBottom: 12 }}>
+      <div className="flex items-center" style={{ justifyContent: "space-between", gap: 8, padding: "10px 12px" }}>
+        <button
+          type="button"
+          onClick={() => setOpen((o) => !o)}
+          aria-expanded={open}
+          style={{ flex: 1, textAlign: "left", background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 6, color: "var(--s2j-text)" }}
+        >
+          <span className="flex items-center" style={{ gap: 6 }}>
+            <span style={{ color: "var(--s2j-blue)", display: "inline-flex" }}><IconRefresh size={15} /></span>
+            <span style={{ fontSize: 13.5, fontWeight: 600 }}>What-if scenarios</span>
+            <span style={{ fontWeight: 400, color: "var(--s2j-text-muted)", fontSize: 11.5 }}>— explore changes free</span>
+          </span>
+          <span aria-hidden="true" style={{ color: "var(--s2j-text-muted)", fontSize: 13, lineHeight: 1 }}>{open ? "▾" : "▸"}</span>
+        </button>
+        <InfoTip align="right" text="Preview the impact of a change — add or remove a sprint, lower the focus factor, or defer features — for FREE. It re-packs the SAME Claude ordering against the new numbers; it never spends or re-asks Claude. To actually re-optimize the ORDER, use Re-rank with Claude. Deferrals here are preview-only — to drop a feature for real, remove it in the editor." />
+      </div>
       {open ? (
         <div style={{ padding: "0 12px 12px" }}>
           {stale ? (
@@ -843,15 +869,16 @@ function WhatIfPanel({ jobId, baselineForm, slimFeatures, stale, planBusy, onApp
               <span style={labelStyle}>Focus factor</span>
               <input type="text" inputMode="decimal" value={focus} placeholder={`baseline ${baseFocus}`} onChange={(e) => setFocus(e.target.value)} style={fieldStyle} />
             </div>
-            <button type="button" onClick={() => setDeferOpen((o) => !o)} className="text-xs" style={{ background: "none", border: "1px dashed var(--s2j-border)", color: "var(--s2j-blue)", cursor: "pointer", padding: "6px 10px", borderRadius: 6 }}>
+            <button type="button" onClick={() => setDeferOpen((o) => !o)} aria-expanded={deferOpen} className="text-xs" style={{ background: "none", border: "1px dashed var(--s2j-border)", color: "var(--s2j-blue)", cursor: "pointer", padding: "6px 10px", borderRadius: 6 }}>
               {deferOpen ? "▾" : "▸"} Defer features{deferred.size ? ` (${deferred.size})` : ""}
             </button>
             {active ? <button type="button" onClick={reset} className="text-xs" style={{ background: "none", border: "none", color: "var(--s2j-text-muted)", cursor: "pointer", textDecoration: "underline" }}>Reset</button> : null}
           </div>
 
-          {/* defer checklist */}
+          {/* defer checklist — no internal maxHeight/overflow: the picker is opt-in (collapsed by default)
+              and PAGE-scrolls with the rest (Forge-iframe content-driven sizing; no internal scroll trap). */}
           {deferOpen ? (
-            <div style={{ border: "1px solid var(--s2j-border)", borderRadius: 8, padding: 8, marginBottom: 10, maxHeight: 160, overflowY: "auto" }}>
+            <div style={{ border: "1px solid var(--s2j-border)", borderRadius: 8, padding: 8, marginBottom: 10 }}>
               {(slimFeatures || []).map((f) => f && f._uid ? (
                 <label key={f._uid} className="flex items-center" style={{ gap: 6, fontSize: 12, padding: "2px 0", cursor: "pointer" }}>
                   <input type="checkbox" checked={deferred.has(f._uid)} onChange={() => toggleDefer(f._uid)} />
@@ -911,7 +938,7 @@ function WhatIfPanel({ jobId, baselineForm, slimFeatures, stale, planBusy, onApp
               {/* apply / defer-note */}
               <div className="flex items-center" style={{ gap: 10, marginTop: 10, flexWrap: "wrap" }}>
                 {canApplyCapacity ? (
-                  <button type="button" onClick={() => { const patch = {}; if (sprintDelta !== 0) patch.sprintCount = baseSprints + sprintDelta; if (focusChanged) patch.focusFactor = focus; onApplyScenario(patch); reset(); }} style={{ background: "var(--s2j-blue)", border: "none", color: "#fff", cursor: "pointer", padding: "7px 12px", borderRadius: 7, fontSize: 12.5, fontWeight: 600 }}>
+                  <button type="button" onClick={() => { const patch = {}; if (sprintDelta !== 0) patch.sprintCount = baseSprints + sprintDelta; if (focusChanged) patch.focusFactor = focus; onApplyScenario(patch); reset(); }} className="btn-nav" style={{ padding: "7px 12px", borderRadius: 7, fontSize: 12.5 }}>
                     Apply capacity change (free re-pack)
                   </button>
                 ) : null}
@@ -979,6 +1006,105 @@ function SkillDiagnostics({ skillDiagnostics }) {
       ) : null}
     </div>
   );
+}
+
+// Moodboard wizard primitives (MOOD / WIZARD_WRAP / stepSurface / step*Style / Stepper / Accordion /
+// WizardNext) now live in ./WizardKit (shared with the Test Cases wizard). ChoiceCard + RecapRow stay
+// here (planner-specific). See docs/DESIGN-SYSTEM-MOODBOARD.md.
+
+const STEP_LABELS = ["Planning mode", "Team capacity", "Review & generate", "Your plan"];
+
+// A big, readable mode card (Step 1). Selected = blue border + ice wash + a check; the glassy surface
+// evokes the moodboard. The whole card is one button (no nested interactive elements).
+function ChoiceCard({ icon, title, desc, selected, onClick, disabled }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      aria-pressed={selected}
+      style={{
+        flex: "1 1 250px", textAlign: "left", cursor: disabled ? "not-allowed" : "pointer",
+        borderRadius: 14, padding: 18, transition: "all 0.15s", position: "relative",
+        border: `2px solid ${selected ? "var(--s2j-blue)" : "rgba(125,160,202,0.32)"}`,
+        // Selected: the moodboard "soft surface wash" (rgba .35 ice at the 55% stop, matching stepSurface)
+        // over an OPAQUE white base — legible without backdrop-filter (never lean on transparency). The 2px
+        // blue border carries "selected".
+        background: selected ? "linear-gradient(160deg, rgba(193,232,255,0.35) 0%, rgba(255,255,255,0) 55%), #ffffff" : "#fff",
+        boxShadow: selected ? "0 6px 22px rgba(5,38,89,0.12)" : "0 2px 10px rgba(5,38,89,0.05)",
+      }}
+    >
+      <div className="flex items-center" style={{ gap: 10, marginBottom: 8 }}>
+        <span style={{
+          width: 38, height: 38, borderRadius: 10, flexShrink: 0, display: "inline-flex",
+          alignItems: "center", justifyContent: "center",
+          background: selected ? "var(--s2j-blue)" : MOOD.ice, color: selected ? "#fff" : MOOD.blueDeep,
+        }}>{icon}</span>
+        <span style={{ fontSize: 15.5, fontWeight: 700, color: MOOD.navy }}>{title}</span>
+        {selected ? <span style={{ marginLeft: "auto", color: "var(--s2j-blue)", display: "inline-flex" }}><SignalIcon kind="success" size={18} /></span> : null}
+      </div>
+      <p style={{ fontSize: 13, color: "var(--s2j-text-muted)", margin: 0, lineHeight: 1.55 }}>{desc}</p>
+    </button>
+  );
+}
+
+// One labeled row in the Step-3 recap.
+function RecapRow({ label, value, last }) {
+  return (
+    <div className="flex" style={{ justifyContent: "space-between", gap: 12, padding: "8px 0", borderBottom: last ? "none" : "1px solid var(--s2j-border)" }}>
+      <span style={{ fontSize: 13, color: "var(--s2j-text-muted)" }}>{label}</span>
+      <span style={{ fontSize: 13.5, color: MOOD.navy, fontWeight: 600, textAlign: "right" }}>{value}</span>
+    </div>
+  );
+}
+
+// Compact magnitude string for the §11 teaser: "Short on Backend + QA 54 pts" — the SAME overDemand the
+// SkillBottleneck callout reads, so the plan-screen teaser and the step-5 detail can never disagree.
+function bottleneckTeaser(bm) {
+  if (!bm) return null;
+  const short = (k) => (bm.overDemand && bm.overDemand[k]) || 0;
+  const bn = (bm.bottleneckBuckets || []).filter((k) => short(k) > 0.05);
+  if (!bn.length) return null;
+  const total = bn.reduce((a, k) => a + short(k), 0);
+  return `Short on ${bn.map(skillLabel).join(" + ")} ${fmt1(total)} pts`;
+}
+
+// ── Plan-health teaser (§11) — the compact bridge from the plan (step 4) to the analysis (step 5). It keeps
+// the COUNTS + MAGNITUDE of the demoted signals ON the plan screen (so a user can never commit unaware that N
+// features don't fit), and routes to the detail. ALWAYS rendered: warning-tinted when any warning signal
+// exists, a green affirmation when clean (absence must never read as "all clear"). When there is no step 5 to
+// route to (a clean Kanban plan), it renders the affirmation as a non-interactive div.
+function PlanHealthStrip({ signals, hasWarning, featureCount, routes, onOpen }) {
+  const clean = signals.length === 0;
+  const kind = hasWarning ? "warning" : clean ? "success" : "info";
+  const outer = {
+    width: "100%", textAlign: "left", marginBottom: 12, borderRadius: 10, padding: "10px 12px",
+    border: `1px solid ${hasWarning ? "var(--s2j-orange-border)" : clean ? "var(--s2j-green-border)" : "var(--s2j-border)"}`,
+    borderLeft: `4px solid ${hasWarning ? "var(--s2j-orange)" : clean ? "var(--s2j-green)" : "var(--s2j-blue)"}`,
+    background: hasWarning ? "var(--s2j-orange-bg)" : clean ? "var(--s2j-green-bg)" : "var(--s2j-bg-section)",
+  };
+  const inner = (
+    <div className="flex items-center" style={{ justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
+      <span className="flex items-center" style={{ gap: 8, flexWrap: "wrap" }}>
+        <SignalIcon kind={kind} size={15} />
+        {clean ? (
+          <span style={{ fontSize: 13, fontWeight: 600, color: "var(--s2j-text)" }}>No blockers — {featureCount} features planned</span>
+        ) : (
+          <>
+            <span style={{ fontSize: 12.5, fontWeight: 700, color: "var(--s2j-text)" }}>Plan health:</span>
+            {signals.map((s, i) => (
+              <span key={i} style={{ display: "inline-flex", alignItems: "center", gap: 4, fontSize: 11.5, color: "var(--s2j-text)", border: `1px solid ${s.kind === "warning" ? "var(--s2j-orange-border)" : "var(--s2j-border)"}`, background: "var(--s2j-bg)", borderRadius: 999, padding: "1px 8px" }}>
+                <SignalIcon kind={s.kind} size={10} /> {s.label}
+              </span>
+            ))}
+          </>
+        )}
+      </span>
+      {routes ? <span style={{ fontSize: 12, fontWeight: 600, color: "var(--s2j-blue)", whiteSpace: "nowrap" }}>Review plan health →</span> : null}
+    </div>
+  );
+  if (!routes) return <div style={outer}>{inner}</div>;
+  return <button type="button" onClick={onOpen} style={{ ...outer, cursor: "pointer" }}>{inner}</button>;
 }
 
 export default function PlanScreen({
@@ -1056,6 +1182,8 @@ export default function PlanScreen({
   // The register: shared derivation (buildRiskRegister) so the screen + the Plan Brief list the SAME
   // features in the SAME order (BRIEF-DRIFT). nameOfUid resolves the display name from the slim features.
   // buildRiskRegister itself branches on plan.methodology to tag by reach tier (kanban) vs sprint (scrum).
+  // nameOfUid is a fresh closure each render but reads byUid (in the deps) and buildRiskRegister calls it
+  // synchronously → byUid in the deps is sufficient; nameOfUid need not be listed (deps are complete).
   const riskRegister = useMemo(() => buildRiskRegister(plan, nameOfUid), [plan, byUid]);
   // Capacity verdict (deficit / fragmentation) — Scrum-only (they read plan.sprints + deficit metrics that a
   // kanban plan does NOT have). Guarded so reading them for a kanban plan can't crash (the #1 trap).
@@ -1081,309 +1209,470 @@ export default function PlanScreen({
     });
   }, [result, nameFeatures, form, pageTitle, isKanban]);
 
-  return (
-    <div className="p-6" style={WRAP}>
-      {/* header */}
-      <div className="flex items-center" style={{ gap: 10, marginBottom: 6 }}>
+  // ── WIZARD (4 steps): Mode → Capacity → Review&generate → Plan. One focus per step (the screen was
+  // overloaded). Step 4 IS the plan; "generating" is its loading sub-state. An existing plan lands on 4.
+  const hasCapErrors = !!(capacityErrors && capacityErrors.length);
+  const [step, setStep] = useState(() => (hasPlan ? 4 : 1));
+  // maxStep headroom is 5 once a plan exists (so the Plan-health step is reachable on a reload too — must-fix);
+  // the Stepper only renders as many dots as `stepLabels` has, so extra headroom on a clean Kanban plan (4 steps)
+  // is harmless.
+  const [maxStep, setMaxStep] = useState(() => (hasPlan ? 5 : 1));
+  const wasBusy = useRef(false);
+  // Auto-advance: a plan/re-rank run shows the loading sub-state on step 4; on completion land on 4 (plan
+  // ready) or route a failure to where it's fixable (capacity errors → step 2; key/plan error → step 3).
+  useEffect(() => {
+    if (busy) { wasBusy.current = true; setStep(4); setMaxStep(4); return undefined; }
+    if (wasBusy.current) {
+      wasBusy.current = false;
+      if (hasPlan) { setStep(4); setMaxStep(5); } // land on the PLAN; make Plan health reachable, never auto-jump to it
+      else if (hasCapErrors) { setStep(2); }
+      else { setStep(3); }
+    }
+    return undefined;
+  }, [busy, hasPlan, hasCapErrors]);
+  const disarm = () => { if (armed) onArmToggle(false); };
+  const goStep = (n) => { disarm(); setStep(n); setMaxStep((m) => Math.max(m, n)); };
+
+  // Re-pack / what-if-apply are FREE + instant (no Claude). Track them locally so the loading sub-state shows
+  // honest "Re-packing…" copy, never the billed "Claude is planning… takes minutes". Cleared when busy ends.
+  const [repacking, setRepacking] = useState(false);
+  useEffect(() => { if (!busy) setRepacking(false); return undefined; }, [busy]);
+  const handleRepack = () => { setRepacking(true); onRepack(); };
+  const handleApply = (patch) => { setRepacking(true); onApplyScenario(patch); };
+
+  // a11y: on a STEP change (not the first mount) move focus to the fresh step content, so keyboard / screen-
+  // reader users land on the new step instead of a now-unmounted button. preventScroll keeps the iframe still.
+  const stepBodyRef = useRef(null);
+  const stepMounted = useRef(false);
+  useEffect(() => {
+    if (!stepMounted.current) { stepMounted.current = true; return undefined; }
+    const el = stepBodyRef.current;
+    if (el && typeof el.focus === "function") {
+      try { el.focus({ preventScroll: true }); } catch (_) { el.focus(); }
+    }
+    return undefined;
+  }, [step]);
+
+  // recap (step 3) — a concise confirmation of the setup before a billed run
+  const teamSize = Array.isArray(form && form.people) ? form.people.length : 0;
+  const capLine = preview && preview.ok
+    ? (preview.methodology === "kanban"
+        ? (Number.isFinite(Number(preview.expectedPointsQuarter)) ? `≈ ${fmt1(preview.expectedPointsQuarter)} pts expected this quarter` : "—")
+        : (Array.isArray(preview.perSprintCapacityPoints) && preview.perSprintCapacityPoints.length
+            ? `≈ ${fmt1(preview.perSprintCapacityPoints[0])} pts/sprint · ~${fmt1(preview.totalCapacityPoints)} pts total`
+            : "—"))
+    : "—";
+
+  // step-4 collapsed-detail counts (render an accordion only when it carries content)
+  const diagCount = (g.cyclicNodes || []).length + (g.danglingRefs || []).length + (g.ambiguousDeps || []).length
+    + (g.duplicateNames || []).length + (g.duplicateUids || []).length + (g.selfDeps || []).length
+    + ((plan && plan.sizingIssues) || []).length;
+  const skillDiagCount = plan && plan.skillDiagnostics
+    ? (plan.skillDiagnostics.unclassified || []).length + (plan.skillDiagnostics.unknownTaskTypes || []).length
+    : 0;
+
+  // ── Step 5 "Plan health": the analysis, split off the plan artifact (Linear-Insights pattern) ──
+  // It EXISTS when there's analysis worth a step. Scrum always has assumptions → always; a Kanban plan only
+  // if it carries risks / warnings / concerns / data-quality (else the step would be empty — it must earn it).
+  const kanbanHealthCount = (warnings ? warnings.length : 0) + riskRegister.length
+    + ((specConcernSummary && specConcernSummary.total) || 0) + diagCount;
+  const hasStep5 = hasPlan && (!isKanban || kanbanHealthCount > 0);
+  const stepLabels = hasStep5 ? [...STEP_LABELS, "Plan health"] : STEP_LABELS;
+
+  // §11 health teaser signals — SINGLE-SOURCED from the exact derivations the step-5 detail renders, so the
+  // plan-screen counts can never drift from the page that explains them. Magnitude (pts) where it's known.
+  const bnTeaser = (!isKanban && plan) ? bottleneckTeaser(plan.bucketMetrics) : null;
+  const healthSignals = [];
+  if (plan) {
+    if (!isKanban) {
+      if (plan.overflow && plan.overflow.length) healthSignals.push({ label: `Doesn’t fit (${plan.overflow.length})`, kind: "warning" });
+      if (deficit) healthSignals.push({ label: "Capacity shortfall", kind: "warning" });
+      if (bnTeaser) healthSignals.push({ label: bnTeaser, kind: "warning" });
+    } else {
+      const beyond = Number(metrics.beyondReachPoints) || 0;
+      if (beyond > 0.05) healthSignals.push({ label: `${fmt1(beyond)} pts beyond this quarter’s reach`, kind: "warning" });
+    }
+    if (riskRegister.length) healthSignals.push({ label: `Risks (${riskRegister.length})`, kind: "warning" });
+    if (specConcernSummary && specConcernSummary.total) healthSignals.push({ label: `Concerns (${specConcernSummary.total})`, kind: specConcernSummary.complianceCount ? "warning" : "info" });
+    if (diagCount) healthSignals.push({ label: `Data quality (${diagCount})`, kind: "info" });
+  }
+  const healthHasWarning = healthSignals.some((s) => s.kind === "warning");
+  // Defensive: never sit on a step-5 that no longer exists (e.g. a plan mutated to a clean Kanban). Unreachable
+  // in the normal flow (re-pack/re-rank both leave step 5 first), but keeps the stepper's active state honest.
+  useEffect(() => { if (step === 5 && !hasStep5) setStep(4); return undefined; }, [step, hasStep5]);
+
+  // ── STEP BODIES ──
+  let stepBody = null;
+  if (step === 1) {
+    // STEP 1 — Planning mode (owns methodology so Step 2's form drops its toggle)
+    stepBody = (
+      <div style={stepSurface}>
+        <h3 style={stepTitleStyle}>Choose how to plan</h3>
+        <p style={stepSubStyle}>Two ways to turn this {featureCount}-feature breakdown into a plan — you can change this anytime.</p>
+        <div className="flex" style={{ gap: 14, flexWrap: "wrap" }}>
+          <ChoiceCard
+            icon={<IconCalendar size={20} />}
+            title="Sprints (Scrum)"
+            desc="Pack the backlog into capacity-bounded sprints with dates. Best when you run fixed-length iterations and want a sprint-by-sprint allocation."
+            selected={!formIsKanban}
+            disabled={busy}
+            onClick={() => onFormChange({ methodology: "scrum" })}
+          />
+          <ChoiceCard
+            icon={<IconList size={20} />}
+            title="Kanban backlog"
+            desc="A pull-ready, dependency-legal backlog cut into Now / Next / Later by how much your team is likely to reach this quarter — no sprints, no dates."
+            selected={formIsKanban}
+            disabled={busy}
+            onClick={() => onFormChange({ methodology: "kanban" })}
+          />
+        </div>
+        {methodologyChanged ? (
+          <div style={{ fontSize: 11.5, color: "var(--s2j-orange)", marginTop: 12, display: "inline-flex", alignItems: "center", gap: 4, lineHeight: 1.5 }}>
+            <SignalIcon kind="warning" size={12} /> You switched the planning mode — on the plan step, Re-pack (free) to apply it to your existing plan.
+          </div>
+        ) : null}
+        <div className="flex" style={{ justifyContent: "flex-end", marginTop: 22 }}>
+          <WizardNext onClick={() => goStep(2)}>Next: team capacity</WizardNext>
+        </div>
+      </div>
+    );
+  } else if (step === 2) {
+    // STEP 2 — Team capacity (the form, methodology hidden, with the live preview)
+    stepBody = (
+      <div style={stepSurface}>
+        <h3 style={stepTitleStyle}>Tell us about your team</h3>
+        <p style={stepSubStyle}>
+          {formIsKanban
+            ? "Each person's available days this quarter set the expected throughput."
+            : "Each person's available days per sprint set the capacity for each sprint."}
+          {" "}Click the <SignalIcon kind="info" size={12} style={{ verticalAlign: "-0.1em" }} /> icons for what a field means.
+        </p>
+        <CapacityForm form={form} onChange={onFormChange} disabled={busy} hideMethodology />
+
+        {preview && preview.ok && preview.methodology === "kanban" && Number.isFinite(Number(preview.expectedPointsQuarter)) ? (
+          <KanbanCapacityPreview preview={preview} form={form} />
+        ) : preview && preview.ok && preview.methodology !== "kanban" && Array.isArray(preview.perSprintCapacityPoints) && preview.perSprintCapacityPoints.length ? (
+          <CapacityPreview preview={preview} form={form} />
+        ) : null}
+
+        {hasCapErrors ? (
+          <SignalCallout kind="error" title="Fix the capacity inputs to plan" style={{ marginTop: 12 }}>
+            <ul style={{ margin: "4px 0 0", paddingLeft: 18 }}>
+              {capacityErrors.map((e, i) => <li key={i} style={{ marginBottom: 2 }}>{e.message}</li>)}
+            </ul>
+          </SignalCallout>
+        ) : null}
+
+        <div className="flex items-center" style={{ justifyContent: "space-between", marginTop: 22 }}>
+          <BackButton onClick={() => goStep(1)} label="Back" className="" title="Back to planning mode" />
+          <WizardNext onClick={() => goStep(3)}>Next: review &amp; generate</WizardNext>
+        </div>
+      </div>
+    );
+  } else if (step === 3) {
+    // STEP 3 — Review & generate (recap + objective + cost estimate + the billed Generate/Re-rank)
+    stepBody = (
+      <div style={stepSurface}>
+        <h3 style={stepTitleStyle}>Review &amp; generate</h3>
+        <p style={stepSubStyle}>Confirm the setup and pick what to optimize for. Claude orders the work; the {formIsKanban ? "reach" : "sprint"} math is deterministic. Review-only — nothing is written to Jira.</p>
+
+        <div style={{ marginBottom: 18 }}>
+          <RecapRow label="Planning mode" value={formIsKanban ? "Kanban backlog" : "Sprints (Scrum)"} />
+          <RecapRow label="Features to plan" value={String(featureCount)} />
+          <RecapRow label="Team" value={`${teamSize} ${teamSize === 1 ? "person" : "people"}`} />
+          {!formIsKanban ? <RecapRow label="Sprint structure" value={`${(form && form.sprintCount) || "—"} sprints × ${(form && form.sprintLengthDays) || "—"} days`} /> : null}
+          <RecapRow label="Computed capacity" value={capLine} last />
+        </div>
+
+        <div style={{ marginBottom: 16 }}>
+          <span style={labelStyle}>Planning objective<InfoTip text="What to optimize the ORDER for. Balanced = leverage + priority first (the default). Ship the MVP fastest = a minimal working slice first. Minimize delivery risk = the most uncertain work first. Maximize early value = highest-value work first. It only re-weights the order — it never breaks a dependency. Changing it runs a billed Re-rank with Claude." /></span>
+          <select
+            value={(form && form.objective) || "balanced"}
+            disabled={busy}
+            onChange={(e) => onFormChange({ objective: e.target.value })}
+            style={fieldStyle}
+          >
+            <option value="balanced">Balanced (default)</option>
+            <option value="mvp">Ship the MVP fastest</option>
+            <option value="min_risk">Minimize delivery risk</option>
+            <option value="max_value">Maximize early value</option>
+          </select>
+          {objectiveChanged ? (
+            <div style={{ fontSize: 11, color: "var(--s2j-orange)", marginTop: 4, display: "inline-flex", alignItems: "center", gap: 4, lineHeight: 1.5 }}>
+              <SignalIcon kind="warning" size={11} /> Objective changed — Re-rank with Claude to apply it.
+            </div>
+          ) : hasPlan ? (
+            <div style={{ fontSize: 11, color: "var(--s2j-text-light)", marginTop: 4 }}>Changing this re-orders the plan — a billed Re-rank.</div>
+          ) : null}
+        </div>
+
+        {methodologyChanged ? (
+          <div style={{ fontSize: 11, color: "var(--s2j-orange)", marginBottom: 12, display: "inline-flex", alignItems: "center", gap: 4, lineHeight: 1.5 }}>
+            <SignalIcon kind="warning" size={11} /> Planning mode changed — on the plan step, Re-pack (free) to apply it.
+          </div>
+        ) : null}
+
+        {keyError ? (
+          <SignalCallout kind="error" title="Anthropic key needed" style={{ marginBottom: 12 }}>
+            {keyError.detail || "Add your Anthropic API key in Settings to generate a plan."}
+          </SignalCallout>
+        ) : null}
+        {planError ? (
+          <SignalCallout kind="error" title="Couldn’t build the plan" style={{ marginBottom: 12 }}>
+            {planError.detail || "The plan could not be computed — please try again or adjust the breakdown."}
+          </SignalCallout>
+        ) : null}
+
+        {!hasPlan && estimate && estimate.upper_usd > 0 ? (
+          <SignalCallout kind="info" title="Estimated Anthropic usage" style={{ marginBottom: 14 }} iconTitle="Pre-flight cost estimate">
+            <span style={{ fontSize: 12.5 }}>
+              Up to <strong>~{fmtUsd(estimate.upper_usd)}</strong>{estimate.expected_usd ? ` (typically ~${fmtUsd(estimate.expected_usd)})` : ""} — billed to your own key, no markup. Exact cost is echoed after the run.
+            </span>
+          </SignalCallout>
+        ) : null}
+
         <button
           type="button"
-          onClick={onBack}
-          className="text-xs flex items-center gap-1"
-          style={{ background: "none", border: "1px solid var(--s2j-border)", color: "var(--s2j-text-muted)", cursor: "pointer", padding: "5px 9px", borderRadius: 6 }}
+          onClick={() => {
+            // BOTH first-generate AND re-rank are billed Anthropic calls → 2-step armed confirm so neither
+            // spends on a single click (cost honesty; carries the test-case bill-shock lesson — PLAN-14).
+            if (!armed) { onArmToggle(true); return; }
+            onArmToggle(false);
+            onGenerate();
+          }}
+          disabled={busy}
+          className="btn-primary"
+          style={{ width: "100%", justifyContent: "center", padding: "11px 16px", fontSize: 14, borderRadius: 10 }}
         >
-          <IconArrowLeft size={13} /> Back to review
+          {busy ? "Planning…" : armed ? (hasPlan ? "Confirm re-rank with Claude" : "Confirm & generate plan") : hasPlan ? <><IconRefresh size={15} /> Re-rank with Claude</> : <>{formIsKanban ? <IconList size={15} /> : <IconCalendar size={15} />} Generate plan</>}
         </button>
-        <h2 style={{ fontSize: 18, fontWeight: 700, color: "var(--s2j-text)", margin: 0, display: "inline-flex", alignItems: "center", gap: 8 }}>
-          <span style={{ color: "var(--s2j-blue)" }}>{headerIsKanban ? <IconList size={18} /> : <IconCalendar size={18} />}</span> {headerIsKanban ? "Backlog plan" : "Sprint plan"}
-        </h2>
+        {armed ? (
+          <p style={{ fontSize: 11, color: "var(--s2j-orange)", margin: "8px 0 0", textAlign: "center", lineHeight: 1.5 }}>
+            Click again to confirm — this runs a billed Claude call on your own key.
+          </p>
+        ) : null}
+
+        <div className="flex items-center" style={{ justifyContent: "space-between", marginTop: 18 }}>
+          <BackButton onClick={() => goStep(2)} label="Back" className="" title="Back to team capacity" />
+          {hasPlan ? <WizardNext onClick={() => goStep(4)}>View plan</WizardNext> : null}
+        </div>
       </div>
-      <p style={{ fontSize: 12.5, color: "var(--s2j-text-muted)", marginTop: 0, marginBottom: 16 }}>
+    );
+  } else if (step === 5 && hasStep5) {
+    // ── STEP 5 — Plan health: ALL the analysis, separated from the plan artifact (Linear-Insights split).
+    // Critical blocks (deficit / doesn't-fit / bottleneck / concerns / risks) render OUTSIDE accordions; only
+    // assumptions / skill detail / data quality stay collapsed. The narrow WIZARD_WRAP applies (step !== 4). ──
+    stepBody = (
+      <div>
+        <h3 style={stepTitleStyle}>Plan health</h3>
+        <p style={stepSubStyle}>Everything that shapes whether this plan holds — what doesn’t fit, where you’re short, and the risks to front-load. The plan itself is on the previous step.</p>
+
+        {warnings && warnings.length ? (
+          <SignalCallout kind="info" title="Heads-up" style={{ marginBottom: 12 }} iconTitle="Non-blocking notes about your inputs">
+            <ul style={{ margin: "4px 0 0", paddingLeft: 18 }}>{warnings.map((w, i) => <li key={i} style={{ marginBottom: 2 }}>{w.message}</li>)}</ul>
+          </SignalCallout>
+        ) : null}
+
+        {!isKanban ? (
+          <>
+            {deficit ? (
+              <SignalCallout kind="warning" title={deficit.title} style={{ marginBottom: 12 }}>
+                {deficit.body} Add a sprint, raise capacity, or descope — they’re listed below.
+              </SignalCallout>
+            ) : null}
+            {plan.overflow && plan.overflow.length ? (
+              <div style={{ border: "1px solid var(--s2j-orange-border)", borderRadius: 10, background: "var(--s2j-orange-bg)", padding: 12, marginBottom: 12 }}>
+                <div className="flex items-center gap-2" style={{ marginBottom: 8 }}>
+                  <SignalIcon kind="warning" size={15} />
+                  <strong style={{ fontSize: 13, color: "var(--s2j-text)" }}>Doesn’t fit ({plan.overflow.length})</strong>
+                </div>
+                {plan.overflow.map((o, i) => (
+                  <div key={i} style={{ fontSize: 12, color: "var(--s2j-text)", padding: "2px 0" }}>
+                    <span style={{ fontWeight: 500 }}>{o.name || nameOfUid(o.id)}</span>
+                    <span style={{ color: "var(--s2j-text-muted)" }}>{" — "}{overflowReasonText(o, nameOfUid)}</span>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+            <SkillBottleneck bucketMetrics={plan.bucketMetrics} />
+          </>
+        ) : null}
+
+        <SpecConcernsBand summary={specConcernSummary} />
+        <RiskRegister entries={riskRegister} usedLlm={r.usedLlm} kanban={isKanban} />
+
+        {/* collapsed detail — demoted, never dropped (Plan brief moved to the foot of step 4 — partner) */}
+        {!isKanban && assumptions && assumptions.length ? (
+          <Accordion title="Assumptions" count={assumptions.length} kind="info">
+            {assumptions.map((a, i) => (
+              <div key={i} className="flex" style={{ justifyContent: "space-between", gap: 8, fontSize: 12.5, padding: "3px 0" }}>
+                <span style={{ color: "var(--s2j-text-muted)" }}>{a.label}</span>
+                <span style={{ color: "var(--s2j-text)", fontWeight: 500, textAlign: "right" }}>
+                  {String(a.value)}{a.source === "default" ? <span style={{ color: "var(--s2j-text-light)", fontWeight: 400 }}> (default)</span> : null}
+                </span>
+              </div>
+            ))}
+          </Accordion>
+        ) : null}
+        {!isKanban && plan.bucketsActive && skillDiagCount ? (
+          <Accordion title="Skill detail" count={skillDiagCount} kind="info">
+            <SkillDiagnostics skillDiagnostics={plan.skillDiagnostics} />
+          </Accordion>
+        ) : null}
+        {diagCount ? (
+          <Accordion title="Data quality" count={diagCount} kind="info">
+            <PlanDiagnostics g={g} sizingIssues={plan.sizingIssues} nameOfUid={nameOfUid} />
+          </Accordion>
+        ) : null}
+
+        <div className="flex items-center" style={{ justifyContent: "space-between", marginTop: 16, flexWrap: "wrap", gap: 10 }}>
+          <BackButton onClick={() => goStep(4)} label="Back to plan" className="" title="Back to your plan" />
+          {/* Terminal forward CTA — back to the breakdown review, where Push to Jira / test-case generation live.
+              GREEN (commit) per the partner: it's the culmination of the planning flow, not mere wayfinding. */}
+          <button type="button" onClick={onBack} className="btn-primary" style={{ fontSize: 13.5, padding: "9px 18px" }} title="Return to the breakdown review — from there you can push to Jira or generate test cases">
+            Continue to review <span aria-hidden="true">→</span>
+          </button>
+        </div>
+      </div>
+    );
+  } else {
+    // ── STEP 4 — Your plan (plan-first; all analysis demoted to step 5 + the health teaser). "Generating"
+    // is the loading sub-state. ──
+    stepBody = (
+      <div>
+        {busy ? (
+          <PlanningState elapsed={elapsed} kanban={formIsKanban} repacking={repacking} />
+        ) : r.empty ? (
+          <SignalCallout kind="info" title="No features to plan">
+            This breakdown has no features yet. Add features in the editor, then come back to plan.
+          </SignalCallout>
+        ) : !hasPlan ? (
+          <div style={{ border: "1px dashed var(--s2j-border)", borderRadius: 12, padding: 32, textAlign: "center", color: "var(--s2j-text-light)" }}>
+            <div style={{ display: "inline-flex", color: "var(--s2j-border)", marginBottom: 8 }}>{formIsKanban ? <IconList size={32} /> : <IconCalendar size={32} />}</div>
+            <p style={{ fontSize: 13.5, margin: "0 0 14px", lineHeight: 1.55 }}>
+              {formIsKanban
+                ? `Fill in your team capacity and generate a plan to see ${featureCount} features ordered into a Now / Next / Later backlog.`
+                : `Fill in your team capacity and generate a plan to see ${featureCount} features allocated across your sprints.`}
+            </p>
+            <WizardNext onClick={() => goStep(1)}>Start setup</WizardNext>
+          </div>
+        ) : isKanban ? (
+          // ── KANBAN plan view (plan-first): the backlog + the honesty framing lead; analysis demoted to step 5 ──
+          <>
+            <div className="flex" style={{ justifyContent: "flex-end", marginBottom: 12 }}>
+              <button type="button" onClick={handleRepack} disabled={busy} title="Free: re-applies your current capacity to the same Claude ordering — instant, no Claude call. To re-optimize the order itself, change the Planning objective and Re-rank with Claude." className="btn-secondary" style={{ fontSize: 12.5 }}>
+                <IconRefresh size={13} /> Re-pack backlog (free)
+              </button>
+            </div>
+            {r.llmNote ? (<SignalCallout kind="info" title="Ordered without Claude" style={{ marginBottom: 12 }}>{r.llmNote}</SignalCallout>) : null}
+
+            {/* honesty stays INLINE — it frames HOW to read the bands (load-bearing per the research), like the
+                fragmentation note frames the sprint columns; only verdicts-about-features move to step 5. */}
+            <KanbanHonestyPanel assumptions={assumptions} />
+            <SignalCallout kind="info" title="Likely reach this quarter" style={{ marginBottom: 12 }}>{kanbanReachVerdict(metrics)}</SignalCallout>
+
+            {/* THE PLAN */}
+            <BacklogBand plan={plan} byUid={byUid} riskByUid={riskByUid} />
+
+            {/* §11 health teaser → step 5 (or a clean affirmation when this Kanban plan carries no analysis) */}
+            <PlanHealthStrip signals={healthSignals} hasWarning={healthHasWarning} featureCount={featureCount} routes={hasStep5} onOpen={() => goStep(5)} />
+
+            {r.cost && r.cost.total_usd != null ? (
+              <p className="text-xs" style={{ marginTop: 12, color: "var(--s2j-text-light)" }}>
+                <IconCost size={12} /> This ranking used {fmtUsd(r.cost.total_usd)} of your Anthropic key. Re-pack is free; only Re-rank with Claude is billed.
+              </p>
+            ) : null}
+          </>
+        ) : (
+          // ── SCRUM plan view (plan-first): the sprint columns + What-if lead; all analysis demoted to step 5 ──
+          <>
+            <div className="flex" style={{ justifyContent: "flex-end", marginBottom: 12 }}>
+              <button type="button" onClick={handleRepack} disabled={busy} title="Free: re-applies your current capacity to the same Claude ordering — instant, no Claude call. To re-optimize the order itself, change the Planning objective and Re-rank with Claude." className="btn-secondary" style={{ fontSize: 12.5 }}>
+                <IconRefresh size={13} /> Re-pack sprints (free)
+              </button>
+            </div>
+            {r.llmNote ? (<SignalCallout kind="info" title="Ordered without Claude" style={{ marginBottom: 12 }}>{r.llmNote}</SignalCallout>) : null}
+
+            {/* THE PLAN — sprint columns (the first thing the user came for) */}
+            <div className="flex" style={{ gap: 12, flexWrap: "wrap", marginBottom: 16 }}>
+              {plan.sprints.map((s, i) => (
+                <SprintColumn key={i} sprint={s} number={i + 1} byUid={byUid} oversizedSet={oversizedSet} riskByUid={riskByUid} profile={sprintRiskProfiles[i]} startDate={form && form.sprintStartDate} sprintLengthDays={form && form.sprintLengthDays} />
+              ))}
+            </div>
+
+            {/* fragmentation stays INLINE — a one-line caveat about the order you're reading, not a separate verdict */}
+            {fragmentation ? (
+              <SignalCallout kind="info" title={fragmentation.title} style={{ marginBottom: 12 }}>
+                {fragmentation.body} Re-rank or adjust sprint length.
+              </SignalCallout>
+            ) : null}
+
+            {/* What-if — the co-star, +1 prominence right under the plan. Hidden when the form's mode no longer
+                matches the rendered plan (a sprint scenario under a kanban form would silently drop — §11);
+                the nudge then explains + points at Re-pack. */}
+            {methodologyChanged ? (
+              <SignalCallout kind="warning" title="Planning mode changed" style={{ marginBottom: 12 }}>
+                You switched the planning mode since this plan was built. Re-pack (free, top-right) to rebuild it in the new mode — What-if scenarios return once the plan and the mode agree.
+              </SignalCallout>
+            ) : (
+              <WhatIfPanel jobId={jobId} baselineForm={form} slimFeatures={nameFeatures} stale={r.stale} planBusy={busy} onApplyScenario={handleApply} />
+            )}
+
+            {/* §11 health teaser — the counts + magnitude stay ON the plan; the per-feature WHY lives on step 5 */}
+            <PlanHealthStrip signals={healthSignals} hasWarning={healthHasWarning} featureCount={featureCount} routes={hasStep5} onOpen={() => goStep(5)} />
+
+            {/* Plan brief — export a stakeholder-ready summary; sits at the FOOT of the plan itself (partner) */}
+            <PlanBriefExport brief={brief} />
+
+            {r.cost && r.cost.total_usd != null ? (
+              <p className="text-xs" style={{ marginTop: 12, color: "var(--s2j-text-light)" }}>
+                <IconCost size={12} /> This ranking used {fmtUsd(r.cost.total_usd)} of your Anthropic key. Re-pack is free; only Re-rank with Claude is billed.
+              </p>
+            ) : null}
+          </>
+        )}
+
+        {!busy && hasPlan ? (
+          <div className="flex items-center" style={{ justifyContent: "space-between", marginTop: 16, flexWrap: "wrap", gap: 10 }}>
+            <BackButton onClick={() => goStep(2)} label="Back to capacity" className="" title="Adjust team capacity" />
+            {hasStep5 ? (
+              <WizardNext onClick={() => goStep(5)}>View plan health</WizardNext>
+            ) : (
+              // Clean Kanban has no step 5 → step 4 is terminal, so it carries the green Continue-to-review CTA.
+              <button type="button" onClick={onBack} className="btn-primary" style={{ fontSize: 13.5, padding: "9px 18px" }} title="Return to the breakdown review — from there you can push to Jira or generate test cases">
+                Continue to review <span aria-hidden="true">→</span>
+              </button>
+            )}
+          </div>
+        ) : null}
+      </div>
+    );
+  }
+
+  return (
+    <div className="p-6" style={step === 4 ? WRAP : WIZARD_WRAP}>
+      <BackButton onClick={onBack} label="Back to review" title="Return to the breakdown review" className="mb-2" />
+      <h2 style={{ fontSize: 22, fontWeight: 700, color: MOOD.navy, letterSpacing: "-0.01em", margin: "0 0 4px", display: "inline-flex", alignItems: "center", gap: 10 }}>
+        <span style={{ color: "var(--s2j-blue)" }}>{headerIsKanban ? <IconList size={20} /> : <IconCalendar size={20} />}</span>
+        {headerIsKanban ? "Backlog plan" : "Sprint plan"}
+      </h2>
+      <p style={{ fontSize: 13, color: "var(--s2j-text-muted)", margin: "0 0 18px", lineHeight: 1.55 }}>
         {headerIsKanban
-          ? <>Order this breakdown into a pull-ready backlog, cut into Now / Next / Later by how much your team is likely to reach this quarter. Claude orders the work; the reach math is deterministic. Review-only — nothing is written to Jira.</>
-          : <>Allocate this breakdown across sprints from your team’s capacity. Claude orders the work; the sprint math is deterministic. Review-only — nothing is written to Jira.</>}
+          ? "Order this breakdown into a pull-ready backlog, cut into Now / Next / Later by likely reach."
+          : "Allocate this breakdown across sprints from your team’s capacity."}
       </p>
 
-      {/* stale banner (UX-1) */}
+      <Stepper labels={stepLabels} step={step} maxStep={maxStep} onJump={goStep} busy={busy} ariaLabel="Planner steps" />
+
       {r.stale ? (
         <SignalCallout kind="warning" title="This plan is out of date" style={{ marginBottom: 14 }}>
           The breakdown changed since this plan was generated. Re-rank to refresh it against the current features.
         </SignalCallout>
       ) : null}
 
-      <div className="flex" style={{ gap: 16, alignItems: "flex-start", flexWrap: "wrap" }}>
-        {/* LEFT: the capacity form + actions */}
-        <div style={{ flex: "1 1 320px", minWidth: 300, maxWidth: 440 }}>
-          <CapacityForm form={form} onChange={onFormChange} disabled={busy} />
-
-          {/* Live computed-capacity preview — the derived pts (and the focus-factor sensitivity), visible
-              BEFORE generating (transparency for the multiplier-weight finding). Branch on the preview's OWN
-              methodology echo: kanban shows the THROUGHPUT RANGE (never a single reach number as headline). */}
-          {!busy && preview && preview.ok && preview.methodology === "kanban" && Number.isFinite(Number(preview.expectedPointsQuarter)) ? (
-            <KanbanCapacityPreview preview={preview} form={form} />
-          ) : !busy && preview && preview.ok && preview.methodology !== "kanban" && Array.isArray(preview.perSprintCapacityPoints) && preview.perSprintCapacityPoints.length ? (
-            <CapacityPreview preview={preview} form={form} />
-          ) : null}
-
-          {/* capacity validation blockers (CAP-1 — fail-loud, no LLM was spent) */}
-          {capacityErrors && capacityErrors.length ? (
-            <SignalCallout kind="error" title="Fix the capacity inputs to plan" style={{ marginTop: 12 }}>
-              <ul style={{ margin: "4px 0 0", paddingLeft: 18 }}>
-                {capacityErrors.map((e, i) => <li key={i} style={{ marginBottom: 2 }}>{e.message}</li>)}
-              </ul>
-            </SignalCallout>
-          ) : null}
-
-          {keyError ? (
-            <SignalCallout kind="error" title="Anthropic key needed" style={{ marginTop: 12 }}>
-              {keyError.detail || "Add your Anthropic API key in Settings to generate a plan."}
-            </SignalCallout>
-          ) : null}
-
-          {planError ? (
-            <SignalCallout kind="error" title="Couldn’t build the plan" style={{ marginTop: 12 }}>
-              {planError.detail || "The plan could not be computed — please try again or adjust the breakdown."}
-            </SignalCallout>
-          ) : null}
-
-          {/* warnings (clamps / duplicate names / override discrepancy / under-utilization) */}
-          {warnings && warnings.length ? (
-            <SignalCallout kind="info" title="Heads-up" style={{ marginTop: 12 }} iconTitle="Non-blocking notes about your inputs">
-              <ul style={{ margin: "4px 0 0", paddingLeft: 18 }}>
-                {warnings.map((w, i) => <li key={i} style={{ marginBottom: 2 }}>{w.message}</li>)}
-              </ul>
-            </SignalCallout>
-          ) : null}
-
-          {/* primary action: generate / re-rank (billed) */}
-          <div style={{ marginTop: 14 }}>
-            {/* P12 — planning objective. Changing it re-weights the ordering → it runs a billed Re-rank
-                (the free Re-pack reuses the cached, objective-specific ordering, so it would look stale). */}
-            <div style={{ marginBottom: 10 }}>
-              <span style={labelStyle}>Planning objective<InfoTip text="What to optimize the ORDER for. Balanced = leverage + priority first (the default). Ship the MVP fastest = a minimal working slice first. Minimize delivery risk = the most uncertain work first. Maximize early value = highest-value work first. It only re-weights the order — it never breaks a dependency. Changing it runs a billed Re-rank with Claude." /></span>
-              <select
-                value={(form && form.objective) || "balanced"}
-                disabled={busy}
-                onChange={(e) => onFormChange({ objective: e.target.value })}
-                style={fieldStyle}
-              >
-                <option value="balanced">Balanced (default)</option>
-                <option value="mvp">Ship the MVP fastest</option>
-                <option value="min_risk">Minimize delivery risk</option>
-                <option value="max_value">Maximize early value</option>
-              </select>
-              {objectiveChanged ? (
-                <div style={{ fontSize: 10.5, color: "var(--s2j-orange)", marginTop: 4, display: "inline-flex", alignItems: "center", gap: 4, lineHeight: 1.5 }}>
-                  <SignalIcon kind="warning" size={11} /> Objective changed — Re-rank with Claude to apply it (Re-pack keeps the current ordering).
-                </div>
-              ) : hasPlan ? (
-                <div style={{ fontSize: 10.5, color: "var(--s2j-text-light)", marginTop: 4 }}>Changing this re-orders the plan — a billed Re-rank.</div>
-              ) : null}
-            </div>
-            {methodologyChanged ? (
-              <div style={{ fontSize: 10.5, color: "var(--s2j-orange)", marginTop: 0, marginBottom: 6, display: "inline-flex", alignItems: "center", gap: 4, lineHeight: 1.5 }}>
-                <SignalIcon kind="warning" size={11} /> Planning mode changed — Re-pack (free) to apply it.
-              </div>
-            ) : null}
-            <button
-              type="button"
-              onClick={() => {
-                // BOTH first-generate AND re-rank are billed Anthropic calls → 2-step armed confirm so
-                // neither spends on a single click (cost honesty; carries the test-case bill-shock lesson — PLAN-14).
-                if (!armed) { onArmToggle(true); return; }
-                onArmToggle(false);
-                onGenerate();
-              }}
-              disabled={busy}
-              className="flex items-center justify-center gap-2"
-              style={{
-                width: "100%",
-                background: "var(--s2j-blue)",
-                border: "none",
-                color: "#fff",
-                cursor: busy ? "not-allowed" : "pointer",
-                padding: "10px 14px",
-                borderRadius: 8,
-                fontSize: 14,
-                fontWeight: 600,
-                opacity: busy ? 0.7 : 1,
-              }}
-            >
-              {busy ? "Planning…" : armed ? (hasPlan ? "Confirm re-rank with Claude" : "Confirm & generate plan") : hasPlan ? "Re-rank with Claude" : <>{formIsKanban ? <IconList size={15} /> : <IconCalendar size={15} />} Generate plan</>}
-            </button>
-
-            {/* re-pack (free) — only once a plan exists; assumption-only edits */}
-            {hasPlan ? (
-              <button
-                type="button"
-                onClick={onRepack}
-                disabled={busy}
-                className="flex items-center justify-center gap-2"
-                style={{ width: "100%", marginTop: 8, background: "var(--s2j-bg-section)", border: "1px solid var(--s2j-border)", color: "var(--s2j-text)", cursor: busy ? "not-allowed" : "pointer", padding: "8px 14px", borderRadius: 8, fontSize: 13, fontWeight: 500 }}
-              >
-                <IconRefresh size={14} /> {formIsKanban ? "Re-pack backlog (free)" : "Re-pack sprints (free)"}
-              </button>
-            ) : null}
-
-            {/* cost honesty (UX-5): pre-flight estimate before generate; echo after */}
-            {!hasPlan && estimate && estimate.upper_usd > 0 ? (
-              <p className="text-xs" style={{ marginTop: 8, color: "var(--s2j-text-muted)" }}>
-                <IconCost size={12} /> Estimated Anthropic usage:{" "}
-                <strong>up to ~{fmtUsd(estimate.upper_usd)}</strong>
-                {estimate.expected_usd ? ` (typically ~${fmtUsd(estimate.expected_usd)})` : ""} — billed to your own key, no markup.
-              </p>
-            ) : null}
-            {hasPlan ? (
-              <p className="text-xs" style={{ marginTop: 8, color: "var(--s2j-text-muted)" }}>
-                <IconCost size={12} />{" "}
-                {r.cost && r.cost.total_usd != null
-                  ? <>This ranking used <strong>{fmtUsd(r.cost.total_usd)}</strong> of your Anthropic key.</>
-                  : "Re-pack is free (no Claude call); Re-rank with Claude is billed to your key."}
-                {" "}Adjust capacity and Re-pack as many times as you like — only Re-rank calls Claude.
-              </p>
-            ) : null}
-          </div>
-
-          {/* assumptions echo (every multiplier visible — the trust mechanism). Kanban surfaces these in its
-              dedicated honesty panel (right pane) → suppress the left echo here to avoid a duplicate list. */}
-          {!isKanban && assumptions && assumptions.length ? (
-            <div style={{ marginTop: 14, border: "1px solid var(--s2j-border)", borderRadius: 8, padding: "10px 12px", background: "var(--s2j-bg)" }}>
-              <div style={{ fontSize: 11, fontWeight: 700, color: "var(--s2j-text-muted)", marginBottom: 6, textTransform: "uppercase", letterSpacing: 0.4 }}>Assumptions</div>
-              {assumptions.map((a, i) => (
-                <div key={i} className="flex" style={{ justifyContent: "space-between", gap: 8, fontSize: 12, padding: "2px 0" }}>
-                  <span style={{ color: "var(--s2j-text-muted)" }}>{a.label}</span>
-                  <span style={{ color: "var(--s2j-text)", fontWeight: 500, textAlign: "right" }}>
-                    {String(a.value)}{a.source === "default" ? <span style={{ color: "var(--s2j-text-light)", fontWeight: 400 }}> (default)</span> : null}
-                  </span>
-                </div>
-              ))}
-            </div>
-          ) : null}
-        </div>
-
-        {/* RIGHT: the plan */}
-        <div style={{ flex: "2 1 460px", minWidth: 340 }}>
-          {busy ? (
-            <PlanningState elapsed={elapsed} kanban={formIsKanban} />
-          ) : r.empty ? (
-            <SignalCallout kind="info" title="No features to plan">
-              This breakdown has no features yet. Add features in the editor, then come back to plan.
-            </SignalCallout>
-          ) : !hasPlan ? (
-            <div style={{ border: "1px dashed var(--s2j-border)", borderRadius: 10, padding: 32, textAlign: "center", color: "var(--s2j-text-light)" }}>
-              <div style={{ display: "inline-flex", color: "var(--s2j-border)", marginBottom: 8 }}>{formIsKanban ? <IconList size={32} /> : <IconCalendar size={32} />}</div>
-              <p style={{ fontSize: 13, margin: 0 }}>
-                {formIsKanban
-                  ? `Fill in your team capacity and generate a plan to see ${featureCount} features ordered into a Now / Next / Later backlog.`
-                  : `Fill in your team capacity and generate a plan to see ${featureCount} features allocated across your sprints.`}
-              </p>
-            </div>
-          ) : isKanban ? (
-            // ── KANBAN plan view (methodology=kanban): Now / Next / Later band + the honesty panel ──
-            // NO sprint columns, NO overflow bucket, NO what-if, NO brief, NO sprint-capacity / fragile meters
-            // (all sprint-shaped → deferred to v2 per the locked scope). The diagnostics + Risk Register +
-            // spec-wide concerns channels are REUSED (they're methodology-agnostic).
-            <>
-              {/* fallback note (LLM unavailable → deterministic order) */}
-              {r.llmNote ? (
-                <SignalCallout kind="info" title="Ordered without Claude" style={{ marginBottom: 12 }}>{r.llmNote}</SignalCallout>
-              ) : null}
-
-              {/* THE HONESTY PANEL (load-bearing — this IS the product per the research) */}
-              <KanbanHonestyPanel assumptions={assumptions} />
-
-              {/* grounded reach verdict (shared derivation — no "will deliver", a forecast) */}
-              <SignalCallout kind="info" title="Likely reach this quarter" style={{ marginBottom: 12 }}>
-                {kanbanReachVerdict(metrics)}
-              </SignalCallout>
-
-              {/* spec-wide concerns (plan-level risk/compliance posture — never per-feature) */}
-              <SpecConcernsBand summary={specConcernSummary} />
-
-              {/* the Now / Next / Later backlog band, with visible reach lines */}
-              <BacklogBand plan={plan} byUid={byUid} riskByUid={riskByUid} />
-
-              {/* risk register — the flagged features, sorted, with WHY + tier (Tier-1; tier-tagged, not sprint) */}
-              <RiskRegister entries={riskRegister} usedLlm={r.usedLlm} kanban />
-
-              {/* diagnostics — each its own honest channel, never silent (dangling / unsized / dup / cycles …) */}
-              <PlanDiagnostics g={g} sizingIssues={plan.sizingIssues} nameOfUid={nameOfUid} />
-            </>
-          ) : (
-            <>
-              {/* P18 — copy a defensible, stakeholder-ready brief out of the iframe */}
-              <PlanBriefExport brief={brief} />
-
-              {/* fallback note (LLM unavailable → deterministic order) */}
-              {r.llmNote ? (
-                <SignalCallout kind="info" title="Ordered without Claude" style={{ marginBottom: 12 }}>{r.llmNote}</SignalCallout>
-              ) : null}
-
-              {/* deficit headline (PACK-5 — loud, never silent) */}
-              {deficit ? (
-                <SignalCallout kind="warning" title={deficit.title} style={{ marginBottom: 12 }}>
-                  {deficit.body} Add a sprint, raise capacity, or descope — they’re listed below.
-                </SignalCallout>
-              ) : null}
-
-              {/* fragmentation note (UX-7) */}
-              {fragmentation ? (
-                <SignalCallout kind="info" title={fragmentation.title} style={{ marginBottom: 12 }}>
-                  {fragmentation.body} Re-rank or adjust sprint length.
-                </SignalCallout>
-              ) : null}
-
-              {/* skill bottleneck (Tier-2): short on a discipline while another sits idle — the honest headline */}
-              <SkillBottleneck bucketMetrics={plan.bucketMetrics} />
-
-              {/* spec-wide concerns (plan-level risk/compliance posture — never per-feature) */}
-              <SpecConcernsBand summary={specConcernSummary} />
-
-              {/* sprint columns */}
-              <div className="flex" style={{ gap: 12, flexWrap: "wrap", marginBottom: 16 }}>
-                {plan.sprints.map((s, i) => (
-                  <SprintColumn key={i} sprint={s} number={i + 1} byUid={byUid} oversizedSet={oversizedSet} riskByUid={riskByUid} profile={sprintRiskProfiles[i]} startDate={form && form.sprintStartDate} sprintLengthDays={form && form.sprintLengthDays} />
-                ))}
-              </div>
-
-              {/* overflow bucket (typed reasons) */}
-              {plan.overflow && plan.overflow.length ? (
-                <div style={{ border: "1px solid var(--s2j-orange-border)", borderRadius: 10, background: "var(--s2j-orange-bg)", padding: 12, marginBottom: 12 }}>
-                  <div className="flex items-center gap-2" style={{ marginBottom: 8 }}>
-                    <SignalIcon kind="warning" size={15} />
-                    <strong style={{ fontSize: 13, color: "var(--s2j-text)" }}>Doesn’t fit ({plan.overflow.length})</strong>
-                  </div>
-                  {plan.overflow.map((o, i) => (
-                    <div key={i} style={{ fontSize: 12, color: "var(--s2j-text)", padding: "2px 0" }}>
-                      <span style={{ fontWeight: 500 }}>{o.name || nameOfUid(o.id)}</span>
-                      <span style={{ color: "var(--s2j-text-muted)" }}>
-                        {" — "}{overflowReasonText(o, nameOfUid)}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              ) : null}
-
-              {/* skill diagnostics (Tier-2): unclassifiable features / unknown task types — never silent.
-                  Only in skill mode — a pooled plan never opted into skills, so don't show skill jargon. */}
-              {plan.bucketsActive ? <SkillDiagnostics skillDiagnostics={plan.skillDiagnostics} /> : null}
-
-              {/* risk register — the flagged features, sorted, with WHY + where (Tier-1) */}
-              <RiskRegister entries={riskRegister} usedLlm={r.usedLlm} />
-
-              {/* what-if scenarios (P20) — explore changes free; no re-rank. HIDDEN while the form methodology is
-                  toggled away from the rendered (Scrum) plan: a sprint scenario applied under a kanban form would
-                  silently drop the sprint delta (computeThroughput ignores sprintCount) — §11 no silent action.
-                  The methodologyChanged nudge directs the user to Re-pack first. (deep-audit G2) */}
-              {!methodologyChanged ? (
-                <WhatIfPanel jobId={jobId} baselineForm={form} slimFeatures={nameFeatures} stale={r.stale} planBusy={busy} onApplyScenario={onApplyScenario} />
-              ) : null}
-
-              {/* diagnostics — each its own honest channel, never silent */}
-              <PlanDiagnostics g={g} sizingIssues={plan.sizingIssues} nameOfUid={nameOfUid} />
-            </>
-          )}
-        </div>
-      </div>
+      {/* tabIndex=-1 focus target: the step-change effect focuses this so AT users land on the new step */}
+      <div ref={stepBodyRef} tabIndex={-1} style={{ outline: "none" }}>{stepBody}</div>
     </div>
   );
 }
