@@ -57,14 +57,25 @@ jobs:
       - name: Use Node 24 (match the Forge nodejs24.x runtime)
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v4.4.0 — SHA-pinned (bump via Dependabot)
         with:
-          node-version: 24
+          # ⚠ PINNED EXACT (was floating `24`) to dodge the Node 24.17.0 regression — the REAL cause of the
+          # recurring `forge deploy` "Invalid response body … Premature close" (research-army root-cause,
+          # 2026-06-27). 24.17.0's security fix (CVE-2026-48931, http.Agent) added a 'data' listener to idle
+          # keep-alive sockets; node-fetch@2 — which @forge/cli bundles — then throws a FALSE
+          # ERR_STREAM_PREMATURE_CLOSE during the deploy's packaging fetches. Atlassian CONFIRMED it's Node, not
+          # the CLI/CDN (community .../101420, 2026-06-24). This is why LOCAL (a different 24.x) worked while a
+          # floating-`24` runner served the broken 24.17.0. 24.18.0 (PR #64004, 2026-06-23) is the FIX release;
+          # if setup-node can't resolve it, fall back to 24.16.0 (last pre-regression). Loosen back to `24` once
+          # @forge/cli drops node-fetch (Atlassian-committed). See nodejs.org/en/blog/release/v24.18.0.
+          node-version: 24.18.0
           cache: npm
           cache-dependency-path: |
             package-lock.json
             static/hello-world/package-lock.json
 
-      - name: Assert Node 24
-        run: node -e "if(!process.version.startsWith('v24')){console.error('Node '+process.version+' != v24');process.exit(1)}"
+      - name: Assert Node 24 (and NOT the broken 24.17.0)
+        run: |
+          echo "Node $(node -v)"
+          node -e "const v=process.version; if(!v.startsWith('v24')){console.error('Node '+v+' != v24');process.exit(1)} if(v==='v24.17.0'){console.error('Node 24.17.0 is the node-fetch \"Premature close\" regression — forge deploy WILL fail. Pin setup-node to 24.18.0 (or 24.16.0).');process.exit(1)}"
 
       - name: Assert deploy actions are SHA-pinned (fail-fast policy enforcement — §14.3 #2; runs before any token use)
         run: |
@@ -100,8 +111,10 @@ jobs:
           # the SAME timestamped URL (i.e. NOT transient; the retry couldn't help because the old CLI
           # re-resolves the same problematic wrapper). The CLI's own warning recommended 12.22.0 → 13.0.0;
           # @13 resolves the CURRENT runtime wrapper. ⚠ Update your LOCAL `forge` to @13 too for parity
-          # (`npm i -g @forge/cli@13`) — the §3.2b "match local" intent. The deploy-step retry stays as a
-          # defense for genuinely-transient network blips.
+          # (`npm i -g @forge/cli@13`) — the §3.2b "match local" intent.
+          # ⭐ CORRECTION (2026-06-27): the @12→@13 bump did NOT actually fix the "Premature close" — that was
+          # the Node 24.17.0 × node-fetch@2 regression (the setup-node pin is the real fix). @13 is still the
+          # right CLI to run; keep @13 + the Node pin in lockstep.
           npm install -g @forge/cli@13
           # A FRESH CLI in CI has no usage-analytics preference, and `--non-interactive` (used at deploy) REFUSES
           # to run until one is set. false = opt out of CLI telemetry (consistent with the no-egress posture;
@@ -132,19 +145,19 @@ jobs:
         env:
           FORGE_EMAIL: ${{ secrets.FORGE_EMAIL }}
           FORGE_API_TOKEN: ${{ secrets.FORGE_API_TOKEN }}
-        # TWO defenses against Atlassian-side TRANSIENT network flakiness during deploy — both
-        # surface as "Invalid response body … Premature close" fetching an Atlassian endpoint
-        # (NOT our code; recurring on the GitHub-runner ↔ Atlassian-CDN link):
-        #  1. --no-verify — `forge deploy` otherwise runs `forge lint` INTERNALLY, which fetches
-        #     the external Jira swagger (developer.atlassian.com/.../swagger.v3.json), flaky.
-        #     --no-verify skips that internal lint (lint still runs as the ADVISORY step above;
-        #     it also sidesteps the globalPage-resolver lint false-positive, gotcha #13).
-        #  2. RETRY — the deploy ALSO fetches CDN assets during PACKAGING (e.g. the forge-node-
-        #     runtime wrapper.js) which "Premature close" too. We retry ONLY that transient
-        #     network class. ⭐ SAFE re: duplicate versions: these fetches fail during packaging,
-        #     BEFORE any Marketplace version is created, so a retry cannot create a duplicate. A
-        #     NON-transient failure (real manifest/auth/version error, or a post-upload failure)
-        #     is NOT retried — fail fast. The bundle is still validated by `npm run ci` + server-side.
+        # ⭐ ROOT CAUSE of the recurring "Invalid response body … Premature close" — CORRECTED 2026-06-27 by a
+        # research-army deep-dive; SUPERSEDES the earlier "Atlassian-CDN / runner-network flakiness" guess: it
+        # was the Node 24.17.0 × node-fetch@2 regression (NOT the CDN, NOT the runner↔Atlassian link). THE FIX
+        # is the EXACT Node pin in the setup-node step above (24.18.0). The two defenses below are now belt-and-
+        # suspenders for GENUINELY-transient blips (kept — harmless):
+        #  1. --no-verify — `forge deploy` otherwise runs `forge lint` INTERNALLY (fetches the Jira swagger);
+        #     --no-verify skips it (lint still runs as the ADVISORY step above; also sidesteps the globalPage
+        #     resolver lint false-positive, gotcha #13).
+        #  2. RETRY — only on the transient network class. ⭐ SAFE re: duplicate versions: the packaging fetches
+        #     fail BEFORE any Marketplace version is created, so a retry cannot create a duplicate. A NON-
+        #     transient failure (real manifest/auth/version, or a post-upload error) is NOT retried — fail fast.
+        #     ⚠ NB: the retry could NOT fix the Node-24.17.0 case (the WHOLE run was on the broken Node — every
+        #     attempt failed identically); only the version pin does. Bundle still validated by `npm run ci`.
         run: |
           max=3
           attempt=1
