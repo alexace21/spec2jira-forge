@@ -111,6 +111,14 @@ html, body, #root {
   outline: none;
 }
 
+/* Moodboard form-field focus ring (pair with the formFieldStyle base in components/moodboard.jsx) — a glassy
+   field must never read as inactive: an ice-tint ring + a blue border on focus. */
+.s2j-field:focus {
+  outline: none;
+  border-color: var(--s2j-blue);
+  box-shadow: 0 0 0 3px rgba(193, 232, 255, 0.5);
+}
+
 /* Base text color for Forge iframe */
 body {
   color: var(--s2j-text);
