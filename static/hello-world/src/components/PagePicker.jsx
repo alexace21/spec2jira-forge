@@ -23,6 +23,7 @@ import React, { useEffect, useState, useCallback, useRef } from "react";
 import { invoke } from "@forge/bridge";
 import { SignalCallout } from "./Signal";
 import { IconSettings } from "./Icon";
+import { MoodCard, TYPE, MOOD } from "./moodboard";
 
 const SEARCH_DEBOUNCE_MS = 350;
 const SEARCH_MIN_QUERY_LEN = 2;
@@ -249,9 +250,10 @@ function PagePickerScreen({ onSelect, onOpenSettings }) {
       {/* Title left, Settings top-right (flex) — the in-app entry into AdminSettings,
           since the globalSettings Configure page is unreachable in the centralized admin. */}
       <div className="flex items-start justify-between gap-3 mb-1">
+        {/* moodboard (Phase 3) — the app-root navy wordmark (kept as <h1>: this is the
+            top-level home, so it holds the document's primary heading). */}
         <h1
-          className="text-xl font-semibold"
-          style={{ color: "var(--s2j-text)" }}
+          style={{ ...TYPE.title, fontSize: 22, color: MOOD.navy }}
         >
           Spec2Tickets
         </h1>
@@ -283,14 +285,8 @@ function PagePickerScreen({ onSelect, onOpenSettings }) {
           two ways to LOCATE a page apart from the white list rows below, and keeps
           the manual page-ID option right next to search instead of buried at the
           bottom of the screen (where it was easy to miss). 2026-06-26 UX. */}
-      <div
-        className="rounded-lg p-4 mb-6"
-        style={{
-          background: "var(--s2j-bg-section)",
-          border: "1px solid var(--s2j-border)",
-          boxShadow: "0 1px 2px rgba(0,0,0,0.04)",
-        }}
-      >
+      {/* moodboard (Phase 3) — the primary action zone as a glass card. */}
+      <MoodCard density="minor" style={{ marginBottom: 24 }}>
         <label
           className="block text-sm font-medium mb-2"
           style={{ color: "var(--s2j-text)" }}
@@ -302,10 +298,11 @@ function PagePickerScreen({ onSelect, onOpenSettings }) {
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           placeholder="Type at least 2 characters..."
-          className="w-full px-3 py-2 rounded text-sm"
+          className="w-full px-3 py-2 text-sm s2j-field"
           style={{
             background: "var(--s2j-bg)",
             border: "1px solid var(--s2j-border)",
+            borderRadius: 10,
             color: "var(--s2j-text)",
             outline: "none",
           }}
@@ -319,18 +316,9 @@ function PagePickerScreen({ onSelect, onOpenSettings }) {
           </p>
         )}
         {searchError && (
-          <div
-            className="rounded p-2 mt-2 text-xs"
-            style={{
-              background: "var(--s2j-red-bg)",
-              border: "1px solid var(--s2j-red-border)",
-              color: "var(--s2j-text)",
-            }}
-          >
-            <strong style={{ color: "var(--s2j-red)" }}>Search error</strong>
-            {" — "}
+          <SignalCallout kind="error" title="Search error" style={{ marginTop: 8 }} fontSize={12}>
             {searchError}
-          </div>
+          </SignalCallout>
         )}
 
         {/* Manual page-ID — the second way to find a page, kept right next to search. */}
@@ -373,10 +361,11 @@ function PagePickerScreen({ onSelect, onOpenSettings }) {
                   value={manualId}
                   onChange={(e) => setManualId(e.target.value)}
                   placeholder="123456789"
-                  className="flex-1 px-3 py-2 rounded text-sm"
+                  className="flex-1 px-3 py-2 text-sm s2j-field"
                   style={{
                     background: "var(--s2j-bg)",
                     border: "1px solid var(--s2j-border)",
+                    borderRadius: 10,
                     color: "var(--s2j-text)",
                     outline: "none",
                   }}
@@ -395,7 +384,7 @@ function PagePickerScreen({ onSelect, onOpenSettings }) {
             </form>
           )}
         </div>
-      </div>
+      </MoodCard>
 
       {/* ── Search results ───────────────────────────────────── */}
       {results.length > 0 && (
@@ -423,17 +412,12 @@ function PagePickerScreen({ onSelect, onOpenSettings }) {
 
       {/* ── Search empty-state ──────────────────────────────── */}
       {showSearchEmpty && (
-        <div
-          className="rounded p-3 mb-6 text-xs"
-          style={{
-            background: "var(--s2j-bg-section)",
-            border: "1px solid var(--s2j-border)",
-            color: "var(--s2j-text-light)",
-          }}
-        >
-          No pages found matching "{trimmedQuery}". Try a different keyword
-          or use the manual page ID below.
-        </div>
+        <MoodCard density="utility" style={{ marginBottom: 24 }}>
+          <p style={{ ...TYPE.micro }}>
+            No pages found matching "{trimmedQuery}". Try a different keyword
+            or use the manual page ID in the search card above.
+          </p>
+        </MoodCard>
       )}
 
       {/* ── Live multi-batch dashboard (3 status groups) ──────────
@@ -543,33 +527,28 @@ function PagePickerScreen({ onSelect, onOpenSettings }) {
           Gentle prompt to report bugs (support email) or leave a Marketplace review
           — drives the feedback loop + adoption (reviews lift the listing). The review
           link is wired post-approval (the public listing isn't live yet). */}
-      <div
-        className="mt-10 rounded-lg p-4 text-sm leading-relaxed"
-        style={{
-          background: "var(--s2j-bg-section)",
-          border: "1px solid var(--s2j-border)",
-          color: "var(--s2j-text-light)",
-        }}
-      >
-        <span className="font-semibold" style={{ color: "var(--s2j-text)" }}>
-          Help us keep improving Spec2Tickets.
-        </span>{" "}
-        Found a bug or have an idea? Email{" "}
-        <a href="mailto:support@spec2jira.com" style={{ color: "var(--s2j-blue)" }}>
-          support@spec2jira.com
-        </a>{" "}
-        — we read every message. Enjoying it?{" "}
-        <a
-          href={MARKETPLACE_REVIEW_URL}
-          target="_blank"
-          rel="noopener noreferrer"
-          style={{ color: "var(--s2j-blue)" }}
-        >
-          Leave a quick review
-        </a>{" "}
-        on the Atlassian Marketplace — it takes a minute and helps other teams find
-        us.
-      </div>
+      <MoodCard density="minor" style={{ marginTop: 40 }}>
+        <p className="text-sm leading-relaxed" style={{ color: "var(--s2j-text-light)" }}>
+          <span className="font-semibold" style={{ color: "var(--s2j-text)" }}>
+            Help us keep improving Spec2Tickets.
+          </span>{" "}
+          Found a bug or have an idea? Email{" "}
+          <a href="mailto:support@spec2jira.com" style={{ color: "var(--s2j-blue)" }}>
+            support@spec2jira.com
+          </a>{" "}
+          — we read every message. Enjoying it?{" "}
+          <a
+            href={MARKETPLACE_REVIEW_URL}
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{ color: "var(--s2j-blue)" }}
+          >
+            Leave a quick review
+          </a>{" "}
+          on the Atlassian Marketplace — it takes a minute and helps other teams find
+          us.
+        </p>
+      </MoodCard>
     </div>
   );
 }
