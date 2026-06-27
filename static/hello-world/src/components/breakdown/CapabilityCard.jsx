@@ -1,12 +1,13 @@
 import { useState } from 'react';
 import FeatureCard from './FeatureCard.jsx';
 import { newStoryUid } from '../../lib/v3Schema';
+import { glassSurface, MOOD } from '../moodboard';
 
 /**
  * CapabilityCard — Editor for a single Capability (→ JIRA Epic).
  * Light theme (Swagger palette).
  */
-export default function CapabilityCard({ capability, index, onUpdate, onDelete }) {
+export default function CapabilityCard({ capability, index, onUpdate, onDelete, featureGlass = true }) {
   // Collapsed by default (2026-06-26 UX): every entry to the Review/editor screen opens
   // with all categories collapsed for a scannable overview; the user expands what they
   // want. BreakdownEditor remounts per reviewing entry (key="screen-reviewing"), so this
@@ -61,9 +62,11 @@ export default function CapabilityCard({ capability, index, onUpdate, onDelete }
 
   return (
     <div className="rounded-lg overflow-hidden" style={{
-      border: '1px solid var(--s2j-border)',
+      // moodboard (Phase 4) — the Category is the editor's top structural level, so it
+      // carries the glass surface in BOTH A/B variants; the blue left-accent is kept.
+      ...glassSurface('minor'),
       borderLeft: '4px solid var(--s2j-blue)',
-      background: 'var(--s2j-bg)',
+      overflow: 'hidden',
     }}>
       {/* Header */}
       <button
@@ -88,7 +91,7 @@ export default function CapabilityCard({ capability, index, onUpdate, onDelete }
           <span className="text-[10px]" style={{ color: 'var(--s2j-text-muted)' }}>Category</span>
         </span>
 
-        <span className="flex-1 truncate text-sm font-semibold" style={{ color: 'var(--s2j-text)' }}>
+        <span className="flex-1 truncate text-sm font-semibold" style={{ color: MOOD.navy }}>
           {capability.name}
         </span>
 
@@ -176,6 +179,7 @@ export default function CapabilityCard({ capability, index, onUpdate, onDelete }
                 index={fIdx}
                 onUpdate={(updated) => updateFeature(fIdx, updated)}
                 onDelete={() => deleteFeature(fIdx)}
+                featureGlass={featureGlass}
               />
             ))}
           </div>

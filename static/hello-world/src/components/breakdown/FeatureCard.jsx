@@ -4,6 +4,7 @@ import TaskCard from './TaskCard.jsx';
 import LabelsEditor from './LabelsEditor.jsx';
 import { parseConcernPrefix, SEVERITY_PALETTE, CONCERN_TYPE_LABEL } from '../../lib/v3Schema.js';
 import { IconX } from '../Icon';
+import { glassSurface, MOOD } from '../moodboard';
 
 /**
  * FeatureCard — Editor for a single Feature (→ JIRA Story).
@@ -65,7 +66,13 @@ function _priorityVisuals(priority) {
   return null;
 }
 
-export default function FeatureCard({ feature, index, onUpdate, onDelete }) {
+// `featureGlass` (moodboard Phase 4) is the A/B knob the editor passes down:
+//   true  = B (full-glass) — every Story card is a glass surface (richer, layered).
+//   false = A (hierarchical) — Story cards stay flat so the glass Category container
+//           carries the depth and the hierarchy reads cleaner (less glass-on-glass).
+// The Story's green left-accent + the overflow-hidden (the SelectBadge portal relies on
+// the clip → it portals out) are identical in both.
+export default function FeatureCard({ feature, index, onUpdate, onDelete, featureGlass = true }) {
   const [expanded, setExpanded] = useState(false);
 
   const taskCount = feature.tasks?.length || 0;
@@ -132,11 +139,11 @@ export default function FeatureCard({ feature, index, onUpdate, onDelete }) {
   }
 
   return (
-    <div className="rounded-lg overflow-hidden" style={{
-      border: '1px solid var(--s2j-border)',
-      borderLeft: '3px solid var(--s2j-green)',
-      background: 'var(--s2j-bg)',
-    }}>
+    <div className="rounded-lg overflow-hidden" style={
+      featureGlass
+        ? { ...glassSurface('utility'), borderLeft: '3px solid var(--s2j-green)', overflow: 'hidden' }
+        : { border: '1px solid var(--s2j-border)', borderLeft: '3px solid var(--s2j-green)', background: 'var(--s2j-bg)' }
+    }>
       {/* Header */}
       <button
         onClick={() => setExpanded(!expanded)}
@@ -160,7 +167,7 @@ export default function FeatureCard({ feature, index, onUpdate, onDelete }) {
           <span className="text-[10px]" style={{ color: 'var(--s2j-text-muted)' }}>Story</span>
         </span>
 
-        <span className="flex-1 truncate text-sm font-medium" style={{ color: 'var(--s2j-text)' }}>
+        <span className="flex-1 truncate text-sm font-semibold" style={{ color: MOOD.navy }}>
           {feature.name}
         </span>
 
@@ -293,7 +300,7 @@ export default function FeatureCard({ feature, index, onUpdate, onDelete }) {
               <select
                 value={priority || 'Medium'}
                 onChange={(e) => updateField('priority', e.target.value)}
-                className="text-xs rounded px-1.5 py-0.5"
+                className="text-xs rounded px-1.5 py-0.5 s2j-field"
                 style={{ background: 'var(--s2j-bg)', color: 'var(--s2j-text)', border: '1px solid var(--s2j-border)' }}
               >
                 <option value="High">High</option>
@@ -306,7 +313,7 @@ export default function FeatureCard({ feature, index, onUpdate, onDelete }) {
               <select
                 value={storyPoints ?? ''}
                 onChange={(e) => updateField('story_points', e.target.value === '' ? null : Number(e.target.value))}
-                className="text-xs rounded px-1.5 py-0.5"
+                className="text-xs rounded px-1.5 py-0.5 s2j-field"
                 style={{ background: 'var(--s2j-bg)', color: 'var(--s2j-text)', border: '1px solid var(--s2j-border)' }}
               >
                 <option value="">—</option>

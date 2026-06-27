@@ -4,9 +4,15 @@ import { newStoryUid } from '../../lib/v3Schema';
 import CapabilityCard from './CapabilityCard.jsx';
 import SharedACPanel from './SharedACPanel.jsx';
 import LabelsEditor from './LabelsEditor.jsx';
+import { glassSurface } from '../moodboard';
 
 export default function BreakdownEditor({ initialBreakdown, onPush, isPushing = false, breakdownRef }) {
   const [breakdown, setBreakdown] = useState(() => JSON.parse(JSON.stringify(initialBreakdown)));
+  // ⚠ TEMP (moodboard Phase 4 A/B) — a live toggle so the reviewer can compare Story-card
+  // styles in one deploy: Glass (B, full-glass every Story) vs Flat (A, hierarchical). Once
+  // the partner picks a variant, REMOVE this state + the stats-bar toggle and hardcode the
+  // winning `featureGlass` value into CapabilityCard's default. Not for production.
+  const [featureGlass, setFeatureGlass] = useState(true);
 
   useEffect(() => {
     setBreakdown(JSON.parse(JSON.stringify(initialBreakdown)));
@@ -133,16 +139,34 @@ export default function BreakdownEditor({ initialBreakdown, onPush, isPushing = 
               {stats.totalItems} Jira items
             </span>
           </div>
-          {/* Re-reading AI insights mid-edit lives on the reviewing top-bar's "Back to AI
-              insights" button now (2026-06-26) — the natural top-left back position; it
-              lifts edits via editorBreakdownRef so nothing is lost. */}
-          <button onClick={resetBreakdown}
-            className="rounded px-2 py-1 text-[11px] transition-colors"
-            style={{ color: 'var(--s2j-text-muted)' }}
-            onMouseEnter={e => { e.target.style.background = 'var(--s2j-border)'; e.target.style.color = 'var(--s2j-text)'; }}
-            onMouseLeave={e => { e.target.style.background = 'transparent'; e.target.style.color = 'var(--s2j-text-muted)'; }}>
-            Reset
-          </button>
+          <div className="flex items-center gap-2">
+            {/* ⚠ TEMP (moodboard Phase 4 A/B) — live Story-card style toggle for the review
+                deploy; REMOVE once the variant is chosen (see the featureGlass comment above). */}
+            <div className="flex items-center rounded-md overflow-hidden" style={{ border: '1px solid var(--s2j-border)' }} title="Story card style (review only)">
+              {[['glass', 'Glass', true], ['flat', 'Flat', false]].map(([k, label, val]) => (
+                <button key={k} onClick={() => setFeatureGlass(val)}
+                  aria-pressed={featureGlass === val}
+                  title={`${label} Story cards`}
+                  className="px-2 py-0.5 text-[10px] font-medium transition-colors"
+                  style={{
+                    background: featureGlass === val ? 'var(--s2j-blue-bg)' : 'transparent',
+                    color: featureGlass === val ? 'var(--s2j-blue)' : 'var(--s2j-text-muted)',
+                  }}>
+                  {label}
+                </button>
+              ))}
+            </div>
+            {/* Re-reading AI insights mid-edit lives on the reviewing top-bar's "Back to AI
+                insights" button now (2026-06-26) — the natural top-left back position; it
+                lifts edits via editorBreakdownRef so nothing is lost. */}
+            <button onClick={resetBreakdown}
+              className="rounded px-2 py-1 text-[11px] transition-colors"
+              style={{ color: 'var(--s2j-text-muted)' }}
+              onMouseEnter={e => { e.target.style.background = 'var(--s2j-border)'; e.target.style.color = 'var(--s2j-text)'; }}
+              onMouseLeave={e => { e.target.style.background = 'transparent'; e.target.style.color = 'var(--s2j-text-muted)'; }}>
+              Reset
+            </button>
+          </div>
         </div>
       </div>
 
@@ -152,10 +176,12 @@ export default function BreakdownEditor({ initialBreakdown, onPush, isPushing = 
       <div className="px-4 py-4 space-y-4">
         {/* Epic metadata */}
         {breakdown.epic && (
-          <div className="rounded-lg p-4 space-y-3" style={{
-            background: 'var(--s2j-bg)',
-            border: '1px solid var(--s2j-border)',
+          <div className="rounded-lg space-y-3" style={{
+            // moodboard (Phase 4) — the Epic is the breakdown's top scope, so it gets the
+            // glass surface with its blue left-accent (consistent in both A/B variants).
+            ...glassSurface('minor'),
             borderLeft: '4px solid var(--s2j-blue)',
+            padding: 16,
           }}>
             <div className="flex items-center gap-2 mb-1">
               <span className="rounded px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider"
@@ -219,7 +245,8 @@ export default function BreakdownEditor({ initialBreakdown, onPush, isPushing = 
           </div>
           {breakdown.capabilities.map((cap, i) => (
             <CapabilityCard key={i} capability={cap} index={i}
-              onUpdate={(u) => updateCapability(i, u)} onDelete={() => deleteCapability(i)} />
+              onUpdate={(u) => updateCapability(i, u)} onDelete={() => deleteCapability(i)}
+              featureGlass={featureGlass} />
           ))}
         </div>
       </div>
