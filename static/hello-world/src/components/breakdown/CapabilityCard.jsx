@@ -7,7 +7,7 @@ import { glassSurface, MOOD } from '../moodboard';
  * CapabilityCard — Editor for a single Capability (→ JIRA Epic).
  * Light theme (Swagger palette).
  */
-export default function CapabilityCard({ capability, index, onUpdate, onDelete, featureGlass = true }) {
+export default function CapabilityCard({ capability, index, onUpdate, onDelete }) {
   // Collapsed by default (2026-06-26 UX): every entry to the Review/editor screen opens
   // with all categories collapsed for a scannable overview; the user expands what they
   // want. BreakdownEditor remounts per reviewing entry (key="screen-reviewing"), so this
@@ -62,11 +62,11 @@ export default function CapabilityCard({ capability, index, onUpdate, onDelete, 
 
   return (
     <div className="rounded-lg overflow-hidden" style={{
-      // moodboard (Phase 4) — the Category is the editor's top structural level, so it
-      // carries the glass surface in BOTH A/B variants; the blue left-accent is kept.
+      // moodboard — the Category is the editor's top structural level, so it carries the glass
+      // surface; the blue left-accent is kept. (overflow-hidden lives on the className — the
+      // SelectBadge type dropdown is portaled out and relies on the clip.)
       ...glassSurface('minor'),
       borderLeft: '4px solid var(--s2j-blue)',
-      overflow: 'hidden',
     }}>
       {/* Header */}
       <button
@@ -179,7 +179,6 @@ export default function CapabilityCard({ capability, index, onUpdate, onDelete, 
                 index={fIdx}
                 onUpdate={(updated) => updateFeature(fIdx, updated)}
                 onDelete={() => deleteFeature(fIdx)}
-                featureGlass={featureGlass}
               />
             ))}
           </div>

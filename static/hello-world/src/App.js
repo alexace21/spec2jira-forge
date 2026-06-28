@@ -3367,7 +3367,17 @@ function InsightsScreen({
           <summary className="cursor-pointer text-xs font-medium uppercase tracking-wider p-3" style={{ color: "var(--s2j-text-muted)" }}>
             AI ambiguity note
           </summary>
-          <div className="p-3 pt-0 text-xs" style={{ color: "var(--s2j-text)", borderTop: "1px solid var(--s2j-border)" }}>
+          {/* readability fix (partner) — the note is a long, clause-dense paragraph; bump it off
+              text-xs to 13px with an airy 1.7 line-height + full padding so it isn't a cramped wall. */}
+          <div
+            className="px-3 pb-3 pt-3"
+            style={{
+              color: "var(--s2j-text)",
+              borderTop: "1px solid var(--s2j-border)",
+              fontSize: 13,
+              lineHeight: 1.7,
+            }}
+          >
             {signals.ambiguityNote}
           </div>
         </details>

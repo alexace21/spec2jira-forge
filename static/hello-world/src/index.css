@@ -8,13 +8,20 @@
  * Applied: April 14, 2026
  */
 :root {
-  --s2j-text:         #3b4151;
-  --s2j-text-light:   #6b7280;
-  --s2j-text-muted:   #8a8fa3;
+  /* ⭐ Moodboard re-theme (aggressive, partner 2026-06-28) — the NEUTRAL chrome now lives in the
+     blue-on-white moodboard gamut: greys → navy / steel / sky-steel, section fills + borders → ice/sky.
+     Because every screen reads these tokens, this repaints the WHOLE app at once. The ACTION-BUTTON
+     colours (--s2j-green commit / --s2j-blue nav / --s2j-red danger, below) + the SEMANTIC severity
+     tints (Signal.jsx traffic-light) are deliberately LEFT — buttons keep the agreed convention and
+     severity stays a true signal. (Originals: text #3b4151 / light #6b7280 / muted #8a8fa3 /
+     section #fafafa / border #e2e2e2.) */
+  --s2j-text:         #0a2440;   /* deep navy — primary text + neutral icons (currentColor) */
+  --s2j-text-light:   #3c6193;   /* steel — secondary text */
+  --s2j-text-muted:   #6285ad;   /* sky-steel — labels / muted icons */
 
   --s2j-bg:           #ffffff;
-  --s2j-bg-section:   #fafafa;
-  --s2j-border:       #e2e2e2;
+  --s2j-bg-section:   #eef5fd;   /* SOFT inset ice — stats bars, profiles, list panels (lightened from #e7f0fb per partner) */
+  --s2j-border:       #dbe8f5;   /* soft ice-sky hairline (lightened from #d0e1f3) */
 
   --s2j-blue:         #61affe;
   --s2j-blue-dark:    #4a9fe8;
@@ -119,10 +126,12 @@ html, body, #root {
   box-shadow: 0 0 0 3px rgba(193, 232, 255, 0.5);
 }
 
-/* Base text color for Forge iframe */
+/* Base text color for Forge iframe + the ambient moodboard ICE FIELD. The whole app sits on a faint
+   ice wash (#f3f8ff); the near-white glass cards (glassSurface) float ABOVE it. Solid (not a gradient)
+   so it is height-independent — the Forge content-driven iframe never gets an empty band. */
 body {
   color: var(--s2j-text);
-  background: var(--s2j-bg);
+  background: #f7faff;
 }
 
 /* Override Tailwind grays to Swagger equivalents inside our app */

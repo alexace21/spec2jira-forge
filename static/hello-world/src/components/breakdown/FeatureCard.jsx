@@ -66,13 +66,10 @@ function _priorityVisuals(priority) {
   return null;
 }
 
-// `featureGlass` (moodboard Phase 4) is the A/B knob the editor passes down:
-//   true  = B (full-glass) — every Story card is a glass surface (richer, layered).
-//   false = A (hierarchical) — Story cards stay flat so the glass Category container
-//           carries the depth and the hierarchy reads cleaner (less glass-on-glass).
-// The Story's green left-accent + the overflow-hidden (the SelectBadge portal relies on
-// the clip → it portals out) are identical in both.
-export default function FeatureCard({ feature, index, onUpdate, onDelete, featureGlass = true }) {
+// The Story card is a moodboard GLASS surface (the partner chose "Glass" over flat in the 6.5.0 A/B
+// review). Its green left-accent + overflow-hidden (the SelectBadge type dropdown is portaled and relies
+// on the clip) carry over from the editor's other cards.
+export default function FeatureCard({ feature, index, onUpdate, onDelete }) {
   const [expanded, setExpanded] = useState(false);
 
   const taskCount = feature.tasks?.length || 0;
@@ -139,11 +136,7 @@ export default function FeatureCard({ feature, index, onUpdate, onDelete, featur
   }
 
   return (
-    <div className="rounded-lg overflow-hidden" style={
-      featureGlass
-        ? { ...glassSurface('utility'), borderLeft: '3px solid var(--s2j-green)', overflow: 'hidden' }
-        : { border: '1px solid var(--s2j-border)', borderLeft: '3px solid var(--s2j-green)', background: 'var(--s2j-bg)' }
-    }>
+    <div className="rounded-lg overflow-hidden" style={{ ...glassSurface('utility'), borderLeft: '3px solid var(--s2j-green)' }}>
       {/* Header */}
       <button
         onClick={() => setExpanded(!expanded)}

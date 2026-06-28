@@ -38,14 +38,29 @@ export const formFieldStyle = {
   background: "var(--s2j-bg)", color: "var(--s2j-text)",
 };
 
-// ── glassSurface(density) — the canonical glass recipe in 3 densities. MAJOR reuses the proven wizard
-// stepSurface (ice→white wash + glass + soft deep-blue shadow); MINOR/UTILITY are lighter for rows/list-items. ──
+// ── glassSurface(density) — the canonical glass recipe in 3 densities. ALL THREE carry the moodboard
+// ice→white wash (the linear-gradient that makes the glass VISIBLE on a white page — the look of the
+// Capacity-Planner wizard's stepSurface). MAJOR reuses the proven wizard stepSurface (ice 0.34); MINOR
+// (0.26) and UTILITY (0.18) step the tint + shadow DOWN so nested cards read as a ladder, never a flat
+// white box. ⚠ The earlier flat rgba(255,255,255,0.72) fills were near-invisible on white — that is why
+// the moodboard "didn't show"; do not regress them to a solid fill. Legibility never depends on the tint
+// (the gradient fades to opaque white by ~60%), so the Forge-iframe near-opaque rule still holds. ──
 export function glassSurface(density = "major") {
   if (density === "utility") {
-    return { background: "rgba(255,255,255,0.72)", border: "1px solid rgba(125,160,202,0.26)", borderRadius: 12, boxShadow: "0 2px 10px rgba(5,38,89,0.05)" };
+    return {
+      background: "linear-gradient(160deg, rgba(193,232,255,0.12) 0%, rgba(255,255,255,0) 64%), #ffffff",
+      border: "1px solid rgba(125,160,202,0.24)",
+      borderRadius: 12,
+      boxShadow: "0 3px 12px rgba(5,38,89,0.05)",
+    };
   }
   if (density === "minor") {
-    return { background: "rgba(255,255,255,0.72)", border: "1px solid rgba(125,160,202,0.30)", borderRadius: 14, boxShadow: "0 4px 16px rgba(5,38,89,0.06)" };
+    return {
+      background: "linear-gradient(160deg, rgba(193,232,255,0.18) 0%, rgba(255,255,255,0) 60%), #ffffff",
+      border: "1px solid rgba(125,160,202,0.28)",
+      borderRadius: 14,
+      boxShadow: "0 6px 20px rgba(5,38,89,0.06)",
+    };
   }
   return { ...stepSurface }; // MAJOR
 }
