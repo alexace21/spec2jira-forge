@@ -377,7 +377,12 @@ The moodboard (from [[moodboard-design-system]]) is now rolled out across the WH
 
 **Verified:** CI=true CRA build green throughout; `npm run check` green (syntax 11/11 + **version-drift-guard: package.json + DIAG_APP_VERSION both 6.5.0**, lockstep). Dev redeployed with the final build (toggle gone). Release summary + notes drafted for the partner (≤80 / ≤1000).
 
-**NEXT (partner-executed):** push `feature/UI-UX-improvements` → merge to `main` → ⭐ **deploy to PRODUCTION via the new GitHub Actions workflow** (`.github/workflows/deploy.yml`, manual-approval Environment; this is the FIRST real prod use of the CI deploy — watch for the Node-24.18.0 pin fix from [[mvp-monitoring-cicd]]; ship-from-local is the fallback if it fails). No new scopes in this release → no customer re-consent. **Then the moodboard rollout is DONE** — future moodboard work is calibration only (the token/kit levers are the place to tune).
+**✅ SHIPPED — v6.5.0 is LIVE on production (2026-06-28).** Partner pushed → merged to `main` →
+deployed to PROD via the **GitHub Actions workflow** (`.github/workflows/deploy.yml`). ⭐⭐ **This was the
+FIRST real prod use of the CI deploy and it SUCCEEDED** — the **Node-24.18.0 pin fix DID stop the "Premature
+close"** ([[mvp-monitoring-cicd]] root-cause confirmed live; ship-from-local is no longer the only path). No new
+scopes → no customer re-consent. **The app-wide moodboard rollout is DONE** — future moodboard work is
+calibration only (tune the `:root` ice tokens + `glassSurface` densities, not per-screen edits).
 
 ---
 
