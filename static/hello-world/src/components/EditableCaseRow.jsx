@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect, useCallback } from "react";
 import EditableField from "./breakdown/EditableField.jsx";
 import AcTraceEditor from "./AcTraceEditor.jsx";
-import { IconX } from "./Icon";
+import { IconX, IconChevronRight } from "./Icon";
 import { SignalIcon } from "./Signal";
 
 // Canon (src/prompts.js TEST_CASE_SCHEMA): type ∈ 3, priority ∈ 4 (optional).
@@ -128,6 +128,21 @@ export default function EditableCaseRow({
 
   function set(field, val) { onChange({ ...c, [field]: val }); }
 
+  // Collapsible (partner 2026-06-28): cases are CLOSED by default so a long story reads as a quick
+  // scan — the header (# · type · priority · title) stays visible; the chevron opens the editor. A NEW
+  // case starts OPEN (it must be filled). The save bar + an invalid marker stay visible even collapsed
+  // (POLICY: never hide unsaved / dropped state). The toggle is a <span role="button">, NOT a <button>,
+  // so it still works inside the read-only disabled <fieldset> (which natively disables real buttons).
+  const [open, setOpen] = useState(!!isNewCase);
+  const chevronRef = useRef(null);
+  const toggleOpen = () => {
+    const next = !open;
+    setOpen(next);
+    // a11y (gate fix): collapsing unmounts the body, so if focus was inside it, keep focus on the
+    // chevron rather than letting the browser strand it on <body>. (The chevron is always mounted.)
+    if (!next && chevronRef.current) chevronRef.current.focus();
+  };
+
   // Validity hint — the parse DROPS a case with no When or no Then; surface it so the drop
   // is never silent (POLICY: surface failures, never silent).
   const when = Array.isArray(c.when) ? c.when.filter((s) => String(s || "").trim()) : [];
@@ -167,8 +182,25 @@ export default function EditableCaseRow({
         minInlineSize: "auto",
       }}
     >
-      {/* Header: # · type · priority · title · delete */}
-      <div className="flex items-start gap-2 mb-3 flex-wrap">
+      {/* Header: chevron · # · type · priority · title · (invalid marker) · delete — ALWAYS visible; the
+          body below collapses. The chevron is a <span role=button> (works inside the read-only fieldset). */}
+      <div className="flex items-start gap-2 flex-wrap" style={{ marginBottom: open ? 12 : 0 }}>
+        <span
+          ref={chevronRef}
+          role="button"
+          tabIndex={0}
+          onClick={toggleOpen}
+          onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggleOpen(); } }}
+          aria-expanded={open}
+          aria-label={open ? "Collapse this test case" : "Expand this test case"}
+          className="mt-1 shrink-0"
+          style={{ cursor: "pointer", color: "var(--s2j-text-muted)", lineHeight: 0, padding: 2 }}
+          title={open ? "Collapse this case" : "Expand this case"}
+        >
+          <span style={{ display: "inline-flex", transform: open ? "rotate(90deg)" : "none", transition: "transform 0.15s" }}>
+            <IconChevronRight size={14} />
+          </span>
+        </span>
         <span className="text-[12px] mt-1.5 shrink-0 font-medium" style={{ color: "var(--s2j-text-muted)" }}>#{caseNumber}</span>
         <select
           value={type}
@@ -196,6 +228,16 @@ export default function EditableCaseRow({
         <div className="flex-1 min-w-[140px] font-semibold text-[14px]" style={{ color: "var(--s2j-text)" }}>
           <EditableField value={c.title} placeholder="Scenario title…" maxLength={200} onChange={(val) => set("title", val)} />
         </div>
+        {/* collapsed-visible §11 marker — a dropped-risk (no When/Then) case must show even when closed */}
+        {invalid && !open && (
+          <span
+            className="mt-1.5 shrink-0"
+            style={{ color: "var(--s2j-orange)", lineHeight: 0 }}
+            title="This case is missing a When or Then — it will be dropped on save. Open it to fix."
+          >
+            <SignalIcon kind="warning" size={14} title="Incomplete — open to fix" />
+          </span>
+        )}
         <button
           type="button"
           onClick={onDeleteClick}
@@ -211,54 +253,59 @@ export default function EditableCaseRow({
         </button>
       </div>
 
-      {invalid && (
-        <div className="text-[12px] mb-3 flex items-center gap-1.5" style={{ color: "var(--s2j-orange)" }}>
-          <SignalIcon kind="warning" size={14} /> A case needs at least one When and one Then, or it is dropped on save.
-        </div>
+      {/* Collapsible body — the full editor; closed by default (the partner's scan-then-open flow). */}
+      {open && (
+        <>
+          {invalid && (
+            <div className="text-[12px] mb-3 flex items-center gap-1.5" style={{ color: "var(--s2j-orange)" }}>
+              <SignalIcon kind="warning" size={14} /> A case needs at least one When and one Then, or it is dropped on save.
+            </div>
+          )}
+
+          {/* concern (clearable) */}
+          <FieldBlock label="Concern (optional)">
+            <EditableField
+              value={c.concern || ""}
+              multiline
+              placeholder="e.g. [ASSUMPTION|medium] …"
+              className="text-[13px] leading-relaxed"
+              onChange={(val) => set("concern", val || undefined)}
+            />
+          </FieldBlock>
+
+          {/* Scenario (BDD): Given / When / Then grouped under one labeled subsection for readability */}
+          <div
+            className="mb-2 pt-1"
+            style={{ borderTop: "1px solid rgba(125,160,202,0.22)" }}
+          >
+            <span style={{ display: "block", fontSize: 11.5, fontWeight: 700, color: "var(--s2j-text-light)", textTransform: "uppercase", letterSpacing: "0.06em", margin: "8px 0 8px" }}>
+              Scenario (BDD)
+            </span>
+            <StringListEditor label="Given (preconditions)" items={c.given} onChange={(v) => set("given", v)} placeholder="a precondition…" />
+            <StringListEditor label="When (action)" items={c.when} onChange={(v) => set("when", v)} placeholder="an observable action…" />
+            <StringListEditor label="Then (outcome)" items={c.then} onChange={(v) => set("then", v)} placeholder="an observable outcome…" />
+          </div>
+
+          {/* Expected result */}
+          <FieldBlock label="Expected result">
+            <EditableField
+              value={c.expected_result || ""}
+              multiline
+              placeholder="the single falsifiable pass/fail assertion…"
+              className="text-[13px] leading-relaxed"
+              onChange={(val) => set("expected_result", val)}
+            />
+          </FieldBlock>
+
+          {/* Test data */}
+          <StringListEditor label="Test data (optional)" items={c.test_data} onChange={(v) => set("test_data", v)} placeholder="a concrete value…" />
+
+          {/* ac_trace — coverage-safe checklist */}
+          <div className="mt-2 pt-3" style={{ borderTop: "1px dashed rgba(125,160,202,0.30)" }}>
+            <AcTraceEditor acTrace={c.ac_trace} acceptanceCriteria={acceptanceCriteria} onChange={(next) => set("ac_trace", next)} />
+          </div>
+        </>
       )}
-
-      {/* concern (clearable) */}
-      <FieldBlock label="Concern (optional)">
-        <EditableField
-          value={c.concern || ""}
-          multiline
-          placeholder="e.g. [ASSUMPTION|medium] …"
-          className="text-[13px] leading-relaxed"
-          onChange={(val) => set("concern", val || undefined)}
-        />
-      </FieldBlock>
-
-      {/* Scenario (BDD): Given / When / Then grouped under one labeled subsection for readability */}
-      <div
-        className="mb-2 pt-1"
-        style={{ borderTop: "1px solid rgba(125,160,202,0.22)" }}
-      >
-        <span style={{ display: "block", fontSize: 11.5, fontWeight: 700, color: "var(--s2j-text-light)", textTransform: "uppercase", letterSpacing: "0.06em", margin: "8px 0 8px" }}>
-          Scenario (BDD)
-        </span>
-        <StringListEditor label="Given (preconditions)" items={c.given} onChange={(v) => set("given", v)} placeholder="a precondition…" />
-        <StringListEditor label="When (action)" items={c.when} onChange={(v) => set("when", v)} placeholder="an observable action…" />
-        <StringListEditor label="Then (outcome)" items={c.then} onChange={(v) => set("then", v)} placeholder="an observable outcome…" />
-      </div>
-
-      {/* Expected result */}
-      <FieldBlock label="Expected result">
-        <EditableField
-          value={c.expected_result || ""}
-          multiline
-          placeholder="the single falsifiable pass/fail assertion…"
-          className="text-[13px] leading-relaxed"
-          onChange={(val) => set("expected_result", val)}
-        />
-      </FieldBlock>
-
-      {/* Test data */}
-      <StringListEditor label="Test data (optional)" items={c.test_data} onChange={(v) => set("test_data", v)} placeholder="a concrete value…" />
-
-      {/* ac_trace — coverage-safe checklist */}
-      <div className="mt-2 pt-3" style={{ borderTop: "1px dashed rgba(125,160,202,0.30)" }}>
-        <AcTraceEditor acTrace={c.ac_trace} acceptanceCriteria={acceptanceCriteria} onChange={(next) => set("ac_trace", next)} />
-      </div>
 
       {/* Per-case Save/Revert footer (Work B) — under THIS case when it has unsaved edits, so the controls
           are always where you're editing. Save persists the WHOLE story (KVS is per-story — the tooltip is
