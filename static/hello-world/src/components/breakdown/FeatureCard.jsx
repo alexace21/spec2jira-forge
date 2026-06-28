@@ -4,6 +4,7 @@ import TaskCard from './TaskCard.jsx';
 import LabelsEditor from './LabelsEditor.jsx';
 import { parseConcernPrefix, SEVERITY_PALETTE, CONCERN_TYPE_LABEL } from '../../lib/v3Schema.js';
 import { IconX } from '../Icon';
+import { glassSurface, MOOD } from '../moodboard';
 
 /**
  * FeatureCard — Editor for a single Feature (→ JIRA Story).
@@ -65,6 +66,9 @@ function _priorityVisuals(priority) {
   return null;
 }
 
+// The Story card is a moodboard GLASS surface (the partner chose "Glass" over flat in the 6.5.0 A/B
+// review). Its green left-accent + overflow-hidden (the SelectBadge type dropdown is portaled and relies
+// on the clip) carry over from the editor's other cards.
 export default function FeatureCard({ feature, index, onUpdate, onDelete }) {
   const [expanded, setExpanded] = useState(false);
 
@@ -132,11 +136,7 @@ export default function FeatureCard({ feature, index, onUpdate, onDelete }) {
   }
 
   return (
-    <div className="rounded-lg overflow-hidden" style={{
-      border: '1px solid var(--s2j-border)',
-      borderLeft: '3px solid var(--s2j-green)',
-      background: 'var(--s2j-bg)',
-    }}>
+    <div className="rounded-lg overflow-hidden" style={{ ...glassSurface('utility'), borderLeft: '3px solid var(--s2j-green)' }}>
       {/* Header */}
       <button
         onClick={() => setExpanded(!expanded)}
@@ -160,7 +160,7 @@ export default function FeatureCard({ feature, index, onUpdate, onDelete }) {
           <span className="text-[10px]" style={{ color: 'var(--s2j-text-muted)' }}>Story</span>
         </span>
 
-        <span className="flex-1 truncate text-sm font-medium" style={{ color: 'var(--s2j-text)' }}>
+        <span className="flex-1 truncate text-sm font-semibold" style={{ color: MOOD.navy }}>
           {feature.name}
         </span>
 
@@ -293,7 +293,7 @@ export default function FeatureCard({ feature, index, onUpdate, onDelete }) {
               <select
                 value={priority || 'Medium'}
                 onChange={(e) => updateField('priority', e.target.value)}
-                className="text-xs rounded px-1.5 py-0.5"
+                className="text-xs rounded px-1.5 py-0.5 s2j-field"
                 style={{ background: 'var(--s2j-bg)', color: 'var(--s2j-text)', border: '1px solid var(--s2j-border)' }}
               >
                 <option value="High">High</option>
@@ -306,7 +306,7 @@ export default function FeatureCard({ feature, index, onUpdate, onDelete }) {
               <select
                 value={storyPoints ?? ''}
                 onChange={(e) => updateField('story_points', e.target.value === '' ? null : Number(e.target.value))}
-                className="text-xs rounded px-1.5 py-0.5"
+                className="text-xs rounded px-1.5 py-0.5 s2j-field"
                 style={{ background: 'var(--s2j-bg)', color: 'var(--s2j-text)', border: '1px solid var(--s2j-border)' }}
               >
                 <option value="">—</option>

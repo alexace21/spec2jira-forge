@@ -1,6 +1,6 @@
 import React from "react";
 import { IconX } from "./Icon";
-import { SignalIcon } from "./Signal";
+import { SignalCallout } from "./Signal";
 
 // Checkbox-matching normalizer — kept IN SYNC with normAC in src/testcases.js (the authoritative
 // backend coverage normalizer). Ticking an AC stores the VERBATIM live AC string, so the box-tick →
@@ -153,15 +153,15 @@ export default function AcTraceEditor({ acTrace, acceptanceCriteria, onChange })
         </span>
       </label>
 
-      {/* stale references — grounded entries matching no current AC; dropped on save */}
+      {/* stale references — grounded entries matching no current AC; dropped on save.
+          moodboard (Phase 5): the warning vocabulary. */}
       {staleEntries.length > 0 && (
-        <div
-          className="rounded px-2 py-1 text-[11px]"
-          style={{ background: "var(--s2j-orange-bg)", border: "1px solid var(--s2j-orange-border)", color: "var(--s2j-text)" }}
+        <SignalCallout
+          kind="warning"
+          title={`${staleEntries.length} reference${staleEntries.length > 1 ? "s" : ""} no longer match an AC (will be dropped on save)`}
+          fontSize={11}
+          style={{ marginTop: 4 }}
         >
-          <p className="font-semibold mb-0.5">
-            <SignalIcon kind="warning" size={14} /> {staleEntries.length} reference{staleEntries.length > 1 ? "s" : ""} no longer match an AC (will be dropped on save)
-          </p>
           {staleEntries.map((t, i) => (
             <div key={i} className="flex items-start gap-1">
               <span style={{ color: "var(--s2j-text-light)" }}>{t.ac_text}</span>
@@ -170,7 +170,7 @@ export default function AcTraceEditor({ acTrace, acceptanceCriteria, onChange })
               </button>
             </div>
           ))}
-        </div>
+        </SignalCallout>
       )}
     </div>
   );

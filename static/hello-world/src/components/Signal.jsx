@@ -104,8 +104,11 @@ export function SignalCallout({ kind = "info", title, children, style, iconTitle
       style={{
         background: c.bg,
         border: `1px solid ${c.border}`,
-        borderRadius: 8,
+        // moodboard (2026-06-27, additive): match card depth — radius 8→12 + a soft blue-tinted shadow so
+        // callouts sit at the same elevation as MoodCard. Pure paint; tone/border/icon/body all unchanged.
+        borderRadius: 12,
         padding: "10px 12px",
+        boxShadow: "0 4px 16px rgba(5,38,89,0.06)",
         display: "flex",
         gap: 10,
         alignItems: "flex-start",

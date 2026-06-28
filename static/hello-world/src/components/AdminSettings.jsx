@@ -2,7 +2,8 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@forge/bridge";
 import { classText, opLabel, levelColor, relTime } from "../lib/diagnosticsView";
 import { IconCheck, IconX, IconMaximize, IconChevronRight } from "./Icon";
-import { SignalIcon } from "./Signal";
+import { SignalIcon, SignalCallout } from "./Signal";
+import { MoodCard, TYPE, MOOD, glassSurface } from "./moodboard";
 
 /**
  * AdminSettings — v3.0.0 BYOK configuration page.
@@ -391,10 +392,8 @@ export default function AdminSettings({ initialTab = "settings", diagRefFilter =
     <div>
       {tabBar}
     <div className="p-8" style={{ maxWidth: "640px" }}>
-      <h1
-        className="text-xl font-semibold mb-1"
-        style={{ color: "var(--s2j-text)" }}
-      >
+      {/* moodboard (Phase 3) — navy settings title. */}
+      <h1 className="mb-1" style={{ ...TYPE.title, fontSize: 22, color: MOOD.navy }}>
         Spec2Tickets Settings
       </h1>
       <p className="text-sm mb-5" style={{ color: "var(--s2j-text-muted)" }}>
@@ -403,13 +402,7 @@ export default function AdminSettings({ initialTab = "settings", diagRefFilter =
 
       {/* Account / Plan — read-only status for the customer's admin */}
       {account && (
-        <div
-          className="rounded-lg p-4 mb-6"
-          style={{
-            background: "var(--s2j-bg-section)",
-            border: "1px solid var(--s2j-border)",
-          }}
-        >
+        <MoodCard density="minor" style={{ marginBottom: 24 }}>
           <p
             className="text-xs font-medium uppercase tracking-wider mb-3"
             style={{ color: "var(--s2j-text-muted)" }}
@@ -474,20 +467,15 @@ export default function AdminSettings({ initialTab = "settings", diagRefFilter =
                   }`}
             </p>
           )}
-        </div>
+        </MoodCard>
       )}
 
       {/* Info callout (v6 value framing). BOTH editions are BYOK (your own Anthropic
           key); the difference is the feature set — Standard = core, Advanced = + test
-          cases. The old "Managed — no key needed" path was removed (false under v6). */}
-      <div
-        className="rounded-lg p-4 mb-6 text-sm"
-        style={{
-          background: "var(--s2j-blue-bg)",
-          border: "1px solid var(--s2j-blue-border)",
-          color: "var(--s2j-text)",
-        }}
-      >
+          cases. The old "Managed — no key needed" path was removed (false under v6).
+          moodboard (Phase 3): a glass MoodCard with a blue accent bar keeps the "this is
+          guidance" cue without the heavy full-blue tint. */}
+      <MoodCard density="minor" accent="var(--s2j-blue)" style={{ marginBottom: 24 }} className="text-sm">
         <p className="mb-2">
           <strong>Powered by Claude:</strong> Spec2Tickets uses Anthropic's Claude
           Sonnet 4.6 to analyze your Confluence pages. Both editions run on your own
@@ -549,7 +537,7 @@ export default function AdminSettings({ initialTab = "settings", diagRefFilter =
           </a>
           {" "}+ your own data processing agreement with Anthropic.
         </p>
-      </div>
+      </MoodCard>
 
       {/* Form */}
       <div className="space-y-5">
@@ -571,7 +559,7 @@ export default function AdminSettings({ initialTab = "settings", diagRefFilter =
                 value={anthropicApiKey}
                 onChange={handleApiKeyChange}
                 placeholder={apiKeyConfigured ? "•••••••• (configured)" : "sk-ant-api03-..."}
-                className="flex-1"
+                className="flex-1 s2j-field"
                 style={inputStyle}
                 autoComplete="off"
               />
@@ -618,6 +606,7 @@ export default function AdminSettings({ initialTab = "settings", diagRefFilter =
             value={defaultProjectKey}
             onChange={(e) => setDefaultProjectKey(e.target.value.toUpperCase())}
             placeholder="PROJ"
+            className="s2j-field"
             style={{
               ...inputStyle,
               maxWidth: "160px",
@@ -669,6 +658,7 @@ export default function AdminSettings({ initialTab = "settings", diagRefFilter =
                   }}
                   placeholder={'{\n  "customfield_10042": { "value": "Platform" },\n  "customfield_10016": 3\n}'}
                   rows={6}
+                  className="s2j-field"
                   style={{
                     ...inputStyle,
                     fontFamily: "monospace",
@@ -678,14 +668,7 @@ export default function AdminSettings({ initialTab = "settings", diagRefFilter =
                   spellCheck={false}
                 />
               </Field>
-              <div
-                className="rounded-lg p-3 mt-2 text-xs"
-                style={{
-                  background: "var(--s2j-blue-bg)",
-                  border: "1px solid var(--s2j-blue-border)",
-                  color: "var(--s2j-text)",
-                }}
-              >
+              <SignalCallout kind="info" style={{ marginTop: 8 }} fontSize={12}>
                 <p className="mb-1">
                   <strong>How to find a field ID:</strong> in Jira go to Settings → Issues → Custom fields, click the field → the URL contains <code>customfield_XXXXX</code>. The <em>value shape</em> depends on the field type:
                 </p>
@@ -702,31 +685,22 @@ export default function AdminSettings({ initialTab = "settings", diagRefFilter =
                   </a>{" "}
                   — paste your push error and we'll help map the fields.
                 </p>
-              </div>
+              </SignalCallout>
             </div>
           )}
         </div>
       </div>
 
+      {/* moodboard (Phase 3) — keep the role=alert live region (a11y) and let
+          SignalCallout carry the success/error vocabulary inside it. */}
       {message && (
-        <div
-          role="alert"
-          aria-live="polite"
-          className="mt-4 rounded-lg p-3 text-sm"
-          style={{
-            background:
-              message.type === "success"
-                ? "var(--s2j-green-bg)"
-                : "var(--s2j-red-bg)",
-            border: `1px solid ${
-              message.type === "success"
-                ? "var(--s2j-green-border)"
-                : "var(--s2j-red-border)"
-            }`,
-            color: "var(--s2j-text)",
-          }}
-        >
-          {message.text}
+        <div role="alert" aria-live="polite" className="mt-4">
+          <SignalCallout
+            kind={message.type === "success" ? "success" : "error"}
+            fontSize={14}
+          >
+            {message.text}
+          </SignalCallout>
         </div>
       )}
 
@@ -1021,10 +995,8 @@ function DiagnosticsTab({ refFilter = "", onRefFilterChange }) {
 
   return (
     <div className="p-8" style={{ maxWidth: "640px" }}>
-      <h1
-        className="text-xl font-semibold mb-1"
-        style={{ color: "var(--s2j-text)" }}
-      >
+      {/* moodboard (Phase 5) — navy diagnostics title. */}
+      <h1 className="mb-1" style={{ ...TYPE.title, fontSize: 22, color: MOOD.navy }}>
         Diagnostics
       </h1>
       <p className="text-sm mb-5" style={{ color: "var(--s2j-text-muted)" }}>
@@ -1038,6 +1010,7 @@ function DiagnosticsTab({ refFilter = "", onRefFilterChange }) {
           value={refFilter}
           onChange={(e) => onRefFilterChange && onRefFilterChange(e.target.value)}
           placeholder="Filter by diagnostic ref…"
+          className="s2j-field"
           style={{
             ...inputStyle,
             maxWidth: "280px",
@@ -1070,10 +1043,10 @@ function DiagnosticsTab({ refFilter = "", onRefFilterChange }) {
           timestamp only — no page/document content. */}
       {data?.sweepHeartbeat && (
         <div
-          className="rounded-md p-3 mb-3 flex items-center gap-2 text-xs"
+          className="mb-3 flex items-center gap-2 text-xs"
           style={{
-            background: "var(--s2j-bg-section)",
-            border: "1px solid var(--s2j-border)",
+            ...glassSurface("utility"),
+            padding: 12,
             color: "var(--s2j-text)",
           }}
           title="Vendor maintenance: the daily background job that removes never-pushed breakdowns 7 days after last access. Counts only — no page or document content."
@@ -1577,17 +1550,12 @@ function ContextProfilesEditor({ profiles, setProfiles, apiKeyConfigured, onMess
       </p>
 
       {profiles.length === 0 && (
-        <p
-          className="text-xs mb-3 rounded-md p-3"
-          style={{
-            background: "var(--s2j-bg-section)",
-            border: "1px solid var(--s2j-border)",
-            color: "var(--s2j-text-muted)",
-          }}
-        >
-          No project context yet. Add one per project to tailor breakdowns to its domain,
-          glossary, and conventions.
-        </p>
+        <MoodCard density="utility" style={{ marginBottom: 12 }}>
+          <p style={{ ...TYPE.micro }}>
+            No project context yet. Add one per project to tailor breakdowns to its domain,
+            glossary, and conventions.
+          </p>
+        </MoodCard>
       )}
 
       <div className="space-y-4">
@@ -1596,11 +1564,7 @@ function ContextProfilesEditor({ profiles, setProfiles, apiKeyConfigured, onMess
           const over = (p.context || "").trim().length > PROJECT_CONTEXT_MAX_CHARS;
           const busy = distillingId === p.id;
           return (
-            <div
-              key={p.id}
-              className="rounded-lg p-3"
-              style={{ border: "1px solid var(--s2j-border)", background: "var(--s2j-bg)" }}
-            >
+            <MoodCard key={p.id} density="minor">
               <div className="flex items-center gap-2 mb-2">
                 <input
                   type="text"
@@ -1609,6 +1573,7 @@ function ContextProfilesEditor({ profiles, setProfiles, apiKeyConfigured, onMess
                   placeholder="Context name (e.g. Logistics Platform)"
                   maxLength={CONTEXT_PROFILE_NAME_MAX}
                   disabled={busy}
+                  className="s2j-field"
                   style={{ ...inputStyle, fontWeight: 600 }}
                 />
                 <button
@@ -1638,6 +1603,7 @@ function ContextProfilesEditor({ profiles, setProfiles, apiKeyConfigured, onMess
                 }
                 rows={6}
                 disabled={busy}
+                className="s2j-field"
                 style={{ ...inputStyle, resize: "vertical", lineHeight: 1.5, opacity: busy ? 0.6 : 1 }}
                 spellCheck={true}
               />
@@ -1714,19 +1680,12 @@ function ContextProfilesEditor({ profiles, setProfiles, apiKeyConfigured, onMess
               {/* [diag Phase 5 (I)] Distill category-drop note — the final merge was
                   missing these categories (the §8 starvation marker). ADDITIVE. */}
               {distillDropped && distillDropped.id === p.id && (
-                <p
-                  className="text-xs mt-2 rounded-md p-2"
-                  style={{
-                    background: "var(--s2j-orange-bg)",
-                    border: "1px solid var(--s2j-orange-border)",
-                    color: "var(--s2j-text)",
-                  }}
-                >
+                <SignalCallout kind="warning" style={{ marginTop: 8 }} fontSize={12}>
                   Categories not extracted: {distillDropped.labels.join(", ")} —
                   re-run Summarize with Claude to fill them.
-                </p>
+                </SignalCallout>
               )}
-            </div>
+            </MoodCard>
           );
         })}
       </div>
@@ -1790,7 +1749,7 @@ function ContextProfilesEditor({ profiles, setProfiles, apiKeyConfigured, onMess
                 }}
               >
                 <div className="flex items-center justify-between mb-3">
-                  <span className="text-sm font-semibold" style={{ color: "var(--s2j-text)" }}>
+                  <span className="text-sm font-semibold" style={{ color: MOOD.navy }}>
                     {p.name || "Project context"}
                   </span>
                   <button
@@ -1821,6 +1780,7 @@ function ContextProfilesEditor({ profiles, setProfiles, apiKeyConfigured, onMess
                     "Personas: Ops Coordinator, Customs Broker, Account Manager.\n" +
                     "Conventions: UK English; refer to services by their internal names."
                   }
+                  className="s2j-field"
                   style={{
                     ...inputStyle,
                     flex: 1,
@@ -1890,17 +1850,10 @@ function ContextProfilesEditor({ profiles, setProfiles, apiKeyConfigured, onMess
                 {/* [diag Phase 5 (I)] Distill category-drop note — mirrored in the
                     focus-mode editor (a distill run from here must surface it too). */}
                 {distillDropped && distillDropped.id === p.id && (
-                  <p
-                    className="text-xs mt-2 rounded-md p-2"
-                    style={{
-                      background: "var(--s2j-orange-bg)",
-                      border: "1px solid var(--s2j-orange-border)",
-                      color: "var(--s2j-text)",
-                    }}
-                  >
+                  <SignalCallout kind="warning" style={{ marginTop: 8 }} fontSize={12}>
                     Categories not extracted: {distillDropped.labels.join(", ")} —
                     re-run Summarize with Claude to fill them.
-                  </p>
+                  </SignalCallout>
                 )}
               </div>
             </div>
@@ -1961,7 +1914,7 @@ const inputStyle = {
   width: "100%",
   padding: "8px 12px",
   fontSize: "0.875rem",
-  borderRadius: "6px",
+  borderRadius: "10px",
   border: "1px solid var(--s2j-border)",
   background: "var(--s2j-bg)",
   color: "var(--s2j-text)",

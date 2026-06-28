@@ -309,7 +309,7 @@ function SharedACItem({
         <select
           value={item.assigned_feature || ''}
           onChange={(e) => e.target.value ? onAssign(e.target.value) : onUnassign()}
-          className="flex-1 rounded px-2 py-1.5 text-[11px] outline-none transition-colors"
+          className="flex-1 rounded px-2 py-1.5 text-[11px] outline-none transition-colors s2j-field"
           style={{
             border: isAssigned ? '1px solid var(--s2j-green-border)' : '1px solid var(--s2j-border)',
             color: isAssigned ? '#065f46' : 'var(--s2j-text)',

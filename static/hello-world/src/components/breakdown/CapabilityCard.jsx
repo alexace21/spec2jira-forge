@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import FeatureCard from './FeatureCard.jsx';
 import { newStoryUid } from '../../lib/v3Schema';
+import { glassSurface, MOOD } from '../moodboard';
 
 /**
  * CapabilityCard — Editor for a single Capability (→ JIRA Epic).
@@ -61,9 +62,11 @@ export default function CapabilityCard({ capability, index, onUpdate, onDelete }
 
   return (
     <div className="rounded-lg overflow-hidden" style={{
-      border: '1px solid var(--s2j-border)',
+      // moodboard — the Category is the editor's top structural level, so it carries the glass
+      // surface; the blue left-accent is kept. (overflow-hidden lives on the className — the
+      // SelectBadge type dropdown is portaled out and relies on the clip.)
+      ...glassSurface('minor'),
       borderLeft: '4px solid var(--s2j-blue)',
-      background: 'var(--s2j-bg)',
     }}>
       {/* Header */}
       <button
@@ -88,7 +91,7 @@ export default function CapabilityCard({ capability, index, onUpdate, onDelete }
           <span className="text-[10px]" style={{ color: 'var(--s2j-text-muted)' }}>Category</span>
         </span>
 
-        <span className="flex-1 truncate text-sm font-semibold" style={{ color: 'var(--s2j-text)' }}>
+        <span className="flex-1 truncate text-sm font-semibold" style={{ color: MOOD.navy }}>
           {capability.name}
         </span>
 

@@ -4,6 +4,7 @@ import { newStoryUid } from '../../lib/v3Schema';
 import CapabilityCard from './CapabilityCard.jsx';
 import SharedACPanel from './SharedACPanel.jsx';
 import LabelsEditor from './LabelsEditor.jsx';
+import { glassSurface } from '../moodboard';
 
 export default function BreakdownEditor({ initialBreakdown, onPush, isPushing = false, breakdownRef }) {
   const [breakdown, setBreakdown] = useState(() => JSON.parse(JSON.stringify(initialBreakdown)));
@@ -117,7 +118,8 @@ export default function BreakdownEditor({ initialBreakdown, onPush, isPushing = 
   // resolve against (that combination collapsed the editor to ~0 live). `flex flex-col`
   // just stacks the three zones (stats bar · content · push bar) at natural height.
   return (
-    <div className="flex flex-col" style={{ background: 'var(--s2j-bg)' }}>
+    // transparent so the app's ambient ice field (body) shows through — the glass cards float on ice.
+    <div className="flex flex-col" style={{ background: 'transparent' }}>
       {/* Stats bar */}
       <div className="shrink-0 px-4 py-2.5" style={{
         borderBottom: '1px solid var(--s2j-border)',
@@ -152,10 +154,12 @@ export default function BreakdownEditor({ initialBreakdown, onPush, isPushing = 
       <div className="px-4 py-4 space-y-4">
         {/* Epic metadata */}
         {breakdown.epic && (
-          <div className="rounded-lg p-4 space-y-3" style={{
-            background: 'var(--s2j-bg)',
-            border: '1px solid var(--s2j-border)',
+          <div className="rounded-lg space-y-3" style={{
+            // moodboard (Phase 4) — the Epic is the breakdown's top scope, so it gets the
+            // glass surface with its blue left-accent (consistent in both A/B variants).
+            ...glassSurface('minor'),
             borderLeft: '4px solid var(--s2j-blue)',
+            padding: 16,
           }}>
             <div className="flex items-center gap-2 mb-1">
               <span className="rounded px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider"
