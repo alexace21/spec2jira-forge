@@ -361,6 +361,26 @@ package names de-scaffolded (→ `spec2tickets`). Build green (bundle ≈ −1.4
 
 ---
 
+## ⚡ HANDOVER NOTE (2026-06-28 — ⭐⭐⭐ APP-WIDE MOODBOARD ROLLOUT → v6.5.0: P0–P5 + deep audit + aggressive token re-theme + A/B=Glass + collapsible test cases; agent-conducted; branch `feature/UI-UX-improvements`)
+
+> ⚠ Branch `feature/UI-UX-improvements` — **DEV-deployed + partner live-accepted; partner pushes + merges to `main` + deploys to PROD via the new GitHub Actions workflow.** Durable: [[moodboard-design-system]] (rollout complete) · [[ui-button-color-convention]] · [[deep-audit-vs-per-change-gate]] (vindicated again — cross-phase gaps). Commits this session (8): `41cd66f` P0 kit → `7698560` P1 → `5a3b86c` P2 → `8559d59` P3 → `6dc9366` P4 → `d545910` P5 → `cb25155` deep-audit fixes → `213ce94` re-theme+A/B-finalize → `823661a` collapse → `df9ab72` v6.5.0 bump.
+
+The moodboard (from [[moodboard-design-system]]) is now rolled out across the WHOLE app, taken to **v6.5.0**, finalized + live-accepted. Cadence: a kit (P0) → per-surface phases (P1–P5, each: build → §13 read-only gate → fix → commit) → a partner-instructed **whole-surface deep audit** (5 lenses × adversarial verify over all 6 phases) → live calibration rounds.
+
+⭐ **THE METHOD WIN (vindicates [[deep-audit-vs-per-change-gate]] AGAIN):** the per-PHASE §13 gates each passed (each saw only its own phase's diff), but the **whole-surface deep audit caught 3 real CROSS-PHASE consistency gaps a per-phase gate structurally cannot see** — ErrorScreen was the ONLY screen left without the `ScreenHeader` `<h2>` every other screen got; LabelsEditor + SharedACPanel fields lacked the `.s2j-field` focus ring applied everywhere else. All fixed (`cb25155`). The audit also explicitly VERIFIED the load-bearing invariants intact (index callbacks, the Forge-iframe page-scroll rule, button conventions, a11y live region, every data-bearing conversion) + correctly REFUTED the noise (TestCasesScreen "missed" → already moodboard'd via WizardKit; a false "flat variant loses portal clip" HIGH).
+
+⭐⭐ **THE BIG LESSON (live calibration — fold into [[moodboard-design-system]]):** the first per-component paint was **too subtle** — `MoodCard` minor/utility used a FLAT near-opaque `rgba(255,255,255,.72)` fill that is **near-invisible on a white page** ("не виждам разлики"). FIX = impose the moodboard at the **TOKEN + KIT level**, not per-component: (1) `glassSurface` (all densities) now carries the **ice→white gradient** that makes glass visible (the Capacity-Planner `stepSurface` look); (2) the `:root` neutral tokens were RE-THEMED app-wide — greys → navy/steel/sky-steel, borders+section fills → ice, the page `body` sits on a faint ice field — so **every screen repaints at once** (everything reads `var(--s2j-*)`). Calibrated SOFT per partner feedback (page `#f7faff`, section `#eef5fd`, glass ice 0.12/0.18/0.34). ⚠ **Deliberate exceptions (the agreed rule): the action buttons (green=commit/blue=nav/red=danger) + the SEMANTIC severity tints (Signal.jsx traffic-light + data badges: confidence ✓/⚠/✗, complexity, priority, task-type) are LEFT** — buttons keep the convention; severity stays a true signal.
+
+⭐ **A/B (Phase 4) = GLASS.** A temp in-app `Glass | Flat` toggle let the partner compare LIVE in one deploy; they chose Glass (full-glass every Story card). The toggle + `featureGlass` prop plumbing are REMOVED and Glass is hardcoded (`213ce94`). The editor's load-bearing constraints HELD (page-scroll only — `glassSurface` adds no height/overflow; `FeatureCard`+`CapabilityCard` keep `overflow-hidden` on the className for the `SelectBadge` portal clip).
+
+⭐ **Collapsible test cases (`823661a`).** In the Test-Cases per-story wizard each `EditableCaseRow` is now collapsible, **CLOSED by default** (`useState(!!isNewCase)` — new cases open) — header (chevron · # · type · priority · title) scans, click to open. Toggle is a `<span role=button>` (works inside the read-only disabled `<fieldset>`); the Save/Revert bar + a §11 invalid-marker stay visible when collapsed (never hide state); the ABSOLUTE-index model is untouched. §13 gate fixed 2 a11y findings (aria-label + focus-keep-on-collapse).
+
+**Verified:** CI=true CRA build green throughout; `npm run check` green (syntax 11/11 + **version-drift-guard: package.json + DIAG_APP_VERSION both 6.5.0**, lockstep). Dev redeployed with the final build (toggle gone). Release summary + notes drafted for the partner (≤80 / ≤1000).
+
+**NEXT (partner-executed):** push `feature/UI-UX-improvements` → merge to `main` → ⭐ **deploy to PRODUCTION via the new GitHub Actions workflow** (`.github/workflows/deploy.yml`, manual-approval Environment; this is the FIRST real prod use of the CI deploy — watch for the Node-24.18.0 pin fix from [[mvp-monitoring-cicd]]; ship-from-local is the fallback if it fails). No new scopes in this release → no customer re-consent. **Then the moodboard rollout is DONE** — future moodboard work is calibration only (the token/kit levers are the place to tune).
+
+---
+
 ## ⚡ HANDOVER NOTE (2026-06-27 — ⭐⭐ UI/UX MOODBOARD WIZARDS: Capacity-Planner + Test-Cases redesigned; design-army → §13 → deep-audit → fix-verify cadence; agent-conducted; branch `feature/UI-UX-improvements`)
 
 > ⚠ Branch `feature/UI-UX-improvements` — DEV-deployed + partner live-accepted; **partner pushes**. Two feature
