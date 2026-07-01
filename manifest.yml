@@ -128,6 +128,14 @@ permissions:
     # scopes above cover both. If PagePicker search ever 403s after this,
     # re-add read:confluence-content.summary (its classic equivalent).
     - read:page:confluence
+    # read:confluence-user — resolve the page's last-editor accountId → display name for the
+    # ReadyScreen "Pre-flight check" RIGHT PAGE? tile ("v{n} · last edited {date} by {name}").
+    # ⚠ NEW SCOPE (added 2026-07-01, partner-approved with eyes open) → forces a one-time
+    # customer RE-CONSENT (every site admin re-approves in Manage Apps on the next release).
+    # Pairs with the classic v1 user endpoint GET /wiki/rest/api/user?accountId={id} (the v1
+    # USER API is live — only the v1 CONTENT API is 410 Gone). displayName may be null under a
+    # user's privacy settings → fetchPage degrades to "v{n} · last edited {date}", never fabricates.
+    - read:confluence-user
     # v3.0.0 NEW — JIRA write scopes for asUser() push.
     # Replaces v2.x service-account pattern (was: backend uses customer-
     # provisioned email + API token к POST к JIRA). Forge native

@@ -28,6 +28,8 @@ import {
   IconLink,
   IconCalendar,
   IconList,
+  IconCheck,
+  IconChevronRight,
 } from "./components/Icon";
 import {
   adaptToLegacyShape,
@@ -40,6 +42,12 @@ import {
   QUALITY_PALETTE,
 } from "./lib/v3Schema";
 import { classText } from "./lib/diagnosticsView";
+import {
+  extractPageOutline,
+  estimateGenerationTimeBand,
+  preflightVerdict,
+  preflightAmberCount,
+} from "./lib/pageOutline";
 import "./index.css";
 
 // v3.0.0 result-loading helper. Resolver getResults returns either
@@ -392,6 +400,11 @@ function App() {
   // their monthly fair-use count + reset date on the Ready screen, for transparency
   // before they hit the cap (not only after). Best-effort; fed by the getUsage resolver.
   const [usage, setUsage] = useState(null);
+  // Page-preflight (design-army synthesis, 2026-07-01) — the default Jira project key
+  // is already fetched by getSettings() at mount for the setup gate below, but was
+  // previously discarded; retained here (mirrors the existing contextProfiles state
+  // pattern) so ReadyScreen can name the ACTUAL push target before the user commits.
+  const [defaultProjectKey, setDefaultProjectKey] = useState(null);
   const loadUsage = useCallback(async () => {
     try {
       const u = await invoke("getUsage");
@@ -665,6 +678,7 @@ function App() {
           invoke("getUsage").catch(() => null),
         ]);
         if (mountUsage && !mountUsage.error) setUsage(mountUsage);
+        if (settings?.defaultProjectKey) setDefaultProjectKey(settings.defaultProjectKey);
 
         // v6 value-split: BOTH editions are BYOK → every user needs an Anthropic key. The
         // old `isManaged` (edition==='advanced') exemption that let Managed users past setup
@@ -2497,6 +2511,7 @@ function App() {
           onOpenSettings={handleOpenSettings}
           onOpenDiagnostics={handleOpenDiagnostics}
           genFailureNotice={genFailureNotice}
+          defaultProjectKey={defaultProjectKey}
         />
       );
     case "generating":
@@ -2815,6 +2830,7 @@ function ReadyScreen({
   onOpenSettings,
   onOpenDiagnostics,
   genFailureNotice = null,
+  defaultProjectKey = null,
 }) {
   // Prices come from getUsage's pricing[] (single source of truth — no hardcoded
   // USD prices in the UI). v6 value-split: both paid editions (Standard + Advanced)
@@ -2822,6 +2838,14 @@ function ReadyScreen({
   // plus a "includes test cases" value-signal for Advanced. The managedPro branch
   // below is DORMANT (off-Marketplace only; both live editions are unlimited).
   const byokProPrice = findPrice(usage, "byokPro");
+  // Page-preflight (design-army synthesis, 2026-07-01) — pure client-side extraction
+  // over data already fetched (pageData.body); see lib/pageOutline.js.
+  const outline = useMemo(() => extractPageOutline(pageData.body), [pageData.body]);
+  const timeBand = useMemo(
+    () => estimateGenerationTimeBand(pageData.body_length),
+    [pageData.body_length],
+  );
+  const selectedProfile = contextProfiles.find((p) => p.id === selectedContextProfileId);
   return (
     <div className="p-6" style={SCREEN_MAX_WIDTH_STYLE}>
       {/* moodboard (Phase 1) — the Ready header is the app's primary landing surface:
@@ -2927,26 +2951,21 @@ function ReadyScreen({
         </div>
       )}
 
-      {/* v3.0.0 ReadyScreen — simplified UX.
-          v2.x had Document Type radios (MODULE/FEATURE/EPIC_PRODUCT) +
-          Bypass Cache toggle + Preview button. v3.0.0 drops all three:
-          - Sonnet 4.6 doesn't need document-type scoping hint (handles
-            structure automatically via its 1M context + agentic reasoning)
-          - Prompt caching е auto-managed by Anthropic; не customer-facing
-          - Preview (CG-7 pre-flight) was а ~30-90 sec sanity check на
-            v2.x's ~10-30 min full pipeline. v3.0.0 full run е already
-            60-150 sec total — preview adds no value. */}
-      <SignalCallout
-        kind="info"
-        title="Ready to generate"
-        style={{ marginBottom: 16 }}
-        fontSize={14}
-      >
-        Claude Sonnet 4.6 will analyze this Confluence page and produce a
-        structured Jira breakdown — Stories, Subtasks, cross-feature
-        dependencies, and quality signals. Typical runtime: a few minutes,
-        depending on the size of your page.
-      </SignalCallout>
+      {/* Pre-flight check (design-army + verdict-logic army, 2026-07-01) — replaces the
+          static "Ready to generate" boilerplate with a go/no-go card built for the PO/BA
+          who owns the spec: a tri-state VERDICT + four "answer tiles" (right page? complete?
+          right project? how long?) + a collapsed annotated outline. Every signal is a
+          deterministic STRUCTURAL fact (empty leaf sections, task-list state, presence
+          flags, edit metadata) — no free-text guessing — so a repeat user never sees a wrong
+          number. It NEVER blocks Generate; the PO owns the call. */}
+      <PreflightCard
+        key={pageData.page_id}
+        outline={outline}
+        timeBand={timeBand}
+        defaultProjectKey={defaultProjectKey}
+        selectedProfile={selectedProfile}
+        pageData={pageData}
+      />
 
       {/* Project Context selector — pick which named context applies to THIS spec, so
           a multi-project workspace never gets the wrong project's context injected. */}
@@ -3001,6 +3020,517 @@ function ReadyScreen({
         </button>
       </div>
     </div>
+  );
+}
+
+// ── Pre-flight check card (design-army synthesis "2A verdict + 2B annotated outline" +
+// verdict-logic army STRUCTURAL-PURIST ruling, 2026-07-01) ─────────────────────────────
+// The go/no-go card the PO/BA sees right before spending 2-10 min + their own Anthropic
+// money: a tri-state VERDICT banner, four "answer tiles" (right page? complete? goes
+// where? how long?), and a collapsed annotated outline. Every signal is a DETERMINISTIC
+// STRUCTURAL fact from lib/pageOutline.js — no free-text guessing (a wrong "3 TODOs" once
+// makes a repeat user distrust the card forever). It NEVER blocks Generate; the PO owns
+// the spec, we just surface what we can see.
+
+// Tone map. AMBER = --s2j-orange (caution) — matches the design-mockup's warning banner + the
+// orange empty/TODO markers. This is a semantic caution use (not an action button), so it does not
+// touch the green/blue/red action-button convention.
+const PREFLIGHT_TONE = {
+  green: { fg: "var(--s2j-green)", bg: "var(--s2j-green-bg)", border: "var(--s2j-green-border)" },
+  amber: { fg: "var(--s2j-orange)", bg: "var(--s2j-orange-bg)", border: "var(--s2j-orange-border)" },
+  thin:  { fg: "var(--s2j-red)", bg: "var(--s2j-red-bg)", border: "var(--s2j-red-border)" },
+};
+
+// relative "edited N days/weeks ago" — a factual staleness/ownership cue, NEVER a verdict
+// gate (an old-but-complete page is fine). Returns null when the resolver couldn't supply a
+// timestamp (older Confluence payloads / privacy), and the tile degrades gracefully.
+function fmtEditedAgo(iso) {
+  if (!iso) return null;
+  const then = Date.parse(iso);
+  if (Number.isNaN(then)) return null;
+  const days = Math.floor((Date.now() - then) / 86400000);
+  if (days <= 0) return "edited today";
+  if (days === 1) return "edited yesterday";
+  if (days < 7) return `edited ${days} days ago`;
+  if (days < 14) return "edited last week";
+  if (days < 60) return `edited ${Math.floor(days / 7)} weeks ago`;
+  if (days < 365) return `edited ${Math.floor(days / 30)} month${Math.floor(days / 30) === 1 ? "" : "s"} ago`;
+  return `edited over a year ago`;
+}
+
+const PREFLIGHT_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+// absolute "Jun 24, 2026" (header meta) — null when the resolver had no timestamp.
+function fmtEditedDate(iso) {
+  if (!iso) return null;
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return null;
+  const d = new Date(t);
+  return `${PREFLIGHT_MONTHS[d.getMonth()]} ${d.getDate()}, ${d.getFullYear()}`;
+}
+// short "Jun 24" (RIGHT PAGE tile line 3).
+function fmtEditedDateShort(iso) {
+  if (!iso) return null;
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return null;
+  const d = new Date(t);
+  return `${PREFLIGHT_MONTHS[d.getMonth()]} ${d.getDate()}`;
+}
+
+const plur = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+const cap1 = (s) => (s ? s.charAt(0).toUpperCase() + s.slice(1) : s);
+
+// The verdict icon carries the tone colour + a redundant SHAPE (colour is never the only signal),
+// mirroring the design mockup: green check = ready, orange warning-triangle = worth a glance,
+// red warning-triangle = stub.
+function PreflightVerdictIcon({ verdict, size = 20 }) {
+  const kind = verdict === "green" ? "success" : verdict === "amber" ? "warning" : "error";
+  return <SignalIcon kind={kind} size={size} />;
+}
+
+// One "answer tile" — a small glass utility surface: an icon + UPPERCASE micro question,
+// then the fact(s). `tone` optionally colours the icon (used for the COMPLETE verdict).
+function PreflightTile({ icon: Ico, label, tone, children }) {
+  return (
+    <div style={{ ...glassSurface("utility"), padding: "10px 12px" }}>
+      <div className="flex items-center gap-1.5" style={{ marginBottom: 5 }}>
+        <span style={{ color: tone || "var(--s2j-text-muted)", display: "inline-flex" }}>
+          <Ico size={13} />
+        </span>
+        <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.06em", color: "var(--s2j-text-muted)" }}>
+          {label}
+        </span>
+      </div>
+      <div style={{ fontSize: 13, lineHeight: 1.4, color: "var(--s2j-text)" }}>{children}</div>
+    </div>
+  );
+}
+
+// One status line in the COMPLETE? tile — a coloured MARKER (distinct shape) + dark readable text
+// (colour never the only signal): empty = orange hollow square, todo = orange filled dot, ok =
+// green check. Mirrors the design mockup's completion breakdown.
+function PreflightStatusLine({ kind, children }) {
+  let marker;
+  if (kind === "empty") {
+    marker = <span style={{ width: 9, height: 9, border: "1.5px solid var(--s2j-orange)", borderRadius: 2, display: "inline-block", flexShrink: 0 }} />;
+  } else if (kind === "todo") {
+    marker = <span style={{ width: 8, height: 8, background: "var(--s2j-orange)", borderRadius: 999, display: "inline-block", flexShrink: 0 }} />;
+  } else {
+    marker = <span style={{ color: "var(--s2j-green)", display: "inline-flex", flexShrink: 0 }}><IconCheck size={12} /></span>;
+  }
+  return (
+    <div className="flex items-center gap-1.5" style={{ fontSize: 12.5, color: "var(--s2j-text)", marginTop: 3 }}>
+      {marker}
+      <span>{children}</span>
+    </div>
+  );
+}
+
+// Segmented task-completion bar (COMPLETE? tile) — segments proportional to tasks-checked, matching
+// the mockup's thin-segment progress bar. Purely a visual proportion; the exact "N/M tasks checked"
+// number is the authoritative figure on the line below it.
+function TaskProgressBar({ total, complete }) {
+  if (!total) return null;
+  const segs = Math.min(total, 24);
+  const filled = Math.round((Math.max(0, Math.min(complete, total)) / total) * segs);
+  return (
+    <div className="flex" style={{ gap: 2, marginBottom: 2, marginTop: 1 }}>
+      {Array.from({ length: segs }).map((_, i) => (
+        <div
+          key={i}
+          style={{
+            flex: 1,
+            height: 8,
+            borderRadius: 2,
+            background: i < filled ? "var(--s2j-blue)" : "var(--s2j-blue-bg)",
+          }}
+        />
+      ))}
+    </div>
+  );
+}
+
+// A top-level section "pill" (the outline row in the mockup): section title + a muted child-count
+// badge + orange rollup tags for unchecked TODOs / empty sub-sections in its subtree.
+function OutlinePill({ section }) {
+  const { text, childCount, emptyCount, openTodos } = section;
+  const tag = {
+    fontSize: 9.5,
+    fontWeight: 700,
+    letterSpacing: "0.02em",
+    color: "var(--s2j-orange)",
+    background: "var(--s2j-orange-bg)",
+    border: "1px solid var(--s2j-orange-border)",
+    borderRadius: 999,
+    padding: "0 6px",
+    lineHeight: "16px",
+    flexShrink: 0,
+  };
+  return (
+    <span
+      className="inline-flex items-center"
+      style={{
+        gap: 6,
+        padding: "4px 9px",
+        borderRadius: 8,
+        background: "var(--s2j-bg)",
+        border: "1px solid var(--s2j-border)",
+        fontSize: 12.5,
+        fontWeight: 500,
+        color: "var(--s2j-text)",
+        maxWidth: "100%",
+      }}
+    >
+      <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>{text}</span>
+      {childCount > 0 && (
+        <span style={{ fontSize: 10, fontWeight: 700, color: "var(--s2j-text-muted)", background: "var(--s2j-bg-section)", borderRadius: 999, padding: "0 5px", lineHeight: "15px", flexShrink: 0 }}>
+          {childCount}
+        </span>
+      )}
+      {openTodos > 0 && <span style={tag}>{openTodos === 1 ? "TODO" : `${openTodos} TODO`}</span>}
+      {emptyCount > 0 && <span style={tag}>{emptyCount} empty</span>}
+    </span>
+  );
+}
+
+// Guidance shown in place of the outline pills when the page has NO headings (thin / prose-only) —
+// keeps the card substantial (the brief required parity of volume, not a bare warning line).
+function PreflightGuidance() {
+  return (
+    <div>
+      <p style={{ ...TYPE.micro, margin: 0 }}>
+        No headings detected — Claude will still read the full page text.
+      </p>
+      <p style={{ ...TYPE.micro, margin: "4px 0 0" }}>
+        For the richest breakdown, give each feature or requirement its own heading — that is what
+        Claude maps into Epics, Stories, and dependencies.
+      </p>
+    </div>
+  );
+}
+
+// A small text chip on a detailed-outline row. `attention` = the orange caution accent (empty
+// leaf); otherwise a muted neutral (a content-presence fact like "table" / "diagram"). The WORD
+// carries the meaning — colour is only reinforcement (colourblind-safe).
+function OutlineChip({ attention, children }) {
+  return (
+    <span
+      style={{
+        fontSize: 10,
+        fontWeight: 600,
+        padding: "1px 6px",
+        borderRadius: 999,
+        whiteSpace: "nowrap",
+        color: attention ? "var(--s2j-orange)" : "var(--s2j-text-muted)",
+        background: attention ? "var(--s2j-orange-bg)" : "var(--s2j-bg-section)",
+        border: `1px solid ${attention ? "var(--s2j-orange-border)" : "var(--s2j-border)"}`,
+      }}
+    >
+      {children}
+    </span>
+  );
+}
+
+// The DETAILED annotated outline (the "2B" value) — the full <h*> hierarchy, indented by level,
+// each row flagged with its content-presence chips (empty / table / image / diagram / code). Shown
+// on demand behind the "Show detailed outline" toggle, BELOW the top-level pill summary. Only
+// rendered when the page has headings (structure-less pages get PreflightGuidance instead).
+function PreflightOutline({ outline }) {
+  return (
+    <ul style={{ listStyle: "none", margin: "10px 0 0", padding: 0 }}>
+      {outline.headings.map((h, i) => {
+        const depth = Math.min(h.level, 4) - 1;
+        const top = h.level <= 2;
+        return (
+          <li
+            key={`${i}-${h.level}-${h.text}`}
+            className="flex items-center gap-1.5"
+            style={{
+              marginLeft: depth * 14,
+              padding: "2px 0",
+              fontSize: 12,
+              lineHeight: 1.4,
+              color: top ? "var(--s2j-text)" : "var(--s2j-text-light)",
+              fontWeight: top ? 600 : 400,
+            }}
+          >
+            <span
+              style={{
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+                minWidth: 0,
+                flexShrink: 1,
+              }}
+            >
+              {h.text}
+            </span>
+            <span className="flex items-center gap-1" style={{ flexShrink: 0 }}>
+              {h.isEmpty && <OutlineChip attention>empty</OutlineChip>}
+              {h.hasTable && <OutlineChip>table</OutlineChip>}
+              {h.hasImage && <OutlineChip>image</OutlineChip>}
+              {h.hasDiagram && <OutlineChip>diagram</OutlineChip>}
+              {h.hasCode && <OutlineChip>code</OutlineChip>}
+            </span>
+          </li>
+        );
+      })}
+      {outline.moreHeadingsCount > 0 && (
+        <li style={{ ...TYPE.micro, fontStyle: "italic", padding: "2px 0" }}>
+          +{plur(outline.moreHeadingsCount, "more section")}
+        </li>
+      )}
+    </ul>
+  );
+}
+
+// how many top-level section pills to show inline before collapsing the rest into "+N more".
+const OUTLINE_PILL_CAP = 9;
+
+function PreflightCard({ outline, timeBand, defaultProjectKey, selectedProfile, pageData }) {
+  const verdict = preflightVerdict(outline);
+  const amberCount = preflightAmberCount(outline);
+  const tone = PREFLIGHT_TONE[verdict] || PREFLIGHT_TONE.green;
+  // detailed per-heading outline (the "2B" value) is on-demand behind a toggle, BELOW the pill
+  // summary. Collapsed by default (the pills give the at-a-glance); the toggle reveals the full
+  // hierarchy with content chips.
+  const [detailOpen, setDetailOpen] = React.useState(false);
+
+  const editedAgo = fmtEditedAgo(pageData && pageData.version_edited_at);
+  const editedDate = fmtEditedDate(pageData && pageData.version_edited_at);
+  const editedDateShort = fmtEditedDateShort(pageData && pageData.version_edited_at);
+  const author = pageData && pageData.version_author;
+  const version = pageData && pageData.version;
+  const noHeadings = outline.headingCount === 0;
+  const openTodos = Math.max(0, (outline.tasksTotal || 0) - (outline.tasksComplete || 0));
+
+  // Card-header meta (top-right), matching the design mockup: "v14 · edited Jun 24, 2026 · A. Kowalski".
+  // Version is always present; the date/author drop out gracefully when unavailable.
+  const headerMeta = [
+    version != null ? `v${version}` : null,
+    editedDate ? `edited ${editedDate}` : null,
+    author || null,
+  ].filter(Boolean).join(" · ");
+
+  // Verdict copy (honest, never alarmist, always "you can still generate"). The amber body
+  // enumerates the actual causes ("1 empty section · 3 open TODOs"), matching the mockup.
+  const causeBits = [];
+  if (outline.emptyLeafCount > 0) causeBits.push(plur(outline.emptyLeafCount, "empty section"));
+  if (openTodos > 0) causeBits.push(`${openTodos} open TODO${openTodos === 1 ? "" : "s"}`);
+
+  let lead;
+  let body;
+  if (verdict === "green") {
+    lead = "Ready to generate";
+    body = noHeadings
+      ? "No headings detected — Claude will read the full page text. Generate when ready."
+      : "Structured and complete — no structural gaps found. Generate to build the Jira breakdown.";
+  } else if (verdict === "amber") {
+    lead = `Structured — but ${plur(amberCount, "item")} worth a glance first`;
+    body = `${causeBits.join(" · ")}. Nothing blocks generation; this is your call.`;
+  } else {
+    lead = "This page looks like a stub";
+    body = "Very short or unstructured. Double-check you picked the right page — you can still generate.";
+  }
+
+  const hasComplete = amberCount === 0 && !outline.isThin;
+  const shownPills = (outline.topSections || []).slice(0, OUTLINE_PILL_CAP);
+  const morePills = Math.max(0, (outline.topSections || []).length - shownPills.length);
+
+  return (
+    <MoodCard
+      density="minor"
+      title="Pre-flight check"
+      badge={
+        headerMeta ? (
+          <span style={{ ...TYPE.micro, textAlign: "right" }}>{headerMeta}</span>
+        ) : undefined
+      }
+      style={{ marginBottom: 16 }}
+    >
+      {/* Verdict banner — icon + copy, with the amber "N items" count on the right (mockup). */}
+      <div
+        style={{
+          display: "flex",
+          gap: 10,
+          alignItems: "center",
+          background: tone.bg,
+          border: `1px solid ${tone.border}`,
+          borderRadius: 10,
+          padding: "12px 14px",
+          marginBottom: 14,
+        }}
+      >
+        <span style={{ alignSelf: "flex-start", display: "inline-flex", flexShrink: 0 }}>
+          <PreflightVerdictIcon verdict={verdict} />
+        </span>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontSize: 14, fontWeight: 700, color: "var(--s2j-text)" }}>{lead}</div>
+          <div style={{ fontSize: 12.5, lineHeight: 1.5, color: "var(--s2j-text)", marginTop: 2 }}>
+            {body}
+          </div>
+        </div>
+        {verdict === "amber" && (
+          <div style={{ fontSize: 30, fontWeight: 700, color: "var(--s2j-orange)", lineHeight: 1, flexShrink: 0, alignSelf: "center", paddingLeft: 6 }}>
+            {amberCount}
+          </div>
+        )}
+      </div>
+
+      {/* Four answer tiles */}
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
+          gap: 10,
+          marginBottom: 12,
+        }}
+      >
+        <PreflightTile icon={IconCalendar} label="RIGHT PAGE?">
+          <div style={{ fontWeight: 700, fontSize: 14, color: "var(--s2j-text)" }}>
+            {version != null ? `Version ${version}` : "This page"}
+          </div>
+          {editedAgo && <div style={{ marginTop: 2 }}>{cap1(editedAgo)}</div>}
+          {(editedDateShort || author) && (
+            <div style={{ ...TYPE.micro, marginTop: 1 }}>
+              {[editedDateShort, author].filter(Boolean).join(" · ")}
+            </div>
+          )}
+        </PreflightTile>
+
+        <PreflightTile
+          icon={hasComplete ? IconCheck : IconList}
+          label="COMPLETE?"
+          tone={hasComplete ? "var(--s2j-green)" : outline.isThin ? "var(--s2j-red)" : "var(--s2j-orange)"}
+        >
+          {outline.tasksTotal > 0 && (
+            <TaskProgressBar total={outline.tasksTotal} complete={outline.tasksComplete} />
+          )}
+          {hasComplete ? (
+            <PreflightStatusLine kind="ok">No structural gaps</PreflightStatusLine>
+          ) : outline.isThin ? (
+            <div style={{ color: "var(--s2j-text-muted)" }}>Too little structure to tell</div>
+          ) : (
+            <>
+              {outline.emptyLeafCount > 0 && (
+                <PreflightStatusLine kind="empty">
+                  {plur(outline.emptyLeafCount, "empty section")}
+                </PreflightStatusLine>
+              )}
+              {openTodos > 0 && (
+                <PreflightStatusLine kind="todo">
+                  {openTodos} open TODO{openTodos === 1 ? "" : "s"}
+                </PreflightStatusLine>
+              )}
+              {outline.tasksTotal > 0 && (
+                <PreflightStatusLine kind="ok">
+                  {outline.tasksComplete}/{outline.tasksTotal} tasks checked
+                </PreflightStatusLine>
+              )}
+            </>
+          )}
+        </PreflightTile>
+
+        <PreflightTile icon={IconExternalLink} label="RIGHT PROJECT?">
+          <div style={{ fontWeight: 700, fontSize: 14, color: "var(--s2j-text)" }}>
+            Project {defaultProjectKey || "—"}
+          </div>
+          <div style={{ ...TYPE.micro, marginTop: 2 }}>
+            Creates 1 epic + backlog here. Verify before push.
+            {selectedProfile ? ` Context: ${selectedProfile.name}.` : ""}
+          </div>
+        </PreflightTile>
+
+        <PreflightTile icon={IconClock} label="THIS RUN">
+          <div style={{ fontWeight: 700, fontSize: 14, color: "var(--s2j-text)" }}>{timeBand}</div>
+          <div style={{ marginTop: 2 }}>On your Anthropic key</div>
+          <div style={{ ...TYPE.micro, marginTop: 1 }}>
+            {(pageData.body_length || 0).toLocaleString()} chars in
+          </div>
+        </PreflightTile>
+      </div>
+
+      {/* Structure summary line (mockup: "STRUCTURE · N SECTIONS · N WORDS · N LISTS · N TABLES"). */}
+      <div
+        style={{
+          fontSize: 11,
+          fontWeight: 700,
+          letterSpacing: "0.04em",
+          color: "var(--s2j-text-muted)",
+          padding: "10px 0 9px",
+          marginTop: 2,
+          borderTop: "1px solid var(--s2j-border)",
+        }}
+      >
+        STRUCTURE · {outline.headingCount} SECTIONS · {outline.wordCount.toLocaleString()} WORDS ·{" "}
+        {outline.listItemCount} LISTS · {outline.tableCount} TABLES
+      </div>
+
+      {/* Outline pills — top-level sections with child count + orange TODO/empty rollup tags.
+          Structure-less pages get guidance of comparable weight instead. */}
+      {outline.headingCount > 0 ? (
+        <div className="flex flex-wrap" style={{ gap: 6 }}>
+          {shownPills.map((sec, i) => (
+            <OutlinePill key={`${i}-${sec.text}`} section={sec} />
+          ))}
+          {morePills > 0 && (
+            <span
+              className="inline-flex items-center"
+              style={{
+                padding: "4px 9px",
+                borderRadius: 8,
+                background: "var(--s2j-bg-section)",
+                border: "1px solid var(--s2j-border)",
+                fontSize: 12.5,
+                fontWeight: 500,
+                color: "var(--s2j-text-muted)",
+              }}
+            >
+              +{morePills} more section{morePills === 1 ? "" : "s"}
+            </span>
+          )}
+        </div>
+      ) : (
+        <PreflightGuidance />
+      )}
+
+      {/* Detailed outline (the "2B" value) — the full per-heading hierarchy with content chips,
+          on demand below the pill summary. The toggle keeps the default view scannable while
+          preserving the deep structure the accepted 2A+2B synthesis called for. */}
+      {outline.headingCount > 0 && (
+        <>
+          <button
+            type="button"
+            onClick={() => setDetailOpen((v) => !v)}
+            aria-expanded={detailOpen}
+            className="flex items-center gap-1.5"
+            style={{
+              background: "none",
+              border: "none",
+              padding: "8px 0 2px",
+              marginTop: 4,
+              cursor: "pointer",
+              color: "var(--s2j-text-light)",
+              fontSize: 12,
+              fontWeight: 600,
+            }}
+          >
+            <span
+              style={{
+                display: "inline-flex",
+                transform: detailOpen ? "rotate(90deg)" : "none",
+                transition: "transform 0.15s ease",
+              }}
+            >
+              <IconChevronRight size={13} />
+            </span>
+            {detailOpen
+              ? "Hide detailed outline"
+              : `Show detailed outline (${plur(outline.headingCount, "section")})`}
+          </button>
+          {detailOpen && <PreflightOutline outline={outline} />}
+        </>
+      )}
+    </MoodCard>
   );
 }
 

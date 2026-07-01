@@ -83,7 +83,9 @@ export function MoodCard({ title, subtitle, badge, children, footer, density = "
     <>
       {(title || badge) ? (
         <div className="flex items-center" style={{ justifyContent: "space-between", gap: 8, marginBottom: subtitle ? 2 : (children ? 10 : 0) }}>
-          {title ? <span style={{ ...TYPE.heading, color: MOOD.navy }}>{title}</span> : <span />}
+          {/* h3 (not a plain span) — a MoodCard title is real document structure, sitting under the
+              screen's own ScreenHeader h2; TYPE.heading already zeroes margin so this is visual-neutral. */}
+          {title ? <h3 style={{ ...TYPE.heading, color: MOOD.navy }}>{title}</h3> : <span />}
           {badge || null}
         </div>
       ) : null}

@@ -1396,6 +1396,46 @@ resolver.define('fetchPage', async ({ payload }) => {
   }
   const bodyStorage = data.body?.storage?.value || '';
 
+  // ── Pre-flight RIGHT PAGE? tile (2026-07-01) — last-edited date + author. `version.createdAt`
+  // is ALREADY in this same v2 response (free, no extra call). NOTE: this resolver already reads
+  // `data.version?.number` in the return below — so the v2 `version` object is PROVEN present in
+  // this exact GET /pages/{id} response; `createdAt` + `authorId` are documented siblings on it
+  // (Atlassian Confluence v2 page-version schema). Optional chaining still degrades any absence to
+  // null. The v2 version object carries only `authorId` (an opaque accountId), so the display name
+  // needs one MORE call to the v1
+  // user endpoint — gated by the NEW read:confluence-user scope (see manifest). Best-effort:
+  // any failure OR a privacy-nulled displayName degrades to date-only; NEVER blocks the page
+  // read, NEVER fabricates a name. The author call is skipped entirely when authorId is absent.
+  const versionCreatedAt = data.version?.createdAt || null;
+  let versionAuthor = null;
+  const authorId = data.version?.authorId;
+  if (authorId) {
+    // ⏱ Bound this SECOND, in-band Confluence round-trip so a slow/degraded user endpoint can
+    // never push fetchPage toward the 25-second resolver ceiling — the author name is decorative
+    // (best-effort), the page open is the primary action. On timeout we degrade to date-only. The
+    // timer is cleared on the winning path so it never dangles into the resolver's event loop.
+    let authorTimer = null;
+    try {
+      const uResp = await Promise.race([
+        api
+          .asUser()
+          .requestConfluence(route`/wiki/rest/api/user?accountId=${authorId}`),
+        new Promise((_, reject) => {
+          authorTimer = setTimeout(() => reject(new Error('author-lookup-timeout')), 3500);
+        }),
+      ]);
+      if (uResp.ok) {
+        const u = await uResp.json();
+        const name = (u?.displayName || '').trim();
+        if (name) versionAuthor = name;
+      }
+    } catch (_) {
+      /* best-effort — the tile degrades to date-only, never a fabricated name */
+    } finally {
+      if (authorTimer) clearTimeout(authorTimer);
+    }
+  }
+
   // snake_case field names — matches App.js UI expectations (preserved
   // от v2.x backend response shape). Frontend reads pageData.page_id,
   // pageData.space_name, pageData.body_length etc.
@@ -1405,6 +1445,8 @@ resolver.define('fetchPage', async ({ payload }) => {
     space_key: '',  // v2 API returns spaceId only; separate /spaces/{spaceId} call needed за key/name
     space_name: '',
     version: data.version?.number || 1,
+    version_edited_at: versionCreatedAt, // ISO string | null — the RIGHT PAGE? "last edited" line
+    version_author: versionAuthor,       // display name | null (privacy-nulled or resolve-failed)
     body: bodyStorage,
     body_length: bodyStorage.length,
   };
