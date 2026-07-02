@@ -48,6 +48,14 @@
   --s2j-steel:        #5483B3;
   --s2j-skySteel:     #7DA0CA;
   --s2j-ice:          #C1E8FF;
+
+  /* Neutral "attention / informational" accent (verdict-logic army, 2026-07-01) — a semantic
+     ALIAS of the existing steel, so the pre-flight AMBER verdict + the "worth a glance" chips
+     read as ATTENTION, not alarm. This keeps --s2j-orange RESERVED for genuine caution and
+     --s2j-blue (#61affe) RESERVED for nav buttons; steel #5483B3 is distinct from both. */
+  --s2j-accent-info:        var(--s2j-steel);
+  --s2j-accent-info-bg:     #eef5fd;
+  --s2j-accent-info-border: #c5ddf5;
 }
 
 @layer components {
