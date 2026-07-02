@@ -3149,22 +3149,33 @@ function TaskProgressBar({ total, complete }) {
   );
 }
 
+// The orange rollup tag used on outline pills (unchecked TODOs / empty sub-sections) AND on the
+// "+N more sections" pill (aggregate of the gaps hidden past the display cap).
+function PillTag({ children }) {
+  return (
+    <span
+      style={{
+        fontSize: 9.5,
+        fontWeight: 700,
+        letterSpacing: "0.02em",
+        color: "var(--s2j-orange)",
+        background: "var(--s2j-orange-bg)",
+        border: "1px solid var(--s2j-orange-border)",
+        borderRadius: 999,
+        padding: "0 6px",
+        lineHeight: "16px",
+        flexShrink: 0,
+      }}
+    >
+      {children}
+    </span>
+  );
+}
+
 // A top-level section "pill" (the outline row in the mockup): section title + a muted child-count
 // badge + orange rollup tags for unchecked TODOs / empty sub-sections in its subtree.
 function OutlinePill({ section }) {
   const { text, childCount, emptyCount, openTodos } = section;
-  const tag = {
-    fontSize: 9.5,
-    fontWeight: 700,
-    letterSpacing: "0.02em",
-    color: "var(--s2j-orange)",
-    background: "var(--s2j-orange-bg)",
-    border: "1px solid var(--s2j-orange-border)",
-    borderRadius: 999,
-    padding: "0 6px",
-    lineHeight: "16px",
-    flexShrink: 0,
-  };
   return (
     <span
       className="inline-flex items-center"
@@ -3186,8 +3197,8 @@ function OutlinePill({ section }) {
           {childCount}
         </span>
       )}
-      {openTodos > 0 && <span style={tag}>{openTodos === 1 ? "TODO" : `${openTodos} TODO`}</span>}
-      {emptyCount > 0 && <span style={tag}>{emptyCount} empty</span>}
+      {openTodos > 0 && <PillTag>{openTodos === 1 ? "TODO" : `${openTodos} TODO`}</PillTag>}
+      {emptyCount > 0 && <PillTag>{emptyCount} empty</PillTag>}
     </span>
   );
 }
@@ -3334,7 +3345,12 @@ function PreflightCard({ outline, timeBand, defaultProjectKey, selectedProfile, 
 
   const hasComplete = amberCount === 0 && !outline.isThin;
   const shownPills = (outline.topSections || []).slice(0, OUTLINE_PILL_CAP);
-  const morePills = Math.max(0, (outline.topSections || []).length - shownPills.length);
+  const hiddenPills = (outline.topSections || []).slice(OUTLINE_PILL_CAP);
+  const morePills = hiddenPills.length;
+  // aggregate any gaps in the pills PAST the display cap, so an empty/TODO counted in the headline
+  // is never invisible: it shows either on its own pill's tag OR here, on the "+N more" pill.
+  const hiddenEmpty = hiddenPills.reduce((n, s) => n + (s.emptyCount || 0), 0);
+  const hiddenTodos = hiddenPills.reduce((n, s) => n + (s.openTodos || 0), 0);
 
   return (
     <MoodCard
@@ -3476,6 +3492,7 @@ function PreflightCard({ outline, timeBand, defaultProjectKey, selectedProfile, 
             <span
               className="inline-flex items-center"
               style={{
+                gap: 6,
                 padding: "4px 9px",
                 borderRadius: 8,
                 background: "var(--s2j-bg-section)",
@@ -3485,7 +3502,11 @@ function PreflightCard({ outline, timeBand, defaultProjectKey, selectedProfile, 
                 color: "var(--s2j-text-muted)",
               }}
             >
-              +{morePills} more section{morePills === 1 ? "" : "s"}
+              <span>+{morePills} more section{morePills === 1 ? "" : "s"}</span>
+              {/* aggregate the gaps hidden past the pill cap, so the headline count never names an
+                  empty/TODO with no visible home */}
+              {hiddenTodos > 0 && <PillTag>{hiddenTodos} TODO</PillTag>}
+              {hiddenEmpty > 0 && <PillTag>{hiddenEmpty} empty</PillTag>}
             </span>
           )}
         </div>
