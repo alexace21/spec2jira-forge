@@ -70,11 +70,9 @@ export function extractPageOutline(bodyHtml) {
   }
   if (!doc || !doc.body) return EMPTY_OUTLINE;
 
-  // ── one document-order pass: build per-section content facts + global task counts ──
-  const sections = []; // { level, text, hasContent, hasTable, hasImage, hasCode, hasDiagram }
+  // ── one document-order pass: build per-section content facts + per-section task counts ──
+  const sections = []; // { level, text, hasContent, hasTable, hasImage, hasCode, hasDiagram, taskTotal, taskComplete }
   let cur = null;
-  let tasksTotal = 0;
-  let tasksComplete = 0;
   // Count ac:layout-cell — a MULTI-COLUMN layout (>1 cell) decouples DOM document order from
   // reading order: a heading in the left cell and its body in the right cell are visited in
   // separate cell-blocks, so this single-pass "content follows the last heading" attribution
@@ -101,14 +99,15 @@ export function extractPageOutline(bodyHtml) {
           sections.push(cur);
           continue;
         }
-        // count Confluence task checkboxes globally AND per current section (structural, near-zero
-        // false positive) — the per-section counts roll up into the outline pills' "N TODO" tags.
+        // count Confluence task checkboxes PER SECTION (structural, near-zero false positive) — the
+        // per-section counts roll up into the outline pills' TODO tags AND the headline task totals
+        // (both derived from the sections below), so every counted task is attributable to a visible
+        // pill. A task BEFORE the first heading (cur null) is intentionally NOT counted — it would be
+        // an unlocatable amber (the safe under-count direction the structural-purist rule wants).
         if (tag === "ac:task") {
-          tasksTotal += 1;
           if (cur) cur.taskTotal += 1;
         } else if (tag === "ac:task-status") {
           if ((node.textContent || "").trim().toLowerCase() === "complete") {
-            tasksComplete += 1;
             if (cur) cur.taskComplete += 1;
           }
         } else if (tag === "ac:layout-cell") layoutCellCount += 1;
@@ -156,34 +155,43 @@ export function extractPageOutline(bodyHtml) {
   const headings = withText.slice(0, MAX_HEADINGS_SHOWN);
   const moreHeadingsCount = Math.max(0, headingCount - headings.length);
 
-  // ── TOP-LEVEL section rollup (feeds the outline "pills") ──
-  // Group the flat heading list into its SHALLOWEST level (the page's top sections); each pill
-  // shows that section + a rollup over its whole subtree: child-heading count, empty-leaf count,
-  // and unchecked-task ("open TODO") count. A "TODO" here is an unchecked <ac:task> checkbox — a
-  // structural fact — NOT free-text "TODO" prose (which the governing rule forbids scanning).
-  const minLevel = withText.length ? Math.min.apply(null, withText.map((h) => h.level)) : 0;
-  const topSections = [];
+  // ── TOP-LEVEL section rollup (feeds the outline "pills") + the headline counts ──
+  // EXHAUSTIVE grouping: walk the flat heading list; a heading at level <= the current top head
+  // starts a NEW top section, a deeper one is a CHILD of it — so EVERY heading is either a pill head
+  // or folded into exactly one pill (no orphan is ever dropped, incl. a heading shallower OR deeper
+  // than the first one). Each pill rolls up its subtree: child count, empty-leaf count, and per-
+  // section task totals. A "TODO" is an unchecked <ac:task> checkbox (structural) — NOT prose.
+  const topRaw = [];
+  let curTop = null;
   for (let k = 0; k < withText.length; k++) {
-    const s = withText[k];
-    if (s.level !== minLevel) continue; // children are folded into their parent's span below
-    let childCount = 0;
-    let emptyCount = s.isEmpty ? 1 : 0;
-    let openTodos = Math.max(0, s.taskTotal - s.taskComplete);
-    for (let m = k + 1; m < withText.length && withText[m].level > minLevel; m++) {
-      childCount += 1;
-      if (withText[m].isEmpty) emptyCount += 1;
-      openTodos += Math.max(0, withText[m].taskTotal - withText[m].taskComplete);
+    const h = withText[k];
+    if (!curTop || h.level <= curTop.level) {
+      curTop = { text: h.text, level: h.level, childCount: 0, emptyCount: h.isEmpty ? 1 : 0, taskTotal: h.taskTotal, taskComplete: h.taskComplete };
+      topRaw.push(curTop);
+    } else {
+      curTop.childCount += 1;
+      if (h.isEmpty) curTop.emptyCount += 1;
+      curTop.taskTotal += h.taskTotal;
+      curTop.taskComplete += h.taskComplete;
     }
-    topSections.push({ text: s.text, childCount, emptyCount, openTodos });
   }
+  const topSections = topRaw.map((s) => ({
+    text: s.text,
+    childCount: s.childCount,
+    emptyCount: s.emptyCount,
+    openTodos: Math.max(0, s.taskTotal - s.taskComplete),
+  }));
 
-  // ⚠ Count empty leaves ONLY over the DISPLAYED slice (`headings`), not all sections. The outline
-  // renders at most MAX_HEADINGS_SHOWN rows; an empty leaf beyond that cap collapses into the opaque
-  // "+N more sections" tail with no "empty" chip — so counting it would resurrect the exact phantom
-  // FIX-1 killed (an amber "N empty" the user cannot locate). Clamping to the shown set keeps the
-  // count in TRUE agreement with the visible chips; on a >25-heading page a tail-empty is silently
-  // under-counted, which is the rule's intended SAFE direction (never a false caution).
-  const emptyLeafCount = headings.reduce((n, h) => n + (h.isEmpty ? 1 : 0), 0);
+  // ⚠ SINGLE SOURCE OF TRUTH: the headline counts are the SUM over the pill rollups, so the verdict
+  // banner + COMPLETE tile can NEVER contradict a pill tag (the cross-surface consistency the
+  // correctness army flagged: previously emptyLeafCount was clamped to the first 25 headings while
+  // the pills rolled up ALL of them). Every empty leaf / unchecked task counted here is attributed to
+  // exactly one pill, so it is always locatable (a visible pill's tag, or the "+N more sections"
+  // aggregate the card renders for pills past the display cap). Per section tc<=tt, so
+  // sum(openTodos) === tasksTotal - tasksComplete by construction — the banner and tile agree.
+  const emptyLeafCount = topRaw.reduce((n, s) => n + s.emptyCount, 0);
+  const tasksTotal = topRaw.reduce((n, s) => n + s.taskTotal, 0);
+  const tasksComplete = topRaw.reduce((n, s) => n + s.taskComplete, 0);
 
   const bodyText = (doc.body.textContent || "").trim();
   const wordCount = bodyText ? bodyText.split(/\s+/).filter(Boolean).length : 0;
