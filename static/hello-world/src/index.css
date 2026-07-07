@@ -151,3 +151,8 @@ body {
   .s2j-bg-section   { background-color: var(--s2j-bg-section); }
   .s2j-border       { border-color: var(--s2j-border); }
 }
+
+/* (The Page Picker "generating / checking" spinner now uses inline SVG SMIL <animateTransform> in
+   SpinnerGlyph — a reliable in-place spin in the Forge iframe, independent of CSS transform-box
+   quirks AND prefers-reduced-motion. The CSS-keyframe approach read as frozen live, twice. No CSS
+   keyframe needed. The glyph always sits next to a text label, so meaning never depends on motion. */

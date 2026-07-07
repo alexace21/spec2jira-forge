@@ -301,7 +301,16 @@ const PLAN_BATCH_PREFIX = 'planjob:';
 // + a daily scheduled sweep (sweepHandler) — NOT a creation-anchored TTL, which would silently expire
 // a deliverable still under review (the trap above).
 const JOB_META_PREFIX = 'jobmeta:';
-async function setJob(jobId, value) {
+// setJob(jobId, value[, metaExtra]) — centralizes the job: write + the lean jobmeta mirror.
+// `metaExtra` (optional) is a small object of EXTRA display fields merged into the jobmeta
+// mirror ONLY at the terminal transitions (completed/failed) — the picker dashboard reads
+// them without dereferencing the ~240KB job: record. Contract fields (page-picker redesign):
+// completedAt (epoch ms), features (breakdown.features.length), costUsd (the diagnostics-path
+// estimateCost, computed once), truncated (bool), errorReason (short human string, NO page
+// content). Only pass the keys that apply; the base mirror (status/pageTitle/startedAt/
+// lastAccessedAt) is unchanged. Keeping them in the lean mirror preserves getDashboardJobs'
+// pure-read invariant (no heavy deref) + the sweep's enumeration key shape.
+async function setJob(jobId, value, metaExtra) {
   const jobKey = `${JOB_KEY_PREFIX}${jobId}`;
   await kvs.set(jobKey, value);
   // Best-effort lean mirror — a jobmeta failure must never break generation (job: is authoritative).
@@ -315,10 +324,71 @@ async function setJob(jobId, value) {
       // on read-access via touchJobAccess so an actively-reviewed breakdown is never
       // swept; the scheduled orphan sweep deletes a never-pushed job 7 days after this.
       lastAccessedAt: Date.now(),
+      // Terminal display fields (page-picker) merged last so an explicit metaExtra always wins.
+      ...(metaExtra && typeof metaExtra === 'object' ? metaExtra : {}),
     });
   } catch (e) {
     console.warn(`[setJob] jobmeta mirror failed (non-fatal): ${String(e?.message || e)}`);
   }
+}
+
+// shortErrorReason — a terse, human, CONTENT-FREE failure string for the picker "Needs
+// attention" row (jobmeta.errorReason). Derived from the structured error CODE + a curated
+// map; the raw `detail` is NEVER used verbatim (it can echo page-derived text). Falls back to
+// a generic line. Capped defensively.
+function shortErrorReason(error, httpStatus) {
+  const code = String(error || '').trim();
+  const map = {
+    no_results_url: 'Anthropic returned no results — reopen to retry',
+    batch_request_expired: 'Anthropic batch expired — reopen to retry',
+    batch_expired: 'Anthropic batch expired — reopen to retry',
+    refused: 'The model declined this request — reopen to retry',
+    truncated: 'Output hit the length limit — reopen to retry',
+    parse_failed: 'Couldn\'t parse the result — reopen to retry',
+    result_row_missing: 'The result was missing — reopen to retry',
+    network_failure: 'Network error reaching Anthropic — reopen to retry',
+    kvs_persist_failed: 'Storage error — reopen to review and push',
+    kvs_write_failed: 'Storage error — reopen to retry',
+  };
+  if (map[code]) return map[code];
+  // results_fetch_<NNN> / anthropic_http style — surface the HTTP status if we have one.
+  if (Number.isFinite(httpStatus) && httpStatus > 0) {
+    if (httpStatus === 429) return 'Anthropic rate limit (429) — reopen to retry';
+    if (httpStatus === 401 || httpStatus === 403) return 'Anthropic rejected the API key — check Settings';
+    if (httpStatus >= 500) return `Anthropic service error (${httpStatus}) — reopen to retry`;
+    return `Anthropic error (${httpStatus}) — reopen to retry`;
+  }
+  const m = code.match(/results_fetch_(\d{3})/);
+  if (m) {
+    const s = Number(m[1]);
+    if (s === 429) return 'Anthropic rate limit (429) — reopen to retry';
+    if (s === 401 || s === 403) return 'Anthropic rejected the API key — check Settings';
+    if (s >= 500) return `Anthropic service error (${s}) — reopen to retry`;
+    return `Anthropic error (${s}) — reopen to retry`;
+  }
+  return 'Generation failed — reopen to retry';
+}
+
+// buildTerminalMeta — derive the page-picker jobmeta display fields from an authoritative
+// terminal `job` record. Used by the pollJobStatus terminal re-sync (self-healing) so a
+// re-assert can't strip the enriched fields. `costUsd` is not on the job record (computed at
+// completion) → the caller passes the previously-persisted value (or null). Returns only the
+// keys that apply to the job's terminal status; content-free by construction (errorReason via
+// shortErrorReason from the error CODE, never `detail`).
+function buildTerminalMeta(job, costUsdFromPrev) {
+  if (!job || (job.status !== 'completed' && job.status !== 'failed')) return {};
+  const completedAt = job.completedAt ? Date.parse(job.completedAt) : null;
+  const extra = { completedAt: Number.isFinite(completedAt) ? completedAt : null };
+  if (job.status === 'completed') {
+    const features = Array.isArray(job.breakdown?.features) ? job.breakdown.features.length : null;
+    extra.features = features;
+    // Prefer the cost persisted on the heavy record (from completion); else the carried prevMeta value. (deep-audit fix)
+    extra.costUsd = Number.isFinite(job.costUsd) ? job.costUsd : (Number.isFinite(costUsdFromPrev) ? costUsdFromPrev : null);
+    extra.truncated = job.stop_reason === 'max_tokens' || !!job.truncated;
+  } else {
+    extra.errorReason = shortErrorReason(job.error);
+  }
+  return extra;
 }
 
 // ── Task #13: never-pushed-orphan cleanup (access-renewed + scheduled sweep) ────────
@@ -1178,12 +1248,20 @@ resolver.define('searchPages', async ({ payload }) => {
     const data = await response.json();
     const results = (data.results || []).map((r) => {
       const c = r.content || {};
-      return {
+      const out = {
         id: String(c.id || ''),
         title: c.title || r.title || '(untitled)',
         spaceKey: c.space?.key || r.resultGlobalContainer?.key || '',
         spaceName: c.space?.name || r.resultGlobalContainer?.title || '',
       };
+      // DEFENSIVE widen (page-picker): the CQL /wiki/rest/api/search result object carries a
+      // top-level `lastModified` (ISO 8601) and a plain-text `excerpt` snippet. Only add the
+      // keys when actually present + non-empty — omit gracefully so a leaner envelope is safe.
+      const lastModified = typeof r.lastModified === 'string' ? r.lastModified.trim() : '';
+      if (lastModified) out.lastModified = lastModified;
+      const excerpt = typeof r.excerpt === 'string' ? r.excerpt.trim() : '';
+      if (excerpt) out.excerpt = excerpt;
+      return out;
     }).filter((r) => r.id);
     return { results };
   } catch (e) {
@@ -1193,8 +1271,16 @@ resolver.define('searchPages', async ({ payload }) => {
 });
 
 resolver.define('getRecentPages', async () => {
-  const list = await kvs.get(RECENT_PAGES_KEY);
-  return { recent: Array.isArray(list) ? list : [] };
+  // Wrap the read: a KVS fault used to throw silently → the frontend couldn't tell a failed
+  // read from a genuinely-empty recent list. degraded:true surfaces a "couldn't load recent
+  // pages — retry" note instead of a silent gap. (Recent entry shape is unchanged.)
+  try {
+    const list = await kvs.get(RECENT_PAGES_KEY);
+    return { recent: Array.isArray(list) ? list : [] };
+  } catch (e) {
+    console.warn(`[getRecentPages] recent-pages read failed (returning degraded): ${String(e?.message || e)}`);
+    return { recent: [], degraded: true };
+  }
 });
 
 resolver.define('getLastSelectedPage', async () => {
@@ -1270,7 +1356,9 @@ resolver.define('getDashboardJobs', async ({ context }) => {
       context,
       record: { op: 'dashboard.read', error_class: 'kvs_read_failed', level: 'warn', ref: null, surfaced: false },
     });
-    return { jobs: [] };
+    // degraded:true lets the frontend distinguish a READ FAILURE from a genuinely-empty
+    // dashboard (both were {jobs:[]} before) — a failed read must never render as calm-empty.
+    return { jobs: [], degraded: true };
   }
   if (!Array.isArray(list) || list.length === 0) return { jobs: [] };
   // PURE READ (deep-audit fix). Dereference each ref against its job: record for LIVE status;
@@ -1295,7 +1383,16 @@ resolver.define('getDashboardJobs', async ({ context }) => {
       if (!meta) {
         const job = await kvs.get(`${JOB_KEY_PREFIX}${ref.jobId}`).catch(() => null);
         if (!job) return null; // purged/lost → filtered (never shown)
-        meta = { status: job.status, pageTitle: job.pageTitle, startedAt: job.submittedAt || job.createdAt };
+        // Legacy back-compat: derive the picker display fields from the heavy record too
+        // (still a READ, no backfill write) so a pre-jobmeta-enrichment terminal job isn't
+        // blank. costUsd is unavailable here (a computed estimate, never stored) → null.
+        meta = {
+          status: job.status,
+          pageTitle: job.pageTitle,
+          startedAt: job.submittedAt || job.createdAt,
+          lastAccessedAt: null,
+          ...buildTerminalMeta(job, null),
+        };
       }
       return {
         jobId: ref.jobId,
@@ -1303,6 +1400,13 @@ resolver.define('getDashboardJobs', async ({ context }) => {
         pageTitle: ref.pageTitle || meta.pageTitle || 'Untitled',
         status: meta.status, // live: pending | batched | completed | failed
         startedAt: meta.startedAt || ref.trackedAt,
+        // NEW (page-picker) — from the enriched jobmeta; degrade to null/false on legacy rows.
+        lastAccessedAt: Number.isFinite(meta.lastAccessedAt) ? meta.lastAccessedAt : null,
+        completedAt: Number.isFinite(meta.completedAt) ? meta.completedAt : null,
+        features: Number.isFinite(meta.features) ? meta.features : null,
+        costUsd: Number.isFinite(meta.costUsd) ? meta.costUsd : null,
+        truncated: !!meta.truncated,
+        errorReason: typeof meta.errorReason === 'string' ? meta.errorReason : null,
       };
     }),
   );
@@ -1944,16 +2048,20 @@ resolver.define('startGeneration', async ({ payload, context }) => {
     // failure here must NEVER mask the original error the user needs to see: record + still
     // return the original structured error below.
     try {
+      // Page-picker jobmeta enrichment (failed-at-submit): completedAt + a terse content-free
+      // reason so this tracked row surfaces under "Needs attention" with a cause.
+      const submitHttp = classifyDiagGenerationError(submitResult.error)?.counts?.http_status;
       await setJob(jobId,{
         jobId,
         pageId: String(pageId),
         pageTitle,
         ownerAccountId,
         status: 'failed',
+        completedAt: new Date().toISOString(),
         createdAt: new Date().toISOString(),
         error: submitResult.error,
         detail: submitResult.detail,
-      });
+      }, { completedAt: Date.now(), errorReason: shortErrorReason(submitResult.error, submitHttp) });
     } catch (e) {
       console.error('[diag] failed-state bookkeeping write failed ref=' + jobId, e);
       await recordDiagnostic({
@@ -2101,11 +2209,21 @@ resolver.define('pollJobStatus', async ({ payload, context }) => {
       // back to now only if absent, so the setJob invariant (jobmeta always carries lastAccessedAt)
       // holds at every write site and a swept-too-early silent loss can't sneak in via this path.
       const prevMeta = await kvs.get(`${JOB_META_PREFIX}${jobId}`).catch(() => null);
+      // Preserve the terminal DISPLAY fields (page-picker) too, else this re-sync would strip
+      // the completedAt/features/costUsd/truncated/errorReason a prior terminal setJob wrote.
+      // Rebuild them from the authoritative `job` (self-healing if the enriched mirror write
+      // itself failed); costUsd is not stored on `job` (it's a computed estimate) so carry it
+      // from prevMeta if present.
+      const terminalExtra = buildTerminalMeta(
+        job,
+        prevMeta && Number.isFinite(prevMeta.costUsd) ? prevMeta.costUsd : null,
+      );
       await kvs.set(`${JOB_META_PREFIX}${jobId}`, {
         status: job.status,
         pageTitle: job.pageTitle,
         startedAt: job.submittedAt || job.createdAt,
         lastAccessedAt: prevMeta && Number.isFinite(prevMeta.lastAccessedAt) ? prevMeta.lastAccessedAt : Date.now(),
+        ...terminalExtra,
       });
     } catch (_) {}
     return job;
@@ -2188,7 +2306,8 @@ resolver.define('pollJobStatus', async ({ payload, context }) => {
         // [diag Phase 0, §3 site :1545] Bookkeeping write for an ALREADY-failed state — a KVS
         // failure must never mask the original error: record + still return the original below.
         try {
-          await setJob(jobId,failed);
+          // Page-picker jobmeta enrichment (failed): completedAt + a terse content-free reason.
+          await setJob(jobId, failed, { completedAt: Date.now(), errorReason: shortErrorReason(failed.error) });
         } catch (e) {
           console.error('[diag] failed-state bookkeeping write failed ref=' + jobId, e);
           await recordDiagnostic({
@@ -2247,7 +2366,10 @@ resolver.define('pollJobStatus', async ({ payload, context }) => {
         };
         // [diag Phase 0, §3 site :1564] Same contract as :1545 — never mask the original error.
         try {
-          await setJob(jobId,failed);
+          // Page-picker jobmeta enrichment (failed): completedAt + a terse content-free reason
+          // (surface the HTTP status from the closed diag registry when the error carries one).
+          const httpStatus = classifyDiagGenerationError(failed.error)?.counts?.http_status;
+          await setJob(jobId, failed, { completedAt: Date.now(), errorReason: shortErrorReason(failed.error, httpStatus) });
         } catch (e) {
           console.error('[diag] failed-state bookkeeping write failed ref=' + jobId, e);
           await recordDiagnostic({
@@ -2340,6 +2462,9 @@ resolver.define('pollJobStatus', async ({ payload, context }) => {
         model: fetchResult.model,
         elapsedMs,
         stop_reason: fetchResult.stop_reason,
+        // costUsd persisted ON the heavy record (not only the lean mirror) so the terminal re-sync +
+        // legacy dashboard fallback recover it without depending on a prevMeta read. (deep-audit fix)
+        costUsd: (costEstimate && Number.isFinite(costEstimate.total_usd)) ? costEstimate.total_usd : null,
         // Partial-recovery flag когато output hit max_tokens but features salvaged.
         ...(fetchResult.truncated
           ? { truncated: true, truncation_note: fetchResult.truncation_note }
@@ -2354,8 +2479,20 @@ resolver.define('pollJobStatus', async ({ payload, context }) => {
       // `completed`, which is what just failed to fit), record the diagnostic, and hand the
       // breakdown forward INLINE (persistFailed: true) so the user can still review + push it
       // from this tab (push consumes the frontend copy — fully in-memory).
+      // Page-picker jobmeta enrichment (completed): mirror the display fields the dashboard
+      // reads without dereferencing the ~240KB job:. costUsd REUSES the SAME estimateCost the
+      // diagnostics breadcrumb below records (computed once, at ~2290) — no new estimate.
+      // Number.isFinite (not `|| Date.now()`) so a hypothetical epoch-0 parse isn't clobbered —
+      // consistent with buildTerminalMeta; Date.now() is the right fallback here (the job just completed).
+      const completedAtMs = Date.parse(completed.completedAt);
+      const completedMeta = {
+        completedAt: Number.isFinite(completedAtMs) ? completedAtMs : Date.now(),
+        features: Array.isArray(breakdown.features) ? breakdown.features.length : null,
+        costUsd: (costEstimate && Number.isFinite(costEstimate.total_usd)) ? costEstimate.total_usd : null,
+        truncated: fetchResult.stop_reason === 'max_tokens' || !!fetchResult.truncated,
+      };
       try {
-        await setJob(jobId,completed);
+        await setJob(jobId, completed, completedMeta);
       } catch (persistErr) {
         let approxBytes = 0;
         try {
@@ -2377,11 +2514,12 @@ resolver.define('pollJobStatus', async ({ payload, context }) => {
           await setJob(jobId,{
             ...job,
             status: 'failed',
+            completedAt: new Date().toISOString(),
             error: 'kvs_persist_failed',
             detail: persistLikelySize
               ? 'The generated breakdown was too large to store (~' + Math.round(approxBytes / 1024) + ' KB). Review and push it now — and consider splitting the page into smaller sections for next time.'
               : 'The generated breakdown could not be stored (a storage error — not a size problem). Review and push it now; if this repeats, contact support@spec2jira.com.',
-          });
+          }, { completedAt: Date.now(), errorReason: shortErrorReason('kvs_persist_failed') });
         } catch (terminalErr) {
           console.error('[diag] small terminal write ALSO failed ref=' + jobId + ' (KVS may be down)', terminalErr);
         }
@@ -3664,7 +3802,12 @@ resolver.define('startTestCaseGeneration', async ({ payload, context }) => {
       const { features: editedFeatures } = flattenBreakdown(payload.breakdown);
       if (Array.isArray(editedFeatures) && editedFeatures.length > 0) {
         job.breakdown = { ...job.breakdown, features: editedFeatures };
-        await setJob(jobId,{ ...job });
+        // Re-persist the picker jobmeta display fields (this job is completed + tracked): a plain
+        // setJob would strip completedAt/features/costUsd/truncated. Rebuild from the (edited) job;
+        // costUsd isn't on the record (a computed estimate) → carry it from the existing jobmeta.
+        const prevMeta = await kvs.get(`${JOB_META_PREFIX}${jobId}`).catch(() => null);
+        const prevCost = prevMeta && Number.isFinite(prevMeta.costUsd) ? prevMeta.costUsd : null;
+        await setJob(jobId, { ...job }, buildTerminalMeta(job, prevCost));
       } else {
         console.warn(`[startTCGen] edited breakdown flattened to 0 features — keeping stored breakdown for ${jobId} ref=${jobId}`);
         // [diag Phase 4, (E) §2.2 :1998 — worst offender #11] BOTH soft-fallback branches are the
@@ -4533,7 +4676,11 @@ resolver.define('regenerateTestCase', async ({ payload, context }) => {
         const acSig = (fs) => (Array.isArray(fs) ? fs : []).flatMap((s) => (Array.isArray(s && s.acceptance_criteria) ? s.acceptance_criteria : [])).map(normAC).sort().join('|');
         if (acSig(editedFeatures) !== acSig(job.breakdown && job.breakdown.features)) {
           job.breakdown = { ...job.breakdown, features: editedFeatures };
-          await setJob(jobId,job);
+          // Preserve the picker jobmeta display fields (completed + tracked job) on re-persist —
+          // a plain setJob would strip them. Carry costUsd from the existing jobmeta.
+          const prevMeta = await kvs.get(`${JOB_META_PREFIX}${jobId}`).catch(() => null);
+          const prevCost = prevMeta && Number.isFinite(prevMeta.costUsd) ? prevMeta.costUsd : null;
+          await setJob(jobId, job, buildTerminalMeta(job, prevCost));
         }
       } else {
         // [diag Phase 4, gate symmetry] a 0-features flatten is the SAME silent
