@@ -34,12 +34,11 @@ import {
 import {
   adaptToLegacyShape,
   extractV3Signals,
+  computeInsightsView,
+  priorityLabel,
   removeFeatureDependency,
   addFeatureDependency,
-  sortConcernsBySeverity,
-  SEVERITY_PALETTE,
   CONCERN_TYPE_LABEL,
-  QUALITY_PALETTE,
 } from "./lib/v3Schema";
 import { classText } from "./lib/diagnosticsView";
 import {
@@ -3739,8 +3738,416 @@ function GeneratingTestsScreen({ pageTitle, tcElapsed, onBack }) {
 // Reads breakdown = pendingBreakdown || results.breakdown — present at all 3 entry
 // points (poll-complete, persistFailed-inline, reconnect). One-way forward: there is
 // NO back-to-insights path — it is a generation snapshot, not live-updated; the
-// editor's Regenerate produces fresh analysis. Reuses the App.js helpers
-// (ConfidenceBadge, ConcernRow) via function-declaration hoisting.
+// editor's Regenerate produces fresh analysis. Consumes computeInsightsView (a pure
+// helper in lib/v3Schema.js) — the old ConfidenceBadge/ConcernRow are superseded.
+// ── AI Insights — 4A "directed triage" ─────────────────────────────────────────
+// The post-generation orientation screen. Reads like a DECISION top-to-bottom:
+// what you got → can I trust it → the one landmine → the ranked flagged list →
+// the reassurance → the fingerprint / sizing proof. Every datum comes from
+// computeInsightsView(breakdown) (a pure helper in lib/v3Schema.js) — this screen
+// is a read-only snapshot (NO re-run control; Regenerate lives in the editor).
+//
+// Colour rules (WCAG AA on the near-white glass): severity/status WORDS stay dark
+// (--s2j-text); the COLOUR sits on the ICON/square only; colour is never the sole
+// signal (shape + text label everywhere). No tier labels in the shipped UI.
+
+// Priority glyphs (High = up-triangle, Medium = bar, Low = down-triangle) — small
+// inline SVGs so the priority chip carries a SHAPE, not just a colour word. Not in
+// Icon.jsx (that is the functional/action set); these are severity-family markers.
+function PrioGlyph({ band, size = 12 }) {
+  const common = {
+    width: size,
+    height: size,
+    viewBox: "0 0 12 12",
+    fill: "currentColor",
+    style: { display: "block", flexShrink: 0 },
+    "aria-hidden": true,
+    focusable: false,
+  };
+  if (band === "High") {
+    return (
+      <svg {...common}>
+        <path d="M6 2 L11 10 L1 10 Z" />
+      </svg>
+    );
+  }
+  if (band === "Low") {
+    return (
+      <svg {...common}>
+        <path d="M6 10 L1 2 L11 2 Z" />
+      </svg>
+    );
+  }
+  if (!band) {
+    // unknown / non-canonical priority — a neutral hollow dot, NOT the Medium bar (so the shape signal
+    // does not falsely read Medium). (deep-audit fix)
+    return (
+      <svg {...common} fill="none" stroke="currentColor" strokeWidth="1.6">
+        <circle cx="6" cy="6" r="3.2" />
+      </svg>
+    );
+  }
+  // Medium — a horizontal bar.
+  return (
+    <svg {...common}>
+      <rect x="1.5" y="5" width="9" height="2.4" rx="1" />
+    </svg>
+  );
+}
+
+// A low-confidence (✗) diamond — a red rotated square. Its own SHAPE (a diamond),
+// distinct from the amber triangle (⚠ unsure) and the green check (✓ confident).
+function DiamondGlyph({ size = 12, color }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 12 12"
+      fill={color || "currentColor"}
+      style={{ display: "block", flexShrink: 0 }}
+      aria-hidden={true}
+      focusable={false}
+    >
+      <path d="M6 0.5 L11.5 6 L6 11.5 L0.5 6 Z" />
+    </svg>
+  );
+}
+
+// The tone glyph for a confidence indicator — shape+colour, never colour alone.
+//   ✗ → red diamond ; ⚠ → amber triangle ; ✓ → green check ; unrated → steel dot.
+function ToneGlyph({ indicator, size = 14 }) {
+  if (indicator === "✗") return <DiamondGlyph size={size} color="var(--s2j-red)" />;
+  if (indicator === "⚠") {
+    return (
+      <span style={{ color: "var(--s2j-orange)", display: "inline-flex" }}>
+        <SignalIcon kind="warning" size={size + 2} />
+      </span>
+    );
+  }
+  if (indicator === "✓") {
+    return (
+      <span style={{ color: "var(--s2j-green)", display: "inline-flex" }}>
+        <IconCheck size={size + 1} />
+      </span>
+    );
+  }
+  // unrated
+  return (
+    <span
+      aria-hidden={true}
+      style={{
+        width: size - 2,
+        height: size - 2,
+        borderRadius: "50%",
+        background: "var(--s2j-steel)",
+        display: "inline-block",
+        flexShrink: 0,
+      }}
+    />
+  );
+}
+
+// A small square severity chip (red/amber/steel) — the COLOUR marker for a concern
+// row; the "{Severity} · {TypeLabel}" text next to it stays dark.
+function SeveritySquare({ severity, size = 12 }) {
+  const color =
+    severity === "high"
+      ? "var(--s2j-red)"
+      : severity === "medium"
+        ? "var(--s2j-orange)"
+        : "var(--s2j-steel)";
+  return (
+    <span
+      aria-hidden={true}
+      style={{
+        width: size,
+        height: size,
+        borderRadius: 3,
+        background: color,
+        display: "inline-block",
+        flexShrink: 0,
+        marginTop: 2,
+      }}
+    />
+  );
+}
+
+const SEV_WORD = { high: "High", medium: "Medium", low: "Low" };
+
+// One confidence tile in the verdict card (CONFIDENT / UNSURE / LOW CONF. / UNRATED).
+// A 0 reads calm (muted); the tone icon + uppercase label carry the meaning.
+function ConfidenceTile({ indicator, count, label }) {
+  const active = count > 0;
+  // The label WORD stays muted (WCAG AA on the near-white glass); the severity COLOUR is carried by
+  // the ToneGlyph icon only, never by the text (the same light-on-light rule). (deep-audit fix)
+  return (
+    <div
+      style={{
+        ...glassSurface("utility"),
+        padding: "10px 12px",
+        minWidth: 92,
+        textAlign: "center",
+        opacity: active ? 1 : 0.72,
+      }}
+    >
+      <div className="flex items-center justify-center" style={{ gap: 6 }}>
+        <ToneGlyph indicator={indicator} size={14} />
+        <span
+          style={{
+            fontSize: 22,
+            fontWeight: 700,
+            lineHeight: 1,
+            color: active ? "var(--s2j-text)" : "var(--s2j-text-light)",
+          }}
+        >
+          {count}
+        </span>
+      </div>
+      <div
+        className="uppercase"
+        style={{
+          fontSize: 10,
+          letterSpacing: "0.06em",
+          fontWeight: 600,
+          marginTop: 5,
+          color: "var(--s2j-text-muted)",
+        }}
+      >
+        {label}
+      </div>
+    </div>
+  );
+}
+
+// The priority chip for a flagged row — colour on the glyph, word dark.
+function PriorityChip({ priority }) {
+  // Drive the band from the SHARED priorityLabel so display, weight, and the sizing histogram agree.
+  // An unknown/non-canonical value shows its RAW string with a neutral steel glyph — never a false
+  // "Medium" that would disagree with the uncounted spread + band-0 weight. (deep-audit fix)
+  const band = priorityLabel(priority); // 'High' | 'Medium' | 'Low' | null
+  const word = band || priority;
+  const color =
+    band === "High"
+      ? "var(--s2j-red)"
+      : band === "Medium"
+        ? "var(--s2j-orange)"
+        : "var(--s2j-steel)"; // Low OR unknown → steel (neutral)
+  return (
+    <span
+      className="inline-flex items-center"
+      style={{
+        gap: 4,
+        padding: "2px 7px",
+        borderRadius: 8,
+        background: "var(--s2j-bg-section)",
+        border: "1px solid var(--s2j-border)",
+        fontSize: 11,
+      }}
+      title={`${word} priority`}
+    >
+      <span style={{ color, display: "inline-flex" }}>
+        <PrioGlyph band={band} />
+      </span>
+      <span style={{ color: "var(--s2j-text)" }}>{word}</span>
+    </span>
+  );
+}
+
+// A neutral sizing chip (SP / Cx / score) — muted label, navy value.
+function SizeChip({ children, title }) {
+  return (
+    <span
+      title={title}
+      style={{
+        padding: "2px 7px",
+        borderRadius: 8,
+        background: "var(--s2j-bg-section)",
+        border: "1px solid var(--s2j-border)",
+        fontSize: 11,
+        color: "var(--s2j-text)",
+        whiteSpace: "nowrap",
+      }}
+    >
+      {children}
+    </span>
+  );
+}
+
+// One row in the "Look here first" ranked list. A left-accent stripe by tone
+// (red for ✗, amber for ⚠) reinforces urgency; concern chips render below the
+// header. `defaultOpen` shows the concern text without a click (the #1 landmine).
+function FlaggedRow({ feature, defaultOpen, onProceed }) {
+  const [open, setOpen] = useState(!!defaultOpen);
+  const ind = feature.confidence_indicator;
+  const accent =
+    ind === "✗"
+      ? "var(--s2j-red)"
+      : ind === "⚠"
+        ? "var(--s2j-orange)"
+        : "var(--s2j-steel)";
+  const concerns = feature.concerns || [];
+  const hasConcerns = concerns.length > 0;
+  return (
+    <div
+      style={{
+        ...glassSurface("minor"),
+        borderLeft: `4px solid ${accent}`,
+        padding: "12px 14px",
+      }}
+    >
+      <div className="flex items-start" style={{ gap: 10, justifyContent: "space-between" }}>
+        {/* left: glyph + name + category (click to toggle concerns when present) */}
+        <button
+          type="button"
+          onClick={hasConcerns ? () => setOpen((o) => !o) : undefined}
+          aria-expanded={hasConcerns ? open : undefined}
+          style={{
+            display: "flex",
+            alignItems: "flex-start",
+            gap: 8,
+            background: "transparent",
+            border: "none",
+            padding: 0,
+            textAlign: "left",
+            cursor: hasConcerns ? "pointer" : "default",
+            minWidth: 0,
+            flex: 1,
+          }}
+        >
+          <span style={{ marginTop: 1 }}>
+            <ToneGlyph indicator={ind} size={14} />
+          </span>
+          <span style={{ minWidth: 0 }}>
+            <span style={{ fontSize: 13.5, fontWeight: 600, color: MOOD.navy }}>
+              {feature.name}
+            </span>
+            {feature.category ? (
+              <span style={{ fontSize: 12, color: "var(--s2j-text-muted)", marginLeft: 8 }}>
+                {feature.category}
+              </span>
+            ) : null}
+            {hasConcerns ? (
+              <span style={{ fontSize: 11, color: "var(--s2j-text-muted)", marginLeft: 8 }}>
+                {open ? "▾ hide" : `▸ ${concerns.length} concern${concerns.length > 1 ? "s" : ""}`}
+              </span>
+            ) : null}
+          </span>
+        </button>
+        {/* right: sizing chips + score + open-card deep-link */}
+        <div className="flex items-center" style={{ gap: 6, flexWrap: "wrap", justifyContent: "flex-end" }}>
+          {typeof feature.story_points === "number" ? (
+            <SizeChip title="Story points">{feature.story_points} SP</SizeChip>
+          ) : null}
+          {typeof feature.complexity_score === "number" ? (
+            <SizeChip title="Complexity (1-5)">Cx {feature.complexity_score}/5</SizeChip>
+          ) : null}
+          {feature.priority ? <PriorityChip priority={feature.priority} /> : null}
+          {typeof feature.confidence_score === "number" ? (
+            <SizeChip title="Self-rated confidence">{feature.confidence_score}/100</SizeChip>
+          ) : null}
+          <button
+            type="button"
+            onClick={onProceed}
+            className="btn-nav"
+            style={{ padding: "3px 10px", fontSize: 11.5 }}
+            title="Open the breakdown editor"
+            aria-label={`Open ${feature.name} in the editor`}
+          >
+            Open card ↗
+          </button>
+        </div>
+      </div>
+      {/* concern chips — visible when open (top landmine defaults open) */}
+      {hasConcerns && open ? (
+        <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 8 }}>
+          {concerns.map((c, ci) => (
+            <div key={ci} className="flex items-start" style={{ gap: 8 }}>
+              <SeveritySquare severity={c.severity} />
+              <div style={{ minWidth: 0 }}>
+                <span style={{ fontSize: 12, fontWeight: 600, color: "var(--s2j-text)" }}>
+                  {SEV_WORD[c.severity] || "Note"} · {CONCERN_TYPE_LABEL[c.type] || c.type}
+                </span>
+                <span style={{ fontSize: 12.5, color: "var(--s2j-text)", marginLeft: 6, lineHeight: 1.5 }}>
+                  {c.text}
+                </span>
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+// S6 over-fragmented: the flagged list rolled up per category (a glance, not a
+// one-by-one scroll). Expand reveals that category's flagged rows.
+function CategoryRollupRow({ group, onProceed, defaultOpen }) {
+  const [open, setOpen] = useState(!!defaultOpen);
+  return (
+    <div style={{ ...glassSurface("minor"), padding: "12px 14px" }}>
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          gap: 10,
+          width: "100%",
+          background: "transparent",
+          border: "none",
+          padding: 0,
+          textAlign: "left",
+          cursor: "pointer",
+        }}
+      >
+        <span style={{ fontSize: 13.5, fontWeight: 600, color: MOOD.navy }}>
+          {open ? "▾ " : "▸ "}
+          {group.name}
+        </span>
+        <span style={{ fontSize: 12, color: "var(--s2j-text-muted)" }}>
+          {group.featureCount > 0 ? `${group.featureCount} features · ` : ""}
+          {group.flaggedCount} flagged · {group.lowConfCount} low-conf
+        </span>
+      </button>
+      {open ? (
+        <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 8 }}>
+          {group.rows.map((f, i) => (
+            <FlaggedRow key={f._uid || i} feature={f} defaultOpen={defaultOpen && i === 0} onProceed={onProceed} />
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+// A horizontal count bar (concern fingerprint / anything count-based).
+function CountBar({ label, count, max, isCompliance }) {
+  const pct = max > 0 ? Math.max(6, Math.round((count / max) * 100)) : 0;
+  return (
+    <div className="flex items-center" style={{ gap: 8 }}>
+      <div style={{ width: 120, flexShrink: 0, display: "flex", alignItems: "center", gap: 6 }}>
+        {isCompliance ? <SeveritySquare severity="high" size={10} /> : null}
+        <span style={{ fontSize: 12, color: "var(--s2j-text)" }}>{label}</span>
+      </div>
+      <div style={{ flex: 1, height: 10, borderRadius: 6, background: "var(--s2j-bg-section)", overflow: "hidden" }}>
+        <div
+          style={{
+            width: `${pct}%`,
+            height: "100%",
+            borderRadius: 6,
+            background: isCompliance ? "var(--s2j-red)" : "var(--s2j-steel)",
+          }}
+        />
+      </div>
+      <span style={{ fontSize: 12, fontWeight: 600, color: "var(--s2j-text)", width: 24, textAlign: "right" }}>
+        {count}
+      </span>
+    </div>
+  );
+}
+
 function InsightsScreen({
   breakdown,
   pageTitle,
@@ -3750,26 +4157,100 @@ function InsightsScreen({
   onProceed,
   onBack,
 }) {
-  const signals = extractV3Signals(breakdown || {});
-  const sortedSpecConcerns = sortConcernsBySeverity(signals.parsedSpecConcerns);
-  const qualityPalette = signals.overallQuality
-    ? QUALITY_PALETTE[signals.overallQuality]
-    : null;
-  const fc = signals.parsedFeatureConcerns;
-  const featHigh = fc.filter((c) => c.severity === "high").length;
-  const featMed = fc.filter((c) => c.severity === "medium").length;
-  const featLow = fc.filter((c) => c.severity === "low").length;
-  // Nothing flagged → a positive empty-state instead of a near-blank screen. The
-  // TrustCard still renders the confidence summary; this just adds reassuring closure.
-  const nothingFlagged =
-    sortedSpecConcerns.length === 0 &&
-    fc.length === 0 &&
-    !signals.ambiguityNote &&
-    (signals.confidence.flagged?.length || 0) === 0;
+  const view = useMemo(() => computeInsightsView(breakdown || {}), [breakdown]);
+  const {
+    isLegacy,
+    shape,
+    categories,
+    quality,
+    confidence,
+    verdict,
+    complianceLandmine,
+    flagged,
+    confident,
+    concernFingerprint,
+    sizingSpread,
+    ambiguityNote,
+  } = view;
+
+  const features = shape.features;
+  const overFragmented = features > 50;
+  // All-unrated (S2): the model returned a breakdown but rated NO features. Gates the S1/confident
+  // positive-closure so unreviewed features are never painted "all clear". (deep-audit fix)
+  const allUnrated = confidence.total > 0 && confidence.unrated === confidence.total;
+  // In S6, auto-expand the category HOLDING the top-weighted flagged feature (the true landmine), not
+  // merely the most-flagged category — so its concern is visible without a click. (deep-audit fix)
+  const topLandmineCategory = flagged.length > 0 ? (flagged[0].category || "Uncategorised") : null;
+
+  // S5 — collapse multiple data-quality notices into ONE bordered group so they
+  // never push the triage below the fold; a single one renders as a normal callout.
+  const notices = [];
+  if (truncationNote)
+    notices.push({
+      title: "Partial breakdown — some features may be missing",
+      body: truncationNote,
+    });
+  if (persistFailed)
+    notices.push({
+      title: "This breakdown could not be saved to storage (too large)",
+      body: "It is loaded in this tab only — edit and push it now, or it will be lost when you leave. Consider splitting very large pages.",
+    });
+  if (staleBreakdown)
+    notices.push({
+      title: "This page was edited since this breakdown was generated",
+      body: `Page version ${staleBreakdown.generatedAt} → ${staleBreakdown.current}. Open the editor and use Regenerate to include your changes.`,
+    });
+
+  // Verdict tone → the lead icon / accent.
+  const verdictAccent =
+    verdict.tone === "trust"
+      ? "var(--s2j-green)"
+      : verdict.tone === "caution"
+        ? "var(--s2j-orange)"
+        : "var(--s2j-steel)";
+
+  // S6 category roll-up groups (only built when over-fragmented).
+  const rollupGroups = useMemo(() => {
+    if (!overFragmented) return [];
+    const byCat = new Map();
+    (categories || []).forEach((c) => {
+      byCat.set(c.name, {
+        name: c.name,
+        featureCount: c.featureCount,
+        flaggedCount: 0,
+        lowConfCount: 0,
+        rows: [],
+      });
+    });
+    (flagged || []).forEach((f) => {
+      const key = f.category || "Uncategorised";
+      let g = byCat.get(key);
+      if (!g) {
+        g = { name: key, featureCount: 0, flaggedCount: 0, lowConfCount: 0, rows: [] };
+        byCat.set(key, g);
+      }
+      g.flaggedCount += 1;
+      if (f.confidence_indicator === "✗") g.lowConfCount += 1;
+      g.rows.push(f);
+    });
+    // give the ad-hoc "Uncategorised" bucket a real feature count (total − categorised sum) so it
+    // never reads an impossible "0 features · N flagged". (deep-audit fix)
+    const uncat = byCat.get("Uncategorised");
+    if (uncat && !uncat.featureCount) {
+      const categorised = (categories || []).reduce((s, c) => s + (c.featureCount || 0), 0);
+      uncat.featureCount = Math.max(uncat.flaggedCount, features - categorised);
+    }
+    return Array.from(byCat.values())
+      .filter((g) => g.flaggedCount > 0)
+      .sort((a, b) => b.flaggedCount - a.flaggedCount);
+  }, [overFragmented, categories, flagged, features]);
+
+  const spMax = Math.max(1, ...(sizingSpread.storyPoints || []).map((s) => s.count));
+  const fpMax = Math.max(1, ...(concernFingerprint.items || []).map((i) => i.count));
 
   return (
     <div className="p-6" style={SCREEN_MAX_WIDTH_STYLE}>
-      {/* moodboard (Phase 2) — navy "AI insights" title + the page name as subtitle. */}
+      {/* 1 — Header */}
       <ScreenHeader
         title="AI insights"
         subtitle={pageTitle || undefined}
@@ -3777,173 +4258,409 @@ function InsightsScreen({
         backLabel="Back to pages"
         backTitle="Discard this breakdown and return to the page picker"
       />
-      <p style={{ ...TYPE.sub, marginTop: -6, marginBottom: 20 }}>
-        The AI has completed the breakdown and flagged areas to review before you edit.
+      <p style={{ ...TYPE.sub, marginTop: -6, marginBottom: 18 }}>
+        Here is what the AI generated, where the risk sits, and where to look first.
       </p>
 
-      {/* (Spec summary intentionally NOT shown here — 2026-06-26 partner: it is the
-          Epic description, edited in the BreakdownEditor's Epic block, the single
-          source. The intro line above frames this screen; the signals carry the value.) */}
-
-      {/* Partial-breakdown + tab-only warnings — surfaced on the FIRST screen so the
-          user knows the data is incomplete / unsaved before investing time editing. */}
-      {/* moodboard (Phase 2) — the data-quality banners share the warning vocabulary. */}
-      {truncationNote && (
-        <SignalCallout
-          kind="warning"
-          title="Partial breakdown — some features may be missing"
-          style={{ marginBottom: 16 }}
-        >
-          {truncationNote}
+      {/* 2 — Data-quality banner zone (S5: >1 collapses into one group) */}
+      {notices.length === 1 ? (
+        <SignalCallout kind="warning" title={notices[0].title} style={{ marginBottom: 16 }}>
+          {notices[0].body}
         </SignalCallout>
-      )}
-      {persistFailed && (
-        <SignalCallout
-          kind="warning"
-          title="This breakdown could not be saved to storage (too large)."
-          style={{ marginBottom: 16 }}
+      ) : notices.length > 1 ? (
+        <div
+          style={{
+            border: "1px solid var(--s2j-orange-border)",
+            background: "var(--s2j-orange-bg)",
+            borderRadius: 12,
+            padding: "10px 12px",
+            marginBottom: 16,
+            display: "flex",
+            flexDirection: "column",
+            gap: 8,
+          }}
         >
-          It is loaded in this tab only — edit and push it now, or it will be lost
-          when you leave. Consider splitting very large pages.
-        </SignalCallout>
-      )}
-      {/* Stale-page warning (forwarded like truncation/persistFailed — UX-1 deep-audit
-          fix): the page changed in Confluence since this breakdown was generated. Shown
-          here for consistency with the other data-quality banners; the actionable
-          Regenerate lives in the editor, one click forward via "Edit the breakdown →". */}
-      {staleBreakdown && (
-        <SignalCallout
-          kind="warning"
-          title="This page was edited since this breakdown was generated"
-          style={{ marginBottom: 16 }}
-        >
-          Page version {staleBreakdown.generatedAt} → {staleBreakdown.current}. Open the
-          editor and use Regenerate to include your changes.
-        </SignalCallout>
-      )}
-
-      {/* AI self-check (overall quality + confidence + where to focus) */}
-      {(qualityPalette || signals.confidence.total > 0) && (
-        <MoodCard density="minor" style={{ marginBottom: 16 }}>
-          <div className="flex items-center justify-between gap-4">
-            <div>
-              <p className="text-xs font-medium uppercase tracking-wider mb-1" style={{ color: "var(--s2j-text-muted)" }}>
-                AI self-check
-              </p>
-              {qualityPalette && (
-                <p className="text-base font-semibold" style={{ color: qualityPalette.text }}>
-                  {qualityPalette.label}
-                </p>
-              )}
-              <p className="text-xs mt-1" style={{ color: "var(--s2j-text-muted)", maxWidth: "34ch" }}>
-                The AI's own confidence in this breakdown — a guide for where to look, not a guarantee.
-              </p>
-              {signals.confidence.averageScore !== null && (
-                <p className="text-xs mt-1" style={{ color: "var(--s2j-text-muted)" }}>
-                  Average self-rated confidence: {signals.confidence.averageScore}/100
-                </p>
-              )}
-            </div>
-            <div className="flex gap-4 text-sm">
-              <ConfidenceBadge indicator="✓" count={signals.confidence["✓"]} color="var(--s2j-green)" label="Confident" />
-              <ConfidenceBadge indicator="⚠" count={signals.confidence["⚠"]} color="var(--s2j-orange)" label="Unsure" />
-              <ConfidenceBadge indicator="✗" count={signals.confidence["✗"]} color="var(--s2j-red)" label="Low confidence" />
-            </div>
+          <div className="flex items-center" style={{ gap: 8 }}>
+            <SignalIcon kind="warning" size={16} />
+            <span style={{ fontSize: 12.5, fontWeight: 600, color: "var(--s2j-text)" }}>
+              {notices.length} data-quality notices
+            </span>
           </div>
-          {signals.confidence.flagged?.length > 0 && (
-            <div className="mt-3 pt-3" style={{ borderTop: "1px solid var(--s2j-border)" }}>
-              <p className="text-xs font-medium uppercase tracking-wider mb-2" style={{ color: "var(--s2j-text-muted)" }}>
-                Needs your attention
-              </p>
-              <ul className="space-y-1" style={{ listStyle: "none", margin: 0, padding: 0 }}>
-                {signals.confidence.flagged.slice(0, 6).map((f, i) => (
-                  <li key={i} className="flex items-center gap-2 text-xs">
-                    <span style={{ color: f.indicator === "✗" ? "var(--s2j-red)" : "var(--s2j-orange)", flexShrink: 0 }}>
-                      {f.indicator}
-                    </span>
-                    <span className="truncate" style={{ color: "var(--s2j-text)" }}>{f.name}</span>
-                    {typeof f.score === "number" && (
-                      <span style={{ color: "var(--s2j-text-muted)", flexShrink: 0 }}>{f.score}/100</span>
-                    )}
-                  </li>
-                ))}
-              </ul>
-              {signals.confidence.flagged.length > 6 && (
-                <p className="text-xs mt-1" style={{ color: "var(--s2j-text-muted)" }}>
-                  +{signals.confidence.flagged.length - 6} more — find them in the editor
-                </p>
-              )}
+          {notices.map((n, i) => (
+            <div key={i} className="flex items-start" style={{ gap: 8 }}>
+              <SeveritySquare severity="medium" />
+              <div style={{ fontSize: 12, color: "var(--s2j-text)", lineHeight: 1.5 }}>
+                <strong style={{ fontWeight: 600 }}>{n.title}.</strong> {n.body}
+              </div>
             </div>
-          )}
-        </MoodCard>
-      )}
+          ))}
+        </div>
+      ) : null}
 
-      {/* Document-level concerns — risks / compliance / ambiguity ranked by severity */}
-      {sortedSpecConcerns.length > 0 && (
-        <div className="mb-4">
-          <h3 className="text-sm font-semibold mb-2 flex items-center gap-2" style={{ color: "var(--s2j-text)" }}>
-            <SignalIcon kind="warning" size={14} />
-            <span>Document-level concerns ({sortedSpecConcerns.length})</span>
-          </h3>
-          <p className="text-xs mb-3" style={{ color: "var(--s2j-text-muted)" }}>
-            Potential risks, ambiguities, or compliance gaps surfaced by AI analysis. Address high-severity items as you edit.
-          </p>
-          <div className="space-y-2">
-            {sortedSpecConcerns.map((concern, idx) => (
-              <ConcernRow key={idx} concern={concern} />
+      {/* 3 — WHAT YOU GOT (shape card) */}
+      <MoodCard title="What you got" density="minor" style={{ marginBottom: 16 }}>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 6, alignItems: "baseline", fontSize: 13 }}>
+          {[
+            [shape.epics, "epic"],
+            [shape.features, "features"],
+            [shape.tasks, "tasks"],
+            [shape.acceptanceCriteria, "acceptance criteria"],
+            [shape.sharedACs, "shared ACs"],
+            [shape.dependencies, "dependencies"],
+          ].map(([n, lbl], i, arr) => (
+            <span key={lbl} style={{ color: "var(--s2j-text-muted)" }}>
+              <strong style={{ color: MOOD.navy, fontWeight: 700 }}>{n}</strong> {lbl}
+              {i < arr.length - 1 ? <span style={{ margin: "0 4px", opacity: 0.5 }}>·</span> : null}
+            </span>
+          ))}
+        </div>
+        {categories && categories.length > 0 ? (
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 12 }}>
+            {categories.map((c) => (
+              <span
+                key={c.name}
+                style={{
+                  padding: "2px 9px",
+                  borderRadius: 999,
+                  background: "var(--s2j-bg-section)",
+                  border: "1px solid var(--s2j-border)",
+                  fontSize: 11.5,
+                  color: "var(--s2j-text)",
+                }}
+              >
+                {c.name}{" "}
+                <strong style={{ color: MOOD.navy, fontWeight: 700 }}>{c.featureCount}</strong>
+              </span>
             ))}
           </div>
-        </div>
+        ) : null}
+      </MoodCard>
+
+      {/* S3 — LEGACY: no triad, no fake signals. Shape + note + CTA only. */}
+      {isLegacy ? (
+        <>
+          <SignalCallout kind="info" title="This breakdown predates AI self-check" style={{ marginBottom: 20 }}>
+            No confidence or concern signals were captured — review it as you would any draft.
+          </SignalCallout>
+        </>
+      ) : (
+        <>
+          {/* 4 — VERDICT card */}
+          <MoodCard density="minor" accent={verdictAccent} style={{ marginBottom: 16 }}>
+            <div className="flex items-start" style={{ gap: 16, justifyContent: "space-between", flexWrap: "wrap" }}>
+              {/* left — headline + caveat */}
+              <div style={{ minWidth: 0, flex: 1, minInlineSize: 260 }}>
+                <div className="flex items-center" style={{ gap: 8, marginBottom: 4 }}>
+                  {verdict.tone === "trust" ? (
+                    <span style={{ color: "var(--s2j-green)", display: "inline-flex" }}>
+                      <IconCheck size={18} />
+                    </span>
+                  ) : verdict.tone === "caution" ? (
+                    <SignalIcon kind="warning" size={18} />
+                  ) : (
+                    <span
+                      aria-hidden={true}
+                      style={{
+                        width: 12,
+                        height: 12,
+                        borderRadius: "50%",
+                        background: "var(--s2j-steel)",
+                        display: "inline-block",
+                      }}
+                    />
+                  )}
+                  {quality && quality.label ? (
+                    <span
+                      style={{
+                        fontSize: 10.5,
+                        fontWeight: 700,
+                        letterSpacing: "0.05em",
+                        padding: "2px 8px",
+                        borderRadius: 999,
+                        background: "var(--s2j-bg-section)",
+                        border: "1px solid var(--s2j-border)",
+                        color: "var(--s2j-text)",
+                      }}
+                    >
+                      Self-check: {quality.label}
+                    </span>
+                  ) : null}
+                </div>
+                <p style={{ fontSize: 15.5, fontWeight: 700, color: MOOD.navy, lineHeight: 1.3, margin: 0 }}>
+                  {verdict.headline}
+                </p>
+                <p style={{ fontSize: 12.5, color: "var(--s2j-text-muted)", lineHeight: 1.55, marginTop: 6, maxWidth: "60ch" }}>
+                  {verdict.sub}
+                </p>
+                {!allUnrated && confidence.averageScore !== null && confidence.averageScore !== undefined ? (
+                  <p style={{ fontSize: 12, color: "var(--s2j-text-muted)", marginTop: 4 }}>
+                    Average self-rated confidence {confidence.averageScore}/100
+                  </p>
+                ) : null}
+              </div>
+              {/* right — FOUR confidence tiles (UNRATED always present) */}
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                <ConfidenceTile indicator="✓" count={confidence.confident} label="Confident" />
+                <ConfidenceTile indicator="⚠" count={confidence.unsure} label="Unsure" />
+                <ConfidenceTile indicator="✗" count={confidence.lowConf} label="Low conf." />
+                <ConfidenceTile indicator="unrated" count={confidence.unrated} label="Unrated" />
+              </div>
+            </div>
+          </MoodCard>
+
+          {/* S2 — ALL-UNRATED neutral steel note (NOT green "all clear") */}
+          {confidence.total > 0 && confidence.unrated === confidence.total ? (
+            <div
+              style={{
+                border: "1px solid var(--s2j-border)",
+                background: "var(--s2j-bg-section)",
+                borderLeft: "4px solid var(--s2j-steel)",
+                borderRadius: 12,
+                padding: "12px 14px",
+                marginBottom: 16,
+                fontSize: 12.5,
+                color: "var(--s2j-text)",
+                lineHeight: 1.55,
+              }}
+            >
+              <strong style={{ fontWeight: 600 }}>
+                No confidence signals — {confidence.total} of {confidence.total} features unrated.
+              </strong>{" "}
+              The model returned the breakdown but rated nothing. This is NOT all clear. Treat every
+              feature as unreviewed — the weight map and concern fingerprint below still apply.
+            </div>
+          ) : null}
+
+          {/* 5 — COMPLIANCE landmine (structurally separate, above the list) */}
+          {complianceLandmine ? (() => {
+            // Scope + label + CTA vary by whether the landmine is compliance vs a promoted high-severity
+            // concern, and feature- vs document-level. The chip uses a DARKER red so its white text passes
+            // WCAG AA (a plain --s2j-red filled badge was ~3.1:1 — the most critical label on the screen). (deep-audit fixes)
+            const lm = complianceLandmine;
+            const isCompliance = lm.type === "COMPLIANCE";
+            const typeLabel = CONCERN_TYPE_LABEL[lm.type] || lm.type;
+            const chipLabel = isCompliance ? "COMPLIANCE" : `${SEV_WORD[lm.severity] || "High"} ${typeLabel}`.toUpperCase();
+            const scope = lm.relatedFeatureName ? "feature-level" : "document-level";
+            const headline = isCompliance
+              ? "Clear this before you build — it crosses a regulatory boundary."
+              : "Address this before you build — the AI flagged it as high-severity.";
+            return (
+              <div style={{ border: "1px solid var(--s2j-red-border)", background: "var(--s2j-red-bg)", borderRadius: 12, padding: "12px 14px", marginBottom: 16, boxShadow: "0 4px 16px rgba(5,38,89,0.06)" }}>
+                <div className="flex items-center" style={{ gap: 8, marginBottom: 6, flexWrap: "wrap" }}>
+                  <span style={{ fontSize: 10.5, fontWeight: 700, letterSpacing: "0.05em", padding: "2px 8px", borderRadius: 5, background: "#b3121f", color: "#fff" }}>
+                    {chipLabel}
+                  </span>
+                  <span style={{ fontSize: 12, fontWeight: 600, color: "var(--s2j-text)" }}>
+                    {SEV_WORD[lm.severity] || "High"} severity · {scope}
+                  </span>
+                </div>
+                <p style={{ fontSize: 13.5, fontWeight: 700, color: MOOD.navy, margin: "0 0 4px" }}>{headline}</p>
+                <p style={{ fontSize: 12.5, color: "var(--s2j-text)", lineHeight: 1.55, margin: 0 }}>{lm.text}</p>
+                <button type="button" onClick={onProceed} className="btn-nav" style={{ padding: "4px 11px", fontSize: 11.5, marginTop: 10 }}>
+                  {lm.relatedFeatureName ? `Open ${lm.relatedFeatureName} in the editor ↗` : "Open the editor to review ↗"}
+                </button>
+              </div>
+            );
+          })() : null}
+
+          {/* 6 — Look here first (the ranked flagged list) */}
+          {/* S6 over-fragmented banner — OUTSIDE the flagged block so it shows even when nothing is
+             flagged (a >50-feature spec is over-fragmented regardless of flags). (deep-audit fix) */}
+          {overFragmented ? (
+            <SignalCallout kind="warning" title={`${features} features — this spec may be over-fragmented (norm 3-30)`} style={{ marginBottom: 12 }}>
+              Too fine to orient one-by-one — consider merging in the editor.{flagged.length > 0 ? " The flagged list is rolled up by category below." : ""}
+            </SignalCallout>
+          ) : null}
+          {flagged.length > 0 ? (
+            <div style={{ marginBottom: 16 }}>
+              <div className="flex items-center" style={{ gap: 8, marginBottom: 4 }}>
+                <h3 style={{ ...TYPE.heading, color: MOOD.navy, fontSize: 15 }}>Look here first</h3>
+                <span style={{ fontSize: 12, color: "var(--s2j-text-muted)" }}>
+                  {flagged.length} of {features} features flagged · {overFragmented ? "grouped by category" : "sorted by weight"}
+                </span>
+              </div>
+              <p style={{ fontSize: 12, color: "var(--s2j-text-muted)", marginBottom: 12 }}>
+                Every flagged feature is shown — click a row for the AI concern text; open its card to fix it.
+              </p>
+              {overFragmented ? (
+                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  {rollupGroups.map((g) => (
+                    <CategoryRollupRow key={g.name} group={g} defaultOpen={g.name === topLandmineCategory} onProceed={onProceed} />
+                  ))}
+                </div>
+              ) : (
+                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  {flagged.map((f, i) => (
+                    <FlaggedRow
+                      key={f._uid || i}
+                      feature={f}
+                      defaultOpen={i === 0}
+                      onProceed={onProceed}
+                    />
+                  ))}
+                </div>
+              )}
+            </div>
+          ) : allUnrated ? null : confidence.unrated > 0 ? (
+            /* Some (not all) features unrated + none flagged → a NEUTRAL steel note, NEVER a green
+               all-clear (the model did not rate them → unreviewed). Dropping the old green S1 here also
+               kills the triple-green stack in the clean state (the verdict + confident strip suffice). (deep-audit fix) */
+            <div
+              style={{
+                border: "1px solid var(--s2j-border)",
+                background: "var(--s2j-bg-section)",
+                borderLeft: "4px solid var(--s2j-steel)",
+                borderRadius: 12,
+                padding: "12px 14px",
+                marginBottom: 16,
+                fontSize: 12.5,
+                color: "var(--s2j-text)",
+                lineHeight: 1.55,
+              }}
+            >
+              Nothing flagged, but{" "}
+              <strong style={{ fontWeight: 600 }}>{confidence.unrated} of {features} features {confidence.unrated === 1 ? "is" : "are"} unrated</strong>{" "}
+              — the model did not rate them; treat them as unreviewed before you push.
+            </div>
+          ) : null}
+
+          {/* 7 — CONFIDENT skim strip */}
+          {confident && confident.length > 0 ? (
+            <SignalCallout kind="success" title={`${confident.length} confident feature${confident.length === 1 ? "" : "s"} with nothing flagged — skim, don't dwell`} style={{ marginBottom: 16 }}>
+              No concerns flagged on these — any confident feature that DOES carry a concern is in the list above.
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 8 }}>
+                {confident.slice(0, 12).map((c, i) => (
+                  <span
+                    key={i}
+                    style={{
+                      padding: "2px 9px",
+                      borderRadius: 999,
+                      background: "var(--s2j-green-bg)",
+                      border: "1px solid var(--s2j-green-border)",
+                      fontSize: 11.5,
+                      color: "var(--s2j-text)",
+                    }}
+                  >
+                    {c.name}
+                    {typeof c.confidence_score === "number" ? (
+                      <span style={{ color: "var(--s2j-text-muted)", marginLeft: 5 }}>{c.confidence_score}/100</span>
+                    ) : null}
+                  </span>
+                ))}
+                {/* cap the chip wall (esp. in the over-fragmented S6 state the roll-up exists to avoid). (deep-audit fix) */}
+                {confident.length > 12 ? (
+                  <span style={{ fontSize: 11.5, color: "var(--s2j-text-muted)", alignSelf: "center" }}>
+                    +{confident.length - 12} more
+                  </span>
+                ) : null}
+              </div>
+            </SignalCallout>
+          ) : null}
+
+          {/* 8 — CONCERN FINGERPRINT */}
+          {concernFingerprint && concernFingerprint.total > 0 ? (
+            <MoodCard
+              title={`Concern fingerprint · ${concernFingerprint.total} total`}
+              density="minor"
+              style={{ marginBottom: 16 }}
+            >
+              <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
+                {concernFingerprint.items.map((it) => (
+                  <CountBar
+                    key={it.type}
+                    label={it.label}
+                    count={it.count}
+                    max={fpMax}
+                    isCompliance={it.isCompliance}
+                  />
+                ))}
+              </div>
+              {concernFingerprint.narrative ? (
+                <p style={{ fontSize: 12.5, color: "var(--s2j-text-muted)", marginTop: 12, lineHeight: 1.55 }}>
+                  {concernFingerprint.narrative}
+                </p>
+              ) : null}
+            </MoodCard>
+          ) : null}
+
+          {/* 9 — WEIGHT & SIZING SPREAD (the uniform-sizing honesty check) */}
+          {sizingSpread && (sizingSpread.storyPoints || []).length > 0 ? (
+            <MoodCard title="Sizing spread" density="minor" style={{ marginBottom: 16 }}>
+              <div style={{ display: "flex", alignItems: "flex-end", gap: 12, height: 72, marginBottom: 10 }}>
+                {sizingSpread.storyPoints.map((s) => (
+                  <div key={s.sp} style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 4 }}>
+                    <span style={{ fontSize: 11, fontWeight: 600, color: "var(--s2j-text)" }}>{s.count}</span>
+                    <div
+                      style={{
+                        width: 26,
+                        height: Math.max(6, Math.round((s.count / spMax) * 48)),
+                        borderRadius: 5,
+                        background: "var(--s2j-steel)",
+                      }}
+                    />
+                    <span style={{ fontSize: 11, color: "var(--s2j-text-muted)" }}>{s.sp}</span>
+                  </div>
+                ))}
+              </div>
+              <p style={{ fontSize: 12, color: "var(--s2j-text-muted)", margin: 0 }}>
+                {typeof sizingSpread.complexity.min === "number" &&
+                typeof sizingSpread.complexity.max === "number" ? (
+                  <>
+                    Complexity {sizingSpread.complexity.min}–{sizingSpread.complexity.max} (spread) ·{" "}
+                  </>
+                ) : null}
+                Priority {sizingSpread.priority.high}H · {sizingSpread.priority.medium}M ·{" "}
+                {sizingSpread.priority.low}L
+              </p>
+              {sizingSpread.healthy ? (
+                <p className="flex items-center" style={{ gap: 6, fontSize: 12, color: "var(--s2j-text)", marginTop: 6 }}>
+                  <span style={{ color: "var(--s2j-green)", display: "inline-flex" }}>
+                    <IconCheck size={13} />
+                  </span>
+                  Healthy spread — not the uniform &quot;everything is 5 points&quot; that signals a lazy breakdown.
+                </p>
+              ) : (
+                <p style={{ fontSize: 12, color: "var(--s2j-text-muted)", marginTop: 6 }}>
+                  Sizing is close to uniform — worth a sanity check that the estimates vary with real effort.
+                </p>
+              )}
+            </MoodCard>
+          ) : null}
+
+          {/* 10 — AI ambiguity note (collapsed) */}
+          {ambiguityNote ? (
+            <details
+              className="mb-4 rounded-lg"
+              style={{ border: "1px solid var(--s2j-border)", background: "var(--s2j-bg-section)" }}
+            >
+              <summary className="cursor-pointer text-xs font-medium uppercase tracking-wider p-3" style={{ color: "var(--s2j-text-muted)" }}>
+                AI ambiguity note
+              </summary>
+              <div
+                className="px-3 pb-3 pt-3"
+                style={{
+                  color: "var(--s2j-text)",
+                  borderTop: "1px solid var(--s2j-border)",
+                  fontSize: 13,
+                  lineHeight: 1.7,
+                }}
+              >
+                {ambiguityNote}
+              </div>
+            </details>
+          ) : null}
+        </>
       )}
 
-      {/* Feature-level concerns summary (the detail lives on each feature in the editor) */}
-      {fc.length > 0 && (
-        <div
-          className="rounded-lg p-3 mb-4 text-xs"
-          style={{ background: "var(--s2j-bg-section)", border: "1px solid var(--s2j-border)", color: "var(--s2j-text-muted)" }}
-        >
-          <strong style={{ color: "var(--s2j-text)" }}>
-            +{fc.length} feature-level concerns
-          </strong>{" "}
-          attached to individual features (review in the editor). High-severity {featHigh} · Medium {featMed} · Low {featLow}
-        </div>
-      )}
-
-      {/* AI ambiguity note — Sonnet self-disclosed assumption boundary */}
-      {signals.ambiguityNote && (
-        <details
-          className="mb-4 rounded-lg"
-          style={{ border: "1px solid var(--s2j-border)", background: "var(--s2j-bg-section)" }}
-        >
-          <summary className="cursor-pointer text-xs font-medium uppercase tracking-wider p-3" style={{ color: "var(--s2j-text-muted)" }}>
-            AI ambiguity note
-          </summary>
-          {/* readability fix (partner) — the note is a long, clause-dense paragraph; bump it off
-              text-xs to 13px with an airy 1.7 line-height + full padding so it isn't a cramped wall. */}
-          <div
-            className="px-3 pb-3 pt-3"
-            style={{
-              color: "var(--s2j-text)",
-              borderTop: "1px solid var(--s2j-border)",
-              fontSize: 13,
-              lineHeight: 1.7,
-            }}
-          >
-            {signals.ambiguityNote}
-          </div>
-        </details>
-      )}
-
-      {/* Nothing flagged → positive closure (manages the "why so little guidance?" gap). */}
-      {nothingFlagged && (
-        <SignalCallout kind="success" fontSize={12} style={{ marginBottom: 16 }}>
-          No concerns flagged — the AI is confident in this breakdown. Open the editor to refine and push.
-        </SignalCallout>
-      )}
-
-      {/* Forward CTA → the editor. Green (btn-primary), matching the flow's other
-          forward step "Continue to Review →". */}
-      <div className="mt-2 flex justify-end">
+      {/* 11 — Footer: caution + green forward CTA */}
+      <div
+        className="flex items-center"
+        style={{ gap: 12, justifyContent: "space-between", flexWrap: "wrap", marginTop: 20 }}
+      >
+        <span className="flex items-center" style={{ gap: 8, fontSize: 12, color: "var(--s2j-text)" }}>
+          <SignalIcon kind="warning" size={15} />
+          Back to pages leaves this breakdown unsaved — you would pay to generate it again.
+        </span>
         <button onClick={onProceed} className="btn-primary">
           Edit the breakdown →
         </button>
@@ -4843,61 +5560,6 @@ function DependencyStructure({ edges, onRemove, onRestore, onOpenAdd }) {
           </ul>
         </div>
       )}
-    </div>
-  );
-}
-
-// v3.0.0 — confidence indicator с count badge
-function ConfidenceBadge({ indicator, count, color, label }) {
-  return (
-    <div className="text-center">
-      <div
-        className="text-xl font-bold leading-none"
-        style={{ color: count > 0 ? color : "var(--s2j-text-light)" }}
-      >
-        {indicator} {count}
-      </div>
-      <div
-        className="text-[10px] uppercase tracking-wider mt-1"
-        style={{ color: "var(--s2j-text-muted)" }}
-      >
-        {label}
-      </div>
-    </div>
-  );
-}
-
-// v3.0.0 — single concern row с severity badge + type label
-function ConcernRow({ concern }) {
-  const palette = SEVERITY_PALETTE[concern.severity] || SEVERITY_PALETTE.medium;
-  const typeLabel = CONCERN_TYPE_LABEL[concern.type] || concern.type;
-  return (
-    <div
-      className="rounded-lg p-3 text-sm"
-      style={{
-        background: palette.bg,
-        border: `1px solid ${palette.border}`,
-        color: "var(--s2j-text)",
-      }}
-    >
-      <div className="flex items-center gap-2 mb-1">
-        <span
-          className="text-[10px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded"
-          style={{
-            background: palette.text,
-            color: "white",
-          }}
-        >
-          {concern.severity}
-        </span>
-        <span
-          className="text-xs font-semibold"
-          style={{ color: palette.text }}
-        >
-          {typeLabel}
-        </span>
-      </div>
-      <p style={{ color: "var(--s2j-text)" }}>{concern.text}</p>
     </div>
   );
 }
