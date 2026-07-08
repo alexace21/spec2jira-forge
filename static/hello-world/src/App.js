@@ -507,6 +507,10 @@ function App() {
   const [planBusy, setPlanBusy] = useState(false); // a plan/re-pack call is in flight
   const [planEstimate, setPlanEstimate] = useState(null); // pre-flight cost {expected_usd, upper_usd}
   const [planArmed, setPlanArmed] = useState(false); // 2-step armed confirm for the billed re-rank
+  // 2-step armed confirm for Regenerate on the reviewing screen (2026-07-07): regenerating discards
+  // the BA's unsaved editor edits, and window.confirm may be inert in the Forge sandbox, so we arm the
+  // button in-UI. Cleared whenever we leave/reset (handleRegenerate) so it never persists armed.
+  const [regenArmed, setRegenArmed] = useState(false);
   const [planElapsed, setPlanElapsed] = useState(0); // seconds the ranking BATCH has been running (live timer + server echo)
   const planPollRef = useRef(null); // pollPlanStatus interval (the ranking batch runs async, like generation)
   const currentPlanPollJobIdRef = useRef(null); // stale-tick guard (mirrors the breakdown poll's currentPollJobIdRef)
@@ -2072,8 +2076,21 @@ function App() {
     setStaleBreakdown(null);
     setPersistFailed(false); // [deep-audit F6] clear wherever results is nulled
     setIsPushing(false);
+    setRegenArmed(false); // reset the 2-step arm so it never persists across a regenerate
     setScreen("ready");
   }, []);
+
+  // Regenerate is DESTRUCTIVE of unsaved editor edits → a 2-step armed confirm (window.confirm can be
+  // inert in the Forge sandbox). First click arms + relabels; second click (within the window) runs the
+  // real handleRegenerate. Auto-disarms after 4s so a stray first click never leaves it primed.
+  const handleRequestRegenerate = useCallback(() => {
+    if (regenArmed) {
+      handleRegenerate();
+      return;
+    }
+    setRegenArmed(true);
+    setTimeout(() => setRegenArmed(false), 4000);
+  }, [regenArmed, handleRegenerate]);
 
   // handleStartOver (multi-batch, 2026-06-10) — "Start over" on the GENERATING screen. The user
   // edited the page after starting, so this in-flight run is on a STALE version → ABANDON it.
@@ -2304,12 +2321,12 @@ function App() {
               salient when the page changed. Mirrors BackButton's muted-with-hover style;
               marginRight: -8px pins it to the far end of this flex-row top-bar. */}
           <button
-            onClick={handleRegenerate}
+            onClick={handleRequestRegenerate}
             className="text-xs flex items-center gap-1.5 ml-auto"
             style={{
-              background: "none",
+              background: regenArmed ? "var(--s2j-orange-bg)" : "none",
               border: "none",
-              color: "var(--s2j-text-muted)",
+              color: regenArmed ? "var(--s2j-orange)" : "var(--s2j-text-muted)",
               cursor: "pointer",
               padding: "4px 8px",
               borderRadius: "4px",
@@ -2317,16 +2334,22 @@ function App() {
               marginRight: "-8px",
             }}
             onMouseEnter={(e) => {
+              if (regenArmed) return;
               e.currentTarget.style.background = "var(--s2j-border)";
               e.currentTarget.style.color = "var(--s2j-text)";
             }}
             onMouseLeave={(e) => {
+              if (regenArmed) return;
               e.currentTarget.style.background = "none";
               e.currentTarget.style.color = "var(--s2j-text-muted)";
             }}
-            title="Re-run generation from the current page (picks up any edits you've made)"
+            title={
+              regenArmed
+                ? "Click again to regenerate — your edits, concern decisions, and trimmed dependencies on this screen will be discarded"
+                : "Re-run generation from the current page (picks up any edits you've made). Your edits, concern decisions, and trimmed dependencies here are discarded."
+            }
           >
-            <IconRefresh size={14} /> Regenerate
+            <IconRefresh size={14} /> {regenArmed ? "Discard edits & regenerate?" : "Regenerate"}
           </button>
         </div>
         {/* 2026-06-26 UX: plain content-flow block (was flex:1/minHeight:0). Holds the
@@ -2358,12 +2381,16 @@ function App() {
                 </p>
               </div>
               <button
-                onClick={handleRegenerate}
+                onClick={handleRequestRegenerate}
                 className="btn-primary text-xs shrink-0"
                 style={{ whiteSpace: "nowrap" }}
-                title="Re-run generation from the current page (picks up any edits you've made)"
+                title={
+                  regenArmed
+                    ? "Click again to regenerate — your unsaved edits on this screen will be discarded"
+                    : "Re-run generation from the current page (picks up any edits you've made). Your unsaved edits here are discarded."
+                }
               >
-                <IconRefresh size={14} /> Regenerate
+                <IconRefresh size={14} /> {regenArmed ? "Discard edits & regenerate?" : "Regenerate"}
               </button>
             </div>
           )}
@@ -2397,6 +2424,7 @@ function App() {
             onPush={handlePush}
             isPushing={isPushing}
             breakdownRef={editorBreakdownRef}
+            defaultProjectKey={defaultProjectKey}
           />
         </div>
       </div>

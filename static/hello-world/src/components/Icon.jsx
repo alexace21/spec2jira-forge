@@ -184,6 +184,15 @@ export const IconLink = (p) => (
   </S>
 );
 
+// Epic — a stacked-layers glyph (the Epic groups the stories beneath it).
+export const IconLayers = (p) => (
+  <S {...p}>
+    <polygon points="12 2 2 7 12 12 22 7 12 2" />
+    <polyline points="2 17 12 22 22 17" />
+    <polyline points="2 12 12 17 22 12" />
+  </S>
+);
+
 export const IconMaximize = (p) => (
   <S {...p}>
     <polyline points="15 3 21 3 21 9" />

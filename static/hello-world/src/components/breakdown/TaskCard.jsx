@@ -1,134 +1,31 @@
-import { useState, useRef, useLayoutEffect, useCallback } from 'react';
-import { createPortal } from 'react-dom';
+import { useState } from 'react';
 import EditableField from './EditableField.jsx';
 import { TASK_TYPES, TASK_TYPE_COLORS } from './constants.js';
-import { IconCheck } from '../Icon';
+import { IconTrash, IconChevronRight } from '../Icon';
 
 /**
- * SelectBadge — Badge that doubles as a dropdown selector.
- * Light theme.
+ * TaskCard — one sub-task (-> JIRA Subtask) as a COLLAPSIBLE row in the 6A editor.
  *
- * The open menu is rendered through a React portal to document.body and
- * positioned `fixed` from the trigger's bounding rect. This is REQUIRED, not
- * cosmetic: the badge lives inside TaskCard, whose ancestors (FeatureCard and
- * CapabilityCard roots) carry `rounded-lg overflow-hidden` and the editor's
- * scroll container carries `overflow-y-auto`. An absolutely-positioned menu
- * (the previous approach) is CLIPPED by any such ancestor regardless of
- * z-index, so for tasks lower in a feature the options were cut off behind the
- * next row / next card. A portal removes the menu from those clipping subtrees
- * entirely; `fixed` + viewport coordinates keep it anchored under the trigger
- * and immune to ancestor transforms. We also flip the menu upward when there
- * isn't room below (e.g. a task near the viewport bottom).
+ * Collapsed (default): [checkbox] name  [type chip]  [expand chevron]. Click the row (or the
+ * chevron) to expand -> edit NAME (outlined) + DESCRIPTION (outlined) + TYPE.
+ *
+ * TYPE is an INLINE SEGMENTED enum (API/UI/DB/ML/OPS/DOC/TEST) — NOT a portaled dropdown. The old
+ * SelectBadge menu was portaled to document.body specifically to escape the card's `overflow-hidden`
+ * clipping; the segmented control sidesteps the clipping problem entirely (nothing overflows), so it
+ * is both simpler and more robust in the Forge iframe (no fixed-position menu to keep pinned on
+ * scroll). Keeps the task `_uid` React key upstream.
+ *
+ * The leading "checkbox" is a decorative completion marker (sub-tasks have no completion state in the
+ * v3 schema) — it is aria-hidden and non-interactive; the row's expand affordance is the real control.
  */
-function SelectBadge({ value, options, colorMap, labelMap, onChange }) {
-  const [open, setOpen] = useState(false);
-  const triggerRef = useRef(null);
-  const [menuPos, setMenuPos] = useState(null);
-  const display = labelMap ? (labelMap[value] || value) : value;
-  const colorClass = colorMap[value] || 'bg-gray-100 text-gray-600 ring-gray-200';
-
-  // Estimated menu height (rows × ~30px + vertical padding) — used only to
-  // decide flip direction; final size is content-driven.
-  const estMenuHeight = options.length * 30 + 8;
-
-  const reposition = useCallback(() => {
-    const el = triggerRef.current;
-    if (!el) return;
-    const r = el.getBoundingClientRect();
-    const spaceBelow = window.innerHeight - r.bottom;
-    const flipUp = spaceBelow < estMenuHeight + 8 && r.top > spaceBelow;
-    setMenuPos({
-      left: r.left,
-      // When flipping up we anchor the menu's bottom to the trigger's top.
-      top: flipUp ? undefined : r.bottom + 4,
-      bottom: flipUp ? window.innerHeight - r.top + 4 : undefined,
-      minWidth: Math.max(r.width, 120),
-    });
-  }, [estMenuHeight]);
-
-  // Measure synchronously before paint so the menu never flashes at (0,0), and
-  // keep it pinned to the trigger while open as the user scrolls/resizes. The
-  // scroll listener uses the capture phase to catch scroll at any level. (The
-  // editor now page-scrolls — its old inner overflow-y-auto pane was removed
-  // 2026-06-26 — so this fires on iframe/window scroll + resize.)
-  useLayoutEffect(() => {
-    if (!open) return undefined;
-    reposition();
-    window.addEventListener('scroll', reposition, true);
-    window.addEventListener('resize', reposition);
-    return () => {
-      window.removeEventListener('scroll', reposition, true);
-      window.removeEventListener('resize', reposition);
-    };
-  }, [open, reposition]);
-
-  return (
-    <div className="relative">
-      <button
-        ref={triggerRef}
-        onClick={() => setOpen(!open)}
-        className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium
-          ring-1 ring-inset cursor-pointer transition-opacity hover:opacity-80 ${colorClass}`}
-      >
-        {display}
-        <svg className="ml-1 h-3 w-3 opacity-50" viewBox="0 0 20 20" fill="currentColor">
-          <path fillRule="evenodd" d="M5.23 7.21a.75.75 0 011.06.02L10 11.168l3.71-3.938a.75.75 0 111.08 1.04l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 01.02-1.06z" />
-        </svg>
-      </button>
-
-      {open && menuPos && createPortal(
-        <>
-          {/* Click-away backdrop. z-index sits just under the menu; both are
-              portaled to body so no card overflow can clip them. z-index is set
-              inline (not a Tailwind class) so it never depends on the JIT
-              picking up an arbitrary value. */}
-          <div className="fixed inset-0" style={{ zIndex: 2000 }} onClick={() => setOpen(false)} />
-          <div className="fixed rounded-lg py-1"
-            style={{
-              zIndex: 2001,
-              left: menuPos.left,
-              top: menuPos.top,
-              bottom: menuPos.bottom,
-              minWidth: menuPos.minWidth,
-              border: '1px solid var(--s2j-border)',
-              background: 'var(--s2j-bg)',
-              boxShadow: '0 4px 12px rgba(0,0,0,0.1)',
-            }}>
-            {options.map((opt) => {
-              const optColor = colorMap[opt] || '';
-              const optLabel = labelMap ? (labelMap[opt] || opt) : opt;
-              const isSelected = opt === value;
-              return (
-                <button key={opt}
-                  onClick={() => { onChange(opt); setOpen(false); }}
-                  className={`flex w-full items-center gap-2 px-3 py-1.5 text-xs text-left transition-colors`}
-                  style={{ color: isSelected ? 'var(--s2j-text)' : 'var(--s2j-text-light)' }}
-                  onMouseEnter={e => e.currentTarget.style.background = 'var(--s2j-bg-section)'}
-                  onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
-                >
-                  <span className={`inline-block h-2 w-2 rounded-full ring-1 ring-inset ${optColor}`} />
-                  {optLabel}
-                  {isSelected && <span className="ml-auto inline-flex" style={{ color: 'var(--s2j-green)' }}><IconCheck size={14} /></span>}
-                </button>
-              );
-            })}
-          </div>
-        </>,
-        document.body
-      )}
-    </div>
-  );
-}
-
-/**
- * TaskCard — Full inline editor for a single task (→ JIRA Subtask).
- * Light theme (Swagger palette).
- */
-export default function TaskCard({ task, index, onUpdate, onDelete }) {
+export default function TaskCard({ task, index, onUpdate, onDelete, deleteDisabled = false }) {
+  const [expanded, setExpanded] = useState(false);
   function updateField(field, value) { onUpdate({ ...task, [field]: value }); }
 
+  const typeChipColor = TASK_TYPE_COLORS[task.type] || 'bg-gray-100 text-gray-600 ring-gray-200';
+
   return (
-    <div className="group/task rounded-lg p-3 transition-colors" style={{
+    <div className="group/task rounded-lg transition-colors" style={{
       border: '1px solid var(--s2j-border)',
       borderLeft: '3px solid var(--s2j-orange)',
       background: 'var(--s2j-bg)',
@@ -136,48 +33,96 @@ export default function TaskCard({ task, index, onUpdate, onDelete }) {
       onMouseEnter={e => e.currentTarget.style.borderColor = 'var(--s2j-orange-border)'}
       onMouseLeave={e => { e.currentTarget.style.borderColor = 'var(--s2j-border)'; e.currentTarget.style.borderLeftColor = 'var(--s2j-orange)'; }}
     >
-      {/* Header Row */}
-      <div className="flex items-start gap-2">
-        <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded text-[10px] font-mono"
+      {/* ── Collapsed header row: expand toggle + index + checkbox + name + type chip + delete ── */}
+      <div className="flex items-center gap-2 px-3 py-2">
+        {/* Expand toggle — a real button (a11y + keyboard). Chevron rotates when open. */}
+        <button
+          type="button"
+          onClick={() => setExpanded((v) => !v)}
+          aria-expanded={expanded}
+          aria-label={expanded ? `Collapse sub-task ${index + 1}` : `Expand sub-task ${index + 1}`}
+          className="shrink-0 rounded p-0.5 inline-flex items-center justify-center"
+          style={{ color: 'var(--s2j-text-muted)', background: 'none', border: 'none', cursor: 'pointer' }}
+        >
+          <span style={{ display: 'inline-flex', transition: 'transform 120ms', transform: expanded ? 'rotate(90deg)' : 'none' }}>
+            <IconChevronRight size={14} />
+          </span>
+        </button>
+
+        <span className="shrink-0 flex h-5 w-5 items-center justify-center rounded text-[10px] font-mono"
           style={{ background: 'var(--s2j-bg-section)', color: 'var(--s2j-text-muted)' }}>
           {index + 1}
         </span>
 
-        <SelectBadge value={task.type} options={TASK_TYPES} colorMap={TASK_TYPE_COLORS}
-          onChange={(val) => updateField('type', val)} />
+        {/* Decorative completion marker (no completion state in v3) — non-interactive, aria-hidden. */}
+        <span aria-hidden="true" className="shrink-0 inline-flex items-center justify-center rounded"
+          style={{ width: 14, height: 14, border: '1.5px solid var(--s2j-border)', background: 'var(--s2j-bg-section)' }} />
 
-        <div className="flex-1 min-w-0">
+        {/* Name — inline-editable even when collapsed (click-to-edit does not toggle the row). */}
+        <div className="flex-1 min-w-0" onClick={(e) => e.stopPropagation()}>
           <EditableField value={task.summary} onChange={(val) => updateField('summary', val)}
             className="text-sm font-medium" maxLength={200} />
         </div>
 
-        {/* Subtask priority + story points removed — sizing lives at the Story
-            (feature) level in v3, not per-subtask. */}
-        <button onClick={onDelete}
+        {/* Type chip — a compact read-only tag in the collapsed row (edit it in the expanded panel). */}
+        <span className={`shrink-0 inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-medium ring-1 ring-inset ${typeChipColor}`}>
+          {task.type}
+        </span>
+
+        <button onClick={deleteDisabled ? undefined : onDelete}
+          disabled={deleteDisabled}
           className="shrink-0 rounded p-1 opacity-0 group-hover/task:opacity-100 transition-all"
-          style={{ color: 'var(--s2j-text-muted)' }}
-          onMouseEnter={e => { e.target.style.background = 'var(--s2j-red-bg)'; e.target.style.color = 'var(--s2j-red)'; }}
-          onMouseLeave={e => { e.target.style.background = 'transparent'; e.target.style.color = 'var(--s2j-text-muted)'; }}
-          title="Delete task"
+          style={{ color: 'var(--s2j-text-muted)', background: 'none', border: 'none', cursor: deleteDisabled ? 'not-allowed' : 'pointer' }}
+          onMouseEnter={e => { if (!deleteDisabled) { e.currentTarget.style.background = 'var(--s2j-red-bg)'; e.currentTarget.style.color = 'var(--s2j-red)'; } }}
+          onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.color = 'var(--s2j-text-muted)'; }}
+          title={deleteDisabled ? 'A story needs at least one sub-task' : 'Delete sub-task'}
         >
-          <svg className="h-3.5 w-3.5" viewBox="0 0 20 20" fill="currentColor">
-            <path fillRule="evenodd" d="M8.75 1A2.75 2.75 0 006 3.75v.443c-.795.077-1.584.176-2.365.298a.75.75 0 10.23 1.482l.149-.022.841 10.518A2.75 2.75 0 007.596 19h4.807a2.75 2.75 0 002.742-2.53l.841-10.52.149.023a.75.75 0 00.23-1.482A41.03 41.03 0 0014 4.193V3.75A2.75 2.75 0 0011.25 1h-2.5zM10 4c.84 0 1.673.025 2.5.075V3.75c0-.69-.56-1.25-1.25-1.25h-2.5c-.69 0-1.25.56-1.25 1.25v.325C8.327 4.025 9.16 4 10 4zM8.58 7.72a.75.75 0 00-1.5.06l.3 7.5a.75.75 0 101.5-.06l-.3-7.5zm4.34.06a.75.75 0 10-1.5-.06l-.3 7.5a.75.75 0 101.5.06l.3-7.5z" />
-          </svg>
+          <IconTrash size={14} />
         </button>
       </div>
 
-      {/* Details */}
-      <div className="mt-2.5 ml-7 space-y-2.5">
-        {/* Always render so a NEW or description-less subtask can get a description (the old
-            `task.description &&` guard hid the editor → no way to add one). EditableField shows the
-            placeholder in muted italic when empty. */}
-        <div>
-          <span className="text-[11px] font-medium uppercase tracking-wider block mb-1"
-            style={{ color: 'var(--s2j-text-muted)' }}>Description</span>
-          <EditableField value={task.description || ''} onChange={(val) => updateField('description', val)}
-            multiline placeholder="Click to add a description…" className="text-xs leading-relaxed mt-1" style={{ color: 'var(--s2j-text-light)' }} />
+      {/* ── Expanded editor: NAME (outlined, above) + DESCRIPTION (outlined) + TYPE (segmented) ── */}
+      {expanded && (
+        <div className="px-3 pb-3 pt-1 ml-[68px] space-y-2.5">
+          {/* Description — an outlined editable box. */}
+          <div>
+            <span className="text-[11px] font-medium uppercase tracking-wider block mb-1"
+              style={{ color: 'var(--s2j-text-muted)' }}>Description</span>
+            <div className="rounded-lg px-2 py-1.5" style={{ border: '1px solid var(--s2j-border)', background: 'var(--s2j-bg)' }}>
+              <EditableField value={task.description || ''} onChange={(val) => updateField('description', val)}
+                multiline placeholder="Click to add a description…" className="text-xs leading-relaxed" style={{ color: 'var(--s2j-text-light)' }} />
+            </div>
+          </div>
+
+          {/* Type — an inline SEGMENTED enum. No portal, no clipping. */}
+          <div>
+            <span className="text-[11px] font-medium uppercase tracking-wider block mb-1"
+              style={{ color: 'var(--s2j-text-muted)' }}>Type</span>
+            <div role="group" aria-label="Sub-task type" className="inline-flex flex-wrap gap-1">
+              {TASK_TYPES.map((t) => {
+                const active = t === task.type;
+                return (
+                  <button
+                    key={t}
+                    type="button"
+                    onClick={() => updateField('type', t)}
+                    aria-pressed={active}
+                    className="rounded-md px-2 py-0.5 text-[11px] font-medium transition-colors"
+                    style={{
+                      border: active ? '1px solid var(--s2j-blue)' : '1px solid var(--s2j-border)',
+                      background: active ? 'var(--s2j-blue-bg)' : 'var(--s2j-bg)',
+                      color: active ? 'var(--s2j-blue-dark)' : 'var(--s2j-text-light)',
+                      cursor: 'pointer',
+                    }}
+                  >
+                    {t}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }

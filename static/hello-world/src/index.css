@@ -56,6 +56,27 @@
   --s2j-accent-info:        var(--s2j-steel);
   --s2j-accent-info-bg:     #eef5fd;
   --s2j-accent-info-border: #c5ddf5;
+
+  /* Breakdown Editor review-workbench tokens (2026-07-07). Two state tones the editor needs and the
+     palette did not yet name distinctly:
+
+     --s2j-trust — a calm teal/steel-green for a RESOLVED / CONFIDENT review STATE (a concern the BA
+     accepted, a story that is signed-off). It must read as "settled / trusted", NOT as the ACTION
+     commit-green (--s2j-green #49cc90, the Push/Continue buttons) — else "this concern is handled"
+     and "click to commit" collide. A cooler, more muted teal (#2f9e8f) sits clearly apart from the
+     bright commit-green on the near-white glass while still reading positive.
+
+     --s2j-info — the neutral "AI-flagged / open / worth-a-look" tone, an ALIAS of the existing steel
+     accent-info so "open concern" reads as ATTENTION (steel), a different urgency from "caution/at
+     risk" (--s2j-orange amber) and "danger" (--s2j-red, the compliance landmine). Steel #5483B3 is
+     also distinct from the nav-blue (--s2j-blue #61affe) reserved for buttons. */
+  --s2j-trust:        #2f9e8f;
+  --s2j-trust-bg:     #e9f7f4;
+  --s2j-trust-border: #b6e3da;
+
+  --s2j-info:         var(--s2j-accent-info);
+  --s2j-info-bg:      var(--s2j-accent-info-bg);
+  --s2j-info-border:  var(--s2j-accent-info-border);
 }
 
 @layer components {
@@ -140,6 +161,102 @@ html, body, #root {
 body {
   color: var(--s2j-text);
   background: #f7faff;
+}
+
+/* Breakdown Editor master-detail split (2026-07-07): a sticky worklist (left) + the focused story
+   (right). A 2-col grid that STACKS to one column under ~640px so a narrow Forge iframe never scrolls
+   horizontally. `align-items: start` lets the left column's `position: sticky` resolve (a stretched
+   grid item can't stick). Page-scroll only — neither column is an overflow container. */
+.s2j-editor-split {
+  display: grid;
+  grid-template-columns: minmax(220px, 300px) 1fr;
+  gap: 16px;
+  align-items: start;
+}
+.s2j-worklist-sticky {
+  position: sticky;
+  top: var(--s2j-worklist-top, 8px);
+}
+@media (max-width: 640px) {
+  .s2j-editor-split {
+    grid-template-columns: 1fr;
+  }
+  /* When stacked, a pinned worklist would cover the detail on scroll — make it static. */
+  .s2j-worklist-sticky {
+    position: static;
+  }
+}
+
+/* ── Breakdown Editor 6A THREE-PANE (2026-07-08) ──────────────────────────────────────────────
+   [worklist 280] [center 1fr] [rail 320]. The worklist + rail are position:sticky (index.css .s2j-worklist-sticky
+   / .s2j-rail-sticky); the center flows. Page-scroll ONLY — NO 100vh, NO overflow:auto pane (a prior vh
+   ceiling collapsed the editor to ~0 live). align-items:start lets sticky resolve. Stacks to ONE column under
+   900px (rail below center) so a narrow Forge iframe never scrolls horizontally. */
+.s2j-editor-3pane {
+  display: grid;
+  grid-template-columns: minmax(240px, 280px) minmax(0, 1fr) minmax(280px, 320px);
+  gap: 16px;
+  align-items: start;
+}
+.s2j-rail-sticky {
+  position: sticky;
+  top: var(--s2j-rail-top, 8px);
+}
+/* Below 1080px, drop the rail under the center (2 cols) so the center keeps a usable width. */
+@media (max-width: 1080px) {
+  .s2j-editor-3pane {
+    grid-template-columns: minmax(220px, 260px) minmax(0, 1fr);
+  }
+  .s2j-editor-3pane > .s2j-rail-col {
+    grid-column: 1 / -1;
+  }
+  .s2j-rail-sticky {
+    position: static;
+  }
+}
+/* Below 900px, single-column stack (worklist over center over rail); nothing sticky. */
+@media (max-width: 900px) {
+  .s2j-editor-3pane {
+    grid-template-columns: 1fr;
+  }
+  .s2j-editor-3pane > .s2j-rail-col {
+    grid-column: auto;
+  }
+  .s2j-editor-3pane .s2j-worklist-sticky,
+  .s2j-editor-3pane .s2j-rail-sticky {
+    position: static;
+  }
+}
+
+/* ── Wizard overlay (assign / new-story) — a FIXED modal that must NOT displace the editor. Backdrop
+   dims the page; the panel is centered + scrolls INTERNALLY only if its own content overflows the
+   viewport (a modal is allowed a bounded height — this is NOT the editor page-scroll rule). ── */
+.s2j-wizard-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(5, 38, 89, 0.32);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 48px 16px;
+  z-index: 1000;
+  overflow-y: auto;
+}
+.s2j-wizard-panel {
+  width: 100%;
+  max-width: 520px;
+  background: #ffffff;
+  border: 1px solid var(--s2j-border);
+  border-radius: 16px;
+  box-shadow: 0 24px 64px rgba(5, 38, 89, 0.22);
+  display: flex;
+  flex-direction: column;
+  max-height: calc(100vh - 96px);
+  overflow: hidden;
+}
+.s2j-wizard-body {
+  overflow-y: auto;
+  padding: 16px 20px;
 }
 
 /* Override Tailwind grays to Swagger equivalents inside our app */

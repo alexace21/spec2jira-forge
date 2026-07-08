@@ -42,6 +42,24 @@ export function parseConcernPrefix(raw) {
 }
 
 // ════════════════════════════════════════════════════════════
+// PLACEHOLDER-NAME GUARD (single source of truth)
+// ════════════════════════════════════════════════════════════
+
+/**
+ * True iff `name` is still an unedited Add-button placeholder that must never push verbatim:
+ * an EMPTY name, the legacy exact "New Feature"/"New Category", OR the uniquified
+ * "New Feature <4-char>" that "+ New story" mints. The exact 4-char suffix keeps a legit name
+ * like "New Feature Rollout" from being false-flagged. Canonical here so the top caution banner
+ * (ReviewReadinessBar) and the per-story flag (FocusedStory) can never diverge — a previous
+ * divergence (ReviewReadinessBar lacked the empty-string check) left an empty-named story flagged
+ * in the detail pane but uncounted in the banner.
+ */
+export function isPlaceholderName(name) {
+  const n = String(name || '').trim().toLowerCase();
+  return n === '' || /^new (feature|category)( [0-9a-z]{4})?$/.test(n);
+}
+
+// ════════════════════════════════════════════════════════════
 // LEGACY-SHAPE ADAPTER (для BreakdownEditor backward compat)
 // ════════════════════════════════════════════════════════════
 
@@ -67,10 +85,25 @@ export function adaptToLegacyShape(v3) {
   // this runs at load, BEFORE any editor rename). Dependency strings stay frozen generation names
   // too, so the push (flattenBreakdown) maps a frozen dep-name → _orig_name → _uid and a rename can
   // never break the link. Both fields are captured in the SAME idempotent pass and ride edits via spread.
+  // Also mint a stable task._uid in the SAME pass (POLICY §3.5): tasks are mutable (add/delete) and
+  // each wraps a portaled SelectBadge with internal state, so an index-key reconciliation shift can
+  // misalign dropdown state. The uid is editor-only — the push (flattenBreakdown) ignores it.
+  const mintTaskUids = (tasks) =>
+    Array.isArray(tasks)
+      ? tasks.map((t) =>
+          t && typeof t === 'object' ? { ...t, _uid: t._uid || newStoryUid() } : t
+        )
+      : tasks;
   const features = (Array.isArray(v3.features) ? v3.features : []).map((f) => {
     if (!f || typeof f !== 'object') return f;
-    if (f._uid && f._orig_name) return f; // both already minted → stable, untouched
-    return { ...f, _uid: f._uid || newStoryUid(), _orig_name: f._orig_name || f.name };
+    // Feature identity may already be minted (reloaded breakdown), but a NEW task added upstream
+    // could still lack a _uid — so run the task pass unconditionally, cheaply idempotent.
+    return {
+      ...f,
+      _uid: f._uid || newStoryUid(),
+      _orig_name: f._orig_name || f.name,
+      tasks: mintTaskUids(f.tasks),
+    };
   });
 
   // Group by category
@@ -768,6 +801,287 @@ export function addFeatureDependency(breakdown, sourceFeatureName, targetName) {
   return mapFeatureDependencies(breakdown, sourceFeatureName, (deps) =>
     deps.includes(targetName) ? deps : [...deps, targetName]
   );
+}
+
+// ════════════════════════════════════════════════════════════
+// DEPENDENCY CYCLE GUARD (Editor "+ dependency" — E5)
+// ════════════════════════════════════════════════════════════
+//
+// Adding a cross-feature dependency in the editor must not close a circular
+// blocks-loop (the generation-time cycle Verify/Repair only runs at generate;
+// an editor-added edge bypasses it). This is a PURE structural check over the
+// SAME edge model the push reads: feature.dependencies[] holds FROZEN _orig_name
+// target strings (adaptToLegacyShape freezes _orig_name = the generation name),
+// so we build adjacency by each feature's _orig_name -> its dependencies[] and
+// ask: can targetOrigName already reach sourceOrigName? If so, adding
+// source -> target closes a loop. No LLM — deterministic graph reachability.
+
+/**
+ * True iff adding a dependency source -> target would create a cycle, i.e.
+ * targetOrigName can already (transitively) reach sourceOrigName via
+ * feature.dependencies[], OR source === target (a self-edge). Both names are
+ * FROZEN _orig_name strings (the edge model). Guards against pre-existing cycles
+ * in the data with a visited set. O(V+E). Pure — reads only the breakdown graph.
+ */
+export function wouldCreateCycle(breakdown, sourceOrigName, targetOrigName) {
+  if (!breakdown || typeof breakdown !== 'object') return false;
+  if (sourceOrigName == null || targetOrigName == null) return false;
+  // A self-edge is always a cycle.
+  if (sourceOrigName === targetOrigName) return true;
+
+  // Read features with the SAME precedence extractV3Signals / readFeatures use,
+  // so the graph reflects the edited breakdown.
+  const v3 = breakdown._v3_original || breakdown || {};
+  const features = Array.isArray(breakdown.capabilities)
+    ? breakdown.capabilities.flatMap((c) => c.features || [])
+    : Array.isArray(breakdown.features)
+      ? breakdown.features
+      : Array.isArray(v3.features)
+        ? v3.features
+        : [];
+
+  // adjacency: _orig_name (fallback name) -> [dep _orig_name strings]. First
+  // match wins on a duplicate _orig_name (matches origToCurrent in extractV3Signals);
+  // duplicate targets from multiple features are merged so reachability is complete.
+  const adjacency = new Map();
+  for (const f of features) {
+    if (!f || typeof f !== 'object') continue;
+    const key = f._orig_name || f.name;
+    if (key == null) continue;
+    const deps = Array.isArray(f.dependencies) ? f.dependencies : [];
+    if (!adjacency.has(key)) adjacency.set(key, []);
+    const bucket = adjacency.get(key);
+    for (const d of deps) {
+      if (d != null && !bucket.includes(d)) bucket.push(d);
+    }
+  }
+
+  // DFS from targetOrigName; if we reach sourceOrigName, target already depends
+  // (transitively) on source, so source -> target closes a loop. The visited set
+  // both bounds the search and tolerates pre-existing cycles in the data.
+  const visited = new Set();
+  const stack = [targetOrigName];
+  while (stack.length) {
+    const node = stack.pop();
+    if (node === sourceOrigName) return true;
+    if (visited.has(node)) continue;
+    visited.add(node);
+    const next = adjacency.get(node);
+    if (next) {
+      for (const n of next) {
+        if (!visited.has(n)) stack.push(n);
+      }
+    }
+  }
+  return false;
+}
+
+// ════════════════════════════════════════════════════════════
+// CONCERN DISPOSITION (editor-side review tracking; NEVER pushed to Jira)
+// ════════════════════════════════════════════════════════════
+//
+// The editor lets a reviewer TRIAGE each AI-flagged concern (open / edited /
+// accepted / dismissed[+reason]). This lives ON the breakdown as
+//   breakdown._concern_dispositions = { [concernId]: { state, reason? } }
+// so it rides the SAME immutable breakdown object through editorBreakdownRef
+// (survives the screen remount) and naturally RESETS on regenerate (a fresh
+// breakdown has no _concern_dispositions map). It is editor-only — flattenBreakdown
+// (push_handler) never reads _concern_dispositions, so nothing reaches Jira.
+//
+// concernId = `${featureUid}#${concernIndex}`. concerns[] are read-only (the model
+// authored them; the editor does not add/remove per-concern strings), so the index
+// is a STABLE key within a session. Binding to the feature's _uid (not its name)
+// keeps the disposition attached across a rename.
+
+/** Stable id for a single feature concern. Pure. */
+export function concernIdFor(featureUid, concernIndex) {
+  return `${featureUid}#${concernIndex}`;
+}
+
+/**
+ * Read the disposition for a concernId. Missing ⇒ the default open state.
+ * Returns {state, reason?}. Pure — never mutates.
+ */
+export function getConcernDisposition(breakdown, concernId) {
+  const map = breakdown && breakdown._concern_dispositions;
+  const entry = map && typeof map === 'object' ? map[concernId] : null;
+  if (entry && typeof entry === 'object' && entry.state) {
+    return entry.reason != null
+      ? { state: entry.state, reason: entry.reason }
+      : { state: entry.state };
+  }
+  return { state: 'open' };
+}
+
+/**
+ * Set (or clear) the disposition for a concernId. Returns a NEW breakdown
+ * (immutable): shallow-clones the breakdown + the _concern_dispositions map ONLY
+ * — features are kept by reference (React-safe; the concern strings are read-only).
+ *   state === 'open'      -> DELETES the entry (open is the default absence state)
+ *   state === 'dismissed' -> stores { state, reason } (reason is the one-line why)
+ *   any other state       -> stores { state } (reason ignored)
+ */
+export function setConcernDisposition(breakdown, concernId, state, reason) {
+  if (!breakdown || typeof breakdown !== 'object') return breakdown;
+  const prev =
+    breakdown._concern_dispositions && typeof breakdown._concern_dispositions === 'object'
+      ? breakdown._concern_dispositions
+      : {};
+  const nextMap = { ...prev };
+  if (state === 'open' || !state) {
+    delete nextMap[concernId];
+  } else if (state === 'dismissed') {
+    nextMap[concernId] = { state: 'dismissed', reason: reason != null ? reason : '' };
+  } else {
+    nextMap[concernId] = { state };
+  }
+  return { ...breakdown, _concern_dispositions: nextMap };
+}
+
+// ════════════════════════════════════════════════════════════
+// REVIEW READINESS ROLLUP (editor top bar + worklist badges)
+// ════════════════════════════════════════════════════════════
+//
+// The disposition-aware counterpart to computeInsightsView: same features, same
+// weight/landmine derive (single source of truth — REUSE extractV3Signals +
+// computeInsightsView + computeFeatureWeight), PLUS the open/resolved concern
+// counts the disposition map drives. Open concerns NEVER block the Continue CTA
+// (the top bar is informational). Orphaned disposition entries (concernIds for a
+// feature that was deleted, or an index beyond the feature's current concerns)
+// are IGNORED — the counts derive from the CURRENT features, not the raw map.
+
+/**
+ * computeReviewReadiness(breakdown) — the editor top-bar + worklist contract.
+ * Returns {
+ *   totalConcerns, openConcerns, resolvedConcerns,
+ *   perFeature: [{ uid, name, category, openCount, totalCount, indicator, weight, reviewed }] (weight desc),
+ *   storiesNeedingReview,
+ *   landmine   // = computeInsightsView(breakdown).complianceLandmine (may be null)
+ * }. Pure derive; ignores orphaned disposition entries.
+ */
+export function computeReviewReadiness(breakdown) {
+  const features = readFeatures(breakdown);
+  const insights = computeInsightsView(breakdown);
+
+  let totalConcerns = 0;
+  let openConcerns = 0;
+  let storiesNeedingReview = 0;
+  const perFeature = [];
+
+  for (const f of features) {
+    const uid = f && f._uid;
+    const concerns = Array.isArray(f && f.concerns) ? f.concerns : [];
+    const totalCount = concerns.length;
+    let openCount = 0;
+    // A null/undefined uid would make concernIdFor produce a "null#0" id — never a real
+    // disposition key. Guard defensively: without a uid all concerns read as open (their
+    // default), and the story still surfaces in the worklist as unrated/needs-review.
+    if (uid != null) {
+      for (let i = 0; i < totalCount; i++) {
+        const disp = getConcernDisposition(breakdown, concernIdFor(uid, i));
+        if (disp.state === 'open') openCount++;
+      }
+    } else {
+      openCount = totalCount;
+    }
+    totalConcerns += totalCount;
+    openConcerns += openCount;
+
+    const indicator = f && f.confidence_indicator;
+    // Reuse computeFeatureWeight — do NOT re-derive; parse the raw concern strings
+    // to the {severity,...} shape the weight formula reads.
+    const weight = computeFeatureWeight({
+      confidence_indicator: indicator,
+      confidence_score: typeof (f && f.confidence_score) === 'number' ? f.confidence_score : undefined,
+      priority: f && f.priority,
+      story_points: typeof (f && f.story_points) === 'number' ? f.story_points : undefined,
+      complexity_score: typeof (f && f.complexity_score) === 'number' ? f.complexity_score : undefined,
+      concerns: concerns.map(parseConcernPrefix),
+    });
+
+    // "Reviewed" = a FLAGGED story (✗/⚠) whose concerns are ALL resolved. This is the ONLY honest
+    // way a flagged story becomes clear: the human addressed every AI concern. A ✗/⚠ story with NO
+    // concerns has nothing to resolve → NOT reviewed (stays flagged, honest); an unrated story has no
+    // indicator → NOT reviewed (stays unrated); a ✓ story is already confident. The AI's original
+    // indicator/score is preserved everywhere — this flag only flips the worklist icon + this count.
+    const reviewed = (indicator === '✗' || indicator === '⚠') && totalCount > 0 && openCount === 0;
+
+    // Unrated (no confidence_indicator) counts as needing review — never let the readiness bar
+    // read "all clear" while the worklist shows an "Unrated" badge (fresh-army false-reassurance fix).
+    // A `reviewed` story drops from the count (its concerns are all addressed).
+    const needsReview = openCount > 0 || (!reviewed && (indicator === '✗' || indicator === '⚠' || !indicator));
+    if (needsReview) storiesNeedingReview++;
+
+    perFeature.push({
+      uid,
+      name: f && f.name,
+      category: f && f.category,
+      openCount,
+      totalCount,
+      indicator,
+      weight,
+      reviewed,
+    });
+  }
+
+  perFeature.sort((a, b) => b.weight - a.weight);
+
+  return {
+    totalConcerns,
+    openConcerns,
+    resolvedConcerns: totalConcerns - openConcerns,
+    perFeature,
+    storiesNeedingReview,
+    landmine: insights.complianceLandmine || null,
+  };
+}
+
+// ════════════════════════════════════════════════════════════
+// SHARED-AC SAFE INJECTION / REMOVAL (kills the substring data-loss bug)
+// ════════════════════════════════════════════════════════════
+//
+// A shared acceptance criterion assigned to a story is injected into that story's
+// AC list as a canonical `${id}: ${text}` string. The OLD removal keyed on the
+// AC TEXT (substring), so a hand-written AC that happened to share the text was
+// wrongly matched + deleted, and a rename orphaned the binding. The fix: inject
+// with an id PREFIX and match by that EXACT `${id}: ` prefix (never a substring),
+// and bind the assignment to the feature's _uid (survives a rename). Pure helpers;
+// the UI uses them so inject + remove agree by construction.
+
+/** The canonical injected string for a shared AC item. Pure. */
+export function sharedAcInjected(item) {
+  return `${item.id}: ${item.text}`;
+}
+
+/**
+ * True iff acString is the injected form of this shared item — an EXACT
+ * `${item.id}: ` prefix match (NOT a substring of the text). A hand-written AC
+ * with the same text but no `id: ` prefix is NOT matched (the data-loss bug we kill).
+ */
+export function acIsSharedFor(acString, item) {
+  if (typeof acString !== 'string' || !item || item.id == null) return false;
+  return acString.startsWith(`${item.id}: `);
+}
+
+/**
+ * Find a feature by its stable _uid across capabilities[].features. Returns the
+ * feature object or null. (Binding shared-AC assignment by _uid survives a rename.)
+ */
+export function findFeatureByUid(breakdown, uid) {
+  if (!breakdown || typeof breakdown !== 'object' || uid == null) return null;
+  const caps = Array.isArray(breakdown.capabilities) ? breakdown.capabilities : [];
+  for (const c of caps) {
+    const feats = Array.isArray(c && c.features) ? c.features : [];
+    for (const f of feats) {
+      if (f && f._uid === uid) return f;
+    }
+  }
+  // Fallback: native-v3 features (no capabilities wrapper).
+  const flat = Array.isArray(breakdown.features) ? breakdown.features : [];
+  for (const f of flat) {
+    if (f && f._uid === uid) return f;
+  }
+  return null;
 }
 
 // ════════════════════════════════════════════════════════════
