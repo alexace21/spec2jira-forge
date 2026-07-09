@@ -21,6 +21,8 @@ import React from "react";
  *   - onClick (required) — handler that navigates back
  *   - label (default "Back to picker") — button text after arrow
  *   - title (optional) — hover tooltip; screen-specific framing
+ *   - ariaLabel (optional) — accessible name for keyboard/touch/screen-reader users
+ *     when a consequence (e.g. "discards edits") must not be hover-only
  *   - className (default "mb-3") — wrapper className override; pass ""
  *     for no margin (e.g., when wrapping в custom flex-row layout
  *     like reviewing screen's top-bar)
@@ -29,6 +31,7 @@ function BackButton({
   onClick,
   label = "Back to picker",
   title,
+  ariaLabel,
   className = "mb-3",
 }) {
   return (
@@ -54,6 +57,7 @@ function BackButton({
         e.currentTarget.style.color = "var(--s2j-blue)";
       }}
       title={title}
+      aria-label={ariaLabel || undefined}
     >
       ← {label}
     </button>

@@ -740,9 +740,15 @@ function buildSubtaskPayload(projectKey, task, parentStoryKey, subtaskTypeId, cu
  * @param {object} breakdown
  * @param {string} projectKey
  * @param {object|null} customFields
+ * @param {string|null} jobId
+ * @param {{priorKeys:{name?:string,key:string,uid?:string}[], epicKey:string}|null} resumeCtx
+ *        Task C — when present this is a RESUME of a partial push: the Epic already exists
+ *        (resumeCtx.epicKey, NOT re-created) and the seeded uid/name→key maps + priorUids
+ *        skip-set make the engine idempotent-by-uid (skip already-landed items, resolve
+ *        links/subtasks to already-created endpoints). null → a fresh push (unchanged).
  * @returns {Promise<{ok, sessionId?, phase?, epicKey?, totals?, error?, detail?}>}
  */
-export async function startPushSession(breakdown, projectKey, customFields = null, jobId = null) {
+export async function startPushSession(breakdown, projectKey, customFields = null, jobId = null, resumeCtx = null) {
   if (!breakdown) return { ok: false, error: 'no_breakdown', detail: 'No breakdown provided.' };
   if (!projectKey) return { ok: false, error: 'no_project_key', detail: 'No Jira project key.' };
 
@@ -808,11 +814,13 @@ export async function startPushSession(breakdown, projectKey, customFields = nul
     }
   }
 
-  // Create the Epic (one fast call) up front.
-  let epicKey = null;
+  // Create the Epic (one fast call) up front — UNLESS resuming, where the Epic already
+  // exists (resumeCtx.epicKey) and MUST NOT be re-created (that would orphan a second Epic).
+  let epicKey = resumeCtx ? (resumeCtx.epicKey || null) : null;
   // Site base URL for browse deep-links on the success screen. NOT derivable
   // from a create-response `self` (that is the api.atlassian.com/ex/jira proxy
   // host, which 404s in a browser); serverInfo.baseUrl is the real site URL.
+  // (Resume still needs it — its own buildFinalResult deep-links the created issues.)
   let browseBase = null;
   try {
     const si = await api.asUser().requestJira(route`/rest/api/3/serverInfo`);
@@ -820,7 +828,7 @@ export async function startPushSession(breakdown, projectKey, customFields = nul
   } catch (_) {
     /* deep-links fall back to a site-relative path in the UI */
   }
-  if (epic) {
+  if (!resumeCtx && epic) {
     const r = await createSingleIssue(buildEpicPayload(projectKey, epic, customFields));
     if (!r.ok) {
       console.warn(`[push] Epic create FAILED: ${r.error}`);
@@ -833,6 +841,25 @@ export async function startPushSession(breakdown, projectKey, customFields = nul
   let totalTasks = 0;
   for (const f of features) {
     totalTasks += (f.tasks || []).filter((t) => t && (t.summary || '').trim()).length;
+  }
+
+  // Task C — resume seeding: re-hydrate the name→key / uid→key maps + the priorUids skip-set
+  // from the previously-created issues so the engine SKIPS anything already landed (idempotency
+  // by uid — see stepStories/buildFlatTasks) and RESOLVES links/subtasks to the already-created
+  // endpoints. priorUids is a PLAIN OBJECT (a Set would not survive the KVS JSON round-trip
+  // between pushStep calls). All three stay empty on a fresh push → no skips (byte-equivalent).
+  const seedStoryKeyMap = {};
+  const seedUidKeyMap = {};
+  const seedPriorUids = {};
+  if (resumeCtx && Array.isArray(resumeCtx.priorKeys)) {
+    for (const pk of resumeCtx.priorKeys) {
+      if (!pk || !pk.key) continue;
+      if (pk.name) seedStoryKeyMap[pk.name] = pk.key; // name-fallback resolution (dual-keyed with uid)
+      if (pk.uid) {
+        seedUidKeyMap[pk.uid] = pk.key; // uid-first resolution (rename-proof)
+        seedPriorUids[pk.uid] = 1; // skip-set: this Story already landed → never re-create it
+      }
+    }
   }
 
   const sessionId = newSessionId();
@@ -849,8 +876,11 @@ export async function startPushSession(breakdown, projectKey, customFields = nul
     browseBase,
     features,
     links,
-    storyKeyMap: {},
-    uidKeyMap: {}, // Task #3: stable _uid → Jira key (rename-proof resolution, dual-keyed with storyKeyMap)
+    storyKeyMap: seedStoryKeyMap,
+    uidKeyMap: seedUidKeyMap, // Task #3: stable _uid → Jira key (rename-proof resolution, dual-keyed with storyKeyMap); Task C seeds it from priorKeys on resume
+    priorUids: seedPriorUids, // Task C: uid skip-set (plain object; empty on a fresh push) — stepStories/buildFlatTasks skip these already-landed Stories
+    isResume: !!resumeCtx, // Spec C.2: this session is a RESUME of a partial push -> buildFinalResult stamps result.isResume so pushStep marks the terminal ledger record distinct from a fresh push
+
     createdStories: [],
     phase: features.length > 0 ? 'stories' : links.length > 0 ? 'links' : 'done',
     cursor: 0,
@@ -1082,13 +1112,26 @@ async function stepStories(s) {
     }
   }
 
-  const tcEmbeddedIdx = new Set(); // slice idxs whose payload carries a tc embed (counted on SUCCESS below)
-  const payloads = slice.map((f, j) => {
+  // Task C — resume idempotency: skip any Story whose _uid already landed in a prior push
+  // (s.priorUids is seeded in startPushSession from the replayed created_issues). A fresh push
+  // has an empty/undefined priorUids → `attempted` === the full slice (byte-equivalent). A skipped
+  // Story is neither created nor counted; its subtasks/links resolve via the seeded uid/name maps.
+  const attempted = [];         // slice entries actually sent to Jira this chunk
+  const attemptedSliceIdx = []; // each attempted entry's index WITHIN `slice` (aligns tcEntries + the GLOBAL feature idx)
+  for (let j = 0; j < slice.length; j++) {
+    const f = slice[j];
+    if (f && f._uid && s.priorUids && s.priorUids[f._uid]) continue; // already created in a prior push → never duplicate
+    attempted.push(f);
+    attemptedSliceIdx.push(j);
+  }
+
+  const tcEmbeddedIdx = new Set(); // attempted idxs whose payload carries a tc embed (counted on SUCCESS below)
+  const payloads = attempted.map((f, k) => {
     // The content-match above bound the right entry (or null when the feature's ACs match no
     // generated story → edited/new → correctly no embed). tc_skipped is computed at the end
     // (tcTotal − tc_embedded) so it reflects generated stories that did not land an embed.
     let tcEntry = null;
-    const tcCand = tcEntries && tcEntries[j];
+    const tcCand = tcEntries && tcEntries[attemptedSliceIdx[k]];
     // Embed only when the entry actually has cases — a valid-but-empty entry would
     // embed nothing. The tc_embedded COUNT moves to the bulk SUCCESS branch below
     // (deep-audit P2 #3): counting at payload-BUILD measured INTENT, not OUTCOME —
@@ -1096,7 +1139,7 @@ async function stepStories(s) {
     // record + PushedScreen over-reported embeds exactly when stories failed.
     if (tcCand && !tcCand.error && tcCand.result && Array.isArray(tcCand.result.test_cases) && tcCand.result.test_cases.length > 0) {
       tcEntry = tcCand;
-      tcEmbeddedIdx.add(j);
+      tcEmbeddedIdx.add(k);
     }
     return buildStoryPayload(s.projectKey, f, s.epicKey, {
       embedTasks: !s.hasSubtasks,
@@ -1108,17 +1151,18 @@ async function stepStories(s) {
   });
   const bulk = await bulkCreateIssues(payloads);
   for (let j = 0; j < bulk.issues.length; j++) {
+    const f = attempted[j];
     if (bulk.issues[j]) {
-      s.storyKeyMap[slice[j].name] = bulk.issues[j].key;
+      s.storyKeyMap[f.name] = bulk.issues[j].key;
       // Task #3: dual-key by stable _uid alongside name so dependency links AND
       // subtask-parent lookups resolve uid-first (rename-proof), name-fallback.
-      if (slice[j]._uid) ensureUidKeyMap(s)[slice[j]._uid] = bulk.issues[j].key;
+      if (f._uid) ensureUidKeyMap(s)[f._uid] = bulk.issues[j].key;
       // Append-only list (preserves duplicate-named stories, unlike the
       // name-keyed storyKeyMap) so the success screen can deep-link every
       // created Story, not just the last one per name.
       // P15 prerequisite: stamp the stable _uid so the plan-push join is uid-keyed (rename-proof),
       // NOT name-keyed — else a duplicate-named Story mis-resolves to the wrong sprint (the Task #3 class).
-      s.createdStories.push({ name: slice[j].name, key: bulk.issues[j].key, uid: slice[j]._uid || null });
+      s.createdStories.push({ name: f.name, key: bulk.issues[j].key, uid: f._uid || null });
       s.counts.stories_created++;
       // tc_embedded counts OUTCOME (the embed actually landed in a created
       // Story), not intent — see the payload-build note above.
@@ -1128,13 +1172,13 @@ async function stepStories(s) {
       // (diag Phase 2) capture the GLOBAL feature index at the source — the
       // failureDetails struct carries names only, which the ledger bans (§1).
       const diag = ensureDiag(s);
-      if (diag.failedStoryIdxs.length < 20) diag.failedStoryIdxs.push(start + j);
+      if (diag.failedStoryIdxs.length < 20) diag.failedStoryIdxs.push(start + attemptedSliceIdx[j]);
       if (s.failureDetails.stories.length < 10) {
         // (deep-audit P2 #7) pair THIS story with ITS per-element error where one
         // exists — batchError used to carry the whole chunk's array, so story #2's
         // zone-2 line showed story #1's verbatim reason in multi-cause chunks.
         const own = Array.isArray(bulk.errors) ? bulk.errors.find((e) => e && e.index === j) : null;
-        s.failureDetails.stories.push({ name: slice[j].name, batchError: own ? [own] : bulk.errors });
+        s.failureDetails.stories.push({ name: f.name, batchError: own ? [own] : bulk.errors });
       }
     }
   }
@@ -1149,6 +1193,10 @@ async function stepStories(s) {
     } else {
       if (!s.hasSubtasks) {
         for (const f of s.features) {
+          // Task C: a resume-skipped (already-landed) Story did NOT re-embed its checklist this
+          // pass — skip it here too so resume.tasks_embedded stays this-pass-only and the FE merge
+          // (prior + resume) can't double-count. Empty priorUids on a fresh push → no skip.
+          if (f && f._uid && s.priorUids && s.priorUids[f._uid]) continue;
           // uid-first / name-fallback (Task #3) — match the parent-key lookup below.
           if ((f._uid && (s.uidKeyMap || {})[f._uid]) || s.storyKeyMap[f.name]) {
             s.counts.tasks_embedded += (f.tasks || []).filter((t) => t && (t.summary || '').trim()).length;
@@ -1165,6 +1213,11 @@ function buildFlatTasks(s) {
   let orphaned = 0;
   for (let fi = 0; fi < s.features.length; fi++) {
     const f = s.features[fi];
+    // Task C: never re-enqueue subtasks under a Story that already landed in a prior push
+    // (its subtasks were created/attempted then). Skipping BEFORE the orphan branch also keeps
+    // its already-created subtasks out of the orphan count. New Stories created THIS pass are
+    // NOT in priorUids → their previously-orphaned subtasks DO get created. Empty on a fresh push.
+    if (f && f._uid && s.priorUids && s.priorUids[f._uid]) continue;
     // uid-first / name-fallback (Task #3) so a renamed Story still parents its subtasks.
     const parentKey = (f._uid && (s.uidKeyMap || {})[f._uid]) || s.storyKeyMap[f.name];
     if (!parentKey) {
@@ -1245,20 +1298,39 @@ export function buildResolvableLinks(s) {
   const resolvable = [];
   const unresolved = [];
   const uidKeyMap = s.uidKeyMap || {};
+  // (A3) Clarify the human reason string for a name-UNMATCHED endpoint. A bound uid is minted
+  // ONLY on a unique _orig_name match (flattenBreakdown), and a name present in featureNames is
+  // likewise a real feature whose Story merely FAILED to create (story_failed) → keep the honest
+  // "<x> not created". An endpoint that matches NO surviving feature is name_unknown — the AI
+  // paraphrased it (or it was deleted); "not created" reads like a Story-create failure and hid
+  // the real cause. Mirrors classifyUnresolvedLinks so the reason agrees with the ledger class;
+  // the story_failed vs name_unknown CLASSIFICATION itself is unchanged.
+  const featureNames = new Set((s.features || []).map((f) => f && f.name).filter(Boolean));
+  const isKnownStory = (uid, name) => Boolean(uid) || featureNames.has(name);
+  const unmatchedReason = (name) =>
+    `dependency target "${name}" is not a recognized story (the AI may have paraphrased it)`;
   for (const { source, target, sourceUid, targetUid } of s.links) {
+    // Task C — resume idempotency: if BOTH endpoints already landed in a prior push, this link
+    // was already created (or attempted) then — skip it so a resume never re-creates it and the
+    // FE merge never double-counts it. A link into a NEWLY-created Story (only the source landed)
+    // must STILL be created, so BOTH uids are required. Empty priorUids on a fresh push → no skip.
+    if (sourceUid && targetUid && s.priorUids && s.priorUids[sourceUid] && s.priorUids[targetUid]) continue;
     // Task #3: resolve by stable _uid FIRST (rename-proof), fall back to NAME
     // (legacy / pre-uid breakdowns + ambiguous duplicate names). The rename case
     // that used to lie "source X not created" now resolves and never reaches here.
     const sourceKey = (sourceUid && uidKeyMap[sourceUid]) || s.storyKeyMap[source];
     const targetKey = (targetUid && uidKeyMap[targetUid]) || s.storyKeyMap[target];
     if (!sourceKey || !targetKey) {
-      unresolved.push({
-        source, target, sourceUid, targetUid,
-        reason: !sourceKey ? `source "${source}" not created` : `target "${target}" not created`,
-      });
+      const reason = !sourceKey
+        ? (isKnownStory(sourceUid, source) ? `source "${source}" not created` : unmatchedReason(source))
+        : (isKnownStory(targetUid, target) ? `target "${target}" not created` : unmatchedReason(target));
+      unresolved.push({ source, target, sourceUid, targetUid, reason });
       continue;
     }
-    resolvable.push({ source, target, sourceKey, targetKey });
+    // (FIX D) carry the endpoint uids onto the resolvable row so an api_failed detail row can record
+    // them - the FE merge (mergePushResults R1) carries forward ONLY the both-uid api_failed links a
+    // resume provably skips (null-uid links are re-attempted by resume, so they must NOT double-count).
+    resolvable.push({ source, target, sourceKey, targetKey, sourceUid, targetUid });
   }
   return { resolvable, unresolved };
 }
@@ -1350,6 +1422,9 @@ async function stepLinks(s) {
         if (s.failureDetails.links.length < 10) {
           s.failureDetails.links.push({
             source: batch[j].source, target: batch[j].target,
+            // (FIX D) stamp the endpoint uids so the FE merge can carry ONLY the both-uid api_failed
+            // links a resume skips (null-uid ones are re-attempted by resume -> must not double-count).
+            sourceUid: batch[j].sourceUid || null, targetUid: batch[j].targetUid || null,
             error: results[j].error, detail: results[j].detail,
           });
         }
@@ -1368,9 +1443,12 @@ async function stepLinks(s) {
 
 function computeProgress(s) {
   const t = s.totals || {};
-  const totalWork = (t.stories || 0) + (s.hasSubtasks ? t.tasks || 0 : 0) + (t.links || 0);
-  if (totalWork === 0) return 1;
   const c = s.counts;
+  // (R4) orphaned sub-tasks are never attempted (their parent Story failed), so they can never be
+  // "done" - subtract them from the tasks term so the bar's denominator matches the ATTEMPTED work
+  // the tiles + microcopy already use. Without this the bar tops out below 100% then jumps.
+  const totalWork = (t.stories || 0) + (s.hasSubtasks ? Math.max(0, (t.tasks || 0) - ((c && c.subtasks_orphaned) || 0)) : 0) + (t.links || 0);
+  if (totalWork === 0) return 1;
   const done =
     c.stories_created + c.story_failures +
     c.subtasks_created + c.subtask_failures +
@@ -1390,6 +1468,9 @@ function buildFinalResult(s) {
   return {
     partial: !allSuccess,
     result: {
+      // Spec C.2: rides through to the pushStep resolver so a RESUME's terminal ledger record
+      // gets a distinct op (push.resume.final). Additive - the FE ignores unknown result fields.
+      isResume: !!s.isResume,
       project_key: s.projectKey,
       project_name: s.projectName,
       total_epics: s.epicKey ? 1 : 0,

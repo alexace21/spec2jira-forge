@@ -2821,6 +2821,43 @@ resolver.define('purgeJob', async ({ payload, context }) => {
   }
 });
 
+/**
+ * purgePageSnapshot — Task C surgical privacy purge for a PARTIAL push.
+ *
+ * A partial push is NOT terminal: a Resume may follow, so the DERIVED data (job:/tcjob:/
+ * testcases:/jobmeta:) must SURVIVE so the resume can re-create the unwritten items and
+ * re-embed test cases on the resumed Stories. But the raw source-page snapshot (pagesnap:,
+ * ~180KB — the privacy-critical item) is no longer needed once a push has run, so we delete
+ * ONLY it here to keep the "raw page content is removed when you push" claim HONEST while
+ * retaining everything a resume needs. The FULL purge (deleteJobKeys, via purgeJob) runs
+ * later, when the run reaches a CLEAN terminal (a resume that lands everything, or a clean
+ * first push). An abandoned partial's derived keys are swept by the existing 7-day orphan
+ * sweep (jobmeta: survives; startPush already touchJobAccess'd). Best-effort, non-fatal.
+ */
+resolver.define('purgePageSnapshot', async ({ payload, context }) => {
+  const jobId = payload?.jobId;
+  if (!jobId) return { ok: false };
+  try {
+    await kvs.delete(`${PAGE_SNAP_PREFIX}${jobId}`);
+    // NOTE (DPA follow-up): a partial push also retains the plan:/planjob: derived data (alongside
+    // job:/tcjob:/testcases:/jobmeta:) for up to 7 days, until a resume terminates or the orphan sweep runs.
+    console.log(`[purgePageSnapshot] removed raw page snapshot for job ${jobId} (partial push; derived data retained for resume)`);
+    return { ok: true };
+  } catch (e) {
+    console.error(`[purgePageSnapshot] failed (non-fatal): ${String(e?.message || e)} ref=${jobId}`);
+    // The raw-page delete failed → the "removed when you push" privacy claim is at risk; mirror
+    // purgeJob's incomplete-purge ledger record so support can see it. Best-effort — must not throw
+    // out of the resolver (recordDiagnostic is fail-open by contract; the extra try is belt-and-braces).
+    try {
+      await recordDiagnostic({
+        context,
+        record: { op: 'purge', error_class: 'purge_incomplete', level: 'warn', ref: cleanClientRef(jobId), surfaced: false },
+      });
+    } catch (_) { /* fail-open — the purge already failed; never let the trace throw */ }
+    return { ok: false };
+  }
+});
+
 // ════════════════════════════════════════════════════════════
 // CAPACITY-SHEET PLANNER — review-only sprint plan (2026-06-19)
 // ════════════════════════════════════════════════════════════
@@ -3309,6 +3346,31 @@ function buildPushFailureDetailText(details) {
 }
 
 /**
+ * getProjectDisplay — best-effort destination project NAME for the Confirm screen.
+ *
+ * Given { projectKey }, calls push_handler's lookupProject (the same preflight the
+ * health check + push use; it runs asUser().requestJira internally) and returns
+ * { ok:true, key, name } so the reviewer can verify the push TARGET by name (the
+ * #1 wrong-project fear), not just the key. Best-effort: a missing key or ANY
+ * failure returns { ok:false } (never throws) — the UI falls back to key-only.
+ * Content-free logging only: the project NAME is never logged. boardType is
+ * intentionally omitted — lookupProject does not fetch boards, and the spec forbids
+ * a second Jira call solely to obtain it.
+ */
+resolver.define('getProjectDisplay', async ({ payload }) => {
+  const { projectKey } = payload || {};
+  if (!projectKey || typeof projectKey !== 'string') return { ok: false };
+  try {
+    const lookup = await lookupProject(projectKey);
+    if (!lookup || !lookup.ok || !lookup.project) return { ok: false };
+    return { ok: true, key: projectKey, name: lookup.project.name || null };
+  } catch (e) {
+    console.warn(`[getProjectDisplay] lookup failed (fail-open): ${String(e?.message || e)}`);
+    return { ok: false };
+  }
+});
+
+/**
  * startPush — begin a chunked JIRA push session.
  *
  * ⚠ 2026-05-30: chunked-resolver pattern. JIRA bulk create е slow (~0.85
@@ -3432,6 +3494,140 @@ resolver.define('startPush', async ({ payload, context }) => {
   };
 });
 
+// Task C — issue-key shape for validating the untrusted priorKeys/epicKey the FE replays
+// from created_issues (mirrors push_handler's ISSUE_KEY_SHAPE, which is not exported).
+const RESUME_ISSUE_KEY_SHAPE = /^[A-Z][A-Z0-9_]*-\d+$/;
+// Defensive cap on the replayed prior-keys array (a breakdown is dozens of features; this
+// bounds a malicious/oversized payload before it seeds the session maps).
+const RESUME_PRIORKEYS_CAP = 500;
+
+/**
+ * startResumePush — Task C. Begin a RESUME of a partial push: re-create ONLY the items
+ * that did not land the first time, never duplicating the ones that did. Reuses the SAME
+ * chunked engine as startPush (startPushSession + the UI-looped pushStep, which stays
+ * intent-agnostic) with a `resumeCtx` seed so the engine SKIPS any uid already keyed
+ * (idempotency by uid) and RESOLVES links/subtasks to the already-created endpoints.
+ *
+ * The FE replays `priorKeys` = pushResult.created_issues ([{name,key,uid}]) + the created
+ * `epicKey`; both are untrusted payload → validated + capped + malformed entries dropped.
+ * The Epic is NOT re-created (resumeCtx.epicKey rebinds it). Returns the same shape as
+ * startPush: { session_id, phase, totals, epic_key, progress }.
+ */
+resolver.define('startResumePush', async ({ payload, context }) => {
+  const { breakdown, projectKey: payloadProjectKey, jobId, priorKeys, epicKey } = payload || {};
+  const diagJobRef = cleanClientRef(jobId);
+  if (jobId) await touchJobAccess(jobId); // a resume attempt is activity on this breakdown — renew its inactivity timer (mirror startPush)
+  if (!breakdown) {
+    await recordDiagnostic({
+      context,
+      record: { op: 'push.resume', error_class: 'no_breakdown', level: 'warn', ref: diagJobRef, surfaced: true },
+    });
+    return { error: 'no_breakdown', detail: 'No breakdown payload provided' };
+  }
+  // A resume MUST rebind to the already-created Epic; without it we would create a second
+  // Epic. A partial push that reaches the success screen always carries an epic_key (an
+  // Epic-create failure aborts before Pushed), so this is a defensive guard.
+  if (!epicKey || !RESUME_ISSUE_KEY_SHAPE.test(String(epicKey))) {
+    await recordDiagnostic({
+      context,
+      record: { op: 'push.resume', error_class: 'unknown_error', level: 'warn', ref: diagJobRef, surfaced: true },
+    });
+    return { error: 'resume_invalid', detail: 'Resume needs the created Epic key. Regenerate and push again.' };
+  }
+  // Validate + sanitise the replayed prior keys (untrusted payload): keep {name,key,uid}
+  // only when the key is issue-key-shaped; drop malformed entries; cap the length.
+  const cleanPriorKeys = [];
+  if (Array.isArray(priorKeys)) {
+    for (const pk of priorKeys.slice(0, RESUME_PRIORKEYS_CAP)) {
+      if (!pk || typeof pk !== 'object') continue;
+      if (typeof pk.key !== 'string' || !RESUME_ISSUE_KEY_SHAPE.test(pk.key)) continue;
+      cleanPriorKeys.push({
+        name: typeof pk.name === 'string' ? pk.name : null,
+        key: pk.key,
+        uid: typeof pk.uid === 'string' ? pk.uid : null,
+      });
+    }
+  }
+
+  const projectKey = await getProjectKey(payloadProjectKey);
+  if (!projectKey) {
+    await recordDiagnostic({
+      context,
+      record: { op: 'push.resume', error_class: 'no_project_key', level: 'error', ref: diagJobRef, surfaced: true },
+    });
+    return {
+      error: 'no_project_key',
+      detail:
+        'No Jira project key configured. Open Settings → Spec2Tickets and set Default Jira Project Key.',
+    };
+  }
+
+  const settings = await loadSettings();
+  const cfParse = parseRequiredCustomFields(settings.requiredCustomFieldsJson);
+  const customFields = cfParse.ok ? cfParse.value : null;
+  if (!cfParse.ok) {
+    await recordDiagnostic({
+      context,
+      record: { op: 'push.resume', error_class: 'config_invalid', level: 'warn', ref: null, surfaced: false },
+    });
+  }
+
+  let outcome;
+  try {
+    outcome = await startPushSession(breakdown, projectKey, customFields, jobId || null, {
+      priorKeys: cleanPriorKeys,
+      epicKey: String(epicKey),
+    });
+  } catch (e) {
+    console.error(`[startResumePush] threw: ${String(e?.message || e)} ref=${jobId || '-'}`);
+    await recordDiagnostic({
+      context,
+      record: { op: 'push.resume', error_class: 'push_exception', level: 'error', ref: diagJobRef, surfaced: true },
+    });
+    await writeDiagnosticDetail({ ref: diagJobRef, text: String(e?.message || e) });
+    return { error: 'push_exception', detail: String(e?.message || e) };
+  }
+  if (!outcome.ok) {
+    // Same error mapping as startPush (project lookup arrives through this return; the
+    // Epic-create block is skipped on resume so an Epic failure cannot occur here).
+    let errorClass = 'unknown_error';
+    let jira;
+    const code = String(outcome.error || '');
+    if (code === 'project_not_found') errorClass = 'project_not_found';
+    else if (code === 'permission_denied') errorClass = 'permission_denied';
+    else if (code === 'jira_fetch_failed') errorClass = 'network_failure';
+    else {
+      const m = /^jira_(\d+)$/.exec(code);
+      if (m) {
+        errorClass = 'jira_http';
+        jira = [{ status: parseInt(m[1], 10) }];
+      }
+    }
+    await recordDiagnostic({
+      context,
+      record: {
+        op: 'push.resume',
+        error_class: errorClass,
+        level: 'error',
+        ref: diagJobRef,
+        ...(jira ? { jira } : {}),
+        surfaced: true,
+      },
+    });
+    if (outcome.detail) {
+      await writeDiagnosticDetail({ ref: diagJobRef, text: String(outcome.detail) });
+    }
+    return { error: outcome.error, detail: outcome.detail };
+  }
+  return {
+    session_id: outcome.sessionId,
+    phase: outcome.phase,
+    totals: outcome.totals,
+    epic_key: outcome.epicKey,
+    progress: 0,
+  };
+});
+
 /**
  * pushStep — advance a push session by one bounded chunk. UI loops this until
  * { done: true }. Each call stays under the 25-sec resolver timeout.
@@ -3513,11 +3709,14 @@ resolver.define('pushStep', async ({ payload, context }) => {
     const res = outcome.result || {};
     const d = res.diag || {};
     const jobRef = outcome.job_id || null;
+    // Spec C.2: a RESUME's terminal record carries a DISTINCT op (push.resume.final) so support can
+    // tell it from a fresh push's push.final. Fresh pushes (res.isResume falsy) stay byte-identical.
+    const finalOp = res.isResume ? 'push.resume.final' : 'push.final';
     if (outcome.partial) {
       await recordDiagnostic({
         context,
         record: {
-          op: 'push.final',
+          op: finalOp,
           error_class: 'partial_push',
           level: 'error',
           ref: jobRef,
@@ -3561,7 +3760,7 @@ resolver.define('pushStep', async ({ payload, context }) => {
       await recordDiagnostic({
         context,
         record: {
-          op: 'push.final',
+          op: finalOp,
           error_class: 'push_completed',
           level: 'info',
           ref: jobRef,

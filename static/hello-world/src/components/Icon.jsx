@@ -208,6 +208,22 @@ export const IconChevronRight = (p) => (
   </S>
 );
 
+// Show/Hide + expand/collapse toggles: DOWN when collapsed ("Show all"), UP when
+// expanded ("Hide"). A real chevron (not a text arrow ▾/▸) so the toggle reads crisp
+// at any size + colour. Static per-state icons (no CSS transform:rotate — that reads
+// FROZEN in the Forge iframe; page-picker-redesign lesson).
+export const IconChevronDown = (p) => (
+  <S {...p}>
+    <polyline points="6 9 12 15 18 9" />
+  </S>
+);
+
+export const IconChevronUp = (p) => (
+  <S {...p}>
+    <polyline points="18 15 12 9 6 15" />
+  </S>
+);
+
 // Capacity-Sheet Planner — a calendar (sprint planning).
 export const IconCalendar = (p) => (
   <S {...p}>

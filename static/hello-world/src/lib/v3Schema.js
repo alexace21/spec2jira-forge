@@ -94,6 +94,14 @@ export function adaptToLegacyShape(v3) {
           t && typeof t === 'object' ? { ...t, _uid: t._uid || newStoryUid() } : t
         )
       : tasks;
+  // (A2) DEDUPE each feature's dependencies[] at the ROOT (load/adapt), dropping duplicate
+  // target strings. A duplicated blocks-link is meaningless in Jira, AND a duplicate is the one
+  // real way the Review remove/restore drops a link: removeFeatureDependency filters ALL matches
+  // while addFeatureDependency re-adds ONE, so a Remove->Restore round-trip on a duplicated dep
+  // silently collapses two entries to one (a genuine -1 link). Removing duplicates here makes
+  // remove-all === remove-one (the mutation becomes symmetric). Exact-string dedupe.
+  const dedupeDeps = (deps) =>
+    Array.isArray(deps) ? deps.filter((d, i) => deps.indexOf(d) === i) : deps;
   const features = (Array.isArray(v3.features) ? v3.features : []).map((f) => {
     if (!f || typeof f !== 'object') return f;
     // Feature identity may already be minted (reloaded breakdown), but a NEW task added upstream
@@ -103,6 +111,7 @@ export function adaptToLegacyShape(v3) {
       _uid: f._uid || newStoryUid(),
       _orig_name: f._orig_name || f.name,
       tasks: mintTaskUids(f.tasks),
+      dependencies: dedupeDeps(f.dependencies),
     };
   });
 
@@ -191,7 +200,7 @@ export function newStoryUid() {
  *     parsedSpecConcerns: [{type, severity, text}],
  *     parsedFeatureConcerns: [{featureName, type, severity, text}],
  *     categories: [{name, featureCount}],
- *     dependencyEdges: [{source, target, targetDisplay}], // target = FROZEN dep string (mutation key); targetDisplay = current name (display)
+ *     dependencyEdges: [{source, target, targetDisplay, unresolved}], // target = FROZEN dep string (mutation key); targetDisplay = current name (display); unresolved = true when the dep string matches no feature (name_unknown at push)
  *     epicSummary: string | null,
  *     hasEpic: boolean,
  *   }
@@ -266,7 +275,23 @@ export function extractV3Signals(breakdown) {
     for (const depTarget of f.dependencies || []) {
       // target = the FROZEN dep string (the remove/restore mutation key); targetDisplay
       // = the depended-on feature's CURRENT name for the Review display (Task #4).
-      dependencyEdges.push({ source: f.name, target: depTarget, targetDisplay: origToCurrent.get(depTarget) || depTarget });
+      // (A1) unresolved = the dep string matches NO feature's frozen _orig_name, so origToCurrent
+      // has no entry for it → at push this edge silently fails as name_unknown (the AI paraphrased
+      // the target so it maps to no story). Surfaced in the Review dependency editor BEFORE push so
+      // the user knows WHY a link won't be created. A resolvable dep (target IS a real feature's
+      // _orig_name) is in origToCurrent → NOT flagged. Pure derive.
+      dependencyEdges.push({
+        source: f.name,
+        // sourceUid = the SOURCE feature's stable _uid (survives rename; disambiguates
+        // two same-named sources). The remove/restore/add mutation matches the source
+        // uid-first, name-fallback (see mapFeatureDependencies). May be absent on a
+        // legacy breakdown whose features were never adapted → the mutation falls back
+        // to source-name matching (identical to the pre-migration behavior).
+        sourceUid: f._uid,
+        target: depTarget,
+        targetDisplay: origToCurrent.get(depTarget) || depTarget,
+        unresolved: !origToCurrent.has(depTarget),
+      });
     }
 
     for (const concernRaw of f.concerns || []) {
@@ -754,16 +779,26 @@ function buildSizingSpread(features) {
 
 /**
  * Internal: return a NEW breakdown with `fn(dependencies[])` applied to the
- * feature named `sourceFeatureName`, wherever that feature lives
- * (capabilities[].features — push legacy; features — push v3 native;
- * _v3_original.features — display). Immutable; untouched features kept by ref.
+ * SOURCE feature, wherever that feature lives (capabilities[].features — push
+ * legacy; features — push v3 native; _v3_original.features — display). Immutable;
+ * untouched features kept by ref.
+ *
+ * SOURCE identity (uid-first, name-fallback): when `sourceUid` is given the source
+ * is matched by the stable `_uid` — this is the fix for DUPLICATE-named features
+ * (two unrenamed "New Feature" adds would otherwise both match by name and a
+ * mutation on one would corrupt both). When `sourceUid` is ABSENT (legacy callers,
+ * or a legacy breakdown whose features carry no _uid) the match falls back to the
+ * feature name — byte-identical to the pre-migration behavior. The TARGET is NOT
+ * migrated: the dep string stays the frozen _orig_name (resolved uid-first at push).
  */
-function mapFeatureDependencies(breakdown, sourceFeatureName, fn) {
+function mapFeatureDependencies(breakdown, sourceFeatureName, fn, sourceUid) {
   if (!breakdown || typeof breakdown !== 'object') return breakdown;
-  const editFeature = (f) =>
-    f && f.name === sourceFeatureName
+  const editFeature = (f) => {
+    const matches = sourceUid ? (f && f._uid === sourceUid) : (f && f.name === sourceFeatureName);
+    return matches
       ? { ...f, dependencies: fn(Array.isArray(f.dependencies) ? f.dependencies : []) }
       : f;
+  };
   const next = { ...breakdown };
   if (Array.isArray(breakdown.capabilities)) {
     next.capabilities = breakdown.capabilities.map((c) => ({
@@ -784,22 +819,30 @@ function mapFeatureDependencies(breakdown, sourceFeatureName, fn) {
 }
 
 /**
- * Remove `targetName` from the dependencies of the feature `sourceFeatureName`,
- * across every shape the push/display read. Returns a NEW breakdown.
+ * Remove `targetName` from the dependencies of the source feature, across every
+ * shape the push/display read. Returns a NEW breakdown. `sourceUid` (optional)
+ * matches the source uid-first; absent → name-fallback (unchanged behavior).
  */
-export function removeFeatureDependency(breakdown, sourceFeatureName, targetName) {
-  return mapFeatureDependencies(breakdown, sourceFeatureName, (deps) =>
-    deps.filter((d) => d !== targetName)
+export function removeFeatureDependency(breakdown, sourceFeatureName, targetName, sourceUid) {
+  return mapFeatureDependencies(
+    breakdown,
+    sourceFeatureName,
+    (deps) => deps.filter((d) => d !== targetName),
+    sourceUid
   );
 }
 
 /**
  * Inverse of removeFeatureDependency — re-add `targetName` (idempotent: never
- * duplicates). Backs the Review-screen "restore" affordance.
+ * duplicates). Backs the Review-screen "restore" + "add" affordances. `sourceUid`
+ * (optional) matches the source uid-first; absent → name-fallback (unchanged).
  */
-export function addFeatureDependency(breakdown, sourceFeatureName, targetName) {
-  return mapFeatureDependencies(breakdown, sourceFeatureName, (deps) =>
-    deps.includes(targetName) ? deps : [...deps, targetName]
+export function addFeatureDependency(breakdown, sourceFeatureName, targetName, sourceUid) {
+  return mapFeatureDependencies(
+    breakdown,
+    sourceFeatureName,
+    (deps) => (deps.includes(targetName) ? deps : [...deps, targetName]),
+    sourceUid
   );
 }
 

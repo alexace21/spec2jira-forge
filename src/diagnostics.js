@@ -85,6 +85,8 @@ export const DIAG_OPS = Object.freeze([
   'generation.complete',
   'push.final',
   'push.step',
+  'push.resume', // Task C — a RESUME of a partial push (distinct op so support tells resume from a fresh push); its START-failure records carry this op
+  'push.resume.final', // Spec C.2 - the TERMINAL record of a RESUME (clean or still-partial), distinct from a fresh push's push.final so support can tell resume from fresh
   'testgen.batch',
   'testgen.poll', // [seams-audit J5] the TC poll leg — partitions the 7-site testgen.batch/kvs_write_failed junk-drawer tuple into flow legs (mirror of generation.start/.poll)
   'testgen.regen',

@@ -21,7 +21,6 @@ import {
   IconClock,
   IconCost,
   IconBeaker,
-  IconX,
   IconUndo,
   IconExternalLink,
   IconSettings,
@@ -29,13 +28,16 @@ import {
   IconCalendar,
   IconList,
   IconCheck,
-  IconChevronRight,
+  IconChevronDown,
+  IconChevronUp,
+  IconDownload,
 } from "./components/Icon";
 import {
   adaptToLegacyShape,
   extractV3Signals,
   computeInsightsView,
   priorityLabel,
+  isPlaceholderName,
   removeFeatureDependency,
   addFeatureDependency,
   CONCERN_TYPE_LABEL,
@@ -493,6 +495,30 @@ function App() {
   // Chunked-push progress (2026-05-30) — UI loops pushStep, updates these.
   const [pushProgress, setPushProgress] = useState(0);
   const [pushPhase, setPushPhase] = useState("");
+  // Live push data captured from startPush/pushStep (Task A plumbing, 2026-07-08) so the
+  // redesigned PushingScreen can show honest granular progress: the Epic key (proof the
+  // write started), the planned totals ({stories,tasks,links}), and the per-step counts
+  // (created/failed/orphaned per phase). Reset per push; passed straight to PushingScreen.
+  const [pushEpicKey, setPushEpicKey] = useState(null);
+  const [pushTotals, setPushTotals] = useState(null);
+  const [pushCounts, setPushCounts] = useState(null);
+  // Task C — resume-push state (2026-07-08). A resume runs IN PLACE on the Pushed screen (not the
+  // Pushing screen), re-creating only the items that didn't land the first time. resumeInFlightRef
+  // is the synchronous double-click guard (mirror planPushInFlightRef); resumeError stays on the
+  // Pushed screen so a resume failure never abandons the partial-outcome ledger.
+  const resumeInFlightRef = useRef(false);
+  const [resuming, setResuming] = useState(false);
+  const [resumeProgress, setResumeProgress] = useState(0);
+  const [resumeError, setResumeError] = useState(null);
+  // (R3) set true when a resume fails mid-flight (after startResumePush, during the pushStep loop or a
+  // throw): some items may already have been created, so re-clicking Resume off the stale created_issues
+  // could DUPLICATE them. It hides the Resume button until a page reload re-adapts the breakdown (fresh
+  // uids -> computeCanResume false -> resume safely not offered). Cleared only on a fresh push.
+  const [resumeInterrupted, setResumeInterrupted] = useState(false);
+  // (R2) true while finalizePushCleanup's async export capture (getTestCaseExports x2) is running on a
+  // terminal push. During that window capturedExports is still null but the export is NOT lost -
+  // PostPushExport shows a neutral "preparing" state instead of the false "couldn't retain" amber.
+  const [captureInFlight, setCaptureInFlight] = useState(false);
 
   // CG-7 spec linter pre-flight (Layer 1 Session 2, 2026-05-07)
 
@@ -1357,14 +1383,16 @@ function App() {
   // pendingBreakdown) — NOT just the display — so the JIRA push will not recreate
   // a removed Story-blocks-Story link. dependency_links is kept in sync so the
   // "What will be created" tally matches. See v3Schema.removeFeatureDependency.
-  const handleRemoveDependency = useCallback((source, target) => {
-    setPendingBreakdown((prev) => removeFeatureDependency(prev, source, target));
+  // sourceUid (optional) disambiguates duplicate-named source features — the mutation
+  // matches uid-first, name-fallback (see v3Schema.mapFeatureDependencies).
+  const handleRemoveDependency = useCallback((source, target, sourceUid) => {
+    setPendingBreakdown((prev) => removeFeatureDependency(prev, source, target, sourceUid));
     setDryRunResult((dr) =>
       dr ? { ...dr, dependency_links: Math.max(0, (dr.dependency_links || 0) - 1) } : dr,
     );
   }, []);
-  const handleRestoreDependency = useCallback((source, target) => {
-    setPendingBreakdown((prev) => addFeatureDependency(prev, source, target));
+  const handleRestoreDependency = useCallback((source, target, sourceUid) => {
+    setPendingBreakdown((prev) => addFeatureDependency(prev, source, target, sourceUid));
     setDryRunResult((dr) =>
       dr ? { ...dr, dependency_links: (dr.dependency_links || 0) + 1 } : dr,
     );
@@ -1374,13 +1402,71 @@ function App() {
   // mutation as restore (addFeatureDependency is idempotent); the AddDependencyScreen
   // guards self / duplicate / cycle, so the +1 link count is always a real new edge.
   const handleOpenAddDependency = useCallback(() => setScreen("addDependency"), []);
-  const handleAddDependency = useCallback((source, target) => {
-    setPendingBreakdown((prev) => addFeatureDependency(prev, source, target));
+  const handleAddDependency = useCallback((source, target, sourceUid) => {
+    setPendingBreakdown((prev) => addFeatureDependency(prev, source, target, sourceUid));
     setDryRunResult((dr) =>
       dr ? { ...dr, dependency_links: (dr.dependency_links || 0) + 1 } : dr,
     );
     setScreen("confirming");
   }, []);
+
+  // ── Task C: terminal cleanup after a push settles (initial OR resumed) ────────
+  // Single source of truth for the post-push purge gate, so handleConfirmedPush and
+  // handleResumePush behave identically:
+  //   • CLEAN (!partial): capture-before-purge (test cases → FE memory) then the FULL purgeJob
+  //     (page content + breakdown + test cases), exactly as before Task C. This is the TERMINAL
+  //     state — the captured export is the only surviving test copy.
+  //   • PARTIAL: NOT terminal (a resume may follow). Do NOT capture and do NOT full-purge; strip
+  //     ONLY the raw page snapshot (purgePageSnapshot) so "raw page content is removed when you
+  //     push" HOLDS, while the derived data (job:/tcjob:/testcases:/jobmeta:) survives so a resume
+  //     can re-create the missing items + re-embed test cases. An abandoned partial is cleaned up
+  //     by the existing 7-day orphan sweep (jobmeta: survives; startPush already touched access).
+  const finalizePushCleanup = useCallback((settledResult) => {
+    if (!jobId) return;
+    const partial = !!(settledResult && settledResult.partial);
+    // A partial is only RESUMABLE if a resume could actually create something: a failed Story, an
+    // orphaned sub-task (its parent can now be created), or a link that failed because its story
+    // failed / the Jira API rejected it. A partial whose ONLY residual is carried own-failed
+    // sub-tasks under LANDED Stories has nothing to resume → treat it as TERMINAL (capture + full
+    // purge), so its export is retained (like a clean push) and it never shows a false "couldn't
+    // retain export" with no Resume path to progress.
+    // (R1 consequence) resume genuinely CANNOT retry a both-landed api_failed link (buildResolvableLinks
+    // skips it), so an api_failed link is NOT resumable work and must not defer the terminal capture/
+    // purge. Cascaded (story_failed) links ARE retried once their Story is recreated, so they count.
+    // Single source of truth (shared with PushedScreen's resumeCreateCount) — no hand-kept lockstep.
+    const hasResumableWork = resumableWorkCount(settledResult) > 0;
+    if (partial && hasResumableWork) {
+      // NOT terminal — a resume may follow. Keep the derived data; strip only the raw page snapshot.
+      invoke("purgePageSnapshot", { jobId }).catch(() => {});
+      return;
+    }
+    // TERMINAL (clean, OR a partial with no resumable work): capture-before-purge, then full purge.
+    if (testCaseResults && testCaseResults.total > 0) {
+      setCaptureInFlight(true); // (R2) the async export capture is starting - flag it so PostPushExport shows "preparing", not the false "couldn't retain" amber, during the getTestCaseExports round-trip.
+      (async () => {
+        let exp = null;
+        try {
+          const [g, c] = await Promise.all([
+            invoke("getTestCaseExports", { jobId, format: "gherkin" }),
+            invoke("getTestCaseExports", { jobId, format: "csv" }),
+          ]);
+          exp = {
+            gherkin: g && !g.error ? g.gherkin : null,
+            csv: c && !c.error ? c.csv : null,
+            skipped: g && Number.isFinite(g.skipped) ? g.skipped : 0,
+          };
+        } catch (_) {
+          exp = null;
+        } finally {
+          invoke("purgeJob", { jobId }).catch(() => {});
+        }
+        if (exp && (exp.gherkin || exp.csv)) setCapturedExports(exp);
+        setCaptureInFlight(false); // (R2) capture settled (success or null) - the export state is now authoritative (download, or the honest "couldn't retain" amber).
+      })();
+    } else {
+      invoke("purgeJob", { jobId }).catch(() => {});
+    }
+  }, [jobId, testCaseResults]);
 
   // ── Push: Step 2 — confirmed → chunked create in JIRA ────────
   // 2026-05-30: chunked-resolver pattern. JIRA bulk create е slow (~0.85
@@ -1393,11 +1479,18 @@ function App() {
     // confirmation note so they don't have to check Diagnostics to know it happened).
     setTcDiscardedAtPush(tcGenerating);
     setCapturedExports(null); // v6: clear any prior capture; this push re-captures if it has test cases
+    setCaptureInFlight(false); // (R2) a fresh push -> no export capture in flight yet
+    setResumeInterrupted(false); // (R3) a fresh push -> clear any prior resume-interrupted lock
     setPlanPush({ status: "idle" }); // P15: a fresh push → fresh plan-push state
     setKanbanRank({ status: "idle" }); // P15 (kanban): a fresh push → fresh backlog-rank state
     setIsPushing(true);
     setPushProgress(0);
     setPushPhase("starting");
+    // Task A: clear the prior push's live data so a fresh push never shows stale
+    // Epic key / totals / counts before the first step lands.
+    setPushEpicKey(null);
+    setPushTotals(null);
+    setPushCounts(null);
     setScreen("pushing");
 
     const fail = (res, fallback) => {
@@ -1444,6 +1537,10 @@ function App() {
       }
       pushSessionId = sessionId; // [diag Phase 5] for the terminal invoke-catch fallback record
       setPushPhase(start.phase || "stories");
+      // Task A: the Epic exists the moment startPush returns (Epic create is part of
+      // startPush) — surface it + the planned totals so PushingScreen can anchor.
+      setPushEpicKey(start.epic_key || null);
+      setPushTotals(start.totals || null);
 
       // Loop pushStep until done. Safety cap prevents runaway (huge specs
       // chunk in 15s → 2000 steps would be ~30000 items, far beyond any real spec).
@@ -1461,42 +1558,17 @@ function App() {
           setPushResult(step.result);
           setScreen("pushed");
           setIsPushing(false);
-          // Data minimization: page content + breakdown in KVS aren't needed
-          // after the push — purge them (best-effort). See privacy policy §5.
-          // ⭐ v6: if this run produced test cases, CAPTURE the rendered Gherkin/CSV into
-          // FE memory FIRST (getTestCaseExports reads KVS → 404s post-purge), so the terminal
-          // success screen can still offer Copy. Privacy-safe: nothing is kept in KVS — just
-          // two strings in memory, gone on reload. THEN purge. A capture failure degrades
-          // silently to "no Copy on the success screen"; it never blocks the purge.
-          if (jobId) {
-            if (testCaseResults && testCaseResults.total > 0) {
-              (async () => {
-                let exp = null;
-                try {
-                  const [g, c] = await Promise.all([
-                    invoke("getTestCaseExports", { jobId, format: "gherkin" }),
-                    invoke("getTestCaseExports", { jobId, format: "csv" }),
-                  ]);
-                  exp = {
-                    gherkin: g && !g.error ? g.gherkin : null,
-                    csv: c && !c.error ? c.csv : null,
-                    skipped: g && Number.isFinite(g.skipped) ? g.skipped : 0,
-                  };
-                } catch (_) {
-                  exp = null;
-                } finally {
-                  invoke("purgeJob", { jobId }).catch(() => {});
-                }
-                if (exp && (exp.gherkin || exp.csv)) setCapturedExports(exp);
-              })();
-            } else {
-              invoke("purgeJob", { jobId }).catch(() => {});
-            }
-          }
+          // ⭐ Task C — the purge gate branches on partial vs clean (see finalizePushCleanup):
+          // a CLEAN push captures-then-full-purges (page content + breakdown + test cases) exactly
+          // as before; a PARTIAL push strips ONLY the raw page snapshot and RETAINS the derived
+          // data so a resume can finish the write. Data minimization holds either way (the raw page
+          // is always removed on push); the strong "removed when you push" claim is preserved.
+          finalizePushCleanup(step.result);
           return;
         }
         setPushProgress(typeof step.progress === "number" ? step.progress : 0);
         setPushPhase(step.phase || "");
+        setPushCounts(step.counts || null); // Task A: live per-phase created/failed/orphaned counts
       }
 
       setErrorRefId(jobId || null); // [diag Phase 3]
@@ -1523,7 +1595,72 @@ function App() {
       setScreen("error");
       setIsPushing(false);
     }
-  }, [pendingBreakdown, jobId, tcGenerating, testCaseResults]);
+  }, [pendingBreakdown, jobId, tcGenerating, testCaseResults, finalizePushCleanup]);
+
+  // ── Task C: Resume a PARTIAL push ─────────────────────────────
+  // Create ONLY the items that didn't land, never duplicating the ones that did. A structural
+  // clone of handleConfirmedPush's chunked loop, but it targets startResumePush (which seeds the
+  // engine with the previously-created uids/keys so it SKIPS the already-landed items) and runs IN
+  // PLACE on the Pushed screen (no screen switch). On done it MERGES the resume outcome into the
+  // prior pushResult (mergePushResults — honestly carrying forward any prior residual) and re-runs
+  // the terminal cleanup gated on the MERGED result (partial→resume→clean captures the export +
+  // full-purges at that terminal point). A resume start/step failure stays on 'pushed' (the partial
+  // ledger is preserved) and surfaces via resumeError.
+  const handleResumePush = useCallback(async () => {
+    if (resumeInFlightRef.current) return; // synchronous double-click guard (survives a same-frame double-click)
+    if (!pushResult || !pendingBreakdown) return;
+    if (!computeCanResume(pendingBreakdown, pushResult)) return; // stale-uid guard (defensive; the button is also gated)
+    const priorResult = pushResult; // snapshot the pre-resume result for the merge (state may change mid-flight)
+    resumeInFlightRef.current = true;
+    setResumeError(null);
+    setResuming(true);
+    setResumeProgress(0);
+    try {
+      const start = await invoke("startResumePush", {
+        breakdown: pendingBreakdown,
+        jobId,
+        priorKeys: priorResult.created_issues,
+        epicKey: priorResult.epic_key,
+        projectKey: priorResult.project_key,
+      });
+      if (!start || start.error || !start.session_id) {
+        const friendly = _classifyBackendError(start || {}, "Resume failed to start");
+        setResumeError(friendly.message || "Resume failed to start. Try again, or contact support@spec2jira.com.");
+        return;
+      }
+      const sessionId = start.session_id;
+      for (let i = 0; i < 2000; i++) {
+        const step = await invoke("pushStep", { sessionId, jobId: jobId || undefined });
+        if (!step || step.error) {
+          const friendly = _classifyBackendError(step || {}, "Resume step failed");
+          setResumeError(friendly.message || "Resume step failed. Try again, or contact support@spec2jira.com.");
+          setResumeInterrupted(true); // (R3) resume may have created some items before this step failed - block a re-Resume (dup guard) until a reload re-adapts the state.
+          return;
+        }
+        if (step.done) {
+          // Merge the resume outcome into the prior result (union created_issues by uid, sum tallies,
+          // carry forward any prior residual sub-task failure so it never silently vanishes).
+          const merged = mergePushResults(priorResult, step.result);
+          setPushResult(merged);
+          // Terminal cleanup on the MERGED result: clean → capture + full purge; still-partial →
+          // re-strip the page snapshot (idempotent — already gone) and keep the derived data.
+          finalizePushCleanup(merged);
+          return;
+        }
+        setResumeProgress(typeof step.progress === "number" ? step.progress : 0);
+      }
+      setResumeError(
+        "Resume took an unexpectedly large number of steps. Check Jira for created items; contact support@spec2jira.com if items are missing.",
+      );
+      setResumeInterrupted(true); // (R3) items were created across the loop without reaching done - same dup-risk class as a step failure.
+    } catch (err) {
+      setResumeError(err && err.message ? err.message : "Resume failed. Try again, or contact support@spec2jira.com.");
+      setResumeInterrupted(true); // (R3) a throw mid-loop may leave items created - block a re-Resume until a reload re-adapts the state.
+    } finally {
+      setResuming(false);
+      resumeInFlightRef.current = false;
+    }
+  }, [pushResult, pendingBreakdown, jobId, finalizePushCleanup]);
 
   // ── Test-case generation (P5) ─────────────────────────────────
 
@@ -2599,6 +2736,7 @@ function App() {
       return (
         <ConfirmScreen
           dryRunResult={dryRunResult}
+          defaultProjectKey={defaultProjectKey}
           breakdown={pendingBreakdown}
           truncationNote={results?.truncation_note}
           persistFailed={persistFailed}
@@ -2652,7 +2790,15 @@ function App() {
         />
       );
     case "pushing":
-      return <PushingScreen progress={pushProgress} phase={pushPhase} />;
+      return (
+        <PushingScreen
+          progress={pushProgress}
+          phase={pushPhase}
+          epicKey={pushEpicKey}
+          totals={pushTotals}
+          counts={pushCounts}
+        />
+      );
     case "pushed":
       return (
         <PushedScreen
@@ -2662,6 +2808,8 @@ function App() {
           onOpenDiagnostics={handleOpenDiagnostics}
           tcDiscarded={tcDiscardedAtPush}
           capturedExports={capturedExports}
+          hadTestCases={!!(testCaseResults && testCaseResults.total > 0)}
+          testCaseCount={(testCaseResults && testCaseResults.total) || 0}
           hasPlan={!!(planResult && planResult.ok && planResult.plan && (planResult.plan.methodology || "scrum") !== "kanban")}
           hasKanbanPlan={!!(planResult && planResult.ok && planResult.plan && (planResult.plan.methodology) === "kanban")}
           planStale={!!(planResult && planResult.stale)}
@@ -2669,6 +2817,13 @@ function App() {
           onAssignSprints={handleAssignSprints}
           kanbanRank={kanbanRank}
           onRankBacklog={handleRankBacklog}
+          onResume={handleResumePush}
+          canResume={computeCanResume(pendingBreakdown, pushResult)}
+          resuming={resuming}
+          resumeProgress={resumeProgress}
+          resumeError={resumeError}
+          resumeInterrupted={resumeInterrupted}
+          captureInFlight={captureInFlight}
         />
       );
     case "limit_reached":
@@ -3557,19 +3712,13 @@ function PreflightCard({ outline, timeBand, defaultProjectKey, selectedProfile, 
               padding: "8px 0 2px",
               marginTop: 4,
               cursor: "pointer",
-              color: "var(--s2j-text-light)",
+              color: "var(--s2j-blue)",
               fontSize: 12,
               fontWeight: 600,
             }}
           >
-            <span
-              style={{
-                display: "inline-flex",
-                transform: detailOpen ? "rotate(90deg)" : "none",
-                transition: "transform 0.15s ease",
-              }}
-            >
-              <IconChevronRight size={13} />
+            <span style={{ display: "inline-flex" }}>
+              {detailOpen ? <IconChevronUp size={13} /> : <IconChevronDown size={13} />}
             </span>
             {detailOpen
               ? "Hide detailed outline"
@@ -4055,8 +4204,9 @@ function FlaggedRow({ feature, defaultOpen, onProceed }) {
               </span>
             ) : null}
             {hasConcerns ? (
-              <span style={{ fontSize: 11, color: "var(--s2j-text-muted)", marginLeft: 8 }}>
-                {open ? "▾ hide" : `▸ ${concerns.length} concern${concerns.length > 1 ? "s" : ""}`}
+              <span style={{ fontSize: 11, color: "var(--s2j-text-muted)", marginLeft: 8, display: "inline-flex", alignItems: "center", gap: 3 }}>
+                {open ? <IconChevronUp size={11} /> : <IconChevronDown size={11} />}
+                {open ? "hide" : `${concerns.length} concern${concerns.length > 1 ? "s" : ""}`}
               </span>
             ) : null}
           </span>
@@ -4130,8 +4280,8 @@ function CategoryRollupRow({ group, onProceed, defaultOpen }) {
           cursor: "pointer",
         }}
       >
-        <span style={{ fontSize: 13.5, fontWeight: 600, color: MOOD.navy }}>
-          {open ? "▾ " : "▸ "}
+        <span style={{ fontSize: 13.5, fontWeight: 600, color: MOOD.navy, display: "inline-flex", alignItems: "center", gap: 6 }}>
+          {open ? <IconChevronUp size={12} /> : <IconChevronDown size={12} />}
           {group.name}
         </span>
         <span style={{ fontSize: 12, color: "var(--s2j-text-muted)" }}>
@@ -4727,6 +4877,19 @@ function AddDependencyScreen({ breakdown, onAdd, onBack }) {
     });
     return m;
   }, [breakdown]);
+  // source name → stable _uid, so the add mutation targets the source uid-first
+  // (name-fallback when a feature has no _uid). The <select> keys on name, so a
+  // duplicate name resolves to the first-seen uid — still an improvement over pure
+  // name-match (the mutation then hits ONE feature, not both same-named features).
+  const uidOfName = useMemo(() => {
+    const m = new Map();
+    caps.forEach((cap) => {
+      (cap.features || []).forEach((f) => {
+        if (f && f.name && f._uid && !m.has(f.name)) m.set(f.name, f._uid);
+      });
+    });
+    return m;
+  }, [breakdown]);
 
   const [source, setSource] = useState("");
   const [target, setTarget] = useState("");
@@ -4831,7 +4994,7 @@ function AddDependencyScreen({ breakdown, onAdd, onBack }) {
       )}
 
       <div className="flex items-center gap-3">
-        <button onClick={() => onAdd(source, target)} disabled={!canAdd} className="btn-primary">
+        <button onClick={() => onAdd(source, target, uidOfName.get(source))} disabled={!canAdd} className="btn-primary">
           Add dependency
         </button>
         <button onClick={onBack} className="btn-secondary">
@@ -4842,23 +5005,120 @@ function AddDependencyScreen({ breakdown, onAdd, onBack }) {
   );
 }
 
+// ── Review & Push shared helpers (moodboard redesign 2026-07-08) ────────────────
+// ETA for a chunked JIRA write (~0.85 s/issue, gotcha #4), rounded to a friendly band.
+function pushEtaSeconds(items) {
+  return Math.max(1, Math.round((items || 0) * 0.85));
+}
+function pushEtaLabel(items) {
+  const s = pushEtaSeconds(items);
+  if (s < 60) return `~${Math.max(5, Math.round(s / 5) * 5)} sec`;
+  const m = Math.max(1, Math.round(s / 60));
+  return `~${m} min`;
+}
+
+// An UPPERCASE tile label (Confirm answer tiles + the Pushed outcome ledger).
+function TileLabel({ children }) {
+  return (
+    <div
+      style={{
+        fontSize: 10.5,
+        fontWeight: 700,
+        letterSpacing: "0.06em",
+        textTransform: "uppercase",
+        color: "var(--s2j-text-muted)",
+        marginBottom: 6,
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
+// A compact labelled glass tile. `accent` = a top status bar colour.
+function AnswerTile({ label, accent, children, style }) {
+  return (
+    <div
+      style={{
+        ...glassSurface("utility"),
+        padding: 12,
+        ...(accent ? { borderTop: `3px solid ${accent}` } : {}),
+        ...style,
+      }}
+    >
+      <TileLabel>{label}</TileLabel>
+      {children}
+    </div>
+  );
+}
+
+// One checklist line (coloured status icon + DARK text — WCAG "words dark, colour on icon").
+//   state: 'ok' (green check) | 'caution' (amber square) | 'problem' (red triangle)
+function CheckLine({ state, children }) {
+  const icon =
+    state === "ok" ? (
+      <SignalIcon kind="success" size={13} />
+    ) : state === "problem" ? (
+      <SignalIcon kind="error" size={13} />
+    ) : (
+      <span
+        style={{
+          display: "inline-block",
+          width: 10,
+          height: 10,
+          borderRadius: 2,
+          background: "var(--s2j-orange)",
+          flexShrink: 0,
+        }}
+      />
+    );
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 6,
+        fontSize: 12,
+        color: "var(--s2j-text)",
+        lineHeight: 1.5,
+        padding: "1px 0",
+      }}
+    >
+      <span style={{ display: "inline-flex", width: 14, justifyContent: "center", flexShrink: 0 }}>
+        {icon}
+      </span>
+      <span style={{ minWidth: 0 }}>{children}</span>
+    </div>
+  );
+}
+
+// A quiet uppercase sub-section header (e.g. "OPTIONAL BEFORE YOU COMMIT").
+function ZoneHeader({ children }) {
+  return (
+    <p
+      className="text-xs font-semibold uppercase tracking-wider"
+      style={{ color: "var(--s2j-text-muted)", margin: "24px 0 8px", letterSpacing: "0.06em" }}
+    >
+      {children}
+    </p>
+  );
+}
+
 // ── Confirm Push ────────────────────────────────────────────────
-// v3.0.0 ConfirmScreen — embeds Dashboard signals at the push decision point.
+// ConfirmScreen — the slim push-decision step (the last check before an
+// irreversible Jira write). The AI-judgment surfaces (spec summary, self-check
+// confidence, concerns, ambiguity, confidence distribution) MOVED to
+// InsightsScreen — the first screen after generation — 2026-06-26.
 //
-// Replaces the standalone Dashboard screen (which users rarely discovered —
-// flow was BreakdownEditor → push, не back-to-picker → Dashboard → push).
-// PO / Scrum Master / engineering manager gets quality signals + concerns +
-// dependency preview AT the moment they're about к commit Stories/Subtasks к
-// JIRA — the only meaningful decision point.
-//
-// Surfaces (in priority order):
-//   1. Spec quality rating (TrustCard) — overall_quality + averageScore
-//   2. Count summary (Stories + Subtasks + dependency links + project)
-//   3. Concerns to review — high/medium/low severity ranking от spec_concerns
-//   4. Confidence distribution (✓/⚠/✗) с feature-level concern counts
-//   5. Categories breakdown ako multiple categories present
-//   6. Ambiguity note от Sonnet's self-assessment
-//   7. Action: Back to Editor | Create N Items в JIRA
+// Surfaces (in order):
+//   1. Pre-push check — an advisory tri-state verdict + 4 answer tiles
+//      (right project? / what lands / push-blockers / this write). Never blocking.
+//   2. Commit summary — the shape & weight of this backlog (counts, SP spread,
+//      priority mix, acceptance-criteria totals, structure).
+//   3. Cross-feature dependencies — review + trim over-inferred edges before push.
+//   4. Optional before you commit — the subordinated Advanced zone (Capacity-Sheet
+//      Planner + acceptance test-case generation), visually secondary to the commit.
+//   5. Fused commit block + buttons — Back to Editor | Create N items in Jira.
 function ConfirmScreen({
   dryRunResult,
   breakdown,
@@ -4879,6 +5139,7 @@ function ConfirmScreen({
   tcStale,
   usage,
   jobId,
+  defaultProjectKey,
 }) {
   // v6 value-split: test-case generation is an Advanced-edition feature. Gate the UI on the
   // capability the backend sends (usage.hasTestCases). Default-FALSE on an absent field
@@ -4908,12 +5169,34 @@ function ConfirmScreen({
     // `breakdown` is a stable state reference (pendingBreakdown) for the confirm screen's lifetime;
     // it changes only on an edit, which is exactly when a re-estimate is warranted.
   }, [hasTestCases, jobId, testCaseResults, tcStale, breakdown]);
+
+  // Destination project NAME (fear-#1 killer): a best-effort lookup so the reviewer can verify
+  // the push TARGET by name, not just the key. Mirrors the tcEstimate effect: show the KEY
+  // immediately, swap in the NAME when it resolves; on failure the key stands alone. (Task A prop
+  // defaultProjectKey is guaranteed non-empty by the setup gate before Confirm is reachable.)
+  const [projectDisplay, setProjectDisplay] = useState(null); // {ok,key,name} | null
+  useEffect(() => {
+    let cancelled = false;
+    if (!defaultProjectKey) {
+      setProjectDisplay(null);
+      return undefined;
+    }
+    invoke("getProjectDisplay", { projectKey: defaultProjectKey })
+      .then((r) => { if (!cancelled && r && r.ok) setProjectDisplay(r); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [defaultProjectKey]);
+
   const total = dryRunResult?.total_items || 0;
   const epics = dryRunResult?.total_epics || 0;
   const stories = dryRunResult?.total_stories || 0;
   const tasks = dryRunResult?.total_subtasks || 0;
   const links = dryRunResult?.dependency_links || 0;
-  const project = dryRunResult?.project_key || "(Settings)";
+  // Destination: prefer the resolved NAME; the KEY is always present (Task A). destLabel spells
+  // out both when the name is known ("Acme Web (SDTY)"), else just the key.
+  const projectKey = defaultProjectKey || dryRunResult?.project_key || null;
+  const projectName = projectDisplay?.ok ? projectDisplay.name : null;
+  const destLabel = projectName ? `${projectName} (${projectKey})` : (projectKey || "your Jira project");
   const tcStaleNow = !!testCaseResults && !!tcStale; // edited-since-generation → amber warning (not green ✓)
   // 2-step armed confirm for the EXPENSIVE re-run-all (Phase-1 cost fix): a stale re-generate re-runs
   // ALL stories (full Anthropic cost), so the BA must click twice + see the scope — never a surprise
@@ -4931,7 +5214,57 @@ function ConfirmScreen({
   // categories, dependencyEdges). The AI-judgment signals (spec summary, self-check
   // confidence + flagged worklist, spec/feature concerns, ambiguity) MOVED to
   // InsightsScreen — the first screen after generation — 2026-06-26.
-  const signals = extractV3Signals(breakdown || {});
+  // (FIX 10) memoize the breakdown-derived signals: extractV3Signals + computeInsightsView + the
+  // O(features) push-blocker filters ran on EVERY render (the projectDisplay/tcEstimate effect
+  // resolutions, the regenArmed 4s timer). Keyed on [breakdown] - a stable pendingBreakdown reference
+  // for the screen's life, changing only on an edit. Behavior-preserving.
+  const { signals, sizing, unsizedCount, zeroAcCount, placeholderCount, complianceLandmine } = useMemo(() => {
+    const signals = extractV3Signals(breakdown || {});
+    const insights = computeInsightsView(breakdown || {});
+    const sizing = insights?.sizingSpread || { storyPoints: [], priority: { high: 0, medium: 0, low: 0 } };
+    // ── Advisory PUSH-BLOCKER flags (client-side, T0/T1 over pendingBreakdown). NEVER blocking —
+    //    they only tune the pre-push verdict banner. Read the CURRENT edited features (capabilities
+    //    flatMap → features) so edits reflect, mirroring extractV3Signals' precedence. ──
+    const confirmFeatures = Array.isArray(breakdown?.capabilities)
+      ? breakdown.capabilities.flatMap((c) => c.features || [])
+      : Array.isArray(breakdown?.features)
+        ? breakdown.features
+        : [];
+    const unsizedCount = confirmFeatures.filter(
+      (f) => !(typeof f?.story_points === "number" && f.story_points > 0),
+    ).length;
+    const zeroAcCount = confirmFeatures.filter(
+      (f) => !(Array.isArray(f?.acceptance_criteria) && f.acceptance_criteria.length > 0),
+    ).length;
+    const placeholderCount = confirmFeatures.filter((f) => isPlaceholderName(f?.name)).length;
+    const complianceLandmine = insights?.complianceLandmine || null;
+    return { signals, sizing, unsizedCount, zeroAcCount, placeholderCount, complianceLandmine };
+  }, [breakdown]);
+  const truncated = !!truncationNote;
+  const flagCount =
+    (unsizedCount > 0 ? 1 : 0) +
+    (zeroAcCount > 0 ? 1 : 0) +
+    (placeholderCount > 0 ? 1 : 0) +
+    (truncated ? 1 : 0) +
+    (complianceLandmine ? 1 : 0);
+  const flagCauses = [];
+  if (zeroAcCount > 0)
+    flagCauses.push(`${zeroAcCount} ${zeroAcCount === 1 ? "story has" : "stories have"} no acceptance criteria`);
+  if (unsizedCount > 0)
+    flagCauses.push(`${unsizedCount} ${unsizedCount === 1 ? "story has" : "stories have"} no estimate`);
+  if (placeholderCount > 0)
+    flagCauses.push(`${placeholderCount} placeholder ${placeholderCount === 1 ? "name is" : "names are"} still unedited`);
+  if (truncated) flagCauses.push("the breakdown was truncated at generation, so some features may be missing");
+  if (complianceLandmine) flagCauses.push("1 compliance decision travels with this push");
+
+  // Commit-summary maths (all from the edited breakdown via computeInsightsView + extractV3Signals).
+  const spTotal = (sizing.storyPoints || []).reduce((a, s) => a + s.sp * s.count, 0);
+  const spMaxCount = (sizing.storyPoints || []).reduce((m, s) => Math.max(m, s.count), 0) || 1;
+  const spValues = (sizing.storyPoints || []).map((s) => s.sp);
+  const prioMax = Math.max(1, sizing.priority.high, sizing.priority.medium, sizing.priority.low);
+  const totalACs = signals.counts.totalFeatureACs || 0;
+  const avgAc = stories > 0 ? Math.round(totalACs / stories) : 0;
+  const barTotal = Math.max(1, epics + stories + tasks);
 
   return (
     <div className="p-6" style={SCREEN_MAX_WIDTH_STYLE}>
@@ -4939,10 +5272,12 @@ function ConfirmScreen({
           test-case action rows below keep their tinted state-colours (they signal
           available / done / stale), and the green/secondary push buttons are untouched. */}
       <ScreenHeader
-        title="Review and Push to Jira"
+        title="Review & Push to Jira"
+        subtitle="The last check before an irreversible write. Confirm what gets created and where, trim any over-inferred dependencies, then commit."
         onBack={onBackToPicker || undefined}
         backLabel="Back to pages"
         backTitle="Discard edits and return to page picker (use 'Back to Editor' below to keep edits)"
+        backAriaLabel="Back to pages - discards your edits (use Back to Editor below to keep them)"
       />
       {/* (Spec summary + AI self-check + concerns + ambiguity moved to InsightsScreen,
           the first screen after generation — 2026-06-26. ConfirmScreen is now the slim
@@ -4981,108 +5316,208 @@ function ConfirmScreen({
           attention" worklist — moved to InsightsScreen, the first screen after
           generation — 2026-06-26.) */}
 
-      {/* Count summary — what will be created в JIRA */}
+      {/* (1) PRE-PUSH CHECK — an ADVISORY tri-state verdict + 4 answer tiles. NEVER blocking;
+          it only tunes the verdict banner. WCAG: severity words dark, colour on the icon. */}
       <MoodCard density="minor" style={{ marginBottom: 16 }}>
-        <p
-          className="text-xs font-medium uppercase tracking-wider mb-3"
-          style={{ color: "var(--s2j-text-muted)" }}
-        >
-          What will be created
-          {project !== "(Settings)" && ` — Project: ${project}`}
-        </p>
+        <h3 style={{ ...TYPE.heading, color: MOOD.navy, fontSize: 15, fontWeight: 700, marginBottom: 12 }}>Pre-push check</h3>
 
-        <div className="space-y-2 mb-3">
-          {epics > 0 && (
-            <SummaryRow label="Epics" value={epics} color="var(--s2j-blue)" />
-          )}
-          <SummaryRow
-            label="Stories"
-            value={stories}
-            color="var(--s2j-green)"
-          />
-          <SummaryRow
-            label="Subtasks"
-            value={tasks}
-            color="var(--s2j-orange)"
-          />
+        {/* Verdict banner (full-width, inside the card) */}
+        <div
+          style={{
+            display: "flex",
+            alignItems: "flex-start",
+            gap: 12,
+            padding: "12px 14px",
+            borderRadius: 12,
+            background: flagCount === 0 ? "var(--s2j-green-bg)" : "var(--s2j-orange-bg)",
+            border: `1px solid ${flagCount === 0 ? "var(--s2j-green-border)" : "var(--s2j-orange-border)"}`,
+            marginBottom: 14,
+          }}
+        >
+          <div style={{ minWidth: 0, flex: 1 }}>
+            <div style={{ fontWeight: 600, color: "var(--s2j-text)", marginBottom: 3 }}>
+              {flagCount === 0
+                ? "Ready to push — nothing needs a second look"
+                : `Ready to push — ${flagCount} thing${flagCount === 1 ? "" : "s"} worth a glance before you commit`}
+            </div>
+            {flagCauses.length > 0 && (
+              <div style={{ fontSize: 12.5, color: "var(--s2j-text)", lineHeight: 1.5, marginBottom: 4 }}>
+                {flagCauses
+                  .map((c, i) => (i === 0 ? c.charAt(0).toUpperCase() + c.slice(1) : c))
+                  .join(". ")}.
+              </div>
+            )}
+            <div style={{ ...TYPE.micro }}>Nothing blocks the write — this is your call.</div>
+          </div>
+          <div style={{ flexShrink: 0, textAlign: "right", display: "flex", alignItems: "center" }}>
+            {flagCount === 0 ? (
+              <SignalIcon kind="success" size={26} />
+            ) : (
+              <span style={{ fontSize: 26, fontWeight: 700, color: "var(--s2j-orange)", lineHeight: 1 }}>
+                {flagCount}
+              </span>
+            )}
+          </div>
         </div>
 
-        <div
-          className="pt-3"
-          style={{ borderTop: "1px solid var(--s2j-border)" }}
-        >
-          <div className="flex justify-between text-sm">
-            <span
-              className="font-semibold"
-              style={{ color: "var(--s2j-text)" }}
-            >
-              Total items
-            </span>
-            <span
-              className="font-mono font-semibold"
-              style={{ color: "var(--s2j-text)" }}
-            >
-              {total}
-            </span>
-          </div>
-          {links > 0 && (
-            <div className="flex justify-between text-xs mt-1">
-              <span style={{ color: "var(--s2j-text-muted)" }}>
-                Dependency links (Story-blocks-Story)
+        {/* 4 answer tiles */}
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(190px, 1fr))", gap: 10 }}>
+          {/* RIGHT PROJECT? — lead with the NAME (fear-#1 killer) */}
+          <AnswerTile label="Right project?" accent="var(--s2j-green)">
+            <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 2 }}>
+              <span style={{ color: "var(--s2j-green)", display: "inline-flex", flexShrink: 0 }}>
+                <IconCheck size={15} />
               </span>
-              <span
-                className="font-mono"
-                style={{ color: "var(--s2j-text-light)" }}
-              >
-                {links}
+              <span style={{ fontSize: 15, fontWeight: 700, color: "var(--s2j-text)", minWidth: 0, overflowWrap: "anywhere" }}>
+                {projectName || projectKey || "your project"}
               </span>
             </div>
-          )}
-          {signals.counts.sharedACs > 0 && (
-            <div className="flex justify-between text-xs mt-1">
-              <span style={{ color: "var(--s2j-text-muted)" }}>
-                Cross-cutting rules (shared ACs)
-              </span>
-              <span
-                className="font-mono"
-                style={{ color: "var(--s2j-text-light)" }}
-              >
-                {signals.counts.sharedACs}
-              </span>
+            <div style={{ ...TYPE.micro }}>
+              key {projectKey || "—"}
             </div>
-          )}
-          {signals.categories.length > 1 && (
-            <div className="flex justify-between text-xs mt-1">
-              <span style={{ color: "var(--s2j-text-muted)" }}>
-                Categories
-              </span>
-              <span
-                className="font-mono"
-                style={{ color: "var(--s2j-text-light)" }}
-              >
-                {signals.categories.length}
-              </span>
+            <div style={{ ...TYPE.micro, marginTop: 4 }}>
+              {total} items land here. Verify the name, not just the key.
             </div>
-          )}
+          </AnswerTile>
+
+          {/* WHAT LANDS */}
+          <AnswerTile label="What lands" accent="var(--s2j-blue)">
+            <div style={{ fontSize: 20, fontWeight: 700, color: "var(--s2j-text)" }}>{total} items</div>
+            <div style={{ ...TYPE.micro, marginTop: 2 }}>{epics} epic · {stories} stories</div>
+            <div style={{ ...TYPE.micro }}>{tasks} sub-tasks · {links} links</div>
+          </AnswerTile>
+
+          {/* PUSH-BLOCKERS — a mini checklist (only the flags that apply carry a warn state) */}
+          <AnswerTile label="Push-blockers" accent={flagCount === 0 ? "var(--s2j-green)" : "var(--s2j-orange)"}>
+            <CheckLine state={zeroAcCount === 0 ? "ok" : "problem"}>
+              {zeroAcCount === 0
+                ? "every story has ACs"
+                : `${zeroAcCount} ${zeroAcCount === 1 ? "story has" : "stories have"} no ACs`}
+            </CheckLine>
+            <CheckLine state={unsizedCount === 0 ? "ok" : "caution"}>
+              {unsizedCount === 0
+                ? "all stories estimated"
+                : `${unsizedCount} unsized ${unsizedCount === 1 ? "story" : "stories"}`}
+            </CheckLine>
+            <CheckLine state={placeholderCount === 0 ? "ok" : "problem"}>
+              {placeholderCount === 0
+                ? "no placeholder names"
+                : `${placeholderCount} placeholder name${placeholderCount === 1 ? "" : "s"}`}
+            </CheckLine>
+            {complianceLandmine && <CheckLine state="problem">1 compliance decision</CheckLine>}
+          </AnswerTile>
+
+          {/* THIS WRITE — ETA + the irreversible caution (dark word, red icon) */}
+          <AnswerTile label="This write" accent="var(--s2j-orange)">
+            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <span style={{ color: "var(--s2j-text-muted)", display: "inline-flex", flexShrink: 0 }}>
+                <IconClock size={15} />
+              </span>
+              <span style={{ fontSize: 20, fontWeight: 700, color: "var(--s2j-text)" }}>{pushEtaLabel(total)}</span>
+            </div>
+            <div style={{ ...TYPE.micro, marginTop: 4 }}>Created in batches.</div>
+            <div style={{ ...TYPE.micro, display: "flex", alignItems: "center", gap: 4, marginTop: 1 }}>
+              <SignalIcon kind="error" size={12} />
+              <span style={{ color: "var(--s2j-text)", fontWeight: 600 }}>Irreversible</span>
+              <span> — no bulk undo.</span>
+            </div>
+          </AnswerTile>
         </div>
       </MoodCard>
 
-      {/* Test-case summary line — shown when test cases have been generated */}
-      {testCaseResults && typeof testCaseResults.total === "number" && (
-        <div
-          className="rounded-lg p-3 mb-4 text-xs"
-          style={{
-            background: "var(--s2j-bg-section)",
-            border: "1px solid var(--s2j-border)",
-            color: "var(--s2j-text-muted)",
-          }}
-        >
-          <strong style={{ color: "var(--s2j-text)" }}>
-            Test cases: {testCaseResults.total} generated
-          </strong>{" "}
-          — a summary will be added to each Story.
+      {/* (2) COMMIT SUMMARY — the shape & weight of this backlog */}
+      {/* (R5) heading rendered inline (not via MoodCard's title prop) so it can be bolder/larger
+          without touching the shared MoodCard primitive. */}
+      <MoodCard density="minor" style={{ marginBottom: 16 }}>
+        <h3 style={{ ...TYPE.heading, color: MOOD.navy, fontSize: 15, fontWeight: 700, marginBottom: 10 }}>Commit summary — the shape & weight of this backlog</h3>
+        {/* Stacked bar (proportional) + big total */}
+        <div style={{ display: "flex", alignItems: "center", gap: 16, marginBottom: 12, flexWrap: "wrap" }}>
+          <div style={{ flex: 1, minWidth: 200 }}>
+            <div style={{ display: "flex", height: 14, borderRadius: 7, overflow: "hidden", background: "var(--s2j-bg-section)" }}>
+              {epics > 0 && (
+                <div style={{ width: `${(epics / barTotal) * 100}%`, background: "var(--s2j-blue)" }} title={`${epics} Epic`} />
+              )}
+              <div style={{ width: `${(stories / barTotal) * 100}%`, background: "var(--s2j-green)" }} title={`${stories} Stories`} />
+              <div style={{ width: `${(tasks / barTotal) * 100}%`, background: "var(--s2j-orange)" }} title={`${tasks} Sub-tasks`} />
+            </div>
+            <div style={{ ...TYPE.micro, marginTop: 6 }}>
+              {epics} Epic · {stories} Stories · {tasks} Sub-tasks
+            </div>
+          </div>
+          <div style={{ textAlign: "right" }}>
+            <div style={{ fontSize: 20, fontWeight: 700, color: "var(--s2j-text)" }}>{total}</div>
+            <div style={{ ...TYPE.micro }}>total items</div>
+          </div>
         </div>
-      )}
+
+        {/* 4-column stat row */}
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 12, marginTop: 4, borderTop: "1px solid var(--s2j-border)", paddingTop: 12 }}>
+          {/* STORY POINTS */}
+          <div>
+            <TileLabel>Story points</TileLabel>
+            <div style={{ fontSize: 20, fontWeight: 700, color: "var(--s2j-text)" }}>{spTotal}</div>
+            {spValues.length > 0 && (
+              <>
+                <div style={{ display: "flex", alignItems: "flex-end", gap: 3, height: 24, marginTop: 4 }}>
+                  {(sizing.storyPoints || []).map((s) => (
+                    <div
+                      key={s.sp}
+                      title={`${s.count} × ${s.sp} sp`}
+                      style={{ width: 8, height: Math.max(3, (s.count / spMaxCount) * 22), background: "var(--s2j-green)", borderRadius: 2 }}
+                    />
+                  ))}
+                </div>
+                <div style={{ ...TYPE.micro, marginTop: 3 }}>{spValues.join(" · ")} sp spread</div>
+              </>
+            )}
+            {/* (FIX 4) complexity spread from buildSizingSpread (sizing.complexity {min,max}); guarded
+                for legacy breakdowns with no complexity_score (min/max null → hidden). */}
+            {Number.isFinite(sizing.complexity?.min) && Number.isFinite(sizing.complexity?.max) && (
+              <div style={{ ...TYPE.micro, marginTop: spValues.length > 0 ? 1 : 3 }}>
+                complexity {sizing.complexity.min}-{sizing.complexity.max}
+              </div>
+            )}
+          </div>
+
+          {/* PRIORITY MIX */}
+          <div>
+            <TileLabel>Priority mix</TileLabel>
+            {[
+              { k: "High", v: sizing.priority.high, c: "var(--s2j-orange)" },
+              { k: "Medium", v: sizing.priority.medium, c: MOOD.steel },
+              { k: "Low", v: sizing.priority.low, c: MOOD.skySteel },
+            ].map((row) => (
+              <div key={row.k} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, marginTop: 3 }}>
+                <span style={{ width: 48, color: "var(--s2j-text-muted)", flexShrink: 0 }}>{row.k}</span>
+                <span style={{ flex: 1, height: 6, background: "var(--s2j-bg-section)", borderRadius: 3, overflow: "hidden" }}>
+                  <span style={{ display: "block", height: "100%", width: `${(row.v / prioMax) * 100}%`, background: row.c }} />
+                </span>
+                <span style={{ width: 20, textAlign: "right", color: "var(--s2j-text)", fontWeight: 600 }}>{row.v}</span>
+              </div>
+            ))}
+          </div>
+
+          {/* ACCEPTANCE CRITERIA (NITS #2: "every story has ACs", never "covered") */}
+          <div>
+            <TileLabel>Acceptance criteria</TileLabel>
+            <div style={{ fontSize: 20, fontWeight: 700, color: "var(--s2j-text)" }}>{totalACs}</div>
+            <div style={{ ...TYPE.micro, marginTop: 2 }}>~{avgAc} avg / story</div>
+            {zeroAcCount === 0 && <div style={{ ...TYPE.micro }}>every story has ACs</div>}
+          </div>
+
+          {/* STRUCTURE */}
+          <div>
+            <TileLabel>Structure</TileLabel>
+            <div style={{ ...TYPE.micro, marginTop: 2, lineHeight: 1.7 }}>
+              {signals.categories.length} categor{signals.categories.length === 1 ? "y" : "ies"}
+              <br />
+              {links} dependency link{links === 1 ? "" : "s"}
+              <br />
+              {signals.counts.sharedACs} cross-cutting AC{signals.counts.sharedACs === 1 ? "" : "s"}
+            </div>
+          </div>
+        </div>
+      </MoodCard>
 
       {/* Cross-feature dependency structure — shows WHICH feature depends on
           WHICH and lets the reviewer remove an over-inferred edge before push
@@ -5099,6 +5534,10 @@ function ConfirmScreen({
       {/* (Document-level concerns, the feature-level concerns summary, and the AI
           ambiguity note moved to InsightsScreen — the first screen after generation —
           2026-06-26.) */}
+
+      {/* (4) OPTIONAL BEFORE YOU COMMIT — a subordinated zone: the two Advanced entries (plan +
+          test cases), visually secondary to the commit path. All existing gating/logic preserved. */}
+      <ZoneHeader>Optional before you commit</ZoneHeader>
 
       {/* Capacity-Sheet Planner — its OWN dedicated section (partner: it deserves a section, not a
           button crammed into the test-case action row). Review-only; consumes the EDITED breakdown
@@ -5204,6 +5643,11 @@ function ConfirmScreen({
                   {tcEstimate.has_spec_source === false
                     ? " (excludes source-spec context; actual may be lower)"
                     : ""}
+                  {typeof tcEstimate.story_count === "number" && typeof tcEstimate.ac_total === "number" ? (
+                    <span style={{ display: "block", marginTop: 2, color: "var(--s2j-text-light)" }}>
+                      Bills against {tcEstimate.story_count} stor{tcEstimate.story_count === 1 ? "y" : "ies"} · {tcEstimate.ac_total} acceptance criteria.
+                    </span>
+                  ) : null}
                 </p>
               );
             }
@@ -5323,20 +5767,25 @@ function ConfirmScreen({
         </div>
       </div>
 
-      {/* Final action — irreversible-write caution in the moodboard warning vocabulary. */}
-      <SignalCallout kind="warning" style={{ marginBottom: 16 }} fontSize={13}>
-        This will create real Jira issues. The action cannot be undone from within Spec2Tickets.
+      {/* (5) COMMIT BLOCK — destination + irreversible warning fused into ONE amber callout,
+          directly above the buttons. Words dark, colour on the icon. */}
+      <SignalCallout kind="warning" style={{ margin: "24px 0 16px" }} fontSize={13}>
+        You are about to create <strong>{total} real Jira issues</strong> in {destLabel}. Your team
+        will see them immediately. There is no bulk undo from Spec2Tickets — cleanup after a wrong
+        push is manual.
       </SignalCallout>
 
       {/* [seams-audit HIGH (b)] honest consent: pushing now PURGES the in-flight
           TC batch (post-push purge deletes the tcjob) — the user must know the
           generating test cases will be discarded and not embedded. */}
       {tcGenerating && (
-        <p className="text-xs mb-2" style={{ color: "var(--s2j-orange)" }}>
+        <p className="text-xs mb-2" style={{ color: "var(--s2j-text)" }}>
           <SignalIcon kind="warning" size={12} /> Test cases are still generating — pushing now discards that run (they
           will not be embedded in the Jira stories).
         </p>
       )}
+
+      {/* (6) BUTTONS — Back to Editor (secondary) + green commit that spells out the destination. */}
       <div className="flex gap-3">
         <button onClick={onBack} className="btn-secondary" disabled={isPushing}>
           ← Back to Editor
@@ -5352,7 +5801,7 @@ function ConfirmScreen({
               <span>Creating {total} items...</span>
             </>
           ) : (
-            `Create ${total} Items in Jira`
+            `Create ${total} items in ${destLabel}`
           )}
         </button>
       </div>
@@ -5391,32 +5840,50 @@ function DependencyStructure({ edges, onRemove, onRestore, onOpenAdd }) {
   }
   const labelOf = (t) => displayOf.get(t) || t;
 
-  const handleRemove = (source, target) => {
-    onRemove?.(source, target);
+  // (A1) UNRESOLVED (name_unknown) targets — the dep string matched no feature, so at push it
+  // silently fails with no Jira link (this is the "1 link not created, don't know why" cause).
+  // `unresolved` is a property of the target string (independent of source), so key by target.
+  const unresolvedOf = new Map();
+  for (const e of edges || []) {
+    if (e && e.target != null && e.unresolved) unresolvedOf.set(e.target, true);
+  }
+
+  // A removed-list entry is identified by (sourceUid|source, target): match by the
+  // source uid when present (disambiguates two same-named source features), else by
+  // the source name (legacy edges without a uid — unchanged behavior).
+  const sameRemoved = (r, source, target, sourceUid) =>
+    r.target === target && (sourceUid ? r.sourceUid === sourceUid : r.source === source);
+  const handleRemove = (source, target, sourceUid) => {
+    onRemove?.(source, target, sourceUid);
     setRemoved((prev) =>
-      prev.some((r) => r.source === source && r.target === target)
+      prev.some((r) => sameRemoved(r, source, target, sourceUid))
         ? prev
-        : [...prev, { source, target, display: labelOf(target) }],
+        : [...prev, { source, target, sourceUid, display: labelOf(target) }],
     );
   };
-  const handleRestore = (source, target) => {
-    onRestore?.(source, target);
+  const handleRestore = (source, target, sourceUid) => {
+    onRestore?.(source, target, sourceUid);
     setRemoved((prev) =>
-      prev.filter((r) => !(r.source === source && r.target === target)),
+      prev.filter((r) => !sameRemoved(r, source, target, sourceUid)),
     );
   };
 
-  // Group active targets by source feature, preserving first-seen order. Dedupe a
-  // repeated (source,target) pair defensively (a malformed breakdown could list
-  // the same dependency twice — show it once).
+  // Group active targets by SOURCE FEATURE (uid-first, name-fallback), preserving
+  // first-seen order. Grouping by uid keeps two DISTINCT same-named source features
+  // as SEPARATE groups (so a remove hits only the intended one); legacy edges without
+  // a uid group by name (unchanged). Each group carries its source display name +
+  // sourceUid (threaded to onRemove/onRestore). Dedupe a repeated target defensively.
   const bySource = new Map();
   for (const e of edges || []) {
     if (!e || !e.source || !e.target) continue;
-    if (!bySource.has(e.source)) bySource.set(e.source, []);
-    const targets = bySource.get(e.source);
-    if (!targets.includes(e.target)) targets.push(e.target);
+    const key = e.sourceUid || e.source;
+    if (!bySource.has(key)) {
+      bySource.set(key, { source: e.source, sourceUid: e.sourceUid || null, targets: [] });
+    }
+    const group = bySource.get(key);
+    if (!group.targets.includes(e.target)) group.targets.push(e.target);
   }
-  const groups = Array.from(bySource.entries());
+  const groups = Array.from(bySource.values());
 
   // Nothing active AND nothing removed AND no add affordance → render nothing. With
   // onOpenAdd present we ALWAYS render (header + "+ Add dependency") so the user can add
@@ -5464,11 +5931,11 @@ function DependencyStructure({ edges, onRemove, onRestore, onOpenAdd }) {
             className="space-y-2"
             style={{ listStyle: "none", margin: 0, padding: 0 }}
           >
-            {groups.map(([source, targets], gIdx) => {
+            {groups.map(({ source, sourceUid, targets }, gIdx) => {
               const isLast = gIdx === groups.length - 1;
               return (
                 <li
-                  key={source}
+                  key={sourceUid || source}
                   style={{
                     paddingBottom: isLast ? 0 : 8,
                     borderBottom: isLast
@@ -5492,31 +5959,52 @@ function DependencyStructure({ edges, onRemove, onRestore, onOpenAdd }) {
                         className="flex items-center justify-between gap-2 text-xs leading-snug"
                       >
                         <span
-                          className="flex items-start gap-1.5"
-                          style={{ minWidth: 0 }}
+                          style={{ minWidth: 0, display: "flex", flexDirection: "column", gap: 3 }}
                         >
-                          <span style={{ color: "var(--s2j-blue)", flexShrink: 0 }}>
-                            depends on →
+                          <span
+                            className="flex items-start gap-1.5"
+                            style={{ minWidth: 0 }}
+                          >
+                            <span style={{ color: "var(--s2j-blue)", flexShrink: 0 }}>
+                              depends on →
+                            </span>
+                            <span style={{ color: "var(--s2j-text-light)" }}>{labelOf(t)}</span>
                           </span>
-                          <span style={{ color: "var(--s2j-text-light)" }}>{labelOf(t)}</span>
+                          {/* (A1) advisory-only amber flag for a name_unknown dep — words dark,
+                              colour on the icon. Never blocks; mirrors the pre-push readiness. */}
+                          {unresolvedOf.get(t) ? (
+                            <span
+                              className="flex items-start gap-1.5"
+                              style={{ color: "var(--s2j-text)" }}
+                            >
+                              <SignalIcon kind="warning" size={13} style={{ marginTop: 1, flexShrink: 0 }} />
+                              <span style={{ fontSize: 11, lineHeight: 1.4 }}>
+                                Won't create a Jira link - target isn't a recognized story; remove it or add the right one.
+                              </span>
+                            </span>
+                          ) : null}
                         </span>
+                        {/* Partner's explicit call: the remove affordance is a SOLID RED button
+                            with WHITE bold text (not a bare X). red = destructive intent. */}
                         <button
                           type="button"
-                          onClick={() => handleRemove(source, t)}
+                          onClick={() => handleRemove(source, t, sourceUid)}
                           title={`Remove this dependency — "${source}" will no longer be blocked by "${labelOf(t)}" in Jira`}
                           aria-label={`Remove dependency: ${source} depends on ${labelOf(t)}`}
                           style={{
-                            background: "transparent",
+                            background: "var(--s2j-red)",
                             border: "none",
-                            color: "var(--s2j-text-muted)",
+                            color: "#fff",
+                            fontWeight: 700,
                             cursor: "pointer",
                             flexShrink: 0,
-                            padding: "0 4px",
-                            lineHeight: 1,
-                            fontSize: "13px",
+                            padding: "3px 10px",
+                            lineHeight: 1.3,
+                            borderRadius: 6,
+                            fontSize: "12px",
                           }}
                         >
-                          <IconX size={14} />
+                          Remove
                         </button>
                       </li>
                     ))}
@@ -5567,21 +6055,30 @@ function DependencyStructure({ edges, onRemove, onRestore, onOpenAdd }) {
                 >
                   {r.source} → {r.display || r.target}
                 </span>
+                {/* Symmetric SOLID BLUE counterpart to the active list's SOLID RED Remove
+                    (blue = recovery / nav). Same button weight/size, just blue. */}
                 <button
                   type="button"
-                  onClick={() => handleRestore(r.source, r.target)}
+                  onClick={() => handleRestore(r.source, r.target, r.sourceUid)}
                   title="Restore this dependency"
+                  aria-label={`Restore dependency: ${r.source} depends on ${r.display || r.target}`}
                   style={{
-                    background: "transparent",
+                    background: "var(--s2j-blue)",
                     border: "none",
-                    color: "var(--s2j-blue)",
+                    color: "#fff",
+                    fontWeight: 600,
                     cursor: "pointer",
                     flexShrink: 0,
-                    padding: "0 4px",
-                    fontWeight: 500,
+                    padding: "6px 12px",
+                    lineHeight: 1.3,
+                    borderRadius: 6,
+                    fontSize: "13px",
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: 4,
                   }}
                 >
-                  <IconUndo size={12} /> Restore
+                  <IconUndo size={13} /> Restore
                 </button>
               </li>
             ))}
@@ -5592,27 +6089,43 @@ function DependencyStructure({ edges, onRemove, onRestore, onOpenAdd }) {
   );
 }
 
-function SummaryRow({ label, value, color }) {
+// ── Pushing (in-progress, chunked) ──────────────────────────────
+//
+// Honest, granular progress. Reads the Task-A live props: epicKey (Epic exists the
+// moment startPush returns), totals ({stories,tasks,links}), counts (per-phase
+// created/failed/orphaned). All may be null on the very first frame — every read
+// is null-guarded (renders "-"/spinner, never NaN).
+
+// One phase tile on the Pushing screen: created / denominator + a status dot + sub-line.
+function PhaseTile({ label, value, denom, sub, dot }) {
   return (
-    <div className="flex items-center justify-between text-sm">
-      <div className="flex items-center gap-2">
+    <div style={{ ...glassSurface("utility"), padding: 12 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}>
         <span
-          className="inline-block w-2.5 h-2.5 rounded-sm"
-          style={{ background: color }}
+          style={{
+            width: 8,
+            height: 8,
+            borderRadius: 4,
+            background: dot || MOOD.skySteel,
+            flexShrink: 0,
+            display: "inline-block",
+          }}
         />
-        <span style={{ color: "var(--s2j-text)" }}>{label}</span>
+        <TileLabel>{label}</TileLabel>
       </div>
-      <span className="font-mono font-semibold" style={{ color }}>
-        {value}
-      </span>
+      <div style={{ fontSize: 19, fontWeight: 700, color: "var(--s2j-text)" }}>
+        {value == null ? <Spinner size={13} /> : value}
+        <span style={{ color: "var(--s2j-text-light)", fontWeight: 500 }}> / {denom == null ? "—" : denom}</span>
+      </div>
+      {sub ? <div style={{ ...TYPE.micro, marginTop: 2 }}>{sub}</div> : null}
     </div>
   );
 }
 
-// ── Pushing (in-progress, chunked) ──────────────────────────────
-
-function PushingScreen({ progress, phase }) {
+function PushingScreen({ progress, phase, epicKey, totals, counts }) {
   const pct = Math.round((progress || 0) * 100);
+  const c = counts || null;
+  const t = totals || null;
   const phaseLabel =
     phase === "stories"
       ? "Creating Stories..."
@@ -5623,24 +6136,73 @@ function PushingScreen({ progress, phase }) {
           : phase === "starting"
             ? "Setting up..."
             : "Working...";
+
+  // Phase ordering for the status dots.
+  const rank = { starting: 0, stories: 1, subtasks: 2, links: 3, done: 4 }[phase];
+  const phaseRank = typeof rank === "number" ? rank : 0;
+
+  const orphaned = c?.subtasks_orphaned || 0;
+  // The Jira issue key prefix IS the project key (e.g. "SDTY-14" → "SDTY"), so name the destination
+  // from the Epic key when we have it, falling back to the generic phrasing pre-Epic-create.
+  const pushProjectKey = epicKey ? String(epicKey).split("-")[0] : null;
+  // Sub-tasks denominator = ATTEMPTED (planned tasks minus those under a failed Story). This is
+  // what stops the "stall-then-jump": a sub-task under a failed story is never attempted.
+  const tasksAttempted = t && typeof t.tasks === "number" ? Math.max(0, t.tasks - orphaned) : null;
+
+  // Real ETA from remaining items (~0.85 s/issue). Remaining = planned - processed(created+failed).
+  const remaining = (() => {
+    if (!t || !c) return null;
+    const planned = (t.stories || 0) + (tasksAttempted || 0) + (t.links || 0);
+    const processed =
+      (c.stories_created || 0) + (c.story_failures || 0) +
+      (c.subtasks_created || 0) + (c.subtask_failures || 0) +
+      (c.links_created || 0) + (c.link_failures || 0);
+    return Math.max(0, planned - processed);
+  })();
+  const etaText = remaining != null && remaining > 0 ? `about ${pushEtaSeconds(remaining)}s left` : null;
+
+  const storyDot =
+    phaseRank > 1 ? ((c?.story_failures || 0) > 0 ? "var(--s2j-red)" : "var(--s2j-green)") : MOOD.skySteel;
+  const subDot =
+    phaseRank > 2 ? ((c?.subtask_failures || 0) > 0 ? "var(--s2j-orange)" : "var(--s2j-green)")
+      : phaseRank === 2 ? "var(--s2j-blue)" : MOOD.skySteel;
+  const linkDot = phaseRank > 3 ? "var(--s2j-green)" : phaseRank === 3 ? "var(--s2j-blue)" : MOOD.skySteel;
+
   return (
     <div className="p-6" style={SCREEN_MAX_WIDTH_STYLE}>
-      <div className="flex items-center gap-2 mb-3">
+      <div className="flex items-center gap-2 mb-2">
         <Spinner size={18} />
         <h2
           className="font-semibold"
-          style={{ fontSize: 18, color: MOOD.navy, letterSpacing: "-0.01em" }}
+          style={{ fontSize: 19, fontWeight: 700, color: MOOD.navy, letterSpacing: "-0.01em" }}
         >
-          Creating issues in Jira
+          Pushing to Jira...
         </h2>
       </div>
-      <p className="text-sm mb-4" style={{ color: "var(--s2j-text-muted)" }}>
-        {phaseLabel}
+      <p className="text-sm mb-3" style={{ color: "var(--s2j-text-muted)" }}>
+        Writing into {pushProjectKey || "your Jira project"}. Safe to wait — it's created in batches,
+        and leaving this tab won't undo what has already landed.
       </p>
+
+      {/* Epic anchor — renders as soon as startPush returns (the Epic already exists). */}
+      {epicKey && (
+        <SignalCallout kind="success" style={{ marginBottom: 12 }} fontSize={13}>
+          Epic <strong>{epicKey}</strong> created — it's really happening.
+        </SignalCallout>
+      )}
+
+      {/* Phase label (left) + ETA/percent (right), on one row directly above the bar — matches the
+          mockup. Values + null-guards unchanged (etaText is null when nothing remains). */}
+      <div className="flex items-center mb-2" style={{ justifyContent: "space-between", gap: 8 }}>
+        <p className="text-sm" style={{ color: "var(--s2j-text-muted)", margin: 0 }}>{phaseLabel}</p>
+        <p className="text-xs" style={{ color: "var(--s2j-text-light)", margin: 0, textAlign: "right", flexShrink: 0 }}>
+          {etaText ? `${etaText} · ` : ""}{pct}% complete
+        </p>
+      </div>
 
       {/* Progress bar */}
       <div
-        className="w-full rounded-full overflow-hidden mb-2"
+        className="w-full rounded-full overflow-hidden mb-4"
         style={{ height: "10px", background: "var(--s2j-bg-section)" }}
       >
         <div
@@ -5652,9 +6214,42 @@ function PushingScreen({ progress, phase }) {
           }}
         />
       </div>
+
+      {/* 3 phase tiles — created / denominator (null-safe on the first frame). */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 10, marginBottom: 12 }}>
+        <PhaseTile
+          label="Stories"
+          value={c ? c.stories_created || 0 : null}
+          denom={t ? t.stories : null}
+          dot={storyDot}
+          sub={c ? `${c.stories_created || 0} created · ${c.story_failures || 0} failed` : "waiting..."}
+        />
+        <PhaseTile
+          label="Sub-tasks"
+          value={c ? c.subtasks_created || 0 : null}
+          denom={tasksAttempted}
+          dot={subDot}
+          sub={c ? `attempted (${orphaned} under failed stories skipped)` : "waiting..."}
+        />
+        <PhaseTile
+          label="Dependency links"
+          value={c ? c.links_created || 0 : null}
+          denom={t ? t.links : null}
+          dot={linkDot}
+          sub={c ? `${c.links_created || 0} created so far` : "waiting..."}
+        />
+      </div>
+
+      {/* Explain the attempted denominator ONCE so the bar never reads as stalled-then-jumped. */}
+      {t && (t.tasks || 0) > 0 && (
+        <p style={{ ...TYPE.micro, marginBottom: 10 }}>
+          Sub-tasks show attempted, not planned: a sub-task under a story that fails is never
+          attempted, so the denominator settles below {t.tasks}. The bar won't stall then jump.
+        </p>
+      )}
+
       <p className="text-xs" style={{ color: "var(--s2j-text-light)" }}>
-        {pct}% complete · keep this panel open until it finishes (~10–60 sec
-        depending on size). Closing now may leave a partial push.
+        Keep this panel open until it finishes. Closing now may leave a partial push.
       </p>
     </div>
   );
@@ -5662,90 +6257,179 @@ function PushingScreen({ progress, phase }) {
 
 // ── Pushed (Success) ────────────────────────────────────────────
 
-// ── post-push export (v6, 2026-06-18) ───────────────────────────────
+// ── post-push export (v6, 2026-06-18; downloads B4 2026-07-09) ───────────────────────────────
 // The success screen is terminal (no Back-to-Editor). If the run had test cases, App
 // captured the rendered Gherkin/CSV into memory BEFORE the purge — this is the last place
-// the BA can grab the full export (the KVS copy is gone). Tiny local clipboard helper
-// (mirrors TestCasesScreen's — duplicated to avoid a shared-module dep in this CRA app;
-// both are tiny). Never a silent no-op (clipboard → data-URI download fallback).
-async function copyTextToClipboard(text) {
+// the BA can grab the full export (the KVS copy is gone). We DOWNLOAD real files (.feature /
+// .csv) via a data-URI + hidden anchor click — the same in-iframe-proven pattern
+// TestCasesScreen/StoryWizard/PlanScreen use for their exports. Never a silent no-op: returns
+// false so the caller can surface a "Download failed" state.
+function downloadText(text, filename) {
   try {
-    await navigator.clipboard.writeText(text);
+    const a = document.createElement("a");
+    a.href = "data:text/plain;charset=utf-8," + encodeURIComponent(text || "");
+    a.download = filename;
+    a.style.display = "none";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
     return true;
   } catch (_) {
-    try {
-      const a = document.createElement("a");
-      a.href = "data:text/plain;charset=utf-8," + encodeURIComponent(text);
-      a.download = "testcases.txt";
-      a.style.display = "none";
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      return true;
-    } catch (_2) {
-      return false;
-    }
+    return false;
   }
 }
 
-function PostPushExport({ captured }) {
+// PostPushExport — a PRIMARY export block (the push purged the KVS copy; this captured-in-memory
+// export is the only surviving test copy). `hadTestCases` (Task A / NITS #4) disambiguates a null
+// capture: when the run HAD test cases but capture failed pre-purge, we show an HONEST amber state
+// instead of silently hiding the block.
+function PostPushExport({ captured, hadTestCases = false, retained = false, captureInFlight = false, storyCount = 0 }) {
   const [gState, setGState] = useState("idle"); // idle | ok | fail
   const [cState, setCState] = useState("idle");
-  if (!captured || (!captured.gherkin && !captured.csv)) return null;
-  const doCopy = async (text, set) => {
-    const ok = await copyTextToClipboard(text || "");
+  const hasCaptured = !!(captured && (captured.gherkin || captured.csv));
+  const doDownload = (text, filename, set) => {
+    const ok = downloadText(text, filename);
     set(ok ? "ok" : "fail");
     setTimeout(() => set("idle"), 1800);
   };
   const label = (state, base) =>
-    state === "ok"
-      ? "Copied"
-      : state === "fail"
-        ? "Copy failed — check browser permissions"
-        : base;
+    state === "ok" ? "Downloaded" : state === "fail" ? "Download failed" : base;
+
+  // ── Export state machine (each state gates on the RIGHT signal; order below) ──
+  //   1. hasCaptured               -> the download block (returned at the bottom).
+  //   2. captureInFlight           -> neutral "preparing" (the terminal getTestCaseExports round-trip;
+  //      capturedExports is null only transiently here - NEVER the "couldn't retain" amber).
+  //   3. hadTestCases && retained  -> HELD: the derived data (job:/tcjob:/testcases:) is STILL in KVS
+  //      (a partial deferred the terminal capture/purge). Gated on RETENTION, not the Resume button.
+  //   4. hadTestCases && !retained -> TERMINAL + the capture ran and returned null -> honest amber.
+  //   5. else (no test cases)      -> null.
+  // Step 5 is hoisted to the top as the `!hadTestCases` guard (captureInFlight/retained can only be
+  // true when hadTestCases is, so the effective order is identical + the amber never fires early).
+  if (!hasCaptured) {
+    if (!hadTestCases) return null;
+    // (R2) The terminal export capture (getTestCaseExports x2) is still in flight — capturedExports is
+    // null only transiently. Show a neutral "preparing" state, NEVER the "couldn't retain" amber,
+    // during this window (it was flashing for ~1-2s on the common clean-push-with-test-cases path).
+    if (captureInFlight) {
+      return (
+        <SignalCallout kind="info" title="Preparing your test-case export..." style={{ marginBottom: 16 }}>
+          <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+            <Spinner size={14} />
+            Holding the full Gherkin/CSV export before the working copy is cleared...
+          </span>
+        </SignalCallout>
+      );
+    }
+    // (FIX A) HELD gates on RETENTION (retained), NOT the Resume button. `retained` is TRUE exactly
+    // while finalizePushCleanup kept the derived data (partial + resumable work), and it is INDEPENDENT
+    // of whether a Resume button renders: an interrupted resume hides the button (showResume=false) but
+    // does NOT purge (handleResumePush returns before finalizePushCleanup), so the data is still in KVS.
+    // Do NOT reference a Resume button here - it may be hidden.
+    if (hadTestCases && retained) {
+      return (
+        <SignalCallout
+          kind="info"
+          title="Test cases are held with this push"
+          style={{ marginBottom: 16 }}
+        >
+          Test cases are held with this push while items are still missing. The full Gherkin/CSV
+          export stays retained and becomes downloadable here once the push completes. The summaries
+          embedded in each created Story are already in Jira.
+          {/* (FIX 7) be honest that abandoning without resuming forfeits the full export after the
+              7-day sweep — only the per-Story embedded summaries survive. */}
+          <div style={{ marginTop: 6 }}>
+            If you leave without finishing the push, only the summaries embedded in each Story are
+            kept - the full export is not.
+          </div>
+        </SignalCallout>
+      );
+    }
+    // Terminal AND the capture has completed with nothing (hadTestCases && !retained) → honest amber.
+    // This fires ONLY here - never during retention (retained is checked above).
+    return (
+      <SignalCallout
+        kind="warning"
+        title="Couldn't retain the test-case export this time"
+        style={{ marginBottom: 16 }}
+      >
+        The run generated test cases, but we couldn't hold onto the full export before the working
+        copy was cleared. Nothing was written to Jira or kept in storage — regenerate the test cases
+        on a fresh run to export them again. The summaries embedded in each Story are unaffected.
+      </SignalCallout>
+    );
+  }
+
   return (
-    <SignalCallout
-      kind="info"
-      style={{ marginBottom: 16 }}
-      iconTitle="Export your test cases now — the working copy is cleared on push"
-    >
-      <div style={{ fontWeight: 500, marginBottom: 4 }}>Acceptance test cases — export now</div>
-      <div style={{ marginBottom: 8 }}>
-        The working copy is cleared when you push (for privacy), so this is the last place to grab
-        the full Gherkin / CSV.
+    <MoodCard density="minor" accent="var(--s2j-blue)" style={{ marginBottom: 16 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+        <span style={{ color: "var(--s2j-blue)", display: "inline-flex" }}><IconBeaker size={16} /></span>
+        <h3 style={{ ...TYPE.heading, color: MOOD.navy }}>Download your test cases now</h3>
       </div>
+      <p style={{ ...TYPE.sub, marginBottom: 10 }}>
+        {/* (FIX 6) the "across M stories" quantifier (M = generated-story count). N (scenario count)
+            is not captured — M alone. */}
+        {storyCount > 0 ? `Test cases across ${storyCount} ${storyCount === 1 ? "story" : "stories"}. ` : ""}
+        This is the only remaining copy — the working breakdown was cleared on push. Summaries are
+        already embedded in each Story.
+      </p>
       <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
         {captured.gherkin && (
-          <button className="btn-secondary" onClick={() => doCopy(captured.gherkin, setGState)}>
-            {label(gState, "Copy all — Gherkin")}
+          <button
+            type="button"
+            className="btn-nav"
+            onClick={() => doDownload(captured.gherkin, "testcases.feature", setGState)}
+          >
+            <IconDownload size={15} /> {label(gState, "Download .feature")}
           </button>
         )}
         {captured.csv && (
-          <button className="btn-secondary" onClick={() => doCopy(captured.csv, setCState)}>
-            {label(cState, "Copy all — CSV")}
+          <button
+            type="button"
+            className="btn-secondary"
+            onClick={() => doDownload(captured.csv, "testcases.csv", setCState)}
+          >
+            <IconDownload size={15} /> {label(cState, "Download .csv")}
           </button>
         )}
       </div>
       {captured.skipped > 0 && (
-        <div style={{ fontSize: 11, color: "var(--s2j-orange)", marginTop: 6 }}>
+        <div style={{ fontSize: 11, color: "var(--s2j-orange)", marginTop: 8 }}>
           {captured.skipped} {captured.skipped === 1 ? "story" : "stories"} not included (no cases or
           generation failed).
         </div>
       )}
-    </SignalCallout>
+    </MoodCard>
   );
 }
 
 // P15 — the post-push "assign sprints in Jira" panel. Idempotent (re-run reuses same-named sprints).
 // Surfaces partial outcomes in DISJOINT honesty channels: not-in-Jira / overflowed / failed (never silent).
-function AssignSprintsPanel({ planPush, onAssignSprints, planStale = false }) {
+function AssignSprintsPanel({ planPush, onAssignSprints, planStale = false, createdStoryCount = 0 }) {
   const st = planPush?.status || "idle";
+  // Idle-button label names HOW MANY stories will be assigned (the created stories from this push).
+  // Guard N>0 — fall back to the generic label when the count is 0/unknown.
+  const assignLabel =
+    createdStoryCount > 0
+      ? `Assign ${createdStoryCount} stor${createdStoryCount === 1 ? "y" : "ies"} to sprints`
+      : "Assign sprints in Jira";
   const sm = planPush?.result?.summary || {};
+  // counts carries the idempotency proof (sprints_created / sprints_reused) the summary alias omits.
+  const c = planPush?.result?.counts || sm;
+  const created = c.sprints_created || 0;
+  const reused = c.sprints_reused || 0;
   const sprints = planPush?.result?.sprintsCreated || [];
   const boardWarning = planPush?.result?.boardWarning;
+  const failureDetails = planPush?.result?.failureDetails || [];
   // §11: a 207 partial sprint-move bumps no assign_failed counter, so the failed-count callout below won't fire for
   // it — surface the backend's "verify" nudge on its own channel (mirrors RankBacklogPanel's unverifiedPartial).
-  const unverifiedPartial = (planPush?.result?.failureDetails || []).find((f) => f && f.error === "partial_assign_unverified") || null;
+  const unverifiedPartial = failureDetails.find((f) => f && f.error === "partial_assign_unverified") || null;
+  // The most-actionable per-item failure reason (currently discarded) — surfaced under the failed-count callout.
+  const firstFailure = (() => {
+    const f = failureDetails.find((x) => x && x.error !== "partial_assign_unverified");
+    if (!f) return null;
+    if (typeof f === "string") return f;
+    return f.detail || (f.error ? `${f.sprint ? f.sprint + ": " : ""}${f.error}` : null);
+  })();
   return (
     <div style={{ ...glassSurface("minor"), padding: 16, marginBottom: 16 }}>
       <div className="flex items-center gap-2" style={{ marginBottom: 6 }}>
@@ -5764,11 +6448,14 @@ function AssignSprintsPanel({ planPush, onAssignSprints, planStale = false }) {
         <div>
           <SignalCallout kind="success" title={`Assigned ${sm.issues_assigned || 0} issue${sm.issues_assigned === 1 ? "" : "s"} across ${sm.sprints || sprints.length} sprint${(sm.sprints || sprints.length) === 1 ? "" : "s"}`} style={{ marginBottom: 8 }}>
             {sprints.map((g) => `${g.name} (${g.assigned})`).join(" · ")}
+            {(created > 0 || reused > 0) ? (
+              <div style={{ ...TYPE.micro, marginTop: 4 }}>{created} sprint{created === 1 ? "" : "s"} created · {reused} reused (safe to re-run).</div>
+            ) : null}
           </SignalCallout>
           {boardWarning ? <SignalCallout kind="info" title="Multiple Scrum boards" style={{ marginBottom: 6 }}>{boardWarning}</SignalCallout> : null}
           {sm.no_jira_key > 0 ? <SignalCallout kind="info" title={`${sm.no_jira_key} planned feature${sm.no_jira_key === 1 ? "" : "s"} not in Jira`} style={{ marginBottom: 6 }}>Not part of the pushed backlog, so they couldn’t be assigned.</SignalCallout> : null}
           {sm.overflowed > 0 ? <SignalCallout kind="info" title={`${sm.overflowed} overflowed feature${sm.overflowed === 1 ? "" : "s"}`} style={{ marginBottom: 6 }}>Didn’t fit any sprint in the plan, so they weren’t assigned.</SignalCallout> : null}
-          {(sm.assign_failed > 0 || sm.sprint_failures > 0) ? <SignalCallout kind="warning" title="Some assignments failed">{sm.sprint_failures || 0} sprint(s) + {sm.assign_failed || 0} issue(s) failed — check your Jira board permissions and retry (it’s idempotent).</SignalCallout> : null}
+          {(sm.assign_failed > 0 || sm.sprint_failures > 0) ? <SignalCallout kind="warning" title="Some assignments failed">{firstFailure ? <>Reason: {firstFailure} — </> : null}{sm.sprint_failures || 0} sprint(s) + {sm.assign_failed || 0} issue(s) failed — check your Jira board permissions and retry (it’s idempotent).</SignalCallout> : null}
           {unverifiedPartial ? <SignalCallout kind="warning" title="Verify the sprint assignment" style={{ marginBottom: 6 }}>{unverifiedPartial.detail || "Jira reported a partial result (207) — open your board and verify each Story landed in its sprint."}</SignalCallout> : null}
         </div>
       ) : (
@@ -5778,7 +6465,7 @@ function AssignSprintsPanel({ planPush, onAssignSprints, planStale = false }) {
               The breakdown changed since this plan was generated. Re-rank the plan before assigning sprints, or any edited features won’t match.
             </SignalCallout>
           ) : null}
-          <button type="button" className="btn-primary" onClick={onAssignSprints}>Assign sprints in Jira</button>
+          <button type="button" className="btn-primary" onClick={onAssignSprints}>{assignLabel}</button>
           <div style={{ fontSize: 10.5, color: "var(--s2j-text-light)", marginTop: 8, lineHeight: 1.5 }}>
             Needs a Scrum board in this project. The first run may prompt your Jira admin to approve the new board/sprint permission in Manage Apps.
           </div>
@@ -5873,9 +6560,174 @@ function RankBacklogPanel({ kanbanRank, onRankBacklog, planStale = false }) {
   );
 }
 
-function PushedScreen({ result, onNew, jobId = null, onOpenDiagnostics, tcDiscarded = false, capturedExports = null, hasPlan = false, hasKanbanPlan = false, planStale = false, planPush = { status: "idle" }, onAssignSprints = null, kanbanRank = { status: "idle" }, onRankBacklog = null }) {
+// ── Task C — resume-push pure helpers (module scope; unit-reasoned, no React) ──────────────────
+// collectFeatureUids: flatten a breakdown to the SET of feature _uids (matches flattenBreakdown's
+// capabilities[].features[] / features[] shape).
+function collectFeatureUids(breakdown) {
+  const feats =
+    breakdown &&
+    (Array.isArray(breakdown.capabilities)
+      ? breakdown.capabilities.flatMap((c) => (c && c.features) || [])
+      : Array.isArray(breakdown.features)
+        ? breakdown.features
+        : []);
+  const set = new Set();
+  for (const f of feats || []) if (f && f._uid) set.add(f._uid);
+  return set;
+}
+
+// resumableWorkCount: the SINGLE source of truth for "how many items a resume would create" - the
+// failed Stories + their orphaned sub-tasks + the cascaded (story_failed) links that resolve once the
+// story is recreated. EXCLUDES own-failed sub-tasks under a landed Story, name_unknown links, and
+// (R1) api_failed links (a resume can't recreate a link between two already-created stories). This one
+// helper is consumed by BOTH finalizePushCleanup (hasResumableWork = count > 0, the capture/purge +
+// export-retention gate) and PushedScreen (resumeCreateCount = count, the Resume button/count), so the
+// two can never drift out of lockstep by hand (the prior sync hazard). Pure; count > 0 <=> resumable.
+function resumableWorkCount(result) {
+  const f = (result && result.failures) || {};
+  const d = (result && result.diag) || {};
+  return (f.stories || 0) + (d.subtasks_orphaned || 0) + (d.links_unresolved_story_failed || 0);
+}
+
+// computeCanResume: is a partial push safely resumable? Resume feeds created_issues back as
+// priorKeys and skips any uid already keyed. That is only correct while the breakdown under review
+// still shares uids with what was created. If created_issues carries uids the breakdown NO LONGER
+// shares (it was re-adapted → fresh uids, e.g. after a reload), resume would MIS-TARGET → fall back
+// to "regenerate and push again". Nothing-landed (created.length===0) is always resumable (there is
+// nothing to duplicate). Returns a boolean threaded to PushedScreen.
+function computeCanResume(pendingBreakdown, pushResult) {
+  if (!pendingBreakdown || !pushResult) return false;
+  const created = pushResult.created_issues || [];
+  const createdUids = new Set(created.map((it) => it && it.uid).filter(Boolean));
+  const bdUids = collectFeatureUids(pendingBreakdown);
+  let intersects = false;
+  for (const u of createdUids) {
+    if (bdUids.has(u)) { intersects = true; break; }
+  }
+  // Do NOT offer resume when created issues carry uids but NONE match the breakdown (re-adapted).
+  return !(!intersects && created.length > 0);
+}
+
+// mergePushResults(prior, resume): fold a resume outcome into the prior partial pushResult so the
+// Pushed screen shows the COMBINED state. Sums the created tallies, unions created_issues by uid,
+// keeps the prior Epic/project identity, takes the RESIDUAL failures/diag from the resume pass.
+// ⭐ HONESTY (POLICY 11 — no silent failure): a prior sub-task that failed its OWN create under a
+// Story that LANDED is skipped by resume (its parent is already-landed → never re-attempted) → it
+// is ABSENT from resume.failures. A naive `failures = resume.failures` would make it VANISH and the
+// screen would read clean. So we CARRY FORWARD every such prior failed-subtask row (its parent is
+// present in the merged created_issues → it landed → resume did not re-attempt it), bump the merged
+// sub-task failure count, and FORCE merged.partial=true. Those rows still read "did not land".
+// (In the NAMED use case — a required field fails ALL Stories → 0 landed → every subtask is an
+// orphan under a not-yet-created parent → fully resumed → nothing to carry forward.)
+function mergePushResults(prior, resume) {
+  const p = prior || {};
+  const r = resume || {};
+
+  // created_issues = union by uid (fall back to key so two real issues never collapse).
+  const seen = new Set();
+  const mergedCreated = [];
+  for (const it of [...(p.created_issues || []), ...(r.created_issues || [])]) {
+    if (!it) continue;
+    const id = it.uid || `key:${it.key}`;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    mergedCreated.push(it);
+  }
+  const landedNames = new Set(mergedCreated.map((it) => it && it.name).filter(Boolean));
+
+  const total_epics = p.total_epics || 0; // the Epic is created ONCE, in the ORIGINAL push
+  const total_stories = (p.total_stories || 0) + (r.total_stories || 0);
+  const total_subtasks = (p.total_subtasks || 0) + (r.total_subtasks || 0);
+  const total_items = total_epics + total_stories + total_subtasks; // NITS #1: issues only (links are not items)
+  const dependency_links_created = (p.dependency_links_created || 0) + (r.dependency_links_created || 0);
+  const tc_embedded = (p.tc_embedded || 0) + (r.tc_embedded || 0);
+  const tasks_embedded = (p.tasks_embedded || 0) + (r.tasks_embedded || 0);
+  // tc_skipped after both passes = prior's skipped minus what resume managed to embed (clamped >=0).
+  const tc_skipped = Math.max(0, (p.tc_skipped || 0) - (r.tc_embedded || 0));
+
+  // ── Residual failures = the RESUME failures + carried-forward prior sub-tasks (the honesty rule) ──
+  const priorD = (p.failures && p.failures.details) || {};
+  const resumeD = (r.failures && r.failures.details) || {};
+  const resumeSubtaskSig = new Set(
+    (resumeD.subtasks || []).map((d) => `${d && d.parentFeature}|${d && d.taskSummary}`),
+  );
+  const carriedSubtasks = [];
+  for (const d of priorD.subtasks || []) {
+    if (!d) continue;
+    // NOTE: the name-based `parentFeature|taskSummary` dedup signature can (niche) collide only
+    // under duplicate feature names + duplicate sub-task summaries; because the COUNT is now the
+    // uid-accurate prior+resume failure total (below), a collision affects only WHICH capped rows
+    // display, not the reported number.
+    const sig = `${d.parentFeature}|${d.taskSummary}`;
+    if (resumeSubtaskSig.has(sig)) continue; // resume already re-attempted + reported this one
+    if (d.parentFeature && !landedNames.has(d.parentFeature)) continue; // parent didn't land → orphan, not own-failure (not carried here)
+    carriedSubtasks.push(d); // parent landed → resume skipped it → keep it visible as "did not land"
+  }
+
+  // ── (R1/FIX D) Residual LINK failures = carry forward ONLY the api_failed links resume PROVABLY SKIPS ──
+  // A link whose BOTH endpoints landed AND both carry a uid is dropped by buildResolvableLinks' both-landed
+  // skip (which requires sourceUid && targetUid) -> it is ABSENT from `r`, so it must be carried forward or
+  // its failure is erased and a partial reads CLEAN (POLICY 11). A LEGACY null-uid api_failed link does NOT
+  // satisfy that skip guard -> resume RE-ATTEMPTS it and re-reports it in `r`; carrying it from the prior
+  // diag counter too would DOUBLE-count (or show a now-fixed link as failed). So carry the both-uid SUBSET
+  // resume skips, and count from THOSE rows (not the prior diag counter, which mixes both-uid + null-uid).
+  // `l.error` selects api_failed rows (unresolved rows carry `reason` instead); `l.sourceUid && l.targetUid`
+  // narrows to the both-uid ones the backend now stamps on each api_failed row. The prior details array is
+  // capped at 10, so a >10 api_failed run undercounts the COUNT here - but carriedLinkCount > 0 still forces
+  // partial=true below, so it never reads clean.
+  const carriedApiFailedLinks = (priorD.links || []).filter((l) => l && l.error && l.sourceUid && l.targetUid);
+  const carriedLinkCount = carriedApiFailedLinks.length;
+
+  // COUNT = the true prior + resume own-failure totals (uid-accurate), NOT carriedSubtasks.length
+  // (which is capped at 10 for the DISPLAY array only). ALL prior own-failures sit under LANDED
+  // parents (orphans go to subtasks_orphaned, not failures.subtasks) and resume skips landed
+  // parents, so every prior own-failure carries — including any beyond the cap-10 details array.
+  const mergedSubtaskFailCount = (r.failures?.subtasks || 0) + (p.failures?.subtasks || 0);
+  const mergedFailures = {
+    stories: (r.failures && r.failures.stories) || 0, // stories still failing after the resume pass
+    subtasks: mergedSubtaskFailCount, // resume's own-failures + the carried prior residual
+    links: ((r.failures && r.failures.links) || 0) + carriedLinkCount, // (R1) resume's link failures + the carried prior api_failed links
+    details: {
+      stories: (resumeD.stories || []).slice(0, 10),
+      subtasks: [...(resumeD.subtasks || []), ...carriedSubtasks].slice(0, 10),
+      links: [...(resumeD.links || []), ...carriedApiFailedLinks].slice(0, 10), // (R1) union resume link rows + carried prior api_failed rows
+    },
+  };
+
+  // partial = a residual remains after this pass. Force TRUE when a prior failure carries — a
+  // carried residual can NEVER read clean (POLICY 11). The prior own-failure COUNT is now the
+  // source of truth (a >10 residual has more failures than the capped display rows). (R1) a carried
+  // api_failed link is a residual too — force partial when carriedLinkCount > 0.
+  const partial = !!r.partial || (p.failures?.subtasks || 0) > 0 || carriedSubtasks.length > 0 || carriedLinkCount > 0;
+
+  return {
+    ...p, // base: keeps epic_key / project_key / project_name / browse_base / subtasks_embedded / total_epics
+    total_stories,
+    total_subtasks,
+    total_items,
+    dependency_links_created,
+    tc_embedded,
+    tasks_embedded,
+    tc_skipped,
+    created_issues: mergedCreated,
+    partial,
+    failures: mergedFailures,
+    // (R1) keep the resume pass's residual diagnostics but preserve/accumulate the prior api_failed
+    // count — the bare `r.diag` would erase it (resume skips both-landed links, so it never re-reports
+    // them), silently dropping the carried failures from the ledger's link cause-split.
+    diag: { ...(r.diag || {}), links_api_failed: ((r.diag && r.diag.links_api_failed) || 0) + carriedLinkCount },
+  };
+}
+
+function PushedScreen({ result, onNew, jobId = null, onOpenDiagnostics, tcDiscarded = false, capturedExports = null, hadTestCases = false, testCaseCount = 0, hasPlan = false, hasKanbanPlan = false, planStale = false, planPush = { status: "idle" }, onAssignSprints = null, kanbanRank = { status: "idle" }, onRankBacklog = null, onResume = null, canResume = false, resuming = false, resumeProgress = 0, resumeError = null, resumeInterrupted = false, captureInFlight = false }) {
+  // Show-all toggle for the created-story list (collapsed by default; failures stay expanded).
+  const [showAllStories, setShowAllStories] = useState(false);
+
   const total = result?.total_items || result?.created_issues?.length || 0;
-  const stories = result?.created_issues || [];
+  const createdIssues = result?.created_issues || [];
+  const projectKey = result?.project_key || null;
+  const projectName = result?.project_name || null;
+  const destLabel = projectName ? `${projectName} (${projectKey || "?"})` : (projectKey || "your Jira project");
   const browseUrl = (key) =>
     result?.browse_base ? `${result.browse_base}/browse/${key}` : `/browse/${key}`;
   const openIssue = (key) => {
@@ -5885,103 +6737,251 @@ function PushedScreen({ result, onNew, jobId = null, onOpenDiagnostics, tcDiscar
       /* no-op if the bridge router is unavailable */
     }
   };
+
+  // ── severity gradient (T0/T1): a partial must NEVER read as clean success ──
+  const f = result?.failures || {};
+  const failedStories = f.stories || 0;
+  const failedSubtasks = f.subtasks || 0;
+  const failedLinks = f.links || 0;
+  const diag = result?.diag || {};
+  const orphaned = diag.subtasks_orphaned || 0;
+  const partial = !!result?.partial;
+  const issuesFailed = failedStories + failedSubtasks > 0;
+  const linksOrOrphanOnly = !issuesFailed && partial; // only links/orphaned missing — nothing to re-create
+  const cleanDegraded = !partial && ((result?.tc_skipped || 0) > 0 || !!result?.subtasks_embedded);
+  const severity = issuesFailed ? "error" : linksOrOrphanOnly ? "warning" : "success";
+
+  // ── ledger maths ──
+  const createdStories = result?.total_stories || 0;
+  const createdSubtasks = result?.total_subtasks || 0;
+  const linksCreated = result?.dependency_links_created || 0;
+  // Name whichever entity actually failed (a sub-task-only failure must NOT read "0 stories didn't
+  // land"). Join the non-zero of stories/sub-tasks so the banner headline + body stay honest.
+  const failParts = [];
+  if (failedStories > 0) failParts.push(`${failedStories} ${failedStories === 1 ? "story" : "stories"}`);
+  if (failedSubtasks > 0) failParts.push(`${failedSubtasks} sub-task${failedSubtasks === 1 ? "" : "s"}`);
+  const failedPhrase = failParts.join(" + ");
+  // Checklist-aware created-count: a project with no Sub-task type embeds tasks as checklists, so
+  // createdSubtasks is 0 and the real work is tasks_embedded. (Clean branch handles this already.)
+  const createdSubtaskPhrase = result?.subtasks_embedded
+    ? `${result?.tasks_embedded || 0} tasks (as checklists)`
+    : `${createdSubtasks} sub-tasks`;
+  const storiesAttempted = createdStories + failedStories;
+  const subtasksLedgerDenom = createdSubtasks + failedSubtasks + orphaned; // ledger tile denominator
+  const subtasksIssuesDenom = createdSubtasks + failedSubtasks; // completeness (orphaned = never attempted)
+  const linksPlanned = linksCreated + failedLinks;
+  // completeness (ISSUES only — NITS #1; links tracked separately, never folded into items)
+  const epicCount = result?.total_epics || 0;
+  const landedIssues = epicCount + createdStories + createdSubtasks;
+  const attemptedIssues = epicCount + storiesAttempted + subtasksIssuesDenom;
+  const completenessPct = attemptedIssues > 0 ? Math.round((landedIssues / attemptedIssues) * 100) : 100;
+  // (R3) the big banner percentage carries the SEVERITY colour — it is a data figure (like the mockup's
+  // red 88% / green 100%), not a severity WORD, so colour-on-the-number is fine here.
+  const pctColor = severity === "error" ? "var(--s2j-red)" : severity === "warning" ? "var(--s2j-orange)" : "var(--s2j-green)";
+
+  // reason-class + the required-custom-field fix-chip (from diag.jira)
+  const jiraErrs = Array.isArray(diag.jira) ? diag.jira : [];
+  const fieldReject = jiraErrs.find((e) => Array.isArray(e.field_names) && e.field_names.length) || null;
+  const reasonClass = fieldReject
+    ? "a required-field rejection"
+    : jiraErrs[0] && jiraErrs[0].status
+      ? `an HTTP ${jiraErrs[0].status} rejection`
+      : "a Jira write error";
+  const fieldNames = Array.from(new Set(jiraErrs.flatMap((e) => (Array.isArray(e.field_names) ? e.field_names : []))));
+  const fieldStatus = fieldReject && fieldReject.status ? fieldReject.status : null;
+
+  // link cause-split (deterministic; reconciles with failures.links)
+  const linkStoryFailed = diag.links_unresolved_story_failed || 0;
+  const linkNameUnknown = diag.links_unresolved_name_unknown || 0;
+  const linkApiFailed = diag.links_api_failed || 0;
+  const linkCauses = [];
+  if (linkStoryFailed > 0) linkCauses.push({ n: linkStoryFailed, tone: "warning", text: "cascaded - Resume/regenerate recreates the story, then these links" });
+  if (linkNameUnknown > 0) linkCauses.push({ n: linkNameUnknown, tone: "info", text: "unresolved name - the AI paraphrased it; add it by hand in the editor's dependency list" });
+  if (linkApiFailed > 0) linkCauses.push({ n: linkApiFailed, tone: "error", text: "rejected by Jira - add it by hand in the editor, or regenerate (resume cannot recreate a link between two already-created stories)" });
+
+  const failStoryDetails = (f.details?.stories || []).slice(0, 10);
+  const failSubtaskDetails = (f.details?.subtasks || []).slice(0, 10);
+  // (FIX 1) per-link failure rows (already capped at 10 by the push engine). Each row carries the
+  // source -> target pair; unresolved rows have `.reason`, api_failed rows have `.error`/`.detail`.
+  const failLinkDetails = (f.details?.links || []).slice(0, 10);
+  const reasonOf = (d) => {
+    const raw = d?.batchError?.[0]?.message || d?.batchError?.[0]?.status || "could not be created";
+    const s = String(raw);
+    return s.length > 160 ? s.slice(0, 157) + "..." : s;
+  };
+
+  // ⭐ TASK C — resume-push. The action verb becomes "resume" when a resume is offered (onResume
+  // wired AND the stale-uid guard passed), else "regenerate and push again". The blue Resume button
+  // renders in the "What didn't land" section below.
+  const resumeOffered = !!(onResume && canResume);
+  // How many items a resume WILL create: the failed Stories + their orphaned sub-tasks + the cascaded
+  // (story_failed) links, which resolve once the story is recreated. It EXCLUDES: own-failed sub-tasks
+  // under a landed Story (resume can't reach them — they stay in the "what didn't land" list),
+  // name_unknown links (an AI paraphrase to fix by hand), AND (R1) api_failed links — both their
+  // stories already landed, so resume's both-landed skip drops them and a resume can never recreate a
+  // link between two already-created stories. 0 → nothing for resume to do, so the button is hidden.
+  // Single source of truth (shared with finalizePushCleanup's hasResumableWork) — no hand-kept lockstep.
+  const resumeCreateCount = resumableWorkCount(result);
+  // ⭐ retained — the derived data (job:/tcjob:/testcases:) is STILL in KVS. finalizePushCleanup keeps
+  // it EXACTLY when `partial && hasResumableWork`, and hasResumableWork is the SAME three-term set as
+  // resumeCreateCount (failedStories + orphaned + linkStoryFailed), so `partial && resumeCreateCount > 0`
+  // equals that gate. ⭐ retained is INDEPENDENT of resumeInterrupted / canResume: an interrupted resume
+  // does NOT purge (handleResumePush returns before finalizePushCleanup), so the data is still retained
+  // even though the Resume button then hides. This is the RIGHT signal for the "held" export copy.
+  const retained = partial && resumeCreateCount > 0;
+  // (R3) after an interrupted mid-flight resume, hide the button until a reload re-adapts the state -
+  // a re-Resume off the stale created_issues could duplicate Jira issues. Expressed via retained; the
+  // resumeOffered guard (onResume wired AND the stale-uid guard passed) is preserved (unchanged intent).
+  const showResume = retained && resumeOffered && !resumeInterrupted;
+  // (R5) the action verb keys off whether a Resume button ACTUALLY renders (showResume), not merely
+  // whether resume is "offered" (canResume). When there is nothing for resume to create
+  // (resumeCreateCount===0) or it's interrupted, the only path forward is regenerate.
+  const RESUME_VERB = showResume ? "resume" : "regenerate and push again";
+
   return (
     <div className="p-6" style={SCREEN_MAX_WIDTH_STYLE}>
-      {/* moodboard (Phase 2) — the terminal success climax in the green success
-          vocabulary (green check + navy headline + counts). */}
-      <SignalCallout kind="success" style={{ marginBottom: 16 }} fontSize={14}>
-        {/* keep the success climax as a real <h2> — it is the screen's primary
-            statement, so it must hold heading semantics for the document outline. */}
-        <h2 style={{ ...TYPE.heading, color: MOOD.navy, fontSize: 16, marginBottom: 4 }}>
-          Pushed to Jira
-        </h2>
-        <p style={{ color: "var(--s2j-text)", marginBottom: 2 }}>
-          {total} items created in project {result?.project_key || "unknown"}
-        </p>
-        <p style={{ ...TYPE.micro }}>
-          {result?.total_epics || 0} Epics · {result?.total_stories || 0}{" "}
-          Stories ·{" "}
-          {result?.subtasks_embedded
-            ? `${result?.tasks_embedded || 0} tasks (as checklists)`
-            : `${result?.total_subtasks || 0} Subtasks`}
-          {result?.dependency_links_created
-            ? ` · ${result.dependency_links_created} links`
-            : ""}
-        </p>
-        {(result?.tc_embedded > 0 || result?.tc_skipped > 0) && (
-          <p style={{ ...TYPE.micro, marginTop: 4 }}>
-            {result.tc_embedded > 0
-              ? `Test cases summarized in ${result.tc_embedded} Stor${result.tc_embedded === 1 ? "y" : "ies"}`
-              : "Test cases were not attached to any Story"}
-            {result.tc_skipped > 0
-              ? ` (${result.tc_skipped} skipped — ACs changed since generation; regenerate on the Test Cases screen)`
-              : ""}
-          </p>
+      {/* ── Top banner: severity-graded (words dark, colour on the icon; a partial NEVER reads clean). ── */}
+      <SignalCallout kind={severity} style={{ marginBottom: 16 }} fontSize={14}>
+        {/* (R3) content is a flex row: LEFT = title + sub-lines; RIGHT = the big completeness %
+            (top-right, for every outcome). The SignalCallout's own severity icon sits to the left. */}
+        <div style={{ display: "flex", gap: 12, alignItems: "flex-start", width: "100%" }}>
+          <div style={{ flex: 1, minWidth: 0 }}>
+        {severity === "error" ? (
+          <>
+            <h2 style={{ ...TYPE.heading, color: MOOD.navy, fontSize: 19, fontWeight: 700, marginBottom: 4 }}>
+              Pushed with failures - {failedPhrase} didn't land and need a retry
+            </h2>
+            <p style={{ color: "var(--s2j-text)", marginBottom: 2 }}>
+              {createdStories} {createdStories === 1 ? "story" : "stories"} and {createdSubtaskPhrase} created in {destLabel}. {failedPhrase} hit {reasonClass}.
+            </p>
+          </>
+        ) : severity === "warning" ? (
+          <>
+            <h2 style={{ ...TYPE.heading, color: MOOD.navy, fontSize: 19, fontWeight: 700, marginBottom: 4 }}>
+              Pushed - all issues landed; some links/sub-tasks need a look
+            </h2>
+            <p style={{ color: "var(--s2j-text)", marginBottom: 2 }}>
+              {total} items created in {destLabel}.
+            </p>
+            <p style={{ ...TYPE.micro }}>
+              {[failedLinks > 0 ? `${failedLinks} link${failedLinks === 1 ? "" : "s"} not created` : null,
+                orphaned > 0 ? `${orphaned} sub-task${orphaned === 1 ? "" : "s"} skipped` : null]
+                .filter(Boolean).join(" · ")} - see below.
+            </p>
+          </>
+        ) : (
+          <>
+            <h2 style={{ ...TYPE.heading, color: MOOD.navy, fontSize: 19, fontWeight: 700, marginBottom: 4 }}>
+              Pushed to Jira
+            </h2>
+            <p style={{ color: "var(--s2j-text)", marginBottom: 2 }}>
+              {total} items created in {destLabel}
+            </p>
+            <p style={{ ...TYPE.micro }}>
+              {epicCount} Epic{epicCount === 1 ? "" : "s"} · {createdStories} Stories ·{" "}
+              {result?.subtasks_embedded
+                ? `${result?.tasks_embedded || 0} tasks (as checklists)`
+                : `${createdSubtasks} Subtasks`}
+              {linksCreated ? ` · ${linksCreated} links` : ""}
+            </p>
+            {(result?.tc_embedded > 0 || result?.tc_skipped > 0) && (
+              <p style={{ ...TYPE.micro, marginTop: 4 }}>
+                {result.tc_embedded > 0
+                  ? `Test cases summarized in ${result.tc_embedded} Stor${result.tc_embedded === 1 ? "y" : "ies"}`
+                  : "Test cases were not attached to any Story"}
+                {result.tc_skipped > 0
+                  ? ` (${result.tc_skipped} skipped - ACs changed since generation; regenerate on the Test Cases screen)`
+                  : ""}
+              </p>
+            )}
+            {/* cleanDegraded footnote: nothing FAILED, but the push carries a minor note (checklist
+                fallback and/or a dropped test-case embed). Still green — a clean push with a caveat. */}
+            {cleanDegraded && result?.subtasks_embedded && (result?.tasks_embedded || 0) > 0 && (
+              <p style={{ ...TYPE.micro, marginTop: 4, color: "var(--s2j-text-light)" }}>
+                <SignalIcon kind="success" size={11} /> Sub-tasks were added as checklists - this project has no Sub-task type. Nothing failed.
+              </p>
+            )}
+          </>
         )}
-        {/* [polish] a test-case run was in flight when the user pushed → it was
-            discarded (the Create-button warning consented to this). Confirm it here
-            so they don't have to open Diagnostics to learn what happened. */}
+          </div>
+          {/* (R3) big completeness % + landed/attempted caption, top-right for ALL states. */}
+          <div style={{ flexShrink: 0, textAlign: "right" }}>
+            <div style={{ fontSize: 30, fontWeight: 700, color: pctColor, lineHeight: 1 }}>
+              {completenessPct}%
+            </div>
+            <div style={{ ...TYPE.micro, marginTop: 4, whiteSpace: "nowrap" }}>
+              {landedIssues}/{attemptedIssues} issues landed
+            </div>
+          </div>
+        </div>
+        {/* a test-case run was in flight when the user pushed -> it was discarded (consented at Create). */}
         {tcDiscarded && (
-          <p style={{ ...TYPE.micro, marginTop: 4, color: "var(--s2j-orange)" }}>
-            <SignalIcon kind="warning" size={12} /> The in-progress test-case generation was discarded — regenerate from the
+          <p style={{ ...TYPE.micro, marginTop: 4 }}>
+            <SignalIcon kind="warning" size={12} /> The in-progress test-case generation was discarded - regenerate from the
             editor after the push if you want them embedded.
           </p>
         )}
       </SignalCallout>
 
-      {(result?.epic_key || stories.length > 0) && (
-        <MoodCard density="minor" style={{ marginBottom: 16 }}>
-          <p
-            className="text-xs font-medium mb-2"
-            style={{ color: "var(--s2j-text-light)" }}
+      {/* ── OUTCOME LEDGER — 4 tiles, each severity-tinted by its own state. ── */}
+      {/* (R5) heading rendered inline (not via MoodCard's title prop) so it can be bolder/larger
+          without touching the shared MoodCard primitive. */}
+      <MoodCard density="minor" style={{ marginBottom: 16 }}>
+        <h3 style={{ ...TYPE.heading, color: MOOD.navy, fontSize: 15, fontWeight: 700, marginBottom: 10 }}>Outcome</h3>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 10 }}>
+          {/* EPIC — epic-fail aborts before Pushed, so this is normally always green. */}
+          <AnswerTile label="Epic" accent={result?.epic_key ? "var(--s2j-green)" : "var(--s2j-red)"}>
+            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <SignalIcon kind={result?.epic_key ? "success" : "error"} size={14} />
+              <span style={{ fontSize: 15, fontWeight: 700, color: "var(--s2j-text)", overflowWrap: "anywhere" }}>
+                {result?.epic_key || "not created"}
+              </span>
+            </div>
+            <div style={{ ...TYPE.micro, marginTop: 2 }}>{result?.epic_key ? "created" : "failed"}</div>
+          </AnswerTile>
+
+          {/* STORIES */}
+          <AnswerTile label="Stories" accent={failedStories > 0 ? "var(--s2j-red)" : "var(--s2j-green)"}>
+            <div style={{ fontSize: 19, fontWeight: 700, color: "var(--s2j-text)" }}>
+              {createdStories}
+              <span style={{ color: "var(--s2j-text-light)", fontWeight: 500 }}> / {storiesAttempted}</span>
+            </div>
+            <div style={{ ...TYPE.micro, marginTop: 2, color: failedStories > 0 ? "var(--s2j-text)" : undefined }}>
+              {failedStories} failed
+            </div>
+          </AnswerTile>
+
+          {/* SUB-TASKS (or checklists on the fallback path) */}
+          <AnswerTile
+            label="Sub-tasks"
+            accent={failedSubtasks > 0 ? "var(--s2j-red)" : orphaned > 0 ? "var(--s2j-orange)" : "var(--s2j-green)"}
           >
-            Open in Jira
-          </p>
-          {result?.epic_key && (
-            <button
-              onClick={() => openIssue(result.epic_key)}
-              className="btn-secondary mb-3"
-            >
-              Open Epic {result.epic_key} <IconExternalLink size={14} />
-            </button>
-          )}
-          {stories.length > 0 && (
-            <ul
-              style={{
-                margin: 0,
-                padding: 0,
-                listStyle: "none",
-              }}
-            >
-              {stories.map((s) => (
-                <li key={s.key} style={{ padding: "3px 0" }}>
-                  <button
-                    onClick={() => openIssue(s.key)}
-                    style={{
-                      background: "none",
-                      border: "none",
-                      padding: 0,
-                      cursor: "pointer",
-                      color: "var(--s2j-blue)",
-                      textDecoration: "underline",
-                      font: "inherit",
-                    }}
-                  >
-                    {s.key}
-                  </button>
-                  <span
-                    className="text-sm"
-                    style={{ color: "var(--s2j-text-muted)" }}
-                  >
-                    {" "}
-                    — {s.name}
-                  </span>
-                </li>
-              ))}
-            </ul>
-          )}
-        </MoodCard>
-      )}
+            {result?.subtasks_embedded ? (
+              <>
+                <div style={{ fontSize: 19, fontWeight: 700, color: "var(--s2j-text)" }}>{result?.tasks_embedded || 0}</div>
+                <div style={{ ...TYPE.micro, marginTop: 2 }}>as checklists</div>
+              </>
+            ) : (
+              <>
+                <div style={{ fontSize: 19, fontWeight: 700, color: "var(--s2j-text)" }}>
+                  {createdSubtasks}
+                  <span style={{ color: "var(--s2j-text-light)", fontWeight: 500 }}> / {subtasksLedgerDenom}</span>
+                </div>
+                <div style={{ ...TYPE.micro, marginTop: 2 }}>{orphaned} orphaned{failedSubtasks > 0 ? ` · ${failedSubtasks} failed` : ""}</div>
+              </>
+            )}
+          </AnswerTile>
+
+          {/* LINKS */}
+          <AnswerTile label="Links" accent={failedLinks > 0 ? "var(--s2j-orange)" : "var(--s2j-green)"}>
+            <div style={{ fontSize: 19, fontWeight: 700, color: "var(--s2j-text)" }}>
+              {linksCreated}
+              <span style={{ color: "var(--s2j-text-light)", fontWeight: 500 }}> / {linksPlanned}</span>
+            </div>
+            <div style={{ ...TYPE.micro, marginTop: 2 }}>{failedLinks} not created</div>
+          </AnswerTile>
+        </div>
+      </MoodCard>
 
       {/* Graceful-fallback note — project has no subtask type, tasks embedded
           as checklists in Story descriptions. Explains "0 Subtasks" honestly. */}
@@ -6009,74 +7009,229 @@ function PushedScreen({ result, onNew, jobId = null, onOpenDiagnostics, tcDiscar
       {/* Partial-failure surfacing — the push result returns failures: {stories,
           subtasks, links, details}. Surface counts + first few reasons so
           the user understands когато e.g. "0 Subtasks" appears. */}
-      {(() => {
-        const f = result?.failures;
-        const failedStories = f?.stories || 0;
-        const failedSubtasks = f?.subtasks || 0;
-        const failedLinks = f?.links || 0;
-        const totalFailed = failedStories + failedSubtasks + failedLinks;
-        if (totalFailed === 0) return null;
-        const parts = [];
-        if (failedStories) parts.push(`${failedStories} Stories`);
-        if (failedSubtasks) parts.push(`${failedSubtasks} Subtasks`);
-        if (failedLinks) parts.push(`${failedLinks} links`);
-        // First failure reason (most actionable — usually same root cause).
-        // Link failures carry { source, target, reason } (not batchError), so
-        // surface the specific blocked-by relationship — this is what lets a
-        // customer describe the problem and lets us diagnose it from a report.
-        const linkFail = f?.details?.links?.[0];
-        const firstDetail =
-          f?.details?.subtasks?.[0]?.batchError?.[0]?.message ||
-          f?.details?.stories?.[0]?.batchError?.[0]?.message ||
-          (linkFail
-            ? `Link "${linkFail.source}" → "${linkFail.target}": ${
-                linkFail.reason || linkFail.detail || "could not be created"
-              }`
-            : null) ||
-          null;
-        // Truncate the banner reason at a WORD boundary + ellipsis (it was a hard
-        // mid-word substring(0,200) → "…Required custom fie"); the full reason is
-        // always in Settings → Diagnostics (Copy report).
-        const reasonText = (() => {
-          const full = String(firstDetail || "");
-          if (full.length <= 220) return full;
-          const cut = full.slice(0, 220);
-          const sp = cut.lastIndexOf(" ");
-          return (sp > 160 ? cut.slice(0, sp) : cut) + "…";
-        })();
-        return (
-          <SignalCallout
-            kind="warning"
-            title={`${parts.join(" · ")} could not be created`}
-            style={{ marginBottom: 16 }}
-            fontSize={12}
-          >
-            {firstDetail && (
-              <p style={{ ...TYPE.micro, marginBottom: 4 }}>
-                Reason: {reasonText}
-              </p>
-            )}
-            <p style={{ ...TYPE.micro }}>
-              Need help?{" "}
-              <a
-                href="mailto:support@spec2jira.com"
-                style={{ color: "var(--s2j-blue)", textDecoration: "underline" }}
-              >
-                support@spec2jira.com
-              </a>
-            </p>
-            {/* [diag Phase 5, gate MED-3] the partial-push class (the S1 paraphrased-link
-                case) is the feature's highest-value diagnostics class — give the banner
-                the ref + the in-app path to the pre-filtered Diagnostics tab. */}
-            <DiagnosticRefLine refId={jobId} onOpenDiagnostics={onOpenDiagnostics} />
-          </SignalCallout>
-        );
-      })()}
+      {/* ── What didn't land - and the fix (only when partial; red-tinted). ── */}
+      {partial && (
+        <MoodCard density="minor" accent="var(--s2j-red)" style={{ marginBottom: 16 }}>
+          <h3 style={{ ...TYPE.heading, color: MOOD.navy, fontSize: 15, fontWeight: 700, marginBottom: 10 }}>What didn't land - and the fix</h3>
 
-      <PostPushExport captured={capturedExports} />
+          {/* Fix-chip: a required custom field rejected on every Story write (RAW field id). */}
+          {fieldNames.length > 0 && (
+            <SignalCallout kind="error" style={{ marginBottom: 10 }} fontSize={12.5}>
+              <div style={{ marginBottom: 6 }}>
+                Jira rejected a required custom field:{" "}
+                {fieldNames.map((fn, i) => (
+                  <code
+                    key={fn}
+                    // (FIX 8) no marginRight on the LAST chip so the period attaches ("customfield_10074.")
+                    // instead of detaching ("customfield_10074 ."). The " (HTTP …)" template below carries
+                    // its own leading space to separate the chip from the status.
+                    style={{ background: "var(--s2j-bg-section)", border: "1px solid var(--s2j-border)", borderRadius: 4, padding: "1px 5px", fontSize: 12, color: "var(--s2j-text)", marginRight: i < fieldNames.length - 1 ? 4 : 0 }}
+                  >
+                    {fn}
+                  </code>
+                ))}
+                {/* (FIX 8) period attached (no orphaned space): "(HTTP 400). Add it" / "customfield_10074. Add it". */}
+                {fieldStatus ? ` (HTTP ${fieldStatus}). ` : ". "}Add it under Settings &gt; Required custom fields, then {RESUME_VERB}
+                {/* (FIX B) the idempotent-subset promise is TRUE only for the resume verb; a
+                    regenerate starts a fresh push that re-creates ALL items (dupes the landed ones). */}
+                {showResume
+                  ? " - only the unwritten items are created."
+                  : " - a fresh push re-creates all items, including the ones that already landed."}
+              </div>
+              <div style={{ ...TYPE.micro }}>Raw field ID from Jira - a friendly name is a separate lookup.</div>
+            </SignalCallout>
+          )}
+
+          {/* ⭐ TASK C — Resume push. Offered for ANY resumable partial (not only field rejections):
+              gated on canResume (the stale-uid guard) AND at least one item resume WILL create.
+              Idempotent by uid — it never re-creates the already-written items. Blue = navigate/
+              recovery (not green=commit / red=danger). Runs IN PLACE; on success the ledger
+              re-renders with the merged outcome (a resume-to-clean flips this whole screen green). */}
+          {showResume && (
+            <div style={{ marginBottom: 12 }}>
+              <button
+                type="button"
+                onClick={onResume}
+                disabled={resuming}
+                className="btn-nav"
+                style={{ fontSize: 14, opacity: resuming ? 0.7 : 1, cursor: resuming ? "default" : "pointer" }}
+              >
+                {resuming
+                  ? `Resuming... ${Math.round((resumeProgress || 0) * 100)}%`
+                  : `Resume push - create the last ${resumeCreateCount} item${resumeCreateCount === 1 ? "" : "s"}`}
+              </button>
+              <p style={{ ...TYPE.micro, marginTop: 4 }}>Idempotent - never re-creates the already-written items.</p>
+              {resumeError && (
+                <SignalCallout kind="error" style={{ marginTop: 8 }} fontSize={12.5}>
+                  {resumeError}
+                </SignalCallout>
+              )}
+            </div>
+          )}
+
+          {/* (R3/FIX C) resume failed mid-flight - some items may already exist in Jira, so re-clicking
+              Resume off the stale created_issues could duplicate them. The button is hidden (showResume
+              requires !resumeInterrupted). A reload re-inits the app (pushResult gone, breakdown
+              re-adapted -> fresh uids -> canResume false), so there is NO resume path after reload - do
+              NOT promise "reload then resume". Point the user to Jira + finish by hand or start fresh. */}
+          {resumeInterrupted && (
+            <SignalCallout kind="error" style={{ marginBottom: 12 }} fontSize={12.5}>
+              {resumeError ? <div style={{ marginBottom: 6 }}>{resumeError}</div> : null}
+              Resume was interrupted - some items may already have been created in Jira. Open Jira to
+              check what landed. To avoid duplicates, resuming again is disabled; create any
+              still-missing items in Jira, or start a fresh breakdown.
+            </SignalCallout>
+          )}
+
+          {/* Stories that failed to create (up to 10). */}
+          {failedStories > 0 && (
+            <div style={{ marginBottom: 10 }}>
+              <p style={{ fontSize: 12.5, fontWeight: 600, color: "var(--s2j-text)", marginBottom: 4 }}>
+                {failedStories} {failedStories === 1 ? "story" : "stories"} failed to create
+              </p>
+              <ul style={{ margin: 0, padding: 0, listStyle: "none" }}>
+                {failStoryDetails.map((d, i) => (
+                  <li key={i} style={{ ...TYPE.micro, padding: "2px 0", color: "var(--s2j-text)" }}>
+                    <strong>{d.name || "(unnamed)"}</strong> - {reasonOf(d)}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {/* Sub-tasks that failed their OWN create (parent Story landed, sub-task write rejected).
+              Independent of orphaned - these were attempted and appear in failures.details.subtasks. */}
+          {failedSubtasks > 0 && (
+            <div style={{ marginBottom: 10 }}>
+              <p style={{ fontSize: 12.5, fontWeight: 600, color: "var(--s2j-text)", marginBottom: 4 }}>
+                {failedSubtasks} sub-task{failedSubtasks === 1 ? "" : "s"} failed to create
+              </p>
+              <ul style={{ margin: 0, padding: 0, listStyle: "none" }}>
+                {failSubtaskDetails.map((d, i) => (
+                  <li key={i} style={{ ...TYPE.micro, padding: "2px 0", color: "var(--s2j-text)" }}>
+                    {d.parentFeature ? <strong>{d.parentFeature}</strong> : null}{d.parentFeature && d.taskSummary ? " > " : ""}{d.taskSummary || "(sub-task)"} - {reasonOf(d)}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {/* Sub-tasks orphaned by a failed parent (never attempted). */}
+          {orphaned > 0 && (
+            <SignalCallout
+              kind="warning"
+              title={`${orphaned} sub-task${orphaned === 1 ? " was" : "s were"} never attempted - their parent Story failed above`}
+              style={{ marginBottom: 10 }}
+              fontSize={12.5}
+            >
+              {/* (FIX B) "recreates the story, then these" implies a targeted subset - true for resume,
+                  but a regenerate re-creates EVERY item, so word the regenerate branch honestly. */}
+              {showResume
+                ? "Jira never attempted them because the parent Story didn't land. Resume recreates the story, then these."
+                : "Jira never attempted them because the parent Story didn't land. Regenerate and push again to recreate the story and these - a fresh push re-creates all items, including the ones that already landed."}
+            </SignalCallout>
+          )}
+
+          {/* Dependency links not created - split by cause (each its own tinted row). */}
+          {failedLinks > 0 && (
+            <div style={{ marginBottom: 10 }}>
+              <p style={{ fontSize: 12.5, fontWeight: 600, color: "var(--s2j-text)", marginBottom: 6 }}>
+                {failedLinks} dependency link{failedLinks === 1 ? "" : "s"} not created
+                {linkCauses.length > 0 ? ` - ${linkCauses.length} different cause${linkCauses.length === 1 ? "" : "s"}` : ""}
+              </p>
+              {linkCauses.map((lc, i) => (
+                <SignalCallout key={i} kind={lc.tone} title={`${lc.n} link${lc.n === 1 ? "" : "s"}`} style={{ marginBottom: 6 }} fontSize={12}>
+                  {lc.text}
+                </SignalCallout>
+              ))}
+              {/* (FIX 1) the specific links that failed - source -> target per row (capped at 10) so
+                  the user knows WHICH to add by hand, not just the cause counts. */}
+              {failLinkDetails.length > 0 && (
+                <ul style={{ margin: "2px 0 0", padding: 0, listStyle: "none" }}>
+                  {failLinkDetails.map((l, i) => (
+                    <li key={i} style={{ ...TYPE.micro, padding: "2px 0", color: "var(--s2j-text)" }}>
+                      <strong>{l.source || "(unknown)"}</strong> &rarr; <strong>{l.target || "(unknown)"}</strong>
+                      {l.error || l.reason ? ` - ${l.error || l.reason}` : ""}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
+
+          <p style={{ ...TYPE.micro }}>
+            Need help?{" "}
+            <a href="mailto:support@spec2jira.com" style={{ color: "var(--s2j-blue)", textDecoration: "underline" }}>
+              support@spec2jira.com
+            </a>
+          </p>
+          {/* [diag Phase 5, gate MED-3] the partial-push class is the highest-value diagnostics class —
+              give the ref + the in-app path to the pre-filtered Diagnostics tab. */}
+          <DiagnosticRefLine refId={jobId} onOpenDiagnostics={onOpenDiagnostics} />
+        </MoodCard>
+      )}
+
+      {/* ── Open in Jira - the cleanly-created stories (collapsed by default; failures above stay open). ── */}
+      {createdIssues.length > 0 && (
+        <MoodCard density="minor" style={{ marginBottom: 16 }}>
+          <div className="flex items-center" style={{ justifyContent: "space-between", gap: 8 }}>
+            <p className="text-xs font-medium" style={{ color: "var(--s2j-text-light)", margin: 0 }}>
+              Open in Jira - {createdIssues.length} stor{createdIssues.length === 1 ? "y" : "ies"} created cleanly
+            </p>
+            <button
+              type="button"
+              onClick={() => setShowAllStories((v) => !v)}
+              aria-expanded={showAllStories}
+              className="flex items-center gap-1"
+              style={{ background: "none", border: "none", padding: 0, cursor: "pointer", color: "var(--s2j-blue)", fontSize: 12, fontWeight: 600 }}
+            >
+              {showAllStories ? <IconChevronUp size={13} /> : <IconChevronDown size={13} />}
+              {showAllStories ? "Hide" : "Show all"}
+            </button>
+          </div>
+          {showAllStories && (
+            <ul style={{ margin: "8px 0 0", padding: 0, listStyle: "none", display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))", gap: 8 }}>
+              {createdIssues.map((s) => (
+                <li key={s.key} style={{ padding: "3px 0" }}>
+                  <button
+                    onClick={() => openIssue(s.key)}
+                    style={{ background: "none", border: "none", padding: 0, cursor: "pointer", color: "var(--s2j-blue)", textDecoration: "underline", font: "inherit" }}
+                  >
+                    {s.key}
+                  </button>
+                  <span className="text-sm" style={{ color: "var(--s2j-text-muted)" }}> - {s.name}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </MoodCard>
+      )}
+
+      {/* ── Export block (PRIMARY) — the only surviving test copy; honest amber if capture failed. ── */}
+      {/* (FIX A) gate the deferred "held" copy on RETENTION (retained), NOT the Resume button
+          (showResume). An interrupted resume hides the button but does NOT purge, so the data is still
+          retained and the block must not claim data loss. captureInFlight covers the brief async-capture
+          window ("preparing"), so the "couldn't retain" amber fires only when the capture truly ran null. */}
+      <PostPushExport captured={capturedExports} hadTestCases={hadTestCases} retained={retained} captureInFlight={captureInFlight} storyCount={testCaseCount} />
+
+      {/* ── Forward primary — Open the Epic in Jira (blue = navigate). ── */}
+      {result?.epic_key && (
+        <button
+          onClick={() => openIssue(result.epic_key)}
+          className="btn-nav"
+          style={{ marginBottom: 16, fontSize: 14 }}
+        >
+          Open the Epic in Jira {result.epic_key} <IconExternalLink size={14} />
+        </button>
+      )}
+
+      {/* ── What's next — the integrated plan panels (only one applies; each keeps its disjoint honesty channels). ── */}
+      {((hasPlan && onAssignSprints) || (hasKanbanPlan && onRankBacklog)) && (
+        <ZoneHeader>What's next</ZoneHeader>
+      )}
 
       {/* P15 — assign the plan's sprints in Jira (only when a SCRUM plan exists for this push) */}
-      {hasPlan && onAssignSprints ? <AssignSprintsPanel planPush={planPush} onAssignSprints={onAssignSprints} planStale={planStale} /> : null}
+      {hasPlan && onAssignSprints ? <AssignSprintsPanel planPush={planPush} onAssignSprints={onAssignSprints} planStale={planStale} createdStoryCount={createdIssues.length} /> : null}
 
       {/* P15 (kanban) — rank the project's backlog Now→Next→Later (only when a KANBAN plan exists).
           Mutually exclusive with AssignSprintsPanel above (a plan is either scrum or kanban). */}

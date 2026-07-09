@@ -325,6 +325,8 @@ const OP_LABELS = {
   "generation.complete": "Generation completion",
   "push.final": "Push to Jira",
   "push.step": "Push step",
+  "push.resume": "Resume push",
+  "push.resume.final": "Resume push (final)",
   "testgen.batch": "Test-case generation",
   "testgen.poll": "Test-case poll", // [seams-audit J5] the TC poll flow leg
   "testgen.regen": "Test-case regenerate",

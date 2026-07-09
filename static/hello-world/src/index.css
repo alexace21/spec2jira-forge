@@ -23,8 +23,12 @@
   --s2j-bg-section:   #eef5fd;   /* SOFT inset ice — stats bars, profiles, list panels (lightened from #e7f0fb per partner) */
   --s2j-border:       #dbe8f5;   /* soft ice-sky hairline (lightened from #d0e1f3) */
 
-  --s2j-blue:         #61affe;
-  --s2j-blue-dark:    #4a9fe8;
+  /* R4 (2026-07-09): deepened from the pale #61affe to Atlassian's primary blue for app-wide theme
+     alignment. GLOBAL token — drives .btn-nav (Open Epic / Resume / Back / Plan capacity) + the solid
+     Remove(red)/Restore(blue) buttons. White text on #0c66e4 meets WCAG AA (~4.6:1). The light
+     blue-bg/blue-border TINT tokens are intentionally left pale (they back dark text). */
+  --s2j-blue:         #0c66e4;
+  --s2j-blue-dark:    #0055cc;
   --s2j-blue-bg:      #ebf3fb;
   --s2j-blue-border:  #c5ddf5;
 
@@ -52,7 +56,7 @@
   /* Neutral "attention / informational" accent (verdict-logic army, 2026-07-01) — a semantic
      ALIAS of the existing steel, so the pre-flight AMBER verdict + the "worth a glance" chips
      read as ATTENTION, not alarm. This keeps --s2j-orange RESERVED for genuine caution and
-     --s2j-blue (#61affe) RESERVED for nav buttons; steel #5483B3 is distinct from both. */
+     --s2j-blue (#0c66e4) RESERVED for nav buttons; steel #5483B3 is distinct from both. */
   --s2j-accent-info:        var(--s2j-steel);
   --s2j-accent-info-bg:     #eef5fd;
   --s2j-accent-info-border: #c5ddf5;
@@ -69,7 +73,7 @@
      --s2j-info — the neutral "AI-flagged / open / worth-a-look" tone, an ALIAS of the existing steel
      accent-info so "open concern" reads as ATTENTION (steel), a different urgency from "caution/at
      risk" (--s2j-orange amber) and "danger" (--s2j-red, the compliance landmine). Steel #5483B3 is
-     also distinct from the nav-blue (--s2j-blue #61affe) reserved for buttons. */
+     also distinct from the nav-blue (--s2j-blue #0c66e4) reserved for buttons. */
   --s2j-trust:        #2f9e8f;
   --s2j-trust-bg:     #e9f7f4;
   --s2j-trust-border: #b6e3da;
