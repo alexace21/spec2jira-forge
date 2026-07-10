@@ -255,3 +255,17 @@ export const IconList = (p) => (
     <line x1="3" y1="18" x2="3.01" y2="18" />
   </S>
 );
+
+// Data-path / privacy badge (Admin Settings "Your data path" — show this to security).
+export const IconShield = (p) => (
+  <S {...p}>
+    <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+  </S>
+);
+
+// Project-context profile row marker (a folder — a named standing context).
+export const IconFolder = (p) => (
+  <S {...p}>
+    <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+  </S>
+);

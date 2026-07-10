@@ -390,3 +390,219 @@ export function relTime(ts) {
   const d = Math.floor(h / 24);
   return `${d}d ago`;
 }
+
+// ── friendly count chips ───────────────────────────────────────────────────
+// MOVED here from AdminSettings.jsx so composeIncident + the IncidentCard share ONE source. Plain-English
+// labels for the diagnostic count keys — the "what landed / what didn't" chips. Only meaningful NON-ZERO
+// counts surface (zeros live in the raw view); probe/internal keys stay raw-only. Closed finite lookup
+// (POLICY §4 — pure, deterministic). `always:true` keeps a chip even at zero (cost).
+export const COUNT_FRIENDLY = {
+  stories_created: (v) => ({ label: `${v} ${v === 1 ? "story" : "stories"}`, tone: "ok" }),
+  subtasks_created: (v) => ({ label: `${v} sub-tasks`, tone: "ok" }),
+  links_created: (v) => ({ label: `${v} links`, tone: "ok" }),
+  tc_embedded: (v) => ({ label: `${v} test cases`, tone: "ok" }),
+  // test-gen success breadcrumb (testgen_completed) reports its coverage under the `stories` key.
+  stories: (v) => ({ label: `${v} stories covered`, tone: "ok" }),
+  features: (v) => ({ label: `${v} features`, tone: "info" }),
+  cost_usd: (v) => ({ label: `~$${Number(v).toFixed(2)} on your key`, tone: "info", always: true }),
+  stories_failed: (v) => ({ label: `${v} stories failed`, tone: "err" }),
+  subtasks_failed: (v) => ({ label: `${v} sub-tasks failed`, tone: "err" }),
+  links_api_failed: (v) => ({ label: `${v} links failed`, tone: "err" }),
+  subtasks_orphaned: (v) => ({ label: `${v} sub-tasks skipped`, tone: "warn" }),
+  links_unresolved_name_unknown: (v) => ({ label: `${v} link${v === 1 ? "" : "s"} unresolved (name unknown)`, tone: "warn" }),
+  links_unresolved_story_failed: (v) => ({ label: `${v} link${v === 1 ? "" : "s"} unresolved (story failed)`, tone: "warn" }),
+  tasks_embedded: (v) => ({ label: `${v} tasks as checklist`, tone: "warn" }),
+  tc_skipped: (v) => ({ label: `${v} test cases stale`, tone: "warn" }),
+};
+
+// "so far" overrides for an ABORTED push (push_exception): the created counts are PARTIAL, not final —
+// the card sets the flag so a mid-flight count never reads as a completed total.
+const COUNT_FRIENDLY_SOFAR = {
+  stories_created: (v) => ({ label: `${v} ${v === 1 ? "story" : "stories"} so far`, tone: "ok" }),
+  subtasks_created: (v) => ({ label: `${v} sub-tasks so far`, tone: "ok" }),
+};
+
+/**
+ * PURE. Friendly chip list from count entries ([[key, value], ...]). Zeros are dropped (unless `always`).
+ * `opts.soFar` swaps the created-count labels to their "so far" wording (an aborted push).
+ * @returns {Array<{key:string,label:string,tone:string}>}
+ */
+export function friendlyCounts(entries, opts = {}) {
+  const soFar = opts && opts.soFar === true;
+  const out = [];
+  for (const [k, raw] of entries || []) {
+    const fn = (soFar && COUNT_FRIENDLY_SOFAR[k]) || COUNT_FRIENDLY[k];
+    if (!fn) continue;
+    const v = Number(raw);
+    if (!Number.isFinite(v)) continue;
+    const meta = fn(v);
+    if (!meta.always && !(v > 0)) continue; // hide zeros (noise) — they live in the raw view
+    out.push({ key: k, label: meta.label, tone: meta.tone });
+  }
+  return out;
+}
+
+// ── composeIncident — the plain-English INCIDENT STORY (design §2, the load-bearing lever) ──────────────
+// Each diagnostic record becomes a story a BA/PO reads, NOT a technical log line. The per-error_class
+// narrative template composes the sentence from the record's OWN counts; an UNKNOWN class falls back to
+// classText().title/.hint (the humanize authority handles the long tail / background ops).
+
+function countOf(counts, key) {
+  const v = Number(counts[key]);
+  return Number.isFinite(v) ? v : 0;
+}
+function pluralS(v) {
+  return v === 1 ? "" : "s";
+}
+// "1 story" / "3 stories" — a grammatical count so the sentence agrees with the pluralized chips. [F3]
+function nounCount(n, singular, plural) {
+  return `${n} ${n === 1 ? singular : plural}`;
+}
+
+// partial_push: lead with the DOMINANT failure reason (first non-zero in this fixed order); if several are
+// non-zero, lead with the first + a trailing "...and other issues — see the counts."
+function partialPushSentence(counts, hasRejectedField) {
+  const sf = countOf(counts, "stories_failed");
+  const nu = countOf(counts, "links_unresolved_name_unknown");
+  const so = countOf(counts, "subtasks_orphaned");
+  const lsf = countOf(counts, "links_unresolved_story_failed");
+  const laf = countOf(counts, "links_api_failed");
+  const reasons = [];
+  if (sf > 0)
+    // [F2] only assert the required-custom-field cause when the record actually carries a rejected field
+    // (jira[].field_names); a story can also fail for permission / 404 / 500 / validation with no field map.
+    reasons.push(
+      hasRejectedField
+        ? `Everything landed except ${nounCount(sf, "story", "stories")} — Jira rejected them because a required custom field wasn't set.`
+        : `Everything landed except ${nounCount(sf, "story", "stories")} — Jira rejected them; open the raw counts for the exact reason.`,
+    );
+  if (nu > 0)
+    reasons.push(`Everything landed except ${nounCount(nu, "dependency link", "dependency links")} — the AI paraphrased a story name that didn't match, so the link couldn't resolve.`);
+  if (so > 0)
+    reasons.push(`${nounCount(so, "sub-task", "sub-tasks")} didn't land — this project has no Sub-task type, so they were skipped.`);
+  if (lsf > 0)
+    reasons.push(`${nounCount(lsf, "dependency link", "dependency links")} couldn't be created — a linked story failed to push.`);
+  if (laf > 0)
+    reasons.push(`${nounCount(laf, "dependency link", "dependency links")} failed at the Jira API.`);
+  if (reasons.length === 0)
+    return "One or more items could not be created — open the raw counts to see exactly what failed.";
+  let sentence = reasons[0];
+  if (reasons.length > 1) sentence += " ...and other issues — see the counts.";
+  return sentence;
+}
+
+// partial_testgen mirrors partial_push (test-gen cause-split rides the record's counts).
+function partialTestgenSentence(counts) {
+  const failed = countOf(counts, "failed");
+  if (failed > 0)
+    return `Test cases failed for ${failed} ${failed === 1 ? "story" : "stories"} — use the per-story Regenerate on the Test Cases screen to retry them.`;
+  return "Test cases failed for some stories — use the per-story Regenerate on the Test Cases screen to retry them.";
+}
+
+// The per-error_class template. Returns { title, sentence } or null (→ classText fallback).
+function templateFor(errorClass, counts, hasRejectedField) {
+  switch (errorClass) {
+    case "push_completed": {
+      const st = countOf(counts, "stories_created");
+      const sub = countOf(counts, "subtasks_created");
+      const lk = countOf(counts, "links_created");
+      let sentence = `Pushed ${nounCount(st, "story", "stories")}, ${nounCount(sub, "sub-task", "sub-tasks")} and ${nounCount(lk, "link", "links")}. All landed.`;
+      if (countOf(counts, "tasks_embedded") > 0)
+        sentence += " Some sub-tasks became checklist items — this project has no Sub-task type.";
+      if (countOf(counts, "tc_skipped") > 0) sentence += " Some test cases were stale and skipped.";
+      return { title: "Pushed to Jira — everything landed", sentence };
+    }
+    case "partial_push":
+      return { title: "Some items failed to push to Jira", sentence: partialPushSentence(counts, hasRejectedField) };
+    case "generation_completed": {
+      const f = countOf(counts, "features");
+      const cost = Number(counts.cost_usd);
+      const costStr = (Number.isFinite(cost) ? cost : 0).toFixed(2);
+      return {
+        title: "A breakdown completed",
+        sentence: `Generated ${f} features, cost ~$${costStr} on your Anthropic key.`,
+      };
+    }
+    case "testgen_completed": {
+      const s = countOf(counts, "stories"); // NB: the key is `stories`, not `stories_created`
+      return { title: "Test cases generated", sentence: `Generated test cases across ${s} stories.` };
+    }
+    case "health_ok":
+      return {
+        title: "Health check passed",
+        sentence: "All four production checks passed — Anthropic key, Confluence, Jira and storage.",
+      };
+    case "health_degraded":
+      return {
+        title: "Health check found problems",
+        sentence: "One or more production checks failed. Open the System health panel above to see which.",
+      };
+    case "push_exception":
+      return {
+        title: "A push didn't finish",
+        sentence: "A push stopped partway — the connection dropped partway through. Nothing was rolled back; re-running picks up where it left off.",
+      };
+    case "session_not_found":
+      return {
+        title: "A push couldn't resume",
+        sentence: "The push session expired before it could resume — no items were changed. Start the push again from the breakdown.",
+      };
+    case "step_exception":
+      return {
+        title: "A push step failed",
+        sentence: "A step in the push hit an error. Re-run the push to continue where it stopped.",
+      };
+    case "partial_testgen":
+      return { title: "Test cases failed for some stories", sentence: partialTestgenSentence(counts) };
+    default:
+      return null;
+  }
+}
+
+/**
+ * PURE. Turn a diagnostic record into a plain-English incident story.
+ * @returns {{ title:string, level:string, destination:string|null, sentence:string,
+ *   affected:string[], chips:Array<{label:string,tone:string}>, fixChips:Array<{field:string}>,
+ *   seen:string|null }}
+ */
+export function composeIncident(record) {
+  const rec = record && typeof record === "object" && !Array.isArray(record) ? record : {};
+  const errorClass = typeof rec.error_class === "string" ? rec.error_class : "";
+  const level = rec.level === "warn" || rec.level === "info" ? rec.level : "error";
+  const destination =
+    rec.subject && rec.subject.kind === "issue" && typeof rec.subject.id === "string"
+      ? rec.subject.id
+      : null;
+  const affected = Array.isArray(rec.subject_keys) ? rec.subject_keys : [];
+  const counts =
+    rec.counts && typeof rec.counts === "object" && !Array.isArray(rec.counts) ? rec.counts : {};
+  const isAbortedPush = errorClass === "push_exception";
+  const chips = friendlyCounts(Object.entries(counts), { soFar: isAbortedPush });
+  const fixChips = Array.isArray(rec.jira)
+    ? rec.jira
+        .flatMap((j) => (j && Array.isArray(j.field_names) ? j.field_names : []))
+        .map((field) => ({ field }))
+    : [];
+  const occ = rec.occurrences;
+  const occCount = occ && Number(occ.count) > 1 ? Number(occ.count) : null;
+  const seen = occCount ? `Seen ${occCount} times · last ${relTime(occ.lastTs)}` : null;
+
+  const tpl = templateFor(errorClass, counts, fixChips.length > 0);
+  const fallback = classText(errorClass);
+  const title = tpl ? tpl.title : fallback.title;
+  const sentence = tpl ? tpl.sentence : fallback.hint;
+
+  return { title, level, destination, sentence, affected, chips, fixChips, seen };
+}
+
+// Site-wide counter dot tone: a "problem" class (something failed / degraded) reads amber; a healthy
+// completion / pass reads green. (The site-wide aggregate carries no level, so infer from the closed set.)
+const PROBLEM_CLASSES = new Set([
+  "partial_push", "partial_testgen", "push_exception", "step_exception", "session_not_found",
+  "kvs_write_failed", "kvs_persist_failed", "key_storage_failed", "pagesnap_write_failed",
+  "context_profile_failed", "health_degraded", "gate_fail_open", "tracking_degraded",
+  "purge_incomplete", "distill_category_dropped", "unknown_error", "unknown_op",
+]);
+export function classTone(errorClass) {
+  return PROBLEM_CLASSES.has(errorClass) ? "warn" : "ok";
+}

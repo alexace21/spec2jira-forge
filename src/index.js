@@ -799,7 +799,15 @@ resolver.define('saveSettings', async ({ payload, context }) => {
         surfaced: true,
       },
     });
-    return { error: 'Could not save settings (storage error). Try shortening your Project Context profiles, then save again.' };
+    // Surface apiKeyUpdated on the ERROR return too, so the FE can honestly tell the admin the KEY
+    // was saved even though the other settings could not be stored (the §5.13 partial-commit state);
+    // otherwise the UI reads "nothing saved" while the secret is committed server-side.
+    return {
+      error: apiKeyUpdated
+        ? 'Your API key was saved, but the other settings could not be stored. Try shortening your Project Context profiles, then Save again.'
+        : 'Could not save settings (storage error). Try shortening your Project Context profiles, then save again.',
+      apiKeyUpdated,
+    };
   }
 
   return { success: true, apiKeyUpdated };
@@ -846,6 +854,9 @@ resolver.define('testConnection', async ({ payload, context }) => {
     return {
       status: 'ok',
       message: `Connected to Anthropic API (${result.model})`,
+      // [settings redesign] surface the real model as a structured field so the Settings
+      // plan card + verdict can show "AI model: <real model from the API>", not a hard-coded label.
+      model: result.model,
     };
   }
 
@@ -3721,6 +3732,10 @@ resolver.define('pushStep', async ({ payload, context }) => {
           level: 'error',
           ref: jobRef,
           session_ref: diagSessionRef,
+          // [diagnostics redesign T2] the DESTINATION Epic ("Into MOBILE-100") — reuse the whitelisted
+          // `subject` singular field with kind:'issue' (privacy-safe issue key, degrades to no "Into" when
+          // absent). Distinct from subject_keys below, which are the FAILURE keys ("Affected:").
+          subject: res.epic_key ? { kind: 'issue', id: res.epic_key } : undefined,
           // Union of failed STORY idxs + failed subtasks' PARENT feature idxs —
           // the same index space (feature idx), per §1 "story/task indices"
           // (gate F3: the subtask idxs were accumulated but write-only). Cap 20
@@ -3765,6 +3780,9 @@ resolver.define('pushStep', async ({ payload, context }) => {
           level: 'info',
           ref: jobRef,
           session_ref: diagSessionRef,
+          // [diagnostics redesign T2] the DESTINATION Epic ("Into MOBILE-100") — the whitelisted `subject`
+          // singular (kind:'issue'); degrades to no "Into" line when the epic key is absent.
+          subject: res.epic_key ? { kind: 'issue', id: res.epic_key } : undefined,
           counts: {
             stories_created: res.total_stories || 0,
             subtasks_created: res.total_subtasks || 0,
@@ -5695,6 +5713,10 @@ function healthJiraCode(error) {
  */
 resolver.define('runHealthCheck', async ({ context }) => {
   const probes = [];
+  // [settings redesign] capture the resolved model from the anthropic_key probe's testConnection
+  // so the Settings verdict can show the real billing model after an auto-verify (not only after a
+  // manual Test Connection). Additive — omitted from the response when the key probe did not succeed.
+  let healthModel = null;
   try {
     // ── Probe 1: 'anthropic_key' — the key path THIS tier generates with (Managed ⇒
     // OUR env key, BYOK ⇒ the stored secret), tested exactly the way the Settings
@@ -5715,6 +5737,7 @@ resolver.define('runHealthCheck', async ({ context }) => {
         });
       } else {
         const result = await anthropicTestConnection(apiKey);
+        if (result.ok && result.model) healthModel = result.model;
         probes.push(
           result.ok
             ? { name: 'anthropic_key', ok: true, code: 'ok' }
@@ -5800,10 +5823,10 @@ resolver.define('runHealthCheck', async ({ context }) => {
         surfaced: true,
       },
     });
-    return { ok: allOk, probes };
+    return { ok: allOk, probes, ...(healthModel ? { model: healthModel } : {}) };
   } catch (e) {
     console.warn(`[diag] runHealthCheck failed (fail-open): ${String(e?.message || e)}`);
-    return { ok: false, probes }; // whatever completed before the (unexpected) throw
+    return { ok: false, probes, ...(healthModel ? { model: healthModel } : {}) }; // whatever completed before the (unexpected) throw
   }
 });
 
