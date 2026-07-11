@@ -81,9 +81,33 @@ export function computeReady({ licenseGate, verdict } = {}) {
   return v.verified === "verified";
 }
 
+// ── 2c. Setup-guidance line — the calm sentence under the "Set up in order" heading ──────────────
+// Honest across EVERY not-ready sub-state. ⚠ It MUST branch on what is actually outstanding, not just
+// `ready`/`trialActive`: once the project IS set, it must never say "just set your Jira project … you're
+// ready to push" — that both tells the user to redo a done step AND falsely claims readiness while a verify
+// failure shows red in the hero (the honesty invariant a 2-lens audit caught a regression against, 2026-07-12).
+// Pure + exported so the invariant is guarded offline (a future edit can't silently re-collapse the branches).
+export function computeSetupGuidance({ ready, trialActive, verdict } = {}) {
+  if (ready) return null;
+  const v = verdict || {};
+  if (!v.configComplete) {
+    return trialActive
+      ? "You're on your free trial — just set your Jira project below and you're ready to push."
+      : "Two required steps (key + project), then two optional.";
+  }
+  // configComplete but not ready ⇒ the health check failed / couldn't run (or, non-trial, isn't run yet).
+  if (v.verified === "failed") return "Almost there — the verification found a problem. Check the detail above and re-verify.";
+  if (v.verified === "unavailable") return "Almost there — the check couldn't run. Re-verify in a moment.";
+  return "Both required steps are done — run the check to finish.";
+}
+
 // ── 3. Answer tiles ─────────────────────────────────────────────────────────
 // Five tiles; status ∈ ok|warn|error|neutral → the UI paints the icon/tint (neutral = a hollow grey circle,
-// so OPTIONALS never read as an amber gap). value/sub are display strings.
+// so OPTIONALS never read as an amber gap). `req ∈ 'required'|'optional'|null` → the UI renders a moodboard
+// status chip (Required amber / Optional grey), which replaced the bare faint "required"/"optional" sub-words
+// that read poorly. `sub` is now a short DESCRIPTIVE hint only (never a bare requirement word). ⭐ 2026-07-12:
+// the internal data-source tier tags (T0 / T0-T1) were REMOVED — they leaked meaningless engineering jargon
+// onto a PO/BA screen (the mockup carried them; they were never meant to ship).
 export function computeTiles({ verdict, apiKeyLastSetAt, health, profilesCount = 0, hasCustomFields = false, licenseBlocked = false, trialActive = false } = {}) {
   const v = verdict || {};
   const probes = health && Array.isArray(health.probes) ? health.probes : [];
@@ -92,48 +116,50 @@ export function computeTiles({ verdict, apiKeyLastSetAt, health, profilesCount =
 
   const apiKey =
     v.key === "storage_fault"
-      ? { status: "error", value: "Storage fault", sub: "can't read secret" }
+      ? { status: "error", value: "Storage fault", req: null, sub: "can't read secret" }
       : v.key === "configured"
-        ? { status: "ok", value: "Configured", sub: apiKeyLastSetAt ? `last set ${formatDate(apiKeyLastSetAt)}` : "configured" }
+        ? { status: "ok", value: "Configured", req: null, sub: apiKeyLastSetAt ? `last set ${formatDate(apiKeyLastSetAt)}` : "connected" }
         : trialActive
           // While on the $5 free trial the key is OPTIONAL — a NEUTRAL tile (never a red "Not set" gap).
-          ? { status: "neutral", value: "On free trial", sub: "optional — add when it ends" }
-          : { status: "error", value: "Not set", sub: "paste to connect" };
+          ? { status: "neutral", value: "On free trial", req: "optional", sub: "key not needed yet" }
+          : { status: "error", value: "Not set", req: "required", sub: "paste to connect" };
 
   const project =
     v.project === "set"
-      ? { status: "ok", value: v.projectKey || "Set", sub: "push destination" }
-      : { status: "warn", value: "Not set", sub: "required" };
+      ? { status: "ok", value: v.projectKey || "Set", req: null, sub: "push destination" }
+      : { status: "warn", value: "Not set", req: "required", sub: "your push target" };
 
   const context = {
     status: "neutral",
     value: profilesCount > 0 ? `${profilesCount} ${profilesCount === 1 ? "profile" : "profiles"}` : "None",
-    sub: "optional",
+    req: "optional",
+    sub: null,
   };
 
   const customFields = {
     status: "neutral",
     value: hasCustomFields ? "Configured" : "None",
-    sub: "optional",
+    req: "optional",
+    sub: null,
   };
 
   const verified =
     licenseBlocked
-      ? { status: "neutral", value: "Not verified", sub: "plan inactive" } // §5.9 — verification is moot while blocked
+      ? { status: "neutral", value: "Not verified", req: null, sub: "plan inactive" } // §5.9 — verification is moot while blocked
       : v.verified === "verified"
-        ? { status: "ok", value: "Verified", sub: `${probeCount || 4} checks · just now` }
+        ? { status: "ok", value: "Verified", req: null, sub: `${probeCount || 4} checks · just now` }
         : v.verified === "failed"
-          ? { status: "error", value: `${failCount || 1} failed`, sub: "see detail" }
+          ? { status: "error", value: `${failCount || 1} failed`, req: null, sub: "see detail" }
           : v.verified === "unavailable"
-            ? { status: "warn", value: "Could not run", sub: "re-verify" }
-            : { status: "neutral", value: "Not verified", sub: "run the check" };
+            ? { status: "warn", value: "Could not run", req: null, sub: "re-verify" }
+            : { status: "neutral", value: "Not verified", req: null, sub: "run the check" };
 
   return [
-    { id: "apiKey", label: "API KEY", tier: "T0", ...apiKey },
-    { id: "project", label: "PROJECT", tier: "T0", ...project },
-    { id: "context", label: "CONTEXT", tier: "T0", ...context },
-    { id: "customFields", label: "CUSTOM FIELDS", tier: "T0", ...customFields },
-    { id: "verified", label: "VERIFIED", tier: "T0-T1", ...verified },
+    { id: "apiKey", label: "API KEY", ...apiKey },
+    { id: "project", label: "PROJECT", ...project },
+    { id: "context", label: "CONTEXT", ...context },
+    { id: "customFields", label: "CUSTOM FIELDS", ...customFields },
+    { id: "verified", label: "VERIFIED", ...verified },
   ];
 }
 

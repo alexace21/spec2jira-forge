@@ -5,6 +5,7 @@ import {
   computeLicenseGate,
   computeConfigVerdict,
   computeReady,
+  computeSetupGuidance,
   computeTiles,
   classifyProbe,
   probeLabel,
@@ -637,6 +638,12 @@ export default function AdminSettings({ initialTab = "settings", diagRefFilter =
   const projectValid = /^[A-Z][A-Z0-9]{1,9}$/.test(projectKeyClean);
   // [A1] "done" is a function of BOTH signals — a blocked instance never reads "You're done".
   const ready = computeReady({ licenseGate, verdict });
+  // ⭐ 2026-07-12: the "Set up in order" guidance now reads as its OWN calm line (moodboard sub) below the
+  // heading, and the count is a crisp pill (StepProgress) on the right — the old single faint micro span
+  // crammed to the right read poorly + sat in the wrong place. When ready the pill says it all (no line).
+  // Branches on what is actually outstanding (not just `ready`) so it never tells a user to redo a done step
+  // or falsely claims readiness while a verify failure shows red — pure + offline-guarded in settingsView.js.
+  const setupGuidance = computeSetupGuidance({ ready, trialActive, verdict });
 
   return (
     <div>
@@ -724,9 +731,8 @@ export default function AdminSettings({ initialTab = "settings", diagRefFilter =
           style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: 12, marginBottom: 16 }}
         >
           <MoodCard density="minor">
-            <div className="flex items-center justify-between" style={{ marginBottom: 4 }}>
+            <div style={{ marginBottom: 4 }}>
               <span style={{ ...TYPE.label }}>COST ON YOUR KEY</span>
-              <span style={{ fontSize: 9, color: "var(--s2j-text-muted)" }}>T2</span>
             </div>
             <div style={{ fontSize: 26, fontWeight: 700, color: "var(--s2j-text)", lineHeight: 1.1 }}>
               {COST_ANCHOR.typical}
@@ -773,7 +779,7 @@ export default function AdminSettings({ initialTab = "settings", diagRefFilter =
         ) : licenseGate.state === "unknown" ? (
           <SignalCallout kind="warning" title="Plan details couldn't load" style={{ marginBottom: 16 }} fontSize={13}>
             <p className="mb-2">
-              getUsage failed on the server, so plan, price and member-since aren't available right now.
+              The plan lookup failed on the server, so plan, price and member-since aren't available right now.
               <strong> This is different from having no account — your settings below still save and work as
               normal.</strong>
             </p>
@@ -814,24 +820,16 @@ export default function AdminSettings({ initialTab = "settings", diagRefFilter =
           </SignalCallout>
         )}
 
-        {/* 4.5 Set up in order — the led spine */}
+        {/* 4.5 Set up in order — the led spine. The count is a crisp moodboard pill (right); the guidance is
+            its own calm line below the heading (was one faint micro span crammed to the right — bad place + colour). */}
         <div style={{ marginTop: 8 }}>
-          <div className="flex items-center justify-between flex-wrap" style={{ gap: 8, marginBottom: 14 }}>
+          <div className="flex items-center justify-between flex-wrap" style={{ gap: 8, marginBottom: setupGuidance ? 6 : 14 }}>
             <h3 style={{ ...TYPE.heading, color: MOOD.navy }}>Set up in order</h3>
-            <span style={{ ...TYPE.micro }}>
-              {ready ? (
-                <strong>All set{trialActive ? " · on free trial" : " · verified"}</strong>
-              ) : trialActive ? (
-                <>
-                  On your free trial — {verdict.configComplete ? "verify to finish" : "just set your Jira project"}. <strong>{verdict.requiredDone} of {verdict.requiredTotal} required done</strong>
-                </>
-              ) : (
-                <>
-                  Two required steps, then two optional. <strong>{verdict.requiredDone} of {verdict.requiredTotal} required done</strong>
-                </>
-              )}
-            </span>
+            <StepProgress ready={ready} trialActive={trialActive} done={verdict.requiredDone} total={verdict.requiredTotal} />
           </div>
+          {setupGuidance && (
+            <p style={{ ...TYPE.sub, marginTop: 0, marginBottom: 16 }}>{setupGuidance}</p>
+          )}
 
           {/* Step 1 — Connect Anthropic. ⭐ 2026-07-11: while a trial user is still on the $5 free managed
               credit, this whole step is OPTIONAL and the scary BYOK field/info is HIDDEN behind a calm note
@@ -988,7 +986,7 @@ export default function AdminSettings({ initialTab = "settings", diagRefFilter =
           </Step>
 
           {/* Step 3 — Add project context (OPTIONAL, never collapses to done) */}
-          <Step n={3} done={false} title="Add project context" tag="OPTIONAL" tag2="T0·T3" optional>
+          <Step n={3} done={false} title="Add project context" tag="OPTIONAL" optional>
             <p style={{ ...TYPE.micro, marginBottom: 10 }}>
               Standing background — domain, glossary, personas — Claude reuses on every breakdown for a
               project. Durable facts only; leave out anything true of a single page. <strong>You're fully
@@ -1785,7 +1783,7 @@ function DiagnosticsTab({ refFilter = "", onRefFilterChange, onFixInSettings }) 
       <MoodCard density="major" style={{ marginBottom: 16 }}>
         <div className="flex items-center justify-between flex-wrap" style={{ gap: 8, marginBottom: 12 }}>
           <h3 style={{ ...TYPE.heading, color: MOOD.navy }}>System health</h3>
-          <span style={{ ...TYPE.micro }}>the same 4 production paths the app uses · runHealthCheck</span>
+          <span style={{ ...TYPE.micro }}>the same 4 production paths the app uses</span>
         </div>
 
         <SignalCallout kind={healthBanner.kind} title={healthBanner.title} fontSize={13}>
@@ -2815,22 +2813,85 @@ function heroBanner({ verdict, licenseGate, verifying, health, projectKey, trial
   };
 }
 
-// A single answer tile (also reused for the Diagnostics System-health tiles — tier is optional).
+// A single answer tile (also reused for the Diagnostics System-health tiles — the req chip only renders when
+// a tile carries one). ⭐ 2026-07-12: the internal tier tags (T0 / T0-T1) were removed — leaked engineering
+// jargon on a PO screen. The bottom row now pairs a moodboard requirement chip (Required/Optional) with a
+// legible descriptive sub, replacing the old faint 10.5px sub that read as an afterthought.
 function SettingTile({ tile }) {
   return (
     <div style={{ ...glassSurface("utility"), padding: "9px 10px" }}>
-      <div className="flex items-center justify-between" style={{ marginBottom: 5, gap: 4 }}>
-        <span style={{ ...TYPE.label, fontSize: 9.5, letterSpacing: "0.03em" }}>{tile.label}</span>
-        {tile.tier ? <span style={{ fontSize: 9, color: "var(--s2j-text-muted)" }}>{tile.tier}</span> : null}
-      </div>
-      <div className="flex items-center gap-1.5" style={{ marginBottom: 2, minWidth: 0 }}>
+      <span style={{ ...TYPE.label, fontSize: 9.5, letterSpacing: "0.03em", display: "block", marginBottom: 5 }}>{tile.label}</span>
+      <div className="flex items-center gap-1.5" style={{ marginBottom: 6, minWidth: 0 }}>
         {tile.status === "neutral" ? <NeutralDot /> : <SignalIcon kind={tileKind(tile.status)} size={15} />}
         <span style={{ fontSize: 12.5, fontWeight: 700, color: "var(--s2j-text)", wordBreak: "break-word", minWidth: 0 }}>
           {tile.value}
         </span>
       </div>
-      <div style={{ ...TYPE.micro, fontSize: 10.5 }}>{tile.sub}</div>
+      {(tile.req || tile.sub) && (
+        <div className="flex items-center" style={{ gap: 6, flexWrap: "wrap", rowGap: 3 }}>
+          {tile.req ? <ReqChip req={tile.req} /> : null}
+          {tile.sub ? <span style={{ ...TYPE.micro, fontSize: 11, color: "var(--s2j-text-muted)" }}>{tile.sub}</span> : null}
+        </div>
+      )}
     </div>
+  );
+}
+
+// A small moodboard requirement chip: Required (amber tint — the one thing to do stands out) vs Optional
+// (calm grey ring — never reads as a gap). The WORD carries the meaning (not colour alone → WCAG-safe), and
+// the label text stays DARK per the moodboard "colour on the tint, not the words" rule.
+function ReqChip({ req }) {
+  const required = req === "required";
+  return (
+    <span
+      style={{
+        fontSize: 9.5,
+        fontWeight: 600,
+        letterSpacing: "0.02em",
+        lineHeight: 1.4,
+        padding: "1px 7px",
+        borderRadius: 999,
+        color: required ? "var(--s2j-text)" : "var(--s2j-text-muted)",
+        background: required ? "var(--s2j-orange-bg)" : "var(--s2j-bg-section)",
+        border: `1px solid ${required ? "var(--s2j-orange-border)" : "var(--s2j-border)"}`,
+        whiteSpace: "nowrap",
+      }}
+    >
+      {required ? "Required" : "Optional"}
+    </span>
+  );
+}
+
+// The progress badge on the "Set up in order" header — a crisp moodboard pill (replaced the faint micro text
+// crammed to the right of the heading). Ready → a green "All set" chip; otherwise an ice pill with the required
+// count (navy, bold) so "what's left" reads at a glance.
+function StepProgress({ ready, trialActive, done, total }) {
+  if (ready) {
+    return (
+      <span
+        className="flex items-center"
+        style={{
+          gap: 5, fontSize: 11.5, fontWeight: 600, color: "var(--s2j-text)",
+          padding: "3px 10px", borderRadius: 999,
+          background: "var(--s2j-green-bg)", border: "1px solid var(--s2j-green-border)", whiteSpace: "nowrap",
+        }}
+      >
+        <SignalIcon kind="success" size={13} /> All set{trialActive ? " · free trial" : ""}
+      </span>
+    );
+  }
+  return (
+    <span
+      className="flex items-center"
+      style={{
+        gap: 4, fontSize: 11.5, color: "var(--s2j-text-muted)",
+        padding: "3px 10px", borderRadius: 999,
+        background: "linear-gradient(160deg, rgba(193,232,255,0.20) 0%, rgba(255,255,255,0) 70%), #ffffff",
+        border: "1px solid var(--s2j-border)", whiteSpace: "nowrap",
+      }}
+    >
+      <strong style={{ color: MOOD.navy, fontSize: 12.5 }}>{done}</strong> of {total} required
+    </span>
   );
 }
 
@@ -2966,7 +3027,7 @@ function FeatureChip({ children }) {
 }
 
 // A led-setup step (numbered/checked node + title + body). Done REQUIRED steps collapse.
-function Step({ n, done, title, tag, tag2, optional, children }) {
+function Step({ n, done, title, tag, optional, children }) {
   return (
     <div className="flex" style={{ gap: 12, marginBottom: 18 }}>
       <div style={{ flexShrink: 0, width: 24, display: "flex", justifyContent: "center", paddingTop: 1 }}>
@@ -2976,7 +3037,6 @@ function Step({ n, done, title, tag, tag2, optional, children }) {
         <div className="flex items-center flex-wrap" style={{ gap: 8, marginBottom: 6 }}>
           <span style={{ ...TYPE.heading }}>{title}</span>
           {tag ? <StepTag tone={optional ? "opt" : "req"}>{tag}</StepTag> : null}
-          {tag2 ? <span style={{ fontSize: 9, color: "var(--s2j-text-muted)" }}>{tag2}</span> : null}
         </div>
         {children}
       </div>

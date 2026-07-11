@@ -531,7 +531,7 @@ function FeatureChip({ feat, id, oversized, risk, signals, rationale, onCritical
             <div>
               <div className="flex items-center" style={{ gap: 6, marginBottom: 4 }}>
                 <span style={numLabelStyle}>Claude's reasoning</span>
-                <span style={tierTagStyle}>display-only · T2</span>
+                <span style={tierTagStyle}>display-only</span>
               </div>
               <p style={{ fontSize: 11.5, color: "var(--s2j-text)", fontStyle: "italic", margin: 0, lineHeight: 1.5 }}>
                 "{rationale.trim()}" <span style={{ fontStyle: "normal", color: "var(--s2j-text-light)" }}>- Claude</span>
@@ -551,7 +551,6 @@ function FeatureChip({ feat, id, oversized, risk, signals, rationale, onCritical
             <div>
               <div className="flex items-center" style={{ gap: 6, marginBottom: 4 }}>
                 <span style={numLabelStyle}>The numbers behind it</span>
-                <span style={tierTagStyle}>T0</span>
               </div>
               <div className="flex" style={{ gap: 5, flexWrap: "wrap" }}>
                 {showUnblocks ? <span style={chipPill}><Dot color="var(--s2j-blue)" /> Unblocks {unblock}</span> : null}
@@ -966,7 +965,7 @@ function PlanSummaryPanel({ plan, sprintCount, nameOf, brief }) {
       <div className="flex items-center" style={{ justifyContent: "space-between", gap: 8 }}>
         <span className="flex items-center" style={{ gap: 8, flexWrap: "wrap" }}>
           <span style={{ fontSize: 13, fontWeight: 700, color: MOOD.navy }}>Plan summary - the story this plan tells</span>
-          <span style={{ fontSize: 9.5, color: "var(--s2j-text-light)", border: "1px solid var(--s2j-border)", borderRadius: 4, padding: "0 5px" }}>T1 · deterministic · same source as the copy-out</span>
+          <span style={{ fontSize: 9.5, color: "var(--s2j-text-light)", border: "1px solid var(--s2j-border)", borderRadius: 4, padding: "0 5px" }}>deterministic · same source as the copy-out</span>
         </span>
         <button type="button" onClick={() => setOpen((o) => !o)} aria-expanded={open} className="flex items-center" style={{ gap: 4, background: "none", border: "none", cursor: "pointer", color: "var(--s2j-blue)", fontSize: 12, fontWeight: 600, flexShrink: 0 }}>
           {open ? <>Hide <IconChevronUp size={13} /></> : <>Show <IconChevronDown size={13} /></>}
@@ -1832,7 +1831,6 @@ export default function PlanScreen({
               <div style={{ fontSize: 12, color: "var(--s2j-text)", lineHeight: 1.5 }}>
                 Claude {parts.join(" and ")}. A silent miss made visible - absent when the reconciliation is clean.
               </div>
-              <div style={{ fontSize: 10, color: "var(--s2j-text-light)", marginTop: 4 }}>T0 · ranking.unknownIds / omittedCount</div>
             </SignalCallout>
           );
         })()}
