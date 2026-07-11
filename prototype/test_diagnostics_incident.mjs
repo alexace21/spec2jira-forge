@@ -120,7 +120,7 @@ has(inc.sentence, 'Pushed 1 story, 1 sub-task and 1 link. All landed.', 'push_co
 // ── generation_completed ──────────────────────────────────────────────────────
 inc = composeIncident({ error_class: 'generation_completed', level: 'info', counts: { features: 37, cost_usd: 0.118 } });
 eq(inc.title, 'A breakdown completed', 'generation_completed title');
-eq(inc.sentence, 'Generated 37 features, cost ~$0.12 on your Anthropic key.', 'generation_completed sentence (cost 2dp)');
+eq(inc.sentence, 'Generated 37 features, cost ~$0.12 of Anthropic usage.', 'generation_completed sentence (cost 2dp; neutral attribution — not "your key", which is false on a managed trial)');
 ok(chipLabels(inc).includes('37 features'), 'generation_completed features chip');
 ok(chipLabels(inc).some((l) => l.startsWith('~$0.12')), 'generation_completed cost chip (always)');
 

@@ -404,7 +404,7 @@ export const COUNT_FRIENDLY = {
   // test-gen success breadcrumb (testgen_completed) reports its coverage under the `stories` key.
   stories: (v) => ({ label: `${v} stories covered`, tone: "ok" }),
   features: (v) => ({ label: `${v} features`, tone: "info" }),
-  cost_usd: (v) => ({ label: `~$${Number(v).toFixed(2)} on your key`, tone: "info", always: true }),
+  cost_usd: (v) => ({ label: `~$${Number(v).toFixed(2)} Anthropic usage`, tone: "info", always: true }),
   stories_failed: (v) => ({ label: `${v} stories failed`, tone: "err" }),
   subtasks_failed: (v) => ({ label: `${v} sub-tasks failed`, tone: "err" }),
   links_api_failed: (v) => ({ label: `${v} links failed`, tone: "err" }),
@@ -520,7 +520,10 @@ function templateFor(errorClass, counts, hasRejectedField) {
       const costStr = (Number.isFinite(cost) ? cost : 0).toFixed(2);
       return {
         title: "A breakdown completed",
-        sentence: `Generated ${f} features, cost ~$${costStr} on your Anthropic key.`,
+        // Neutral attribution ("Anthropic usage") — NOT "on your Anthropic key": a $5-managed-trial run
+        // bills OUR key, not the admin's own, so "your key" was false in the Diagnostics feed for a trial
+        // customer. The cost figure is real; dropping the whose-key claim is honest for BYOK and trial alike.
+        sentence: `Generated ${f} features, cost ~$${costStr} of Anthropic usage.`,
       };
     }
     case "testgen_completed": {

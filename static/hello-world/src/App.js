@@ -7462,10 +7462,13 @@ function SetupScreen({ message, onOpenSettings, trialActive }) {
   // screen must read as a friendly "add your key to keep going", NOT a first-run "must configure
   // before first use". First-run (no message) keeps the original onboarding copy.
   const hasMessage = !!message;
-  // A trial-on-managed user can also be routed here for a missing default JIRA PROJECT KEY (deferred
-  // past the mount gate) — they need NO Anthropic key. Detect that from the backend-controlled message so
-  // the heading/prerequisite don't wrongly tell them to add an API key (code-review fix). The strings are ours.
-  const isProjectKey = typeof message === "string" && /project key/i.test(message);
+  // A trial-on-managed user reaches setup ONLY for a missing default JIRA PROJECT KEY (deferred past the
+  // mount gate) — they never need BYOK while credit remains (an EXHAUSTED trial user has trialActive=false).
+  // So treat a trialActive user as the project-key route UNCONDITIONALLY, and only fall back to the
+  // message-prose regex for a PAID user with no project. This hardens the "no BYOK scare during trial"
+  // contract against any future backend reword of the no_project_key detail (the fragile-coupling the audit
+  // flagged): even if the regex ever misses, a trial user is never dropped into the BYOK prerequisite.
+  const isProjectKey = trialActive === true || (typeof message === "string" && /project key/i.test(message));
   return (
     <div className="p-6" style={SCREEN_MAX_WIDTH_STYLE}>
       {/* moodboard (Phase 1) — onboarding earns clarity: navy header + a light glass
