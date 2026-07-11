@@ -106,7 +106,10 @@ const SCREEN_MAX_WIDTH_STYLE = {
  *   3. Generic (auth/parse/other) → fall through with raw error,
  *      но HTML stripped from detail
  *
- * Returns: { message: string, routeToSetup: boolean }
+ * Returns: { message: string, routeToSetup: boolean, setupKind?: 'apiKey'|'projectKey'|'full' }
+ *   setupKind (present only when routeToSetup) tells SetupScreen WHICH prerequisite is missing so it never
+ *   guesses from trialActive/message-regex (which mis-routed a trial-with-credit-left user whose run
+ *   exceeded the remaining credit into the wrong "set your project key" copy).
  *
  * Defensive against HTML-leak: raw nginx 502 bodies start с "<html>"
  * — sniffed and replaced с friendly summary. Backend error JSON
@@ -200,6 +203,7 @@ function _classifyBackendError(errorShape, contextLabel = "") {
     return {
       message: detail || "Spec2Tickets is not configured yet.",
       routeToSetup: true,
+      setupKind: "full", // needs the Anthropic key AND a Jira project key
     };
   }
 
@@ -212,6 +216,11 @@ function _classifyBackendError(errorShape, contextLabel = "") {
         detail ||
         "You've used your $5 free trial credit — add your own Anthropic API key to keep going (unlimited, you pay Anthropic directly).",
       routeToSetup: true,
+      // ⭐ The blocker is the ANTHROPIC KEY, not the Jira project — a trial user can hit this with credit
+      // STILL remaining (a single run, e.g. test-cases, costs more than what's left), so trialActive may
+      // still be true. The setup screen MUST read off this explicit kind, never off trialActive (which
+      // would mis-route to the "set your project key" copy while the banner asks for the Anthropic key).
+      setupKind: "apiKey",
     };
   }
 
@@ -225,6 +234,7 @@ function _classifyBackendError(errorShape, contextLabel = "") {
         detail ||
         "No default Jira project key is set. Open Settings and set your Default Jira Project Key, then push again.",
       routeToSetup: true,
+      setupKind: "projectKey", // only the Jira project key is missing (no BYOK scare)
     };
   }
 
@@ -267,6 +277,7 @@ function _classifyBackendError(errorShape, contextLabel = "") {
       message:
         "Anthropic rejected the API key. Open Settings and verify your Anthropic API key (console.anthropic.com → API Keys).",
       routeToSetup: true,
+      setupKind: "apiKey", // the Anthropic key was rejected — fix the key, not the project
     };
   }
 
@@ -402,6 +413,11 @@ function App() {
   const [pageData, setPageData] = useState(null);
   const [pageId, setPageId] = useState(null);
   const [error, setError] = useState(null);
+  // Which prerequisite the SetupScreen must ask for ('apiKey' | 'projectKey' | 'full' | null=first-run),
+  // set from _classifyBackendError's setupKind at each routeToSetup site so the screen never guesses the
+  // kind from trialActive/message-regex (the mis-route that showed "set your project key" while the banner
+  // asked for the Anthropic key). Reset to null on the first-run mount gate.
+  const [setupKind, setSetupKind] = useState(null);
   // [diag Phase 3, design §5] The diagnostic correlation id (jobId) for the CURRENT error
   // screen, or null when the failure has no job in scope (page-fetch errors, submit
   // errors whose response carries no job_id, init failures). Set EXPLICITLY at every
@@ -750,6 +766,7 @@ function App() {
           !trialOnManaged &&
           (!settings?.apiKeyConfigured || !settings?.defaultProjectKey)
         ) {
+          setSetupKind(null); // first-run mount gate (non-trial) — SetupScreen falls back to the full setup
           setScreen("setup");
           return;
         }
@@ -1241,6 +1258,7 @@ function App() {
             "Could not open page",
           );
           if (friendly.routeToSetup) {
+            setSetupKind(friendly.setupKind || null);
             setError(friendly.message);
             setScreen("setup");
             return;
@@ -1351,6 +1369,7 @@ function App() {
       // EH1 polish part 27 — friendly classifier replaces raw error string.
       const friendly = _classifyBackendError(result, "Generate failed");
       if (friendly.routeToSetup) {
+        setSetupKind(friendly.setupKind || null);
         setError(friendly.message);
         setScreen("setup");
         return;
@@ -1544,6 +1563,7 @@ function App() {
       // [diag Phase 3] the push diagnostics record under ref jobId (startPush/pushStep
       // pass it through) — thread it so the error screen's ref matches the record.
       setErrorRefId(jobId || null);
+      setSetupKind(friendly.routeToSetup ? friendly.setupKind || null : null);
       setError(message);
       setScreen(friendly.routeToSetup ? "setup" : "error");
       setIsPushing(false);
@@ -1764,6 +1784,7 @@ function App() {
       setTcGenerating(false); // Fix 6
       const friendly = _classifyBackendError(result, "Test case generation failed");
       if (friendly.routeToSetup) {
+        setSetupKind(friendly.setupKind || null);
         setError(friendly.message);
         setScreen("setup");
         return;
@@ -2378,6 +2399,7 @@ function App() {
         message={error}
         onOpenSettings={handleOpenSettings}
         trialActive={usage?.trial?.onManaged === true}
+        setupKind={setupKind}
       />
     );
 
@@ -7456,19 +7478,22 @@ function ErrorScreen({ error, jobId = null, onRetry, onBackToPicker, onOpenDiagn
  *   - Prerequisite: an Anthropic API key + a JIRA project key
  *   - Navigation path: how to reach Settings to configure them
  */
-function SetupScreen({ message, onOpenSettings, trialActive }) {
+function SetupScreen({ message, onOpenSettings, trialActive, setupKind }) {
   // A `message` is passed when the user is bounced here mid-flow — most commonly after the
   // frictionless $5 managed trial credit is spent (trial_credit_exhausted). In that case the
   // screen must read as a friendly "add your key to keep going", NOT a first-run "must configure
   // before first use". First-run (no message) keeps the original onboarding copy.
   const hasMessage = !!message;
-  // A trial-on-managed user reaches setup ONLY for a missing default JIRA PROJECT KEY (deferred past the
-  // mount gate) — they never need BYOK while credit remains (an EXHAUSTED trial user has trialActive=false).
-  // So treat a trialActive user as the project-key route UNCONDITIONALLY, and only fall back to the
-  // message-prose regex for a PAID user with no project. This hardens the "no BYOK scare during trial"
-  // contract against any future backend reword of the no_project_key detail (the fragile-coupling the audit
-  // flagged): even if the regex ever misses, a trial user is never dropped into the BYOK prerequisite.
-  const isProjectKey = trialActive === true || (typeof message === "string" && /project key/i.test(message));
+  // ⭐ 2026-07-12: the setup MODE is now an EXPLICIT signal (`setupKind`) from _classifyBackendError, not a
+  // guess from trialActive/message-regex. The old `trialActive === true` guess forced the project-key copy for
+  // ANY trial user — but a trial user with credit STILL LEFT can be routed here for the ANTHROPIC KEY when a
+  // single run (e.g. test-cases) costs more than the remaining credit (trial_credit_exhausted), so it wrongly
+  // read "set your Jira project key … you're ready to push" while the banner asked for their Anthropic key.
+  //   'apiKey'     → they must add their own Anthropic key (credit spent / this run exceeds what's left / key rejected)
+  //   'projectKey' → only the Jira project key is missing (a trial user on credit; never a BYOK scare)
+  //   'full'/null  → first-run: a trial user needs only the project key; a paid user needs the full BYOK setup
+  const kind = setupKind || (trialActive ? "projectKey" : "full");
+  const isProjectKey = kind === "projectKey";
   return (
     <div className="p-6" style={SCREEN_MAX_WIDTH_STYLE}>
       {/* moodboard (Phase 1) — onboarding earns clarity: navy header + a light glass
