@@ -8,10 +8,10 @@ import React from "react";
  * в App.js (ready / generating / previewing / reviewing) + Dashboard's
  * own divergent BackButton (was blue underline style).
  *
- * Unified style: BLUE text (the "blue = navigation / go-to-a-screen" convention,
- * 2026-06-26 — back navigation is wayfinding) → on hover a subtle blue-tint
- * background + darker blue. Left-aligned via negative margin so the visual left
- * edge sits flush with content edge, despite button padding.
+ * Unified style: a SOLID dark-blue box with white text (the .btn-nav class —
+ * the "blue = navigation / go-to-a-screen" convention, 2026-06-26; back
+ * navigation is wayfinding), compact sized to match the Picker "Open" row
+ * buttons. btn-nav's CSS carries the box + white text + hover (darker blue).
  *
  * Skipped intentionally on:
  *   - Pushed (terminal — explicit context-specific nav buttons cover this)
@@ -37,25 +37,8 @@ function BackButton({
   return (
     <button
       onClick={onClick}
-      className={`text-xs flex items-center gap-1.5 ${className}`.trim()}
-      style={{
-        background: "none",
-        border: "none",
-        color: "var(--s2j-blue)",
-        cursor: "pointer",
-        padding: "4px 8px",
-        borderRadius: "4px",
-        transition: "all 0.15s",
-        marginLeft: "-8px",
-      }}
-      onMouseEnter={(e) => {
-        e.currentTarget.style.background = "var(--s2j-blue-bg)";
-        e.currentTarget.style.color = "var(--s2j-blue-dark)";
-      }}
-      onMouseLeave={(e) => {
-        e.currentTarget.style.background = "none";
-        e.currentTarget.style.color = "var(--s2j-blue)";
-      }}
+      className={`btn-nav ${className}`.trim()}
+      style={{ fontSize: "12.5px", padding: "6px 14px" }}
       title={title}
       aria-label={ariaLabel || undefined}
     >

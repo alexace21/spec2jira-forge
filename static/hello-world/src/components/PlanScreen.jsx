@@ -2,19 +2,21 @@ import React, { useMemo, useState, useRef, useEffect } from "react";
 import { invoke } from "@forge/bridge";
 import { SignalIcon, SignalCallout } from "./Signal";
 import {
-  IconCalendar, IconUsers, IconRefresh, IconCost, IconPlus, IconTrash, IconList,
+  IconCalendar, IconUsers, IconRefresh, IconCost, IconPlus, IconTrash, IconList, IconChevronDown, IconChevronUp,
 } from "./Icon";
 // Shared pure view-derivations — the SINGLE source of truth so PlanScreen + the Plan Brief can never
 // tell two different stories (§13 gate "BRIEF-DRIFT"). See static/hello-world/src/lib/planView.js.
 import {
   fmt1, fmtUsd, sprintDates, riskReasons, isRiskFlagged, buildRiskRegister, registerWhereLabel,
-  overflowReasonText, deficitHeadline, fragmentationNote, skillLabel, kanbanReachVerdict,
+  overflowReasonText, oversizedReasonText, deficitHeadline, fragmentationNote, skillLabel, kanbanReachVerdict,
+  capacityVerdict, criticalPathInfo, highestLeverage,
 } from "../lib/planView";
 
 const SKILL_METER_ORDER = ["BE", "FE", "QA", "GEN"]; // Tier-2: per-bucket meter order
 import { renderPlanBrief } from "../lib/planBrief";
 import BackButton from "./BackButton";
 import { MOOD, WIZARD_WRAP, stepSurface, stepTitleStyle, stepSubStyle, Stepper, Accordion, WizardNext } from "./WizardKit";
+import { ScreenHeader, glassSurface } from "./moodboard";
 
 // Clipboard + data-URI download fallback (Forge iframe blocks blob:; never a silent no-op). Tiny, so
 // duplicated here rather than importing from App.js (same call the test-case export uses).
@@ -235,9 +237,9 @@ function CapacityForm({ form, onChange, disabled, hideMethodology }) {
           <span style={{ width: 120, display: "inline-flex", alignItems: "center" }}>
             {isKanban ? "Available days (this quarter)" : "Available days / sprint"}
             {isKanban ? (
-              <InfoTip align="right" text="Days each person is available to work OVER THE WHOLE QUARTER — the entire period, NOT per sprint. A full quarter is ≈ 60–65 working days, minus that person's planned time off. (Entering per-sprint days here under-counts the quarter's throughput.)" />
+              <InfoTip align="right" text="PER QUARTER (Kanban): days each person is available OVER THE WHOLE QUARTER — the entire period, NOT per sprint. A full quarter is about 60-65 working days, minus planned time off. In Scrum the SAME field is per sprint — getting this wrong silently multiplies the throughput error, so read the label. (Entering per-sprint days here under-counts the quarter.)" />
             ) : (
-              <InfoTip align="right" text="Days each person is available to work IN ONE SPRINT — not the whole quarter. A 2-week sprint is ≈ 8–10 working days, minus that person's planned time off. (Entering whole-quarter days here over-counts capacity; values above the sprint length are clamped.)" />
+              <InfoTip align="right" text="PER SPRINT (Scrum): days each person is available IN ONE SPRINT — counted once every sprint, NOT the whole quarter. A 2-week sprint is about 8-10 working days, minus planned time off. In Kanban the SAME field is per quarter — getting this wrong silently multiplies the capacity error by the sprint count, so read the label. (Whole-quarter days here over-count; values above the sprint length are clamped.)" />
             )}
           </span>
           <span style={{ width: 28 }} />
@@ -329,7 +331,7 @@ function CapacityForm({ form, onChange, disabled, hideMethodology }) {
           </p>
           <div className="flex" style={{ gap: 10, marginBottom: 10, flexWrap: "wrap" }}>
             <div style={{ width: 140 }}><NumField label="Hours / day" value={f.hoursPerDay} onChange={(v) => set({ hoursPerDay: v })} placeholder="6" disabled={disabled || overrideMode} hint="default 6" tip="Productive delivery hours in one working day, after standing overhead (stand-ups, email). Default 6 out of an 8-hour day." /></div>
-            <div style={{ width: 140 }}><NumField label="Focus factor" value={f.focusFactor} onChange={(v) => set({ focusFactor: v })} placeholder="0.7" disabled={disabled || overrideMode} hint="0–1, e.g. 0.7" tip="The fraction of working time actually spent delivering stories — the rest goes to meetings, reviews and context-switching. Industry range 0.6–0.8. Default 0.7. Enter a fraction (0.7), NOT a percent (70)." /></div>
+            <div style={{ width: 140 }}><NumField label={<>Focus factor <span style={{ fontSize: 8.5, fontWeight: 700, letterSpacing: 0.4, textTransform: "uppercase", color: "var(--s2j-blue)", background: "var(--s2j-blue-bg)", border: "1px solid var(--s2j-blue-border)", borderRadius: 999, padding: "1px 6px", marginLeft: 4, whiteSpace: "nowrap" }}>Biggest lever</span></>} value={f.focusFactor} onChange={(v) => set({ focusFactor: v })} placeholder="0.7" disabled={disabled || overrideMode} hint="0–1, e.g. 0.7" tip="The fraction of working time actually spent delivering stories — the rest goes to meetings, reviews and context-switching. Industry range 0.6–0.8. Default 0.7. Enter a fraction (0.7), NOT a percent (70)." /></div>
             <div style={{ width: 140 }}><NumField label="Hours / point" value={f.hoursPerPoint} onChange={(v) => set({ hoursPerPoint: v })} placeholder="6" disabled={disabled || overrideMode} hint="default 6" tip="How many hours one story point typically takes your team. Lower = more capacity. Default 6. Calibrate from past sprints if you know it." /></div>
           </div>
           <div style={{ width: 260 }}>
@@ -362,7 +364,7 @@ function CapacityForm({ form, onChange, disabled, hideMethodology }) {
 }
 
 // ── One sprint column with an accessible capacity meter ─────────────────────────────
-function SprintColumn({ sprint, number, byUid, oversizedSet, riskByUid, profile, startDate, sprintLengthDays }) {
+function SprintColumn({ sprint, number, byUid, oversizedSet, riskByUid, profile, startDate, sprintLengthDays, signalsByUid, rationaleByUid, onCritical, usedLlm, criticalChainExists }) {
   const cap = Number(sprint.capacity) || 0;
   const load = Number(sprint.load) || 0;
   const util = cap > 0 ? load / cap : 0;
@@ -391,23 +393,23 @@ function SprintColumn({ sprint, number, byUid, oversizedSet, riskByUid, profile,
         {fragile ? (
           <div style={{ marginTop: 6, fontSize: 10.5, color: "var(--s2j-orange)", display: "inline-flex", alignItems: "center", gap: 4 }}>
             <SignalIcon kind="warning" size={11} title="Risk-heavy sprint" />
-            Risk-heavy — {profile.highRiskCount} high-risk item{profile.highRiskCount === 1 ? "" : "s"}{profile.externalDepCount ? `, ${profile.externalDepCount} external dep` : ""}
+            Risk-heavy — {profile.highRiskCount} high-risk item{profile.highRiskCount === 1 ? "" : "s"}{profile.externalDepCount ? `, ${profile.externalDepCount} external dep` : ""}{Number.isFinite(Number(profile.meanRisk)) ? ` · mean risk ${Math.round(Number(profile.meanRisk))}` : ""}
           </div>
         ) : null}
         {/* per-skill sub-meters (Tier-2): where the pressure is. Shown only in skill mode, only for buckets
             that carry capacity or load. a11y: SignalIcon + numeric load/cap, never colour-alone. */}
         {sprint.bucketCapacity ? (
-          <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 2 }}>
+          <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 4 }}>
             {SKILL_METER_ORDER.filter((k) => (Number(sprint.bucketCapacity[k]) || 0) > 0 || (Number(sprint.bucketLoad && sprint.bucketLoad[k]) || 0) > 0).map((k) => {
               const bc = Number(sprint.bucketCapacity[k]) || 0;
               const bl = Number(sprint.bucketLoad && sprint.bucketLoad[k]) || 0;
               const bover = bl > bc + 1e-9;
               const bu = bc > 0 ? bl / bc : (bl > 0 ? 1 : 0);
               return (
-                <div key={k} className="flex items-center" style={{ gap: 4, fontSize: 10 }}>
-                  <SignalIcon kind={bover || bu > 0.9 ? "warning" : "success"} size={9} title={skillLabel(k)} />
-                  <span style={{ width: 56, color: "var(--s2j-text-muted)", textTransform: "capitalize" }}>{skillLabel(k)}</span>
-                  <span style={{ color: bover ? "var(--s2j-orange)" : "var(--s2j-text-light)" }}>{fmt1(bl)} / {fmt1(bc)}</span>
+                <div key={k} className="flex items-center" style={{ gap: 6, fontSize: 12 }}>
+                  <SignalIcon kind={bover || bu > 0.9 ? "warning" : "success"} size={13} title={skillLabel(k)} />
+                  <span style={{ color: "var(--s2j-text)", textTransform: "capitalize", fontWeight: 500 }}>{skillLabel(k)}</span>
+                  <span style={{ marginLeft: "auto", color: bover ? "var(--s2j-orange)" : "var(--s2j-text-muted)", fontWeight: 600, fontVariantNumeric: "tabular-nums" }}>{fmt1(bl)} / {fmt1(bc)}</span>
                 </div>
               );
             })}
@@ -418,34 +420,150 @@ function SprintColumn({ sprint, number, byUid, oversizedSet, riskByUid, profile,
         {sprint.ids.length === 0 ? (
           <span style={{ fontSize: 11.5, color: "var(--s2j-text-light)", fontStyle: "italic" }}>Free capacity</span>
         ) : (
-          sprint.ids.map((id) => <FeatureChip key={id} feat={byUid.get(id)} id={id} oversized={oversizedSet.has(id)} risk={riskByUid && riskByUid.get(id)} />)
+          sprint.ids.map((id) => (
+            <FeatureChip
+              key={id} feat={byUid.get(id)} id={id} oversized={oversizedSet.has(id)} risk={riskByUid && riskByUid.get(id)}
+              signals={signalsByUid && signalsByUid[id]} rationale={rationaleByUid && rationaleByUid[id]} onCritical={onCritical ? onCritical(id) : false} usedLlm={usedLlm} criticalChainExists={criticalChainExists}
+            />
+          ))
         )}
       </div>
     </div>
   );
 }
 
-function FeatureChip({ feat, id, oversized, risk }) {
+// A tiny category dot — the COLOUR rides the dot; the label stays dark navy (moodboard "colour on the dot").
+function Dot({ color, size = 7 }) {
+  return <span aria-hidden="true" style={{ width: size, height: size, borderRadius: "50%", background: color, display: "inline-block", flexShrink: 0 }} />;
+}
+const chipPill = {
+  display: "inline-flex", alignItems: "center", gap: 4, fontSize: 10.5, color: "var(--s2j-text)",
+  border: "1px solid var(--s2j-border)", background: "var(--s2j-bg)", borderRadius: 999, padding: "1px 8px", lineHeight: 1.5,
+};
+const numLabelStyle = { fontSize: 9.5, fontWeight: 700, letterSpacing: 0.5, textTransform: "uppercase", color: "var(--s2j-text-muted)" };
+const tierTagStyle = { fontSize: 9, color: "var(--s2j-text-light)", border: "1px solid var(--s2j-border)", borderRadius: 4, padding: "0 4px" };
+
+// ── FeatureChip (1A in-flow "why here") — used in BOTH the Scrum SprintColumn and the Kanban BacklogBand ──
+// Collapsed = calm: the priority-tint left edge, name, SP, the risk-corner icon, the oversized note — PLUS two
+// conditional, graceful-absent markers: an "unblocks N" leverage pill (downstreamUnblockCount>0) and a
+// "+ why here" cue (a Claude rationale exists). A chip with neither reads exactly as calm as before.
+// Clicking expands IN PLACE (no rail, no popover — the chip grows down the column; Forge page-scroll-safe):
+//   CLAUDE'S REASONING — attributed, display-only (T2, the honesty firewall — never asserted as fact), then
+//   THE NUMBERS BEHIND IT — the deterministic T0 signals (the authoritative numbers next to the untrusted
+//   prose), rendered truthfully + non-redundantly (never "On the critical path" AND "slack" together).
+// On a deterministic-fallback plan there is no rationale → the reasoning block is structurally ABSENT (a muted
+// line says so), never fabricated. a11y: the header is a keyboard-operable button carrying aria-expanded.
+function FeatureChip({ feat, id, oversized, risk, signals, rationale, onCritical, usedLlm, criticalChainExists }) {
+  const [open, setOpen] = useState(false);
   const name = (feat && feat.name) || id;
   const sp = feat && feat.story_points;
   const tint = PRIORITY_TINT[feat && feat.priority] || PRIORITY_TINT.Low;
-  // a compact corner marker for a flagged feature (high/medium risk or external-dep/low-confidence); the
-  // full reasons live in the Risk register below (chips stay scannable). Worst signal wins the icon.
   const flagged = isRiskFlagged(risk);
   const markKind = risk && risk.risk_level === "high" ? "error" : "warning";
   const markTitle = flagged ? riskReasons(risk).map((r) => r.text).join(" · ") : "";
+
+  // T0 scheduling signals (defensive: an old plan without plan.signals → all absent, chip stays calm).
+  const s = signals || {};
+  const unblock = Number(s.downstreamUnblockCount) || 0;
+  const slack = Number(s.slack) || 0;
+  const riskNotable = !!(risk && (risk.risk_level === "high" || risk.risk_level === "medium" || risk.has_external_dep));
+  const riskScore = risk && Number.isFinite(Number(risk.riskScore)) ? Math.round(Number(risk.riskScore)) : null;
+  const hasRationale = typeof rationale === "string" && rationale.trim().length > 0;
+
+  // Truthful + non-redundant chip set (honesty firewall on the deterministic signals): a critical-path member
+  // has zero slack by definition, so never show both "On the critical path" and a slack figure for one chip.
+  const showUnblocks = unblock > 0;
+  const showCritical = !!onCritical;
+  const showSlack = slack > 0 && !onCritical;
+  // A zero-slack feature NOT on the single named critical chain is still on a CO-EQUAL critical path (CPM: slack
+  // 0 means it is on some longest chain) — surface "no slack" so it never reads as schedule-flexible. Guarded on
+  // a chain actually existing, so a dependency-free plan (every feature slack 0) marks nobody.
+  const showNoSlack = slack === 0 && !onCritical && !!criticalChainExists;
+  const showRisk = riskNotable && riskScore != null;
+  const hasSignalChips = showUnblocks || showCritical || showSlack || showNoSlack || showRisk;
+  const expandable = hasRationale || hasSignalChips;
+  const toggle = () => { if (expandable) setOpen((o) => !o); };
+
   return (
     <div style={{ border: `1px solid ${tint.border}`, background: tint.bg, borderRadius: 6, padding: "6px 8px" }}>
-      <div className="flex items-center" style={{ justifyContent: "space-between", gap: 6 }}>
-        <span style={{ fontSize: 12, color: "var(--s2j-text)", lineHeight: 1.3, wordBreak: "break-word" }}>{name}</span>
-        <span className="flex items-center" style={{ gap: 4, flexShrink: 0 }}>
-          {flagged ? <SignalIcon kind={markKind} size={11} title={markTitle} /> : null}
-          {sp != null ? <span style={{ fontSize: 10.5, fontWeight: 700, color: tint.fg }}>{sp}</span> : null}
-        </span>
+      <div
+        {...(expandable
+          ? {
+              role: "button", tabIndex: 0, "aria-expanded": open, onClick: toggle,
+              onKeyDown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(); } },
+              style: { cursor: "pointer" },
+            }
+          : {})}
+      >
+        <div className="flex items-center" style={{ justifyContent: "space-between", gap: 6 }}>
+          <span style={{ fontSize: 12, color: "var(--s2j-text)", lineHeight: 1.3, wordBreak: "break-word" }}>{name}</span>
+          <span className="flex items-center" style={{ gap: 4, flexShrink: 0 }}>
+            {flagged ? <SignalIcon kind={markKind} size={11} title={markTitle} /> : null}
+            {sp != null ? <span style={{ fontSize: 10.5, fontWeight: 700, color: tint.fg }}>{sp}</span> : null}
+            {expandable ? (open
+              ? <IconChevronUp size={13} style={{ color: "var(--s2j-text-muted)" }} title="Hide why here" />
+              : <IconChevronDown size={13} style={{ color: "var(--s2j-text-muted)" }} title="Why here" />) : null}
+          </span>
+        </div>
+        {(showUnblocks || (hasRationale && !open)) ? (
+          <div className="flex items-center" style={{ gap: 6, marginTop: 4, flexWrap: "wrap" }}>
+            {showUnblocks ? (
+              <span style={{ ...chipPill, borderColor: "var(--s2j-blue-border)", background: "var(--s2j-blue-bg)" }}>
+                <Dot color="var(--s2j-blue)" /> unblocks {unblock}
+              </span>
+            ) : null}
+            {hasRationale && !open ? (
+              <span style={{ fontSize: 10.5, color: "var(--s2j-blue)", fontWeight: 600 }}>+ why here <span aria-hidden="true">&rsaquo;</span></span>
+            ) : null}
+          </div>
+        ) : null}
       </div>
+
       {oversized ? (
         <div style={{ fontSize: 10, color: "var(--s2j-orange)", marginTop: 3, display: "inline-flex", alignItems: "center", gap: 3 }}>
-          <SignalIcon kind="warning" size={11} /> larger than one sprint — split it
+          <SignalIcon kind="warning" size={11} /> larger than one sprint - split it
+        </div>
+      ) : null}
+
+      {open && expandable ? (
+        <div style={{ marginTop: 8, paddingTop: 8, borderTop: "1px solid var(--s2j-border)", display: "flex", flexDirection: "column", gap: 8 }}>
+          {hasRationale ? (
+            <div>
+              <div className="flex items-center" style={{ gap: 6, marginBottom: 4 }}>
+                <span style={numLabelStyle}>Claude's reasoning</span>
+                <span style={tierTagStyle}>display-only · T2</span>
+              </div>
+              <p style={{ fontSize: 11.5, color: "var(--s2j-text)", fontStyle: "italic", margin: 0, lineHeight: 1.5 }}>
+                "{rationale.trim()}" <span style={{ fontStyle: "normal", color: "var(--s2j-text-light)" }}>- Claude</span>
+              </p>
+            </div>
+          ) : (
+            // FIX 4: rationale is SPARSE even on a real Claude plan, so a per-feature rationale absence is NOT
+            // evidence of a deterministic plan. Branch on the PLAN-level usedLlm: only assert "deterministic
+            // plan" when Claude genuinely didn't rank; on a Claude plan, say so honestly for THIS feature.
+            <div style={{ fontSize: 11, color: "var(--s2j-text-muted)", lineHeight: 1.5 }}>
+              {usedLlm
+                ? "Claude ranked this plan but didn't note a specific reason for this feature - the signals below are why it's placed here."
+                : "No Claude reasoning on a deterministic plan. Only the signals below are available."}
+            </div>
+          )}
+          {hasSignalChips ? (
+            <div>
+              <div className="flex items-center" style={{ gap: 6, marginBottom: 4 }}>
+                <span style={numLabelStyle}>The numbers behind it</span>
+                <span style={tierTagStyle}>T0</span>
+              </div>
+              <div className="flex" style={{ gap: 5, flexWrap: "wrap" }}>
+                {showUnblocks ? <span style={chipPill}><Dot color="var(--s2j-blue)" /> Unblocks {unblock}</span> : null}
+                {showCritical ? <span style={chipPill}><Dot color={MOOD.blueDeep} /> On the critical path</span> : null}
+                {showSlack ? <span style={chipPill}><Dot color={MOOD.skySteel} /> slack: {fmt1(slack)}</span> : null}
+                {showNoSlack ? <span style={chipPill}><Dot color={MOOD.blueDeep} /> no slack</span> : null}
+                {showRisk ? <span style={chipPill}><SignalIcon kind={markKind} size={10} /> Risk {riskScore}</span> : null}
+              </div>
+            </div>
+          ) : (
+            <div style={{ fontSize: 10.5, color: "var(--s2j-text-light)" }}>No standout scheduling signals for this one.</div>
+          )}
         </div>
       ) : null}
     </div>
@@ -487,72 +605,136 @@ function PlanningState({ elapsed, kanban, repacking }) {
   );
 }
 
-// Live "computed capacity" line — makes the derived pts/sprint + the focus-factor sensitivity legible
-// at INPUT time (the 2026-06-20 finding: a 0.7→0.5 focus change swings capacity ~29% and the user
-// couldn't see why). Shows the counterfactual at the default 0.7 so the lever's weight is obvious.
+// ── Live read-out shell (2A / 2K) — a glass card with a green "LIVE" dot; the sticky sidebar beside the form.
+function ReadoutShell({ title, children }) {
+  return (
+    <div style={{ ...glassSurface("minor"), padding: 16 }}>
+      <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: 0.6, textTransform: "uppercase", color: "var(--s2j-text-muted)", marginBottom: 8, display: "inline-flex", alignItems: "center", gap: 6 }}>
+        <span style={{ width: 6, height: 6, borderRadius: "50%", background: "var(--s2j-green)", display: "inline-block" }} /> {title}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+// Per-skill split bars (Scrum) — the bucket capacities as proportional bars so the split is legible at a glance
+// (colour is neutral steel: capacity is not a severity). a11y: skill label + numeric value carry the meaning.
+function SkillSplitBars({ perSprintBucketCapacity }) {
+  const rows = SKILL_METER_ORDER
+    .map((k) => ({ k, v: Number(perSprintBucketCapacity[k] && perSprintBucketCapacity[k][0]) || 0 }))
+    .filter((r) => r.v > 0);
+  if (!rows.length) return null;
+  const max = Math.max(...rows.map((r) => r.v), 1);
+  return (
+    <div style={{ marginTop: 10 }}>
+      <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: 0.4, textTransform: "uppercase", color: "var(--s2j-text-muted)", marginBottom: 5 }}>Per skill / sprint</div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+        {rows.map((r) => (
+          <div key={r.k} className="flex items-center" style={{ gap: 8 }}>
+            <span style={{ width: 62, fontSize: 11, color: "var(--s2j-text-muted)", textTransform: "capitalize", flexShrink: 0 }}>{skillLabel(r.k)}</span>
+            <span style={{ flex: 1, height: 7, borderRadius: 4, background: "var(--s2j-border)", overflow: "hidden" }}>
+              <span style={{ display: "block", height: "100%", width: `${Math.max(6, (r.v / max) * 100)}%`, background: MOOD.skySteel }} />
+            </span>
+            <span style={{ width: 34, textAlign: "right", fontSize: 11, fontWeight: 600, color: "var(--s2j-text)", flexShrink: 0 }}>{fmt1(r.v)}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// Scrum live read-out (2A) — the big pts/sprint + total, the per-skill split, the focus-factor counterfactual
+// (the biggest lever, made legible via a DIFFERENT focus value so the linear sensitivity is obvious), the
+// non-blocking warnings, and the "no AI, no spend" caption. Driven by the same previewCapacity as the plan.
 function CapacityPreview({ preview, form }) {
   const perSprint = preview.perSprintCapacityPoints[0];
   const sprints = preview.perSprintCapacityPoints.length;
   const total = preview.totalCapacityPoints;
   const ff = Number(form && form.focusFactor) || 0.7;
   const override = form && form.pointsPerSprintOverride !== undefined && form.pointsPerSprintOverride !== "" && form.pointsPerSprintOverride !== null;
-  const atDefault = !override && ff > 0 ? (perSprint / ff) * 0.7 : null; // focus factor scales capacity linearly
+  const compareFf = Math.abs(ff - 0.8) < 1e-9 ? 0.7 : 0.8; // counterfactual at a DIFFERENT ff so the delta is real
+  const cf = !override && ff > 0 ? (perSprint / ff) * compareFf : null; // focus factor scales capacity linearly
+  const delta = cf != null ? cf - perSprint : null;
+  const warnings = Array.isArray(preview.warnings) ? preview.warnings : [];
   return (
-    <div style={{ marginTop: 10, border: "1px solid var(--s2j-blue-border)", background: "var(--s2j-blue-bg)", borderRadius: 8, padding: "8px 12px" }}>
-      <div style={{ fontSize: 13, color: "var(--s2j-text)" }}>
-        Computed capacity: <strong>≈ {fmt1(perSprint)} pts / sprint</strong> · ~{fmt1(total)} pts total over {sprints} sprint{sprints === 1 ? "" : "s"}
+    <ReadoutShell title="Computed capacity · live">
+      <div style={{ fontSize: 22, fontWeight: 700, color: MOOD.navy, lineHeight: 1.15 }}>
+        ≈ {fmt1(perSprint)} <span style={{ fontSize: 13, fontWeight: 600, color: "var(--s2j-text-muted)" }}>pts / sprint</span>
       </div>
-      {atDefault != null && Math.abs(ff - 0.7) > 1e-9 ? (
-        <div style={{ fontSize: 11, color: "var(--s2j-text-muted)", marginTop: 3, lineHeight: 1.5 }}>
-          At focus factor {ff} — this would be ~{fmt1(atDefault)} pts/sprint at the default 0.7. Focus factor scales capacity directly, so it's your single biggest lever.
-        </div>
-      ) : null}
-      {/* Tier-2: the per-skill split, visible at INPUT time (so the bucket capacities aren't a surprise) */}
-      {preview.bucketsActive && preview.perSprintBucketCapacity ? (
-        <div style={{ fontSize: 11, color: "var(--s2j-text-muted)", marginTop: 4, lineHeight: 1.5 }}>
-          Per skill / sprint:{" "}
-          {SKILL_METER_ORDER.filter((k) => (Number(preview.perSprintBucketCapacity[k] && preview.perSprintBucketCapacity[k][0]) || 0) > 0).map((k) => `${skillLabel(k)} ≈ ${fmt1(preview.perSprintBucketCapacity[k][0])}`).join(" · ") || "—"}
-        </div>
-      ) : null}
-    </div>
-  );
-}
+      <div style={{ fontSize: 12, color: "var(--s2j-text-muted)", marginTop: 2 }}>~{fmt1(total)} pts total over {sprints} sprint{sprints === 1 ? "" : "s"}</div>
 
-// Kanban live preview — the THROUGHPUT range (never a single reach number as the headline). Mirrors
-// CapacityPreview's pattern but reads the kanban preview shape (expectedPointsQuarter / conservative /
-// optimistic). The same computeThroughput the plan uses backs it, so it can't drift (the preview guarantee).
-function KanbanCapacityPreview({ preview, form }) {
-  const expected = fmt1(preview.expectedPointsQuarter);
-  const cons = fmt1(preview.conservativePoints);
-  const opt = fmt1(preview.optimisticPoints);
-  const ff = Number(form && form.focusFactor) || 0.7;
-  const override = form && form.pointsPerQuarterOverride !== undefined && form.pointsPerQuarterOverride !== "" && form.pointsPerQuarterOverride !== null;
-  return (
-    <div style={{ marginTop: 10, border: "1px solid var(--s2j-blue-border)", background: "var(--s2j-blue-bg)", borderRadius: 8, padding: "8px 12px" }}>
-      <div style={{ fontSize: 13, color: "var(--s2j-text)" }}>
-        Expected ≈ <strong>{expected} pts</strong> this quarter · likely reach <strong>{cons}–{opt} pts</strong> (conservative–optimistic)
-      </div>
-      {!override && Math.abs(ff - 0.7) > 1e-9 ? (
-        <div style={{ fontSize: 11, color: "var(--s2j-text-muted)", marginTop: 3, lineHeight: 1.5 }}>
-          At focus factor {ff} — focus factor scales throughput directly, so it's your single biggest lever.
+      {preview.bucketsActive && preview.perSprintBucketCapacity ? <SkillSplitBars perSprintBucketCapacity={preview.perSprintBucketCapacity} /> : null}
+
+      {cf != null ? (
+        <div style={{ marginTop: 10, fontSize: 11, color: "var(--s2j-text-muted)", lineHeight: 1.5, borderTop: "1px dashed var(--s2j-border)", paddingTop: 8 }}>
+          If focus factor were {compareFf} → <strong style={{ color: "var(--s2j-text)" }}>≈ {fmt1(cf)}</strong> pts/sprint ({delta >= 0 ? "+" : "-"}{fmt1(Math.abs(delta))}). Focus factor scales capacity linearly - a small change moves the whole plan.
         </div>
       ) : null}
-      <div style={{ fontSize: 10.5, color: "var(--s2j-text-light)", marginTop: 4, lineHeight: 1.5 }}>
-        A forecast, not a target — it sharpens once the team has real flow history.
-      </div>
-      {/* live warnings (deep-audit G4): clamp / duplicate-name / override-discrepancy surfaced AT PREVIEW time
-          — the cheapest place to catch the most-likely Kanban data-entry mistake (per-sprint days in the
-          per-quarter field), instead of only after a billed Generate. */}
-      {Array.isArray(preview.warnings) && preview.warnings.length ? (
-        <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 3 }}>
-          {preview.warnings.map((w, i) => (
+
+      {warnings.length ? (
+        <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 4 }}>
+          {warnings.map((w, i) => (
             <div key={i} style={{ fontSize: 11, color: "var(--s2j-orange)", display: "inline-flex", alignItems: "flex-start", gap: 4, lineHeight: 1.5 }}>
               <SignalIcon kind="warning" size={11} /> <span>{w && w.message ? w.message : String(w)}</span>
             </div>
           ))}
         </div>
       ) : null}
-    </div>
+
+      <div style={{ marginTop: 10, fontSize: 10, color: "var(--s2j-text-light)", display: "inline-flex", alignItems: "center", gap: 4 }}>
+        <SignalIcon kind="info" size={10} /> No AI, no spend - recomputes as you type.
+      </div>
+    </ReadoutShell>
+  );
+}
+
+// Kanban live read-out (2K) — the throughput FORECAST (never a single reach number as the headline): expected,
+// a conservative-optimistic range BAR, the range-derivation note, the focus-factor lever, non-blocking warnings,
+// and the "a forecast, not a commitment" honesty. Same computeThroughput the plan uses → it can't drift.
+function KanbanCapacityPreview({ preview, form }) {
+  const expected = Number(preview.expectedPointsQuarter) || 0;
+  const cons = Number(preview.conservativePoints) || 0;
+  const opt = Number(preview.optimisticPoints) || 0;
+  const ff = Number(form && form.focusFactor) || 0.7;
+  const override = form && form.pointsPerQuarterOverride !== undefined && form.pointsPerQuarterOverride !== "" && form.pointsPerQuarterOverride !== null;
+  const warnings = Array.isArray(preview.warnings) ? preview.warnings : [];
+  const max = Math.max(opt, expected, 1);
+  const pct = (v) => `${Math.max(2, Math.min(100, (v / max) * 100))}%`;
+  return (
+    <ReadoutShell title="Likely reach this quarter · live">
+      <div style={{ fontSize: 22, fontWeight: 700, color: MOOD.navy, lineHeight: 1.15 }}>
+        Expected ≈ {fmt1(expected)} <span style={{ fontSize: 13, fontWeight: 600, color: "var(--s2j-text-muted)" }}>pts</span>
+      </div>
+      <div style={{ fontSize: 12, color: "var(--s2j-text-muted)", marginTop: 2 }}>likely reach {fmt1(cons)} - {fmt1(opt)} pts (conservative - optimistic)</div>
+
+      {/* range bar: the conservative-to-optimistic band, drawn to scale against the optimistic reach */}
+      <div style={{ marginTop: 10, position: "relative", height: 8, borderRadius: 5, background: "var(--s2j-border)", overflow: "hidden" }}>
+        <span style={{ position: "absolute", top: 0, bottom: 0, left: pct(cons), width: `calc(${pct(opt)} - ${pct(cons)})`, background: MOOD.skySteel }} />
+      </div>
+      <div style={{ fontSize: 10.5, color: "var(--s2j-text-light)", marginTop: 4, lineHeight: 1.5 }}>
+        Range = x0.8 / x1.1 of expected. Focus factor is the biggest lever.
+      </div>
+
+      {!override && Math.abs(ff - 0.7) > 1e-9 ? (
+        <div style={{ fontSize: 11, color: "var(--s2j-text-muted)", marginTop: 6, lineHeight: 1.5 }}>
+          At focus factor {ff} - focus factor scales throughput linearly, your single biggest lever.
+        </div>
+      ) : null}
+
+      {warnings.length ? (
+        <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 4 }}>
+          {warnings.map((w, i) => (
+            <div key={i} style={{ fontSize: 11, color: "var(--s2j-orange)", display: "inline-flex", alignItems: "flex-start", gap: 4, lineHeight: 1.5 }}>
+              <SignalIcon kind="warning" size={11} /> <span>{w && w.message ? w.message : String(w)}</span>
+            </div>
+          ))}
+        </div>
+      ) : null}
+
+      <div style={{ marginTop: 10, fontSize: 10.5, color: "var(--s2j-text-light)", lineHeight: 1.5 }}>
+        A forecast, not a commitment - it sharpens once the team has real flow history.
+      </div>
+    </ReadoutShell>
   );
 }
 
@@ -634,7 +816,7 @@ function RiskRegister({ entries, usedLlm, kanban }) {
 // A pull-ready, dependency-legal ordered backlog cut into three confidence tiers, with VISIBLE reach lines
 // (the conservative / optimistic thresholds) between them. Later is SHOWN, never hidden — so the scope
 // trade-off is negotiable (research). Each tier reuses FeatureChip (name + SP + priority tint + risk mark).
-function BacklogSection({ title, subtitle, kind, rows, subtotal, byUid, riskByUid, empty }) {
+function BacklogSection({ title, subtitle, kind, rows, subtotal, byUid, riskByUid, empty, signalsByUid, rationaleByUid, onCritical, usedLlm, criticalChainExists }) {
   return (
     <div style={{ border: `1px solid var(--s2j-border)`, borderRadius: 10, background: "var(--s2j-bg)", marginBottom: 10 }}>
       <div style={{ padding: "10px 12px", borderBottom: "1px solid var(--s2j-border)" }}>
@@ -652,7 +834,12 @@ function BacklogSection({ title, subtitle, kind, rows, subtotal, byUid, riskByUi
         {rows.length === 0 ? (
           <span style={{ fontSize: 11.5, color: "var(--s2j-text-light)", fontStyle: "italic" }}>{empty}</span>
         ) : (
-          rows.map((row) => <FeatureChip key={row.id} feat={byUid.get(row.id)} id={row.id} oversized={false} risk={riskByUid && riskByUid.get(row.id)} />)
+          rows.map((row) => (
+            <FeatureChip
+              key={row.id} feat={byUid.get(row.id)} id={row.id} oversized={false} risk={riskByUid && riskByUid.get(row.id)}
+              signals={signalsByUid && signalsByUid[row.id]} rationale={rationaleByUid && rationaleByUid[row.id]} onCritical={onCritical ? onCritical(row.id) : false} usedLlm={usedLlm} criticalChainExists={criticalChainExists}
+            />
+          ))
         )}
       </div>
     </div>
@@ -670,29 +857,30 @@ function ReachLine({ label, pts }) {
   );
 }
 
-function BacklogBand({ plan, byUid, riskByUid }) {
+function BacklogBand({ plan, byUid, riskByUid, signalsByUid, rationaleByUid, onCritical, usedLlm, criticalChainExists }) {
   const m = plan.metrics || {};
   const now = Array.isArray(plan.now) ? plan.now : [];
   const next = Array.isArray(plan.next) ? plan.next : [];
   const later = Array.isArray(plan.later) ? plan.later : [];
   const sub = (arr) => arr.reduce((a, r) => a + (Number(r.points) || 0), 0);
+  const chipProps = { byUid, riskByUid, signalsByUid, rationaleByUid, onCritical, usedLlm, criticalChainExists };
   return (
     <div style={{ marginBottom: 12 }}>
       <BacklogSection
         title="Now — high confidence" subtitle="Likely delivered this quarter — pull these first." kind="success"
-        rows={now} subtotal={m.reachedNowPoints != null ? m.reachedNowPoints : sub(now)} byUid={byUid} riskByUid={riskByUid}
+        rows={now} subtotal={m.reachedNowPoints != null ? m.reachedNowPoints : sub(now)} {...chipProps}
         empty="Nothing reaches high confidence yet — raise capacity or split the earliest items."
       />
       <ReachLine label="conservative reach" pts={m.conservativePoints} />
       <BacklogSection
         title="Next — stretch (might fit)" subtitle="Within optimistic reach — a stretch, not a commitment." kind="warning"
-        rows={next} subtotal={sub(next)} byUid={byUid} riskByUid={riskByUid}
+        rows={next} subtotal={sub(next)} {...chipProps}
         empty="No stretch items in this band."
       />
       <ReachLine label="optimistic reach" pts={m.optimisticPoints} />
       <BacklogSection
         title="Later — beyond this quarter’s likely reach" subtitle="Shown so the scope trade-off is negotiable — defer, descope, or add capacity." kind="info"
-        rows={later} subtotal={m.beyondReachPoints != null ? m.beyondReachPoints : sub(later)} byUid={byUid} riskByUid={riskByUid}
+        rows={later} subtotal={m.beyondReachPoints != null ? m.beyondReachPoints : sub(later)} {...chipProps}
         empty="The whole backlog is within optimistic reach — nothing beyond this quarter."
       />
     </div>
@@ -736,36 +924,121 @@ function KanbanHonestyPanel({ assumptions }) {
   );
 }
 
-// ── Defensible Plan Brief (P18) — copy a stakeholder-ready, fully-grounded summary out of the iframe ──
-// Pure deterministic render (lib/planBrief.js), captured in-memory → purge-safe, $0, instant. Three
-// formats: Markdown (pastes clean into Confluence/Jira/Slack), plain text, and the allocation CSV.
-function PlanBriefExport({ brief }) {
+// ── Plan summary panel (Scrum, step 4) — the plan's own STORY, on screen (Q3). Reuses the SAME planView
+// derivations the copy-out brief uses (capacityVerdict / criticalPathInfo / highestLeverage / overflowReasonText)
+// so the on-screen summary and the copied brief can NEVER tell two stories (invariant #4 — one source of truth).
+// Collapsible (default shown), SUBORDINATE to the plan hero. KEEPS the three Copy buttons + the "nothing is
+// sent anywhere" caption — it ABSORBS the former PlanBriefExport (P18), so step 4 carries one story panel, not
+// two. Pure deterministic render (lib/planBrief.js), captured in-memory → purge-safe, $0, instant.
+function PlanSummaryPanel({ plan, sprintCount, nameOf, brief }) {
+  const [open, setOpen] = useState(true);
   const [md, setMd] = useState("idle");
   const [txt, setTxt] = useState("idle");
   const [csv, setCsv] = useState("idle");
-  if (!brief) return null;
+  const metrics = plan.metrics || {};
+  const oversizedCount = Array.isArray(plan.oversized) ? plan.oversized.length : 0;
+  const verdict = capacityVerdict(metrics, sprintCount, oversizedCount);
+  const verdictKind = (metrics.deficitPoints > 0 || (metrics.overflowCount || 0) > 0 || oversizedCount > 0) ? "warning" : "success";
+  const cp = criticalPathInfo(plan, nameOf);
+  const leverage = highestLeverage(plan, nameOf, 3);
+  const overflow = Array.isArray(plan.overflow) ? plan.overflow : [];
+  // FIX 6: a force-placed feature larger than one sprint lands in plan.oversized, NOT plan.overflow. The panel
+  // must surface it too (the copy-out brief lists it under "What doesn't fit"), else "Everything planned fits"
+  // is literally false when an oversized item exists.
+  const oversized = Array.isArray(plan.oversized) ? plan.oversized : [];
+  const chainText = cp
+    ? (cp.chainNames && cp.chainNames.length
+        ? cp.chainNames.slice(0, 5).join(" → ") + (cp.chainNames.length > 5 ? ` → … (+${cp.chainNames.length - 5} more)` : "")
+        : `${cp.len} features deep - ends at ${cp.endName}`)
+    : null;
+
   const doCopy = async (text, set, filename) => {
     const ok = await copyPlanText(text || "", filename);
     set(ok ? "ok" : "fail");
     setTimeout(() => set("idle"), 1800);
   };
-  const label = (s, base) => (s === "ok" ? "Copied" : s === "fail" ? "Copy failed — check permissions" : base);
+  const label = (st, base) => (st === "ok" ? "Copied" : st === "fail" ? "Copy failed - check permissions" : base);
   const btn = { background: "var(--s2j-bg)", border: "1px solid var(--s2j-border)", color: "var(--s2j-text)", cursor: "pointer", padding: "5px 10px", borderRadius: 6, fontSize: 12, fontWeight: 500 };
+  const secLabel = { fontSize: 10, fontWeight: 700, letterSpacing: 0.5, textTransform: "uppercase", color: "var(--s2j-text-muted)", marginBottom: 4 };
+
   return (
-    <div style={{ border: "1px solid var(--s2j-border)", borderRadius: 10, background: "var(--s2j-bg-section)", padding: "10px 12px", marginBottom: 12 }}>
-      <div className="flex items-center" style={{ justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
-        <span style={{ fontSize: 12.5, fontWeight: 600, color: "var(--s2j-text)", display: "inline-flex", alignItems: "center", gap: 6 }}>
-          <SignalIcon kind="info" size={13} /> Plan brief — copy a stakeholder-ready summary
+    <div style={{ ...glassSurface("minor"), padding: "12px 16px", marginBottom: 12 }}>
+      <div className="flex items-center" style={{ justifyContent: "space-between", gap: 8 }}>
+        <span className="flex items-center" style={{ gap: 8, flexWrap: "wrap" }}>
+          <span style={{ fontSize: 13, fontWeight: 700, color: MOOD.navy }}>Plan summary - the story this plan tells</span>
+          <span style={{ fontSize: 9.5, color: "var(--s2j-text-light)", border: "1px solid var(--s2j-border)", borderRadius: 4, padding: "0 5px" }}>T1 · deterministic · same source as the copy-out</span>
         </span>
-        <span className="flex" style={{ gap: 6, flexWrap: "wrap" }}>
-          <button type="button" style={btn} onClick={() => doCopy(brief.markdown, setMd, "plan-brief.md")}>{label(md, "Copy (Markdown)")}</button>
-          <button type="button" style={btn} onClick={() => doCopy(brief.plainText, setTxt, "plan-brief.txt")}>{label(txt, "Copy (plain)")}</button>
-          <button type="button" style={btn} onClick={() => doCopy(brief.csv, setCsv, "plan-allocation.csv")}>{label(csv, "Copy allocation (CSV)")}</button>
-        </span>
+        <button type="button" onClick={() => setOpen((o) => !o)} aria-expanded={open} className="flex items-center" style={{ gap: 4, background: "none", border: "none", cursor: "pointer", color: "var(--s2j-blue)", fontSize: 12, fontWeight: 600, flexShrink: 0 }}>
+          {open ? <>Hide <IconChevronUp size={13} /></> : <>Show <IconChevronDown size={13} /></>}
+        </button>
       </div>
-      <div style={{ fontSize: 10.5, color: "var(--s2j-text-light)", marginTop: 6, lineHeight: 1.5 }}>
-        Grounded in this plan’s numbers — nothing is sent anywhere.
-      </div>
+
+      {open ? (
+        <>
+          <div className="flex" style={{ gap: 20, flexWrap: "wrap", marginTop: 12 }}>
+            <div style={{ flex: "1 1 260px", minWidth: 240, display: "flex", flexDirection: "column", gap: 12 }}>
+              <div>
+                <div style={secLabel}>Capacity verdict</div>
+                <div className="flex items-start" style={{ gap: 6 }}>
+                  <span style={{ marginTop: 2 }}><SignalIcon kind={verdictKind} size={13} /></span>
+                  <span style={{ fontSize: 12, color: "var(--s2j-text)", lineHeight: 1.5 }}>{verdict}</span>
+                </div>
+              </div>
+              {chainText ? (
+                <div>
+                  <div style={secLabel}>Critical path · {cp.len} deep</div>
+                  <div style={{ fontSize: 12, color: "var(--s2j-text)", lineHeight: 1.5, wordBreak: "break-word" }}>{chainText}</div>
+                </div>
+              ) : null}
+            </div>
+            <div style={{ flex: "1 1 260px", minWidth: 240, display: "flex", flexDirection: "column", gap: 12 }}>
+              {leverage.length ? (
+                <div>
+                  <div style={secLabel}>Highest leverage</div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                    {leverage.map((x) => (
+                      <div key={x.id} className="flex items-center" style={{ gap: 6, fontSize: 12, color: "var(--s2j-text)" }}>
+                        <Dot color="var(--s2j-blue)" /> <span style={{ wordBreak: "break-word" }}>{x.name}</span>
+                        <span style={{ color: "var(--s2j-text-muted)", flexShrink: 0 }}>↑ unblocks {x.n}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+              <div>
+                <div style={secLabel}>What doesn&rsquo;t fit</div>
+                {overflow.length || oversized.length ? (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                    {overflow.map((o, i) => (
+                      <div key={`o${i}`} style={{ fontSize: 12, color: "var(--s2j-text)", lineHeight: 1.5 }}>
+                        <span style={{ fontWeight: 500 }}>{o.name || (typeof nameOf === "function" ? nameOf(o.id) : o.id)}</span>
+                        <span style={{ color: "var(--s2j-text-muted)" }}>{" - "}{overflowReasonText(o, nameOf)}</span>
+                      </div>
+                    ))}
+                    {oversized.map((o, i) => (
+                      <div key={`z${i}`} style={{ fontSize: 12, color: "var(--s2j-text)", lineHeight: 1.5 }}>
+                        <span style={{ fontWeight: 500 }}>{o.name || (typeof nameOf === "function" ? nameOf(o.id) : o.id)}</span>
+                        <span style={{ color: "var(--s2j-text-muted)" }}>{" - "}{oversizedReasonText(o)}</span>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div style={{ fontSize: 12, color: "var(--s2j-text-muted)" }}>Everything planned fits - nothing cut or oversized.</div>
+                )}
+              </div>
+            </div>
+          </div>
+
+          <div className="flex items-center" style={{ justifyContent: "space-between", gap: 8, flexWrap: "wrap", marginTop: 14, paddingTop: 12, borderTop: "1px solid var(--s2j-border)" }}>
+            <span className="flex" style={{ gap: 6, flexWrap: "wrap" }}>
+              <button type="button" style={btn} onClick={() => doCopy(brief && brief.markdown, setMd, "plan-brief.md")}>{label(md, "Copy (Markdown)")}</button>
+              <button type="button" style={btn} onClick={() => doCopy(brief && brief.plainText, setTxt, "plan-brief.txt")}>{label(txt, "Copy (plain)")}</button>
+              <button type="button" style={btn} onClick={() => doCopy(brief && brief.csv, setCsv, "plan-allocation.csv")}>{label(csv, "Copy allocation (CSV)")}</button>
+            </span>
+            <span style={{ fontSize: 10, color: "var(--s2j-text-light)" }}>Grounded in this plan's numbers - nothing is sent anywhere.</span>
+          </div>
+        </>
+      ) : null}
     </div>
   );
 }
@@ -1074,7 +1347,7 @@ function bottleneckTeaser(bm) {
 // features don't fit), and routes to the detail. ALWAYS rendered: warning-tinted when any warning signal
 // exists, a green affirmation when clean (absence must never read as "all clear"). When there is no step 5 to
 // route to (a clean Kanban plan), it renders the affirmation as a non-interactive div.
-function PlanHealthStrip({ signals, hasWarning, featureCount, routes, onOpen }) {
+function PlanHealthStrip({ signals, hasWarning, featureCount, routes, onOpen, sprintCount, kanban }) {
   const clean = signals.length === 0;
   const kind = hasWarning ? "warning" : clean ? "success" : "info";
   const outer = {
@@ -1088,7 +1361,9 @@ function PlanHealthStrip({ signals, hasWarning, featureCount, routes, onOpen }) 
       <span className="flex items-center" style={{ gap: 8, flexWrap: "wrap" }}>
         <SignalIcon kind={kind} size={15} />
         {clean ? (
-          <span style={{ fontSize: 13, fontWeight: 600, color: "var(--s2j-text)" }}>No blockers — {featureCount} features planned</span>
+          <span style={{ fontSize: 13, fontWeight: 600, color: "var(--s2j-text)" }}>
+            No blockers — {featureCount} features planned{kanban ? " in the backlog" : sprintCount ? ` across ${sprintCount} sprint${sprintCount === 1 ? "" : "s"}` : ""}
+          </span>
         ) : (
           <>
             <span style={{ fontSize: 12.5, fontWeight: 700, color: "var(--s2j-text)" }}>Plan health:</span>
@@ -1178,6 +1453,34 @@ export default function PlanScreen({
   // sprintRiskProfiles / specConcernSummary keys) renders cleanly as "no risk surfaced", never crashes.
   const riskByUid = useMemo(() => new Map(Object.entries((plan && plan.riskByFeature) || {})), [plan]);
   const sprintRiskProfiles = (plan && Array.isArray(plan.sprintRiskProfiles)) ? plan.sprintRiskProfiles : [];
+
+  // ── T0 scheduling signals + T2 Claude rationale for the FeatureChip "why here" (the data-surfacing heart).
+  // signalsByUid: an old plan without plan.signals → {} (chips stay calm). rationaleByUid: {} on a
+  // deterministic-fallback plan (the honesty firewall's structural absence — the reasoning block is then
+  // absent, never fabricated). criticalPathUids: the backend's ordered chain when PRESENT (an array, even an
+  // empty one) → membership is AUTHORITATIVE; an empty [] means NOBODY is on a critical path (a dependency-free
+  // plan), NOT a trigger for the slack fallback. Only when the field is GENUINELY ABSENT (a legacy plan that
+  // predates it) do we derive "on the critical path" from slack === 0 — the contract's defensive fallback. ──
+  const signalsByUid = (plan && plan.signals) || {};
+  const rationaleByUid = (r && r.rationaleByUid) || {};
+  // "Field present (even if empty)" vs "field genuinely absent" — the whole point of FIX 1. A present-but-empty
+  // criticalPathUids is authoritative "no critical path"; falling back to slack===0 there would mark EVERY
+  // feature on a dependency-free plan (all have slack 0), contradicting the Plan summary panel (which shows none).
+  const hasCriticalField = !!(plan && Array.isArray(plan.criticalPathUids));
+  const criticalSet = useMemo(() => new Set((plan && Array.isArray(plan.criticalPathUids)) ? plan.criticalPathUids : []), [plan]);
+  // A named critical chain actually EXISTS (>= 2 features). Used so a zero-slack feature that sits on a CO-EQUAL
+  // longest chain (not the single one criticalPathUids named) still reads as schedule-critical ("no slack")
+  // instead of showing neither marker. When no chain exists (all independent, all slack 0), nobody is critical.
+  const criticalChainExists = hasCriticalField && criticalSet.size > 0;
+  // Legacy plans (generated before criticalPathUids existed) have NO chain field → derive membership from
+  // slack===0, but ONLY when a real chain exists (some criticalPathLen >= 2) — else a dependency-free legacy
+  // plan (every feature slack 0) would mark EVERYONE, the exact contradiction FIX 1 fixed for new plans.
+  const legacyChainExists = !hasCriticalField && Object.values(signalsByUid || {}).some((s) => (Number(s && s.criticalPathLen) || 0) >= 2);
+  const onCritical = (id) => {
+    if (hasCriticalField) return criticalSet.has(id);            // field present (even empty []) → authoritative
+    const sg = signalsByUid[id];                                 // field genuinely absent (legacy plan) → derive from slack===0, gated on a chain existing
+    return !!(sg && Number(sg.slack) === 0 && legacyChainExists);
+  };
   const specConcernSummary = (plan && plan.specConcernSummary) || null;
   // The register: shared derivation (buildRiskRegister) so the screen + the Plan Brief list the SAME
   // features in the SAME order (BRIEF-DRIFT). nameOfUid resolves the display name from the slim features.
@@ -1271,11 +1574,25 @@ export default function PlanScreen({
     ? (plan.skillDiagnostics.unclassified || []).length + (plan.skillDiagnostics.unknownTaskTypes || []).length
     : 0;
 
+  // usedLlm at the RANKING level: true ONLY when Claude actually ranked this plan (false on a deterministic
+  // fallback). The reconciliation note (FIX 2) + its health teaser + its kanbanHealthCount contribution (FIX 3)
+  // all gate on this — a fallback plan never ran Claude, so "omitted N it forgot to rank" would be a false claim.
+  const used = !!(plan && plan.ranking && plan.ranking.usedLlm);
+  // Reconciliation magnitude — usedLlm-gated. A Claude ranking can reference features that don't exist (dropped)
+  // or forget to rank some (appended deterministically). On a fallback plan omittedCount == the whole feature
+  // count, so these are ONLY meaningful when Claude actually ran; !used ⇒ 0.
+  const planRanking = (plan && plan.ranking) || {};
+  const reconUnknown = used && Array.isArray(planRanking.unknownIds) ? planRanking.unknownIds.length : 0;
+  const reconOmitted = used ? (Number(planRanking.omittedCount) || 0) : 0;
+  const reconCount = reconUnknown + reconOmitted;
+
   // ── Step 5 "Plan health": the analysis, split off the plan artifact (Linear-Insights pattern) ──
   // It EXISTS when there's analysis worth a step. Scrum always has assumptions → always; a Kanban plan only
-  // if it carries risks / warnings / concerns / data-quality (else the step would be empty — it must earn it).
+  // if it carries risks / warnings / concerns / data-quality / a usedLlm reconciliation (else the step would be
+  // empty — it must earn it). FIX 3: fold reconCount in so a clean-but-reconciled Kanban plan EARNS step 5 —
+  // otherwise the reconciliation note is unreachable AND the health strip reads falsely clean (a §11 silent miss).
   const kanbanHealthCount = (warnings ? warnings.length : 0) + riskRegister.length
-    + ((specConcernSummary && specConcernSummary.total) || 0) + diagCount;
+    + ((specConcernSummary && specConcernSummary.total) || 0) + diagCount + reconCount;
   const hasStep5 = hasPlan && (!isKanban || kanbanHealthCount > 0);
   const stepLabels = hasStep5 ? [...STEP_LABELS, "Plan health"] : STEP_LABELS;
 
@@ -1286,15 +1603,23 @@ export default function PlanScreen({
   if (plan) {
     if (!isKanban) {
       if (plan.overflow && plan.overflow.length) healthSignals.push({ label: `Doesn’t fit (${plan.overflow.length})`, kind: "warning" });
+      // Oversized (force-placed but larger than one sprint) is a DISJOINT channel from overflow. Surface it here too;
+      // else an oversized-only plan (backlog <= capacity, no overflow) reads a false-green "No blockers" (POLICY 11).
+      if (plan.oversized && plan.oversized.length) healthSignals.push({ label: `Larger than one sprint (${plan.oversized.length})`, kind: "warning" });
       if (deficit) healthSignals.push({ label: "Capacity shortfall", kind: "warning" });
       if (bnTeaser) healthSignals.push({ label: bnTeaser, kind: "warning" });
     } else {
       const beyond = Number(metrics.beyondReachPoints) || 0;
-      if (beyond > 0.05) healthSignals.push({ label: `${fmt1(beyond)} pts beyond this quarter’s reach`, kind: "warning" });
+      // FIX 7: "N pts beyond this quarter's reach" is the SAME fact the reach verdict + the "Later" band state as
+      // INFO (a negotiable scope forecast, not a blocker) — style it info to match, not orange warning.
+      if (beyond > 0.05) healthSignals.push({ label: `${fmt1(beyond)} pts beyond this quarter’s reach`, kind: "info" });
     }
     if (riskRegister.length) healthSignals.push({ label: `Risks (${riskRegister.length})`, kind: "warning" });
     if (specConcernSummary && specConcernSummary.total) healthSignals.push({ label: `Concerns (${specConcernSummary.total})`, kind: specConcernSummary.complianceCount ? "warning" : "info" });
     if (diagCount) healthSignals.push({ label: `Data quality (${diagCount})`, kind: "info" });
+    // FIX 3: a usedLlm reconciliation is never silent — an INFO teaser keeps the strip from reading falsely
+    // clean (its green "No blockers" affirmation) when Claude dropped/omitted features. Routes to the step-5 note.
+    if (reconCount) healthSignals.push({ label: `Ranking reconciled (${reconCount})`, kind: "info" });
   }
   const healthHasWarning = healthSignals.some((s) => s.kind === "warning");
   // Defensive: never sit on a step-5 that no longer exists (e.g. a plan mutated to a clean Kanban). Unreachable
@@ -1338,7 +1663,13 @@ export default function PlanScreen({
       </div>
     );
   } else if (step === 2) {
-    // STEP 2 — Team capacity (the form, methodology hidden, with the live preview)
+    // STEP 2 — Team capacity (2A/2K): the form (LEFT) + a sticky LIVE read-out sidebar (RIGHT) so the user
+    // SEES the capacity their numbers produce as they type — the highest-leverage knobs read as consequential.
+    const readout = preview && preview.ok && preview.methodology === "kanban" && Number.isFinite(Number(preview.expectedPointsQuarter))
+      ? <KanbanCapacityPreview preview={preview} form={form} />
+      : preview && preview.ok && preview.methodology !== "kanban" && Array.isArray(preview.perSprintCapacityPoints) && preview.perSprintCapacityPoints.length
+        ? <CapacityPreview preview={preview} form={form} />
+        : null;
     stepBody = (
       <div style={stepSurface}>
         <h3 style={stepTitleStyle}>Tell us about your team</h3>
@@ -1348,21 +1679,27 @@ export default function PlanScreen({
             : "Each person's available days per sprint set the capacity for each sprint."}
           {" "}Click the <SignalIcon kind="info" size={12} style={{ verticalAlign: "-0.1em" }} /> icons for what a field means.
         </p>
-        <CapacityForm form={form} onChange={onFormChange} disabled={busy} hideMethodology />
-
-        {preview && preview.ok && preview.methodology === "kanban" && Number.isFinite(Number(preview.expectedPointsQuarter)) ? (
-          <KanbanCapacityPreview preview={preview} form={form} />
-        ) : preview && preview.ok && preview.methodology !== "kanban" && Array.isArray(preview.perSprintCapacityPoints) && preview.perSprintCapacityPoints.length ? (
-          <CapacityPreview preview={preview} form={form} />
-        ) : null}
-
-        {hasCapErrors ? (
-          <SignalCallout kind="error" title="Fix the capacity inputs to plan" style={{ marginTop: 12 }}>
-            <ul style={{ margin: "4px 0 0", paddingLeft: 18 }}>
-              {capacityErrors.map((e, i) => <li key={i} style={{ marginBottom: 2 }}>{e.message}</li>)}
-            </ul>
-          </SignalCallout>
-        ) : null}
+        <div className="flex" style={{ gap: 18, alignItems: "flex-start", flexWrap: "wrap" }}>
+          <div style={{ flex: "1 1 440px", minWidth: 300 }}>
+            <CapacityForm form={form} onChange={onFormChange} disabled={busy} hideMethodology />
+            {hasCapErrors ? (
+              <SignalCallout kind="error" title="Fix the capacity inputs to plan" style={{ marginTop: 12 }}>
+                <ul style={{ margin: "4px 0 0", paddingLeft: 18 }}>
+                  {capacityErrors.map((e, i) => <li key={i} style={{ marginBottom: 2 }}>{e.message}</li>)}
+                </ul>
+              </SignalCallout>
+            ) : null}
+          </div>
+          {/* sticky sidebar — page-scroll-safe (a position:sticky element in the document flow, NOT an internal
+              scroll trap); it stacks BELOW the form on a narrow viewport (flex-wrap). */}
+          <div style={{ flex: "1 1 300px", minWidth: 260, position: "sticky", top: 12, alignSelf: "flex-start" }}>
+            {readout || (
+              <div style={{ ...glassSurface("minor"), padding: 16, fontSize: 12, color: "var(--s2j-text-muted)", lineHeight: 1.5 }}>
+                Add at least one team member with available days to see the computed capacity - live, no AI, no spend.
+              </div>
+            )}
+          </div>
+        </div>
 
         <div className="flex items-center" style={{ justifyContent: "space-between", marginTop: 22 }}>
           <BackButton onClick={() => goStep(1)} label="Back" className="" title="Back to planning mode" />
@@ -1474,6 +1811,30 @@ export default function PlanScreen({
           </SignalCallout>
         ) : null}
 
+        {/* Reconciliation note (§11 silent-miss made visible): Claude can reference a feature that doesn't exist
+            (dropped) or forget to rank some (appended deterministically). Absent when the reconciliation is clean. */}
+        {(() => {
+          // FIX 2: only a REAL Claude ranking can be "reconciled". On a deterministic-fallback plan (usedLlm
+          // false) omittedCount == the whole feature count, so the note would falsely say "Claude omitted N it
+          // forgot to rank" though Claude never ran — contradicting the llmNote banner + the Risk register.
+          if (!used) return null;
+          const rk = (plan && plan.ranking) || {};
+          const unknown = Array.isArray(rk.unknownIds) ? rk.unknownIds.length : 0;
+          const omitted = Number(rk.omittedCount) || 0;
+          if (!unknown && !omitted) return null;
+          const parts = [];
+          if (unknown) parts.push(`referenced ${unknown} feature${unknown === 1 ? "" : "s"} that ${unknown === 1 ? "doesn't" : "don't"} exist (dropped)`);
+          if (omitted) parts.push(`omitted ${omitted} it forgot to rank (appended deterministically at the end)`);
+          return (
+            <SignalCallout kind="info" title="Claude's ranking was reconciled" style={{ marginBottom: 12 }} iconTitle="A silent miss made visible">
+              <div style={{ fontSize: 12, color: "var(--s2j-text)", lineHeight: 1.5 }}>
+                Claude {parts.join(" and ")}. A silent miss made visible - absent when the reconciliation is clean.
+              </div>
+              <div style={{ fontSize: 10, color: "var(--s2j-text-light)", marginTop: 4 }}>T0 · ranking.unknownIds / omittedCount</div>
+            </SignalCallout>
+          );
+        })()}
+
         {!isKanban ? (
           <>
             {deficit ? (
@@ -1491,6 +1852,22 @@ export default function PlanScreen({
                   <div key={i} style={{ fontSize: 12, color: "var(--s2j-text)", padding: "2px 0" }}>
                     <span style={{ fontWeight: 500 }}>{o.name || nameOfUid(o.id)}</span>
                     <span style={{ color: "var(--s2j-text-muted)" }}>{" — "}{overflowReasonText(o, nameOfUid)}</span>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+            {/* Oversized — the CONCRETE by-how-much (points vs single-sprint cap), not just "larger than one
+                sprint". Concrete beats vague; names the skill to add when the feature needs one bucket. */}
+            {plan.oversized && plan.oversized.length ? (
+              <div style={{ border: "1px solid var(--s2j-orange-border)", borderRadius: 10, background: "var(--s2j-orange-bg)", padding: 12, marginBottom: 12 }}>
+                <div className="flex items-center gap-2" style={{ marginBottom: 8 }}>
+                  <SignalIcon kind="warning" size={15} />
+                  <strong style={{ fontSize: 13, color: "var(--s2j-text)" }}>Larger than one sprint ({plan.oversized.length})</strong>
+                </div>
+                {plan.oversized.map((o, i) => (
+                  <div key={i} style={{ fontSize: 12, color: "var(--s2j-text)", padding: "2px 0" }}>
+                    <span style={{ fontWeight: 500 }}>{o.name || nameOfUid(o.id)}</span>
+                    <span style={{ color: "var(--s2j-text-muted)" }}>{" - "}{oversizedReasonText(o)}</span>
                   </div>
                 ))}
               </div>
@@ -1573,10 +1950,10 @@ export default function PlanScreen({
             <SignalCallout kind="info" title="Likely reach this quarter" style={{ marginBottom: 12 }}>{kanbanReachVerdict(metrics)}</SignalCallout>
 
             {/* THE PLAN */}
-            <BacklogBand plan={plan} byUid={byUid} riskByUid={riskByUid} />
+            <BacklogBand plan={plan} byUid={byUid} riskByUid={riskByUid} signalsByUid={signalsByUid} rationaleByUid={rationaleByUid} onCritical={onCritical} usedLlm={r.usedLlm} criticalChainExists={criticalChainExists} />
 
             {/* §11 health teaser → step 5 (or a clean affirmation when this Kanban plan carries no analysis) */}
-            <PlanHealthStrip signals={healthSignals} hasWarning={healthHasWarning} featureCount={featureCount} routes={hasStep5} onOpen={() => goStep(5)} />
+            <PlanHealthStrip signals={healthSignals} hasWarning={healthHasWarning} featureCount={featureCount} routes={hasStep5} onOpen={() => goStep(5)} kanban />
 
             {r.cost && r.cost.total_usd != null ? (
               <p className="text-xs" style={{ marginTop: 12, color: "var(--s2j-text-light)" }}>
@@ -1597,7 +1974,7 @@ export default function PlanScreen({
             {/* THE PLAN — sprint columns (the first thing the user came for) */}
             <div className="flex" style={{ gap: 12, flexWrap: "wrap", marginBottom: 16 }}>
               {plan.sprints.map((s, i) => (
-                <SprintColumn key={i} sprint={s} number={i + 1} byUid={byUid} oversizedSet={oversizedSet} riskByUid={riskByUid} profile={sprintRiskProfiles[i]} startDate={form && form.sprintStartDate} sprintLengthDays={form && form.sprintLengthDays} />
+                <SprintColumn key={i} sprint={s} number={i + 1} byUid={byUid} oversizedSet={oversizedSet} riskByUid={riskByUid} profile={sprintRiskProfiles[i]} startDate={form && form.sprintStartDate} sprintLengthDays={form && form.sprintLengthDays} signalsByUid={signalsByUid} rationaleByUid={rationaleByUid} onCritical={onCritical} usedLlm={r.usedLlm} criticalChainExists={criticalChainExists} />
               ))}
             </div>
 
@@ -1620,10 +1997,11 @@ export default function PlanScreen({
             )}
 
             {/* §11 health teaser — the counts + magnitude stay ON the plan; the per-feature WHY lives on step 5 */}
-            <PlanHealthStrip signals={healthSignals} hasWarning={healthHasWarning} featureCount={featureCount} routes={hasStep5} onOpen={() => goStep(5)} />
+            <PlanHealthStrip signals={healthSignals} hasWarning={healthHasWarning} featureCount={featureCount} routes={hasStep5} onOpen={() => goStep(5)} sprintCount={plan.sprints.length} />
 
-            {/* Plan brief — export a stakeholder-ready summary; sits at the FOOT of the plan itself (partner) */}
-            <PlanBriefExport brief={brief} />
+            {/* Plan summary — the plan's story ON screen (verdict / critical path / leverage / what-we-cut),
+                reusing the SAME derivations as the copy-out; keeps the three Copy buttons. Foot of the plan. */}
+            <PlanSummaryPanel plan={plan} sprintCount={plan.sprints.length} nameOf={nameOfUid} brief={brief} />
 
             {r.cost && r.cost.total_usd != null ? (
               <p className="text-xs" style={{ marginTop: 12, color: "var(--s2j-text-light)" }}>
@@ -1652,16 +2030,16 @@ export default function PlanScreen({
 
   return (
     <div className="p-6" style={step === 4 ? WRAP : WIZARD_WRAP}>
-      <BackButton onClick={onBack} label="Back to review" title="Return to the breakdown review" className="mb-2" />
-      <h2 style={{ fontSize: 22, fontWeight: 700, color: MOOD.navy, letterSpacing: "-0.01em", margin: "0 0 4px", display: "inline-flex", alignItems: "center", gap: 10 }}>
-        <span style={{ color: "var(--s2j-blue)" }}>{headerIsKanban ? <IconList size={20} /> : <IconCalendar size={20} />}</span>
-        {headerIsKanban ? "Backlog plan" : "Sprint plan"}
-      </h2>
-      <p style={{ fontSize: 13, color: "var(--s2j-text-muted)", margin: "0 0 18px", lineHeight: 1.55 }}>
-        {headerIsKanban
+      <ScreenHeader
+        onBack={onBack}
+        backLabel="Back to review"
+        backTitle="Return to the breakdown review"
+        icon={headerIsKanban ? <IconList size={20} /> : <IconCalendar size={20} />}
+        title={headerIsKanban ? "Backlog plan" : "Sprint plan"}
+        subtitle={headerIsKanban
           ? "Order this breakdown into a pull-ready backlog, cut into Now / Next / Later by likely reach."
-          : "Allocate this breakdown across sprints from your team’s capacity."}
-      </p>
+          : "Allocate this breakdown across sprints from your team's capacity."}
+      />
 
       <Stepper labels={stepLabels} step={step} maxStep={maxStep} onJump={goStep} busy={busy} ariaLabel="Planner steps" />
 

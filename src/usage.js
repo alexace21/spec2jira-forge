@@ -119,8 +119,14 @@ export const TIERS = Object.freeze({
     price: '$6.70/user/mo', // matches the live Marketplace portal (USD; ≤10 users = $57/mo flat)
     edition: 'standard',
     keySource: 'byok',
-    hasTestCases: false, // test-cases are an Advanced feature
-    hasPlanner: false, // v6.1: the Capacity-Sheet Planner is an Advanced feature too
+    // ⭐ 2026-07-11 STANDARD-ONLY PIVOT: Standard now includes EVERYTHING. Editions collapsed to a
+    // single offer (Advanced retired) per the first-customer marketing analysis. Flipping these two
+    // flags true is the load-bearing change — every FE upsell (!hasTestCases/!hasPlanner) and every
+    // backend edition gate (buildUpgradeRequired) becomes "entitled" for all licensed/trial users.
+    // BOTH remain $0 compute to us under BYOK (the customer's key pays); the $5 managed trial credit
+    // (src/trialCredit.js) is the ONLY case where WE pay, and it is bounded per-install.
+    hasTestCases: true,
+    hasPlanner: true,
   }),
   // v6 NEW: Advanced = BYOK + test-case generation (the value-split headline). BYOK →
   // unlimited (the customer pays compute), so NO cap and $0 compute cost to us.
@@ -217,7 +223,7 @@ export function formatResetDate(iso) {
  * passed context.license, then null (⇒ unlicensed). It also reflects the dev
  * `forge install --license Standard|Advanced` override, which is how we test.
  */
-function resolveLicense(context) {
+export function resolveLicense(context) {
   try {
     const appCtx = getAppContext();
     if (appCtx && appCtx.license) return appCtx.license;
@@ -225,6 +231,28 @@ function resolveLicense(context) {
     // Not in an invocation context (e.g. a unit test) — fall back below.
   }
   return (context && context.license) || null;
+}
+
+/**
+ * Is this license in the 30-day Atlassian evaluation trial? (2026-07-11 — gates the $5 managed
+ * trial credit; only a TRIAL user is offered our key, a paid subscriber is always BYOK.)
+ *
+ * `isEvaluation` is the primary signal (typed `isEvaluation?:boolean` in @forge/api runtime.d.ts).
+ * `trialEndDate` is a belt-and-suspenders guard: if `isEvaluation` were stale (true past the trial
+ * end on some code path), a `trialEndDate` in the PAST closes the door — we never grant free managed
+ * credit after the trial actually ended. Ambiguity (no signals) → false (default to NO free credit,
+ * the SAFE money polarity). A trial that reads active but has no end date is honoured.
+ *
+ * @param {object|null} license - a Forge License object (see resolveLicense).
+ */
+export function isTrialLicense(license) {
+  if (!license || license.isEvaluation !== true) return false;
+  const end = license.trialEndDate;
+  if (end) {
+    const t = Date.parse(end);
+    if (Number.isFinite(t) && t < Date.now()) return false; // stale isEvaluation past trialEndDate
+  }
+  return true;
 }
 
 /**
@@ -340,10 +368,14 @@ export async function checkQuota(context) {
   return {
     tier: tier.key,
     tierLabel: tier.label,
+    // The ACTIVE tier's OWN subscription price — the Account panel shows THIS (the user's real plan
+    // price), independent of pricingTable (which now lists only Standard for the upgrade CTA). Without
+    // it, a grandfathered Advanced subscriber's tier isn't in pricingTable → their price rendered blank.
+    price: tier.price,
     edition: tier.edition, // 'standard'|'advanced'|'managed'(dormant)|null — LABEL only, for messaging
     keySource: tier.keySource, // v6 decouple: 'byok'|'managed' — explicit, never inferred from edition
-    hasTestCases: tier.hasTestCases, // v6: feature capability (Advanced ⇒ true) — the FE gates test-cases on this
-    hasPlanner: tier.hasPlanner, // v6.1: Capacity-Sheet Planner is Advanced-only too — the FE gates the planner on this
+    hasTestCases: tier.hasTestCases, // 2026-07-11 Standard-only: INCLUDED in Standard (always true for a live tier) — kept in the payload so the FE reads "entitled" (removing it would re-paywall via default-FALSE logic)
+    hasPlanner: tier.hasPlanner, // 2026-07-11 Standard-only: the Capacity-Sheet Planner is INCLUDED in Standard too (always true for a live tier) — kept for the same FE back-compat reason
     limit: tier.limit, // null = unlimited
     unlimited,
     used,
@@ -445,9 +477,11 @@ export async function getInstallMeta() {
  * per POLICY).
  */
 export function pricingTable() {
-  // v6: the two LIVE Marketplace editions are Standard (byokPro) + Advanced (byokAdvanced),
-  // both BYOK. managedPro is dormant (off-Marketplace fallback) and intentionally NOT listed.
-  return [TIERS.byokPro, TIERS.byokAdvanced].map((t) => ({
+  // ⭐ 2026-07-11 STANDARD-ONLY: a SINGLE offer — Standard includes everything. Advanced is retired
+  // (byokAdvanced is kept in TIERS as a full-featured internal alias so a pending/existing Advanced
+  // subscriber never loses access — see resolveTier — but it is NOT advertised). managedPro stays
+  // dormant. The FE upgrade CTA now shows one edition.
+  return [TIERS.byokPro].map((t) => ({
     key: t.key,
     label: t.label,
     limit: t.limit, // null = unlimited

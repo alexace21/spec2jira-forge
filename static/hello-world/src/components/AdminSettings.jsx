@@ -93,7 +93,10 @@ function accountPriceFor(account, key) {
   return (account?.pricing || []).find((t) => t.key === key)?.price || null;
 }
 function accountPrice(account) {
-  return account?.tier ? accountPriceFor(account, account.tier) : null;
+  // Prefer the ACTIVE tier's own price (getUsage now sends account.price) so a grandfathered Advanced
+  // subscriber — whose tier is no longer in the Standard-only pricingTable — still shows their real price.
+  // Fall back to the pricing[] lookup for older payloads.
+  return account?.price || (account?.tier ? accountPriceFor(account, account.tier) : null);
 }
 
 // Props (diagnostics Phase 5, design §5):
@@ -591,9 +594,9 @@ export default function AdminSettings({ initialTab = "settings", diagRefFilter =
     );
   }
 
-  // v6 value-split: BOTH editions are BYOK -> the API-key field shows for EVERY edition
-  // (impl-spec §0 #1). Feature access gates on capability flags, never the edition label.
-  const hasTestCases = account?.hasTestCases === true;
+  // Standard now includes everything (breakdown, push, Project Context, test-cases, the capacity
+  // planner). The capability flags the backend sends are always true; hasPlanner still drives the
+  // conditional "Capacity planner" chip in the plan card below.
   const hasPlanner = account?.hasPlanner === true;
 
   // ── The two orthogonal signals (impl-spec §1). computeConfigVerdict/computeTiles own
@@ -620,7 +623,6 @@ export default function AdminSettings({ initialTab = "settings", diagRefFilter =
   const keyStepDone = apiKeyConfigured && !keyStorageFault;
   const projectStepDone = !!savedProjectClean; // [A2] step 2 done keys on the SAVED project
   const projectValid = /^[A-Z][A-Z0-9]{1,9}$/.test(projectKeyClean);
-  const advancedPrice = accountPriceFor(account, "byokAdvanced");
   // [A1] "done" is a function of BOTH signals — a blocked instance never reads "You're done".
   const ready = computeReady({ licenseGate, verdict });
 
@@ -766,9 +768,7 @@ export default function AdminSettings({ initialTab = "settings", diagRefFilter =
           <PlanModelCard
             account={account}
             model={model}
-            hasTestCases={hasTestCases}
             hasPlanner={hasPlanner}
-            advancedPrice={advancedPrice}
           />
         )}
 
@@ -2840,7 +2840,7 @@ function PathArrow() {
 }
 
 // Plan / model card (§4.4). Price comes from pricing[] (single source), model from Test/verify.
-function PlanModelCard({ account, model, hasTestCases, hasPlanner, advancedPrice }) {
+function PlanModelCard({ account, model, hasPlanner }) {
   const price = accountPrice(account);
   const breakdowns = account?.unlimited
     ? "Unlimited"
@@ -2854,20 +2854,12 @@ function PlanModelCard({ account, model, hasTestCases, hasPlanner, advancedPrice
         <PlanCol label="MEMBER SINCE" value={account?.memberSinceLabel || "—"} />
       </div>
       <p style={{ ...TYPE.micro, marginTop: 10 }}>
-        {hasTestCases
-          ? "Everything in Standard, plus AI test-case generation and the capacity planner."
-          : `Your Standard plan includes unlimited breakdowns on your own Anthropic key.${
-              advancedPrice
-                ? ` Upgrade to Advanced (${advancedPrice}) for test-case generation.`
-                : " Upgrade to Advanced for test-case generation."
-            }`}
+        Your Standard plan includes everything: unlimited breakdowns on your own Anthropic key, AI test-case generation, and the capacity planner.
       </p>
-      {hasTestCases && (
-        <div className="flex gap-2 flex-wrap" style={{ marginTop: 8 }}>
-          <FeatureChip>Test-case generation</FeatureChip>
-          {hasPlanner && <FeatureChip>Capacity planner</FeatureChip>}
-        </div>
-      )}
+      <div className="flex gap-2 flex-wrap" style={{ marginTop: 8 }}>
+        <FeatureChip>Test-case generation</FeatureChip>
+        {hasPlanner && <FeatureChip>Capacity planner</FeatureChip>}
+      </div>
     </MoodCard>
   );
 }

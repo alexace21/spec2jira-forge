@@ -14,7 +14,8 @@
 
 import {
   fmt1, fmtUsd, sprintDates, riskReasons, buildRiskRegister,
-  overflowReasonText, capacityVerdict, csvCell, toCSV, skillLabel,
+  overflowReasonText, oversizedReasonText, capacityVerdict, csvCell, toCSV, skillLabel,
+  criticalPathInfo, highestLeverage,
 } from "./planView.js"; // explicit .js so node (offline test) AND webpack both resolve it
 
 // strip markdown markers for the plain-text variant (keep "- " bullets — readable as-is)
@@ -58,7 +59,7 @@ export function renderPlanBrief({ plan, assumptions, warnings, cost, slimFeature
   L.push(`_Review-only — not yet in Jira.${generatedAt ? ` As of ${generatedAt}.` : ""}${llmUsed ? "" : " Ordering fell back to dependencies + priority (Claude was unavailable)."}_`);
   if (stale) L.push(`\n> ⚠ This plan is out of date — the breakdown changed since it was generated. Re-rank before sharing.`);
   L.push("");
-  L.push(`> ${capacityVerdict(metrics, sprintCount)}`);
+  L.push(`> ${capacityVerdict(metrics, sprintCount, (plan.oversized || []).length)}`);
   if (OBJECTIVE_LABEL[objective]) L.push(`\n_Ordered for: **${OBJECTIVE_LABEL[objective]}**._`); // P12 (balanced → omitted)
   L.push("");
 
@@ -118,7 +119,7 @@ export function renderPlanBrief({ plan, assumptions, warnings, cost, slimFeature
   if (overflow.length || oversized.length) {
     L.push(`## What doesn’t fit${overflow.length ? ` (${overflow.length})` : ""}`);
     overflow.forEach((o) => L.push(`- **${o.name || nameOf(o.id)}** — ${overflowReasonText(o, nameOf)}`));
-    oversized.forEach((o) => L.push(`- **${o.name || nameOf(o.id)}** — larger than one sprint; split it`));
+    oversized.forEach((o) => L.push(`- **${o.name || nameOf(o.id)}** — ${oversizedReasonText(o)}`));
     L.push("");
   }
 
@@ -144,18 +145,12 @@ export function renderPlanBrief({ plan, assumptions, warnings, cost, slimFeature
 
   // ── 6. DEPENDENCY HIGHLIGHTS (critical path / leverage / cycles + diagnostics — never silent) ──
   const g = plan.graph || {};
-  const signals = plan.signals || {};
   const depLines = [];
-  const sigEntries = Object.entries(signals);
-  if (sigEntries.length) {
-    let cp = null;
-    for (const [id, s] of sigEntries) if (s && (cp === null || (s.criticalPathLen || 0) > (cp.len || 0))) cp = { id, len: s.criticalPathLen || 0 };
-    if (cp && cp.len > 1) depLines.push(`- **Critical path:** ${cp.len} features deep (ends at ${nameOf(cp.id)})`);
-    const leverage = sigEntries
-      .map(([id, s]) => ({ id, n: (s && s.downstreamUnblockCount) || 0 }))
-      .filter((x) => x.n > 0).sort((a, b) => b.n - a.n).slice(0, 3);
-    if (leverage.length) depLines.push(`- **Highest leverage:** ${leverage.map((x) => `${nameOf(x.id)} (unblocks ${x.n})`).join(", ")}`);
-  }
+  // SHARED derivations (planView) so the brief and the on-screen Plan summary can never disagree (BRIEF-DRIFT).
+  const cpInfo = criticalPathInfo(plan, nameOf);
+  if (cpInfo) depLines.push(`- **Critical path:** ${cpInfo.len} features deep (ends at ${cpInfo.endName})`);
+  const leverage = highestLeverage(plan, nameOf, 3);
+  if (leverage.length) depLines.push(`- **Highest leverage:** ${leverage.map((x) => `${x.name} (unblocks ${x.n})`).join(", ")}`);
   if (Array.isArray(g.cyclicNodes) && g.cyclicNodes.length) depLines.push(`- **Dependency cycle:** ${g.cyclicNodes.map(nameOf).join(", ")} — sequenced by breaking the softest edge; review the order.`);
   if (Array.isArray(g.danglingRefs) && g.danglingRefs.length) depLines.push(`- **Missing dependency:** ${g.danglingRefs.map((d) => `“${d.name}” → “${d.missingDep}”`).join("; ")} (treated as unblocked)`);
   if (Array.isArray(g.ambiguousDeps) && g.ambiguousDeps.length) depLines.push(`- **Ambiguous dependency:** ${g.ambiguousDeps.map((d) => `“${d.name}” → “${d.dep}”`).join("; ")} (left unbound)`);

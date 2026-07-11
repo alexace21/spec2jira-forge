@@ -6,7 +6,8 @@
  * Pure ES modules → node imports them directly:  node prototype/test_planbrief.mjs
  */
 import {
-  fmt1, capacityVerdict, overflowReasonText, buildRiskRegister, riskReasons, isRiskFlagged, csvCell, toCSV,
+  fmt1, capacityVerdict, overflowReasonText, oversizedReasonText, buildRiskRegister, riskReasons, isRiskFlagged, csvCell, toCSV,
+  criticalPathInfo,
 } from '../static/hello-world/src/lib/planView.js';
 import { renderPlanBrief } from '../static/hello-world/src/lib/planBrief.js';
 
@@ -21,6 +22,7 @@ console.log('planView — verdict / overflow reasons / risk register / hardened 
 {
   // capacityVerdict
   check('capacityVerdict: deficit case says "exceeds"', /exceeds .* by 8 pts/.test(capacityVerdict({ totalBacklogPoints: 34, totalCapacity: 26, deficitPoints: 8, overflowCount: 2 }, 2)));
+  check('capacityVerdict: deficit purely from an oversized item (overflow 0) never reads "0 features"', (() => { const v = capacityVerdict({ totalBacklogPoints: 40, totalCapacity: 39, deficitPoints: 1, overflowCount: 0 }, 3, 1); return !/0 feature/.test(v) && /larger than one sprint/.test(v); })());
   check('capacityVerdict: clean fit (no overflow) → "fits within" + spare', /fits within .* \(6 pts to spare\)/.test(capacityVerdict({ totalBacklogPoints: 20, totalCapacity: 26, deficitPoints: 0, overflowCount: 0 }, 2)));
   // ⭐ BRIEF-VERDICT honesty (live-acceptance 2026-06-20): total fits BUT a skill/sequencing overflow exists →
   // the headline must reconcile with "What doesn’t fit", NOT read as a bare "fits within … to spare".
@@ -38,6 +40,12 @@ console.log('planView — verdict / overflow reasons / risk register / hardened 
   check('overflowReasonText: default (no capacity)', overflowReasonText({ reason: 'capacity_exhausted' }) === 'no capacity left');
   check('overflowReasonText: bucket_exhausted names the short skill (Tier-2)', overflowReasonText({ reason: 'bucket_exhausted', starvedBuckets: ['BE'] }) === 'not enough backend capacity');
   check('overflowReasonText: GEN-only → classification message, not "generalist capacity"', overflowReasonText({ reason: 'bucket_exhausted', starvedBuckets: ['GEN'] }) === 'its skill couldn’t be determined — add task types');
+
+  // oversizedReasonText — the CONCRETE by-how-much (shared: panel + step-5 + brief read the SAME string)
+  check('oversizedReasonText: pooled — concrete total vs cap', oversizedReasonText({ points: 13, maxCapacity: 12 }) === 'needs 13 pts vs a 12-pt single-sprint cap. Split it.');
+  check('oversizedReasonText: skill-mode uses BUCKET demand vs BUCKET cap (not total vs pooled)', oversizedReasonText({ points: 10, maxCapacity: 10.5, buckets: ['BE'], bucketDetail: [{ bucket: 'BE', demand: 10, cap: 3.5 }] }) === 'needs 10 backend pts vs a 3.5-pt backend cap per sprint. Split it, or add backend capacity.');
+  check('oversizedReasonText: pooled guard — total <= cap without bucket detail → vague (no false "fits")', oversizedReasonText({ points: 10, maxCapacity: 10.5 }) === 'larger than one sprint - split it');
+  check('oversizedReasonText: missing numbers → vague fallback', oversizedReasonText({}) === 'larger than one sprint - split it');
 
   // buildRiskRegister — sorted by riskScore, sprint-tagged, name-resolved; legacy plan → []
   const plan = {
@@ -62,6 +70,29 @@ console.log('planView — verdict / overflow reasons / risk register / hardened 
   // riskReasons / isRiskFlagged
   check('riskReasons: high + external + low confidence → 3 reasons', riskReasons({ risk_level: 'high', has_external_dep: true, low_confidence: true }).length === 3);
   check('isRiskFlagged: none/no-signal → false', !isRiskFlagged({ risk_level: 'none' }) && !isRiskFlagged(null));
+
+  // criticalPathInfo — the "ends at" node must be the RENDERED chain end (plan.criticalPathUids last), never
+  // the position-first tie-break of the signals scan. On a TIED max depth those two disagree → invariant #4
+  // drift. Here uZ and uA both have criticalPathLen 3 (uZ is scanned FIRST → the old code picked it), but the
+  // backend's chain ends at uA (smallest-uid tie-break). endName must follow the chain, i.e. equal chainNames' last.
+  {
+    const tiePlan = {
+      signals: {
+        uZ: { criticalPathLen: 3, downstreamUnblockCount: 0, slack: 0 },
+        uA: { criticalPathLen: 3, downstreamUnblockCount: 0, slack: 0 },
+        uM: { criticalPathLen: 2, downstreamUnblockCount: 1, slack: 0 },
+      },
+      criticalPathUids: ['uM', 'uX', 'uA'],
+    };
+    const tieName = (id) => ({ uZ: 'Zeta', uA: 'Alpha', uM: 'Mid', uX: 'Ex' }[id] || id);
+    const cpi = criticalPathInfo(tiePlan, tieName);
+    check('criticalPathInfo: tied max-depth → endName === chainNames last (rendered chain end, not position-first)',
+      !!cpi && cpi.endName === cpi.chainNames[cpi.chainNames.length - 1] && cpi.endName === 'Alpha' && cpi.len === 3);
+    // No chain supplied (legacy plan) → falls back to the signals scan (position-first), chainNames null.
+    const legacyCp = criticalPathInfo({ signals: tiePlan.signals }, tieName);
+    check('criticalPathInfo: no criticalPathUids → falls back to signals scan (chainNames null)',
+      !!legacyCp && legacyCp.chainNames === null && legacyCp.endName === 'Zeta');
+  }
 }
 
 // ════════════════ renderPlanBrief — the Defensible Plan Brief ════════════════

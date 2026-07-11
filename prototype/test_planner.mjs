@@ -12,6 +12,7 @@ import {
   SKILL_BUCKETS, TASK_TYPE_TO_SKILL, requiredSkillsOf, apportionPoints, featureSkillSplit,
   DEFAULT_FOCUS_FACTOR, DEFAULT_HOURS_PER_DAY, DEFAULT_HOURS_PER_POINT, MAX_SPRINTS,
   computeThroughput, packBacklogReach, REACH_CONSERVATIVE_FACTOR, REACH_OPTIMISTIC_FACTOR,
+  buildRationaleMap, RATIONALE_MAX_CHARS, computeCriticalPathUids,
 } from '../src/planner.js';
 import { buildPlanRankingUserPrompt, objectiveClause, PLAN_OBJECTIVES } from '../src/prompts.js';
 
@@ -157,6 +158,87 @@ console.log('\ncomputeSchedulingSignals:');
   check('criticalPathLen A=1,B=2,C=3', s.get('uA').criticalPathLen === 1 && s.get('uB').criticalPathLen === 2 && s.get('uC').criticalPathLen === 3);
   check('downstreamUnblockCount A=2,B=1,C=0', s.get('uA').downstreamUnblockCount === 2 && s.get('uB').downstreamUnblockCount === 1 && s.get('uC').downstreamUnblockCount === 0);
   check('signals defined for every node', g.ids.every((id) => s.has(id)));
+}
+
+// ════════════════ 5.5 computeCriticalPathUids (plan data-contract: the single longest chain) ════════════════
+console.log('\ncomputeCriticalPathUids — single longest dependency chain, root→end:');
+{
+  // linear A→B→C → the whole chain, ordered root→end
+  const gLin = buildPlannerGraph([mkF('uC', 'C', 5, 'Medium', ['B']), mkF('uB', 'B', 5, 'Medium', ['A']), mkF('uA', 'A', 5)]);
+  const tLin = topoSortAndCycles(gLin, () => 0, () => 0);
+  const sLin = computeSchedulingSignals(gLin, tLin.order);
+  const cpLin = computeCriticalPathUids(gLin, tLin.order, sLin);
+  check('linear chain → [uA,uB,uC] (root→end)', JSON.stringify(cpLin) === JSON.stringify(['uA', 'uB', 'uC']));
+  check('chain length === max criticalPathLen (N deep)', cpLin.length === 3);
+
+  // branch/diamond: A→B→D and A→C→D; a longest chain is length 3, deterministic tie-break by uid picks uB over uC
+  const gDia = buildPlannerGraph([mkF('uA', 'A', 5), mkF('uB', 'B', 5, 'Medium', ['A']), mkF('uC', 'C', 5, 'Medium', ['A']), mkF('uD', 'D', 5, 'Medium', ['B', 'C'])]);
+  const tDia = topoSortAndCycles(gDia, () => 0, () => 0);
+  const sDia = computeSchedulingSignals(gDia, tDia.order);
+  const cpDia = computeCriticalPathUids(gDia, tDia.order, sDia);
+  check('diamond → a length-3 chain ending at uD', cpDia.length === 3 && cpDia[cpDia.length - 1] === 'uD' && cpDia[0] === 'uA');
+  check('diamond → deterministic tie-break picks uB (smallest uid) not uC', cpDia.includes('uB') && !cpDia.includes('uC'));
+  check('diamond → every hop is a real edge (each step blocks the next)', cpDia.every((id, i) => i === 0 || gDia.blockers.get(cpDia[i]).has(cpDia[i - 1])));
+
+  // no dependencies → no chain of length >= 2 → []
+  const gFlat = buildPlannerGraph([mkF('uX', 'X', 5), mkF('uY', 'Y', 5)]);
+  const tFlat = topoSortAndCycles(gFlat, () => 0, () => 0);
+  const sFlat = computeSchedulingSignals(gFlat, tFlat.order);
+  check('no dependencies → [] (no critical path to name)', computeCriticalPathUids(gFlat, tFlat.order, sFlat).length === 0);
+
+  // empty graph → []
+  check('empty graph → []', computeCriticalPathUids(buildPlannerGraph([]), [], new Map()).length === 0);
+
+  // cyclic input → no crash, excludes the cut edge (a blocker that sits AFTER in the acyclic order)
+  const gCyc = buildPlannerGraph([mkF('uA', 'A', 5, 'Medium', ['B']), mkF('uB', 'B', 5, 'Medium', ['A'])]);
+  const tCyc = topoSortAndCycles(gCyc, () => 0, () => 0);
+  const sCyc = computeSchedulingSignals(gCyc, tCyc.order);
+  const cpCyc = computeCriticalPathUids(gCyc, tCyc.order, sCyc);
+  check('cyclic → no crash, array returned', Array.isArray(cpCyc));
+  check('cyclic → no duplicate uid (cut edge not followed → no loop)', new Set(cpCyc).size === cpCyc.length);
+  check('cyclic → length bounded by node count', cpCyc.length <= gCyc.ids.length);
+  check('cyclic → the cut edge is excluded (order-position, not the raw back-edge)', cpCyc.every((id, i) => i === 0 || tCyc.order.indexOf(cpCyc[i - 1]) < tCyc.order.indexOf(id)));
+
+  // surfaced on the assembled plan (both methodologies)
+  const capCp = computeCapacity({ people: [{ name: 'A', availableDays: 10 }], sprintCount: 2, sprintLengthDays: 10, focusFactor: 0.7, hoursPerDay: 6, hoursPerPoint: 6 });
+  const featsCp = [mkF('uA', 'A', 3), mkF('uB', 'B', 3, 'Medium', ['A']), mkF('uC', 'C', 3, 'Medium', ['B'])];
+  const planCp = assemblePlan({ features: featsCp, capacity: capCp, ranking: null });
+  check('assemblePlan (scrum): criticalPathUids present = [uA,uB,uC]', JSON.stringify(planCp.criticalPathUids) === JSON.stringify(['uA', 'uB', 'uC']));
+  const thrCp = computeThroughput({ people: [{ name: 'A', availableDays: 40 }], focusFactor: 0.7, hoursPerDay: 6, hoursPerPoint: 6 });
+  const planCpK = assemblePlan({ features: featsCp, capacity: thrCp, ranking: null, methodology: 'kanban' });
+  check('assemblePlan (kanban): criticalPathUids present too', JSON.stringify(planCpK.criticalPathUids) === JSON.stringify(['uA', 'uB', 'uC']));
+}
+
+// ════════════════ 5.6 buildRationaleMap (plan data-contract: uid → Claude's "why here") ════════════════
+console.log('\nbuildRationaleMap — compact uid→rationale, honest structural absence:');
+{
+  const sparse = buildRationaleMap([
+    { feature_id: 'uA', rank: 1, rationale: 'pulled early: unblocks 4 features' },
+    { feature_id: 'uB', rank: 2 }, // no rationale (obvious placement) → omitted
+    { feature_id: 'uC', rank: 3, rationale: '   ' }, // whitespace-only → omitted (no hollow "no reason")
+    { feature_id: 'uD', rank: 4, rationale: 'deferred: depends on the external SDK' },
+  ]);
+  check('sparse: only rationale-bearing entries', JSON.stringify(Object.keys(sparse).sort()) === JSON.stringify(['uA', 'uD']));
+  check('sparse: uA rationale preserved', sparse.uA === 'pulled early: unblocks 4 features');
+  check('sparse: empty-string rationale omitted', !('uC' in sparse));
+  check('sparse: missing rationale omitted', !('uB' in sparse));
+
+  check('null ranking → {} (deterministic-fallback structural absence)', JSON.stringify(buildRationaleMap(null)) === '{}');
+  check('undefined ranking → {}', JSON.stringify(buildRationaleMap(undefined)) === '{}');
+  check('empty array → {}', JSON.stringify(buildRationaleMap([])) === '{}');
+  check('non-array → {} (no throw)', JSON.stringify(buildRationaleMap('nope')) === '{}');
+
+  // trimming + capping
+  const trimmed = buildRationaleMap([{ feature_id: 'uA', rationale: '  spaced out  ' }]);
+  check('rationale is trimmed', trimmed.uA === 'spaced out');
+  const longStr = 'x'.repeat(RATIONALE_MAX_CHARS + 250);
+  const capped = buildRationaleMap([{ feature_id: 'uA', rationale: longStr }]);
+  check('long rationale capped to RATIONALE_MAX_CHARS', capped.uA.length === RATIONALE_MAX_CHARS);
+
+  // defensive: garbage rows ignored; duplicate feature_id → first wins
+  const garbage = buildRationaleMap([null, 42, { rank: 1 }, { feature_id: 5, rationale: 'x' }, { feature_id: 'uA', rationale: 'first' }, { feature_id: 'uA', rationale: 'second' }]);
+  check('garbage rows ignored, valid kept', JSON.stringify(Object.keys(garbage)) === JSON.stringify(['uA']));
+  check('duplicate feature_id → first rationale wins', garbage.uA === 'first');
 }
 
 // ════════════════ 6. normalizeRanking (LLM-1/2) ════════════════

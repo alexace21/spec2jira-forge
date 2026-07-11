@@ -203,6 +203,31 @@ function _classifyBackendError(errorShape, contextLabel = "") {
     };
   }
 
+  // Class 1b: trial_credit_exhausted — the frictionless $5 managed trial credit is spent.
+  // Route to Setup so the user can add their own Anthropic key (BYOK, unlimited). Prefer the
+  // backend-provided friendly detail; fall back to a plain-English prompt.
+  if (errorStr === "trial_credit_exhausted") {
+    return {
+      message:
+        detail ||
+        "You've used your $5 free trial credit — add your own Anthropic API key to keep going (unlimited, you pay Anthropic directly).",
+      routeToSetup: true,
+    };
+  }
+
+  // Class 1c: no_project_key — a config gap, route to Setup. Now reachable on the trial onboarding
+  // path: a trial-on-managed user is let past the mount setup gate WITHOUT a default Jira project key
+  // (deferred to push time), so a push can hit this. Without this branch it fell through to the generic
+  // "Something went wrong" ErrorScreen with no Settings affordance (audit MED fix).
+  if (errorStr === "no_project_key") {
+    return {
+      message:
+        detail ||
+        "No default Jira project key is set. Open Settings and set your Default Jira Project Key, then push again.",
+      routeToSetup: true,
+    };
+  }
+
   // Class 2: Anthropic temporarily unavailable / overloaded (5xx, 529). This is
   // on Anthropic's side — not the user's spec or key. Just retry in a few minutes.
   if (
@@ -709,11 +734,22 @@ function App() {
         if (mountUsage && !mountUsage.error) setUsage(mountUsage);
         if (settings?.defaultProjectKey) setDefaultProjectKey(settings.defaultProjectKey);
 
-        // v6 value-split: BOTH editions are BYOK → every user needs an Anthropic key. The
-        // old `isManaged` (edition==='advanced') exemption that let Managed users past setup
-        // with no key is GONE — it would now strand a paying Advanced (BYOK) user keyless and
-        // dead-end them at generate-time. Require the key + the default project for everyone.
-        if (!settings?.apiKeyConfigured || !settings?.defaultProjectKey) {
+        // v6 value-split: BOTH editions are BYOK → a paid/keyed user needs an Anthropic key +
+        // a default project. EXCEPTION (2026-07-11 $5 managed trial credit): a trial user on the
+        // managed-credit onboarding path (no BYOK key, managed configured) can generate immediately
+        // on our key — do NOT wall them at setup. getUsage's `trial.onManaged === true` marks this
+        // path; the project key is only needed at push, so we defer it too for this case.
+        // FAIL SAFE: if mountUsage is null/errored (a metering glitch), the exemption is skipped and
+        // the normal key + project requirement holds — we never hand out managed spend on a glitch.
+        const trialOnManaged =
+          mountUsage &&
+          !mountUsage.error &&
+          mountUsage.trial &&
+          mountUsage.trial.onManaged === true;
+        if (
+          !trialOnManaged &&
+          (!settings?.apiKeyConfigured || !settings?.defaultProjectKey)
+        ) {
           setScreen("setup");
           return;
         }
@@ -1714,16 +1750,6 @@ function App() {
       setScreen("limit_reached");
       return;
     }
-    if (result.error === "edition_required") {
-      // v6 value-split: test-cases are an Advanced feature; the user is licensed but on
-      // Standard. Route to the upgrade screen (NOT the generic Error screen — that reads as
-      // "broken" rather than "upgrade"). Defense-in-depth: the ConfirmScreen button is gated
-      // on usage.hasTestCases, so a Standard user normally never reaches this.
-      setTcGenerating(false); // Fix 6
-      setQuotaInfo(result);
-      setScreen("limit_reached");
-      return;
-    }
     if (result.error === "managed_unavailable") {
       setTcGenerating(false); // Fix 6
       setErrorRefId(jobId || null); // [diag Phase 3] TC-gen failure for THIS job
@@ -1784,19 +1810,6 @@ function App() {
           return;
         }
         if (submitResult.error) {
-          if (submitResult.error === "edition_required") {
-            // v6 value-split: regen is an Advanced feature; route a Standard user to the
-            // upgrade screen, NOT an opaque red error card (pitfall #4). Normally
-            // unreachable — the test-case UI is hidden for Standard.
-            setRegenStates((prev) => {
-              const next = { ...prev };
-              delete next[storyIdx];
-              return next;
-            });
-            setQuotaInfo(submitResult);
-            setScreen("limit_reached");
-            return;
-          }
           setRegenStates((prev) => ({ ...prev, [storyIdx]: "error" }));
           return;
         }
@@ -1873,14 +1886,6 @@ function App() {
         resp = await invoke("saveTestCases", { jobId, storyIdx, result });
       } catch (e) {
         return { error: "save_failed", detail: String(e?.message || e) || "Save failed (network)." };
-      }
-      if (resp && resp.error === "edition_required") {
-        // v6 value-split: editing test cases is an Advanced action (fail-closed backend gate).
-        // Route a downgraded user to the upgrade screen — parity with generate/regenerate —
-        // instead of surfacing a generic red "save failed" on the card.
-        setQuotaInfo(resp);
-        setScreen("limit_reached");
-        return resp;
       }
       if (resp && resp.ok) {
         setTestCaseResults((prev) => {
@@ -2358,20 +2363,7 @@ function App() {
     return (
       <div style={{ maxWidth: "640px", margin: "0 auto" }}>
         <div className="px-8 pt-6">
-          <button
-            type="button"
-            onClick={handleCloseSettings}
-            style={{
-              background: "none",
-              border: "none",
-              color: "var(--s2j-blue)",
-              cursor: "pointer",
-              fontSize: "0.8125rem",
-              padding: 0,
-            }}
-          >
-            ← Back
-          </button>
+          <BackButton onClick={handleCloseSettings} label="Back" className="mb-2" />
         </div>
         <AdminSettings
           initialTab={settingsInitialTab}
@@ -2713,7 +2705,7 @@ function App() {
           onRegenerate={handleRegenerateTestCase}
           onSaveTestCase={handleSaveTestCase}
           regenStates={regenStates}
-          hasTestCases={usage?.hasTestCases === true}
+          hasTestCases={usage?.hasTestCases !== false}
         />
       );
     case "insights":
@@ -2827,20 +2819,12 @@ function App() {
         />
       );
     case "limit_reached":
-      // ⭐ [deep-audit B/E-#5] edition_required can fire MID-FLOW (a Standard/downgraded user
-      // attempted a test-case action on an in-flight breakdown). Returning via handleNewPage would
-      // DISCARD the breakdown + edits under review. For that case Back returns to the Review/Confirm
-      // screen (the breakdown lives in pendingBreakdown) — non-destructive. Other modes
-      // (license_required / fair-use, no work in flight) keep the page-picker return.
+      // Serves license_required (no active subscription) + the dormant Managed fair-use cap.
+      // Both have no work in flight → return to the page picker.
       return (
         <LimitReachedScreen
           quota={quotaInfo}
-          onBack={
-            quotaInfo?.error === "edition_required" && pendingBreakdown
-              ? () => setScreen("confirming")
-              : handleNewPage
-          }
-          backToReview={quotaInfo?.error === "edition_required" && !!pendingBreakdown}
+          onBack={handleNewPage}
         />
       );
     case "error":
@@ -3102,7 +3086,16 @@ function ReadyScreen({
             color: "var(--s2j-text-light)",
           }}
         >
-          {usage.unlimited ? (
+          {usage.trial && usage.trial.onManaged ? (
+            // Frictionless onboarding: a trial user running on the free $5 managed credit. This
+            // must be checked BEFORE `usage.unlimited` — the trial tier is also unlimited, so the
+            // unlimited branch would otherwise mask the remaining-credit read.
+            <span>
+              <strong style={{ color: "var(--s2j-text)" }}>Free trial</strong>{" "}
+              ·{" "}
+              {`$${Number(usage.trial.availableUsd).toFixed(2)} of $${(Number(usage.trial.grantUsd) || 5).toFixed(2)} free trial credit left`}
+            </span>
+          ) : usage.unlimited ? (
             <span>
               <strong style={{ color: "var(--s2j-text)" }}>
                 {usage.tierLabel} plan
@@ -5141,16 +5134,11 @@ function ConfirmScreen({
   jobId,
   defaultProjectKey,
 }) {
-  // v6 value-split: test-case generation is an Advanced-edition feature. Gate the UI on the
-  // capability the backend sends (usage.hasTestCases). Default-FALSE on an absent field
-  // (back-compat: a cached pre-v6 getUsage payload has no hasTestCases → treat as no-access,
-  // never leak the premium feature). The backend remains the authority (fail-closed gate).
-  const hasTestCases = usage?.hasTestCases === true;
-  // v6.1 value-split: the Capacity-Sheet Planner is an Advanced-edition feature too (bundled with
-  // test-cases). Same capability-driven gate (usage.hasPlanner), default-FALSE on an absent field
-  // (back-compat / never leak). The backend startPlan/repackPlan/startPlanPush gates are the authority;
-  // this only hides the entry button + shows a conversion-driving "Advanced" teaser for Standard users.
-  const hasPlanner = usage?.hasPlanner === true;
+  // ⭐ 2026-07-11 STANDARD-ONLY: test-case generation is INCLUDED in the single Standard edition. Default
+  // TRUE (entitled) when usage is missing/glitched — the old default-FALSE (two-edition safe polarity)
+  // now wrongly suppresses the pre-flight cost estimate for an entitled user on a getUsage glitch (the
+  // Generate button is un-gated anyway). Mirrors the TestCasesScreen flip; backend stays the authority.
+  const hasTestCases = usage?.hasTestCases !== false;
   // v6 cost-transparency: pre-flight Anthropic-usage estimate for a test-case run. Fetched
   // (read-only resolver, NO spend) only when test-cases are offered and not already fresh-generated;
   // re-fetched when the breakdown goes stale (edited ACs → new estimate). Best-effort: on any error
@@ -5172,8 +5160,10 @@ function ConfirmScreen({
 
   // Destination project NAME (fear-#1 killer): a best-effort lookup so the reviewer can verify
   // the push TARGET by name, not just the key. Mirrors the tcEstimate effect: show the KEY
-  // immediately, swap in the NAME when it resolves; on failure the key stands alone. (Task A prop
-  // defaultProjectKey is guaranteed non-empty by the setup gate before Confirm is reachable.)
+  // immediately, swap in the NAME when it resolves; on failure the key stands alone. ⚠ 2026-07-11:
+  // defaultProjectKey is NO LONGER guaranteed non-empty — a trial-on-managed user is let past the mount
+  // setup gate WITHOUT a project key (deferred to push), so it can be empty here; destLabel below and the
+  // backend no_project_key guard handle that gracefully (do NOT remove those fallbacks).
   const [projectDisplay, setProjectDisplay] = useState(null); // {ok,key,name} | null
   useEffect(() => {
     let cancelled = false;
@@ -5192,8 +5182,9 @@ function ConfirmScreen({
   const stories = dryRunResult?.total_stories || 0;
   const tasks = dryRunResult?.total_subtasks || 0;
   const links = dryRunResult?.dependency_links || 0;
-  // Destination: prefer the resolved NAME; the KEY is always present (Task A). destLabel spells
-  // out both when the name is known ("Acme Web (SDTY)"), else just the key.
+  // Destination: prefer the resolved NAME; the key MAY be empty (a trial-on-managed user deferred it —
+  // see above), so destLabel falls back to "your Jira project". Spells out both when the name is known
+  // ("Acme Web (SDTY)"), else just the key, else the generic fallback.
   const projectKey = defaultProjectKey || dryRunResult?.project_key || null;
   const projectName = projectDisplay?.ok ? projectDisplay.name : null;
   const destLabel = projectName ? `${projectName} (${projectKey})` : (projectKey || "your Jira project");
@@ -5546,44 +5537,38 @@ function ConfirmScreen({
       {onOpenPlan && (
         <div
           className="rounded-lg p-3 mb-3 flex items-center justify-between gap-3"
-          style={{ background: "var(--s2j-blue-bg)", border: "1px solid var(--s2j-blue-border)" }}
+          style={{ ...glassSurface("utility") }}
         >
           <div style={{ minWidth: 0 }}>
             <p className="text-xs font-medium" style={{ color: "var(--s2j-text)", display: "inline-flex", alignItems: "center", gap: 6 }}>
-              <IconCalendar size={13} /> {hasPlanner ? "Capacity plan from your team" : "Capacity plan from your team — Advanced"}
+              <IconCalendar size={13} /> Capacity plan from your team
             </p>
             <p className="text-xs" style={{ color: "var(--s2j-text-muted)" }}>
-              {hasPlanner
-                ? "Turn these stories into a plan from your team's capacity — Scrum sprints or a Kanban Now / Next / Later backlog. Claude orders the work; the math is deterministic. Review-only; nothing is written to Jira."
-                : "Turn your stories into a plan from your team's capacity — Scrum sprints or a Kanban Now / Next / Later backlog, pushed to Jira. Available on the Advanced edition."}
+              Turn these stories into a plan from your team's capacity — Scrum sprints or a Kanban Now / Next / Later backlog. Claude orders the work; the math is deterministic. Review-only; nothing is written to Jira.
             </p>
           </div>
-          {hasPlanner ? (
-            <button
-              type="button"
-              onClick={() => onOpenPlan()}
-              disabled={isPushing}
-              className="shrink-0"
-              style={{
-                background: "var(--s2j-blue)",
-                border: "none",
-                color: "#fff",
-                padding: "7px 14px",
-                borderRadius: "6px",
-                fontSize: "13px",
-                fontWeight: 500,
-                cursor: isPushing ? "not-allowed" : "pointer",
-                whiteSpace: "nowrap",
-                display: "inline-flex",
-                alignItems: "center",
-                gap: 6,
-              }}
-            >
-              <IconCalendar size={14} /> Plan capacity
-            </button>
-          ) : (
-            <span className="shrink-0 text-xs font-medium" title="The Capacity-Sheet Planner is included in the Advanced edition. Upgrade in your Atlassian site admin to plan your backlog." style={{ color: "var(--s2j-blue)", whiteSpace: "nowrap", padding: "7px 10px" }}>Advanced</span>
-          )}
+          <button
+            type="button"
+            onClick={() => onOpenPlan()}
+            disabled={isPushing}
+            className="shrink-0"
+            style={{
+              background: "var(--s2j-blue)",
+              border: "none",
+              color: "#fff",
+              padding: "7px 14px",
+              borderRadius: "6px",
+              fontSize: "13px",
+              fontWeight: 500,
+              cursor: isPushing ? "not-allowed" : "pointer",
+              whiteSpace: "nowrap",
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 6,
+            }}
+          >
+            <IconCalendar size={14} /> Plan capacity
+          </button>
         </div>
       )}
 
@@ -5593,24 +5578,25 @@ function ConfirmScreen({
       <div
         className="rounded-lg p-3 mb-3 flex items-center justify-between gap-3"
         style={{
-          background: tcStaleNow ? "var(--s2j-orange-bg)" : testCaseResults ? "var(--s2j-green-bg)" : "var(--s2j-blue-bg)",
-          border: `1px solid ${tcStaleNow ? "var(--s2j-orange-border)" : testCaseResults ? "var(--s2j-green-border)" : "var(--s2j-blue-border)"}`,
+          background: tcStaleNow ? "var(--s2j-orange-bg)" : testCaseResults ? "var(--s2j-green-bg)" : glassSurface("utility").background,
+          border: tcStaleNow
+            ? "1px solid var(--s2j-orange-border)"
+            : testCaseResults
+            ? "1px solid var(--s2j-green-border)"
+            : glassSurface("utility").border,
         }}
       >
         <div>
-          <p className="text-xs font-medium" style={{ color: "var(--s2j-text)" }}>
-            {!hasTestCases && !testCaseResults
-              ? "Acceptance test cases — Advanced"
-              : tcStaleNow
+          <p className="text-xs font-medium" style={{ color: "var(--s2j-text)", display: "inline-flex", alignItems: "center", gap: 6 }}>
+            <IconBeaker size={13} />
+            {tcStaleNow
               ? "Test cases may be outdated"
               : testCaseResults
               ? "Acceptance test cases generated"
               : "Optional: acceptance test cases"}
           </p>
           <p className="text-xs" style={{ color: "var(--s2j-text-muted)" }}>
-            {!hasTestCases && !testCaseResults
-              ? "Generate BA-grade Gherkin / CSV acceptance scenarios for every story — available on the Advanced edition."
-              : tcStaleNow
+            {tcStaleNow
               ? "You edited the breakdown since generating these. Re-running re-generates ALL stories (takes a few minutes, uses compute) — or push as-is; the edited stories simply won't get a test-case summary. Your call."
               : "BA-grade Gherkin / CSV export + a summary embedded in each Jira Story."}
           </p>
@@ -5633,13 +5619,11 @@ function ConfirmScreen({
             if (hasTestCases && tcEstimate && (!testCaseResults || tcStaleNow)) {
               return (
                 <p className="text-xs mt-1" style={{ color: "var(--s2j-text-muted)" }}>
-                  <IconCost size={12} /> Estimated Anthropic usage:{" "}
-                  <strong>up to ~{fmtUsd(tcEstimate.upper_usd)}</strong>
+                  <IconCost size={12} /> <strong>Up to ~{fmtUsd(tcEstimate.upper_usd)}</strong>
                   {tcEstimate.expected_usd
                     ? ` (typically ~${fmtUsd(tcEstimate.expected_usd)})`
                     : ""}{" "}
-                  — billed to your own API key, no markup. Rough estimate; you'll see the exact
-                  amount after the run.
+                  on your own API key, no markup - exact amount shown after the run.
                   {tcEstimate.has_spec_source === false
                     ? " (excludes source-spec context; actual may be lower)"
                     : ""}
@@ -5696,11 +5680,11 @@ function ConfirmScreen({
               <IconBeaker size={12} /> Test cases unavailable — breakdown not saved
             </span>
           )}
-          {/* v6 value-split: Generate / Re-run is gated on the Advanced capability (hasTestCases).
-              Standard users get the upsell chip below instead (no spend). The backend gate is the
-              authority (fail-closed); this is UX. View/edit of EXISTING cases stays available
-              (retained paid output). */}
-          {!persistFailed && hasTestCases && (!testCaseResults || tcStaleNow) && (
+          {/* Generate / Re-run all — a paid Anthropic run (armed 2-step confirm; the $ estimate
+              sits right above). Standard now includes everything, so this is always available; the
+              backend gate remains the authority (fail-closed). View/edit of EXISTING cases stays
+              available on the button above. */}
+          {!persistFailed && (!testCaseResults || tcStaleNow) && (
             <button
               type="button"
               onClick={() => {
@@ -5720,17 +5704,21 @@ function ConfirmScreen({
               }}
               disabled={isPushing || tcGenerating}
               style={{
-                background: tcStaleNow ? "var(--s2j-orange-bg)" : "var(--s2j-blue-bg)",
-                border: `1px solid ${tcStaleNow ? "var(--s2j-orange-border)" : "var(--s2j-blue-border)"}`,
-                color: tcStaleNow ? "var(--s2j-text)" : "var(--s2j-blue)",
+                background: tcStaleNow ? "var(--s2j-orange-bg)" : "var(--s2j-blue)",
+                border: tcStaleNow ? "1px solid var(--s2j-orange-border)" : "none",
+                color: tcStaleNow ? "var(--s2j-text)" : "#fff",
                 padding: "6px 12px",
-                borderRadius: "6px",
-                fontSize: "13px",
+                borderRadius: 6,
+                fontSize: 13,
                 fontWeight: 500,
                 cursor: isPushing || tcGenerating ? "not-allowed" : "pointer",
                 whiteSpace: "nowrap",
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 6,
               }}
             >
+              <IconBeaker size={14} />
               {tcGenerating
                 ? "Generating tests…"
                 : regenArmed
@@ -5742,35 +5730,13 @@ function ConfirmScreen({
                 : "Generate Test Cases"}
             </button>
           )}
-          {/* v6 value-split: Standard edition → an upsell chip instead of the Generate button
-              (no spend, no dead-end click). Shown when there are no cases yet OR when cases
-              exist but are stale (Re-run is gated, so the chip is the actionable affordance —
-              avoids a stale warning with no button). A downgraded user with FRESH cases still
-              gets the View/edit button above. */}
-          {!persistFailed && !hasTestCases && (!testCaseResults || tcStaleNow) && (
-            <span
-              title="Test-case generation is included in the Advanced edition. Upgrade in your Atlassian site admin to generate BA-grade acceptance test cases for every story."
-              style={{
-                fontSize: "12px",
-                color: "var(--s2j-blue)",
-                background: "var(--s2j-blue-bg)",
-                border: "1px solid var(--s2j-blue-border)",
-                padding: "6px 12px",
-                borderRadius: "6px",
-                fontWeight: 500,
-                whiteSpace: "nowrap",
-              }}
-            >
-              <IconBeaker size={12} /> Advanced feature
-            </span>
-          )}
         </div>
       </div>
 
       {/* (5) COMMIT BLOCK — destination + irreversible warning fused into ONE amber callout,
           directly above the buttons. Words dark, colour on the icon. */}
-      <SignalCallout kind="warning" style={{ margin: "24px 0 16px" }} fontSize={13}>
-        You are about to create <strong>{total} real Jira issues</strong> in {destLabel}. Your team
+      <SignalCallout kind="warning" style={{ margin: "24px 0 16px" }} fontSize={13.5}>
+        You are about to create <strong>{total} real Jira issues</strong> in <strong>{destLabel}</strong>. Your team
         will see them immediately. There is no bulk undo from Spec2Tickets — cleanup after a wrong
         push is manual.
       </SignalCallout>
@@ -5787,7 +5753,7 @@ function ConfirmScreen({
 
       {/* (6) BUTTONS — Back to Editor (secondary) + green commit that spells out the destination. */}
       <div className="flex gap-3">
-        <button onClick={onBack} className="btn-secondary" disabled={isPushing}>
+        <button onClick={onBack} className="btn-nav" disabled={isPushing}>
           ← Back to Editor
         </button>
         <button
@@ -5915,36 +5881,24 @@ function DependencyStructure({ edges, onRemove, onRestore, onOpenAdd }) {
         )}
       </div>
       <p className="text-xs mb-3" style={{ color: "var(--s2j-text-muted)" }}>
-        Each becomes a Story-blocks-Story link in Jira — the feature it depends on must be
+        Each becomes a <strong style={{ color: "var(--s2j-text)" }}>Story-blocks-Story</strong> link in Jira — the feature it depends on must be
         completed first. Remove any that don't belong, or add one the AI missed.
       </p>
 
       {groups.length > 0 ? (
-        <div
-          className="rounded-lg p-3"
-          style={{
-            background: "var(--s2j-bg-section)",
-            border: "1px solid var(--s2j-border)",
-          }}
-        >
+        <div className="space-y-2">
           <ul
             className="space-y-2"
             style={{ listStyle: "none", margin: 0, padding: 0 }}
           >
-            {groups.map(({ source, sourceUid, targets }, gIdx) => {
-              const isLast = gIdx === groups.length - 1;
+            {groups.map(({ source, sourceUid, targets }) => {
               return (
                 <li
                   key={sourceUid || source}
-                  style={{
-                    paddingBottom: isLast ? 0 : 8,
-                    borderBottom: isLast
-                      ? "none"
-                      : "1px dashed var(--s2j-border)",
-                  }}
+                  style={{ ...glassSurface("utility"), padding: "10px 12px" }}
                 >
                   <div
-                    className="text-xs font-medium leading-tight"
+                    className="text-sm font-bold leading-tight"
                     style={{ color: "var(--s2j-text)" }}
                   >
                     {source}
@@ -7306,44 +7260,35 @@ function EditionRow({ name, price, blurb }) {
 }
 
 function LimitReachedScreen({ quota, onBack, backToReview = false }) {
-  // ⭐ [deep-audit fix] when onBack returns to the in-flight breakdown (edition_required mid-flow),
-  // the back affordances must say so — not the default "page picker" (which would be misleading copy
-  // for a non-destructive return-to-Review).
+  // The back affordance returns to the page picker (no work is in flight for either mode).
   const backTitle = backToReview ? "Return to your breakdown" : "Return to the page picker";
   const backLabel = backToReview ? "← Back to your breakdown" : "← Back to pages";
-  // v6 value-split modes from the routing payload:
-  //   edition_required → a Standard user reached an Advanced-only feature (test-cases) → upsell Advanced.
-  //   license_required (defensive) → no active license → subscribe (both editions).
-  //   quota_exceeded/fairUse → the DORMANT Managed per-user cap (off-Marketplace only; both
-  //     LIVE editions are BYOK + unlimited, so this never fires for a Marketplace customer).
-  const isEditionRequired = quota?.error === "edition_required";
+  // Modes from the routing payload:
+  //   license_required (defensive) → no active license → subscribe (Standard).
+  //   quota_exceeded/fairUse → the DORMANT Managed per-user cap (off-Marketplace only; the LIVE
+  //     Standard edition is BYOK + unlimited, so this never fires for a Marketplace customer).
   const isLicenseRequired = quota?.error === "license_required";
-  const isFairUse = !isEditionRequired && !isLicenseRequired;
+  const isFairUse = !isLicenseRequired;
 
   const limit = quota?.limit;
   const resetsAt =
     quota?.resetsAtLabel ||
     (quota?.resetsAt ? String(quota.resetsAt).slice(0, 10) : null);
-  const standardPrice = findPrice(quota, "byokPro"); // Standard edition
-  const advancedPrice = findPrice(quota, "byokAdvanced"); // v6: Advanced (was 'managedPro' → that key is dormant → blank-price bug)
+  const standardPrice = findPrice(quota, "byokPro"); // Standard edition (the only edition)
 
   // Headline + intro. Prefer the backend-composed `detail` for the body (it is
   // already tier-correct and mentions the reset date / prices); fall back to a
   // mode-specific sentence if it is ever absent.
-  const heading = isEditionRequired
-    ? "Advanced feature"
-    : isLicenseRequired
-      ? "Subscription required"
-      : "You've used this month's breakdowns";
-  const fallbackBody = isEditionRequired
-    ? "The Advanced edition includes test-case generation and the Capacity-Sheet Planner. Upgrade to generate BA-grade acceptance test cases and turn your backlog into a Scrum or Kanban delivery plan."
-    : isLicenseRequired
-      ? "An active subscription is required to use Spec2Tickets. Manage your subscription from your Atlassian site admin."
-      : limit
-        ? `You've used all ${limit} breakdowns included this month${
-            resetsAt ? ` — they reset on ${resetsAt}.` : "."
-          }`
-        : "You've used this month's breakdowns.";
+  const heading = isLicenseRequired
+    ? "Subscription required"
+    : "You've used this month's breakdowns";
+  const fallbackBody = isLicenseRequired
+    ? "An active subscription is required to use Spec2Tickets. Manage your subscription from your Atlassian site admin."
+    : limit
+      ? `You've used all ${limit} breakdowns included this month${
+          resetsAt ? ` — they reset on ${resetsAt}.` : "."
+        }`
+      : "You've used this month's breakdowns.";
 
   const openUpgrade = () => {
     if (!UPGRADE_URL) return;
@@ -7378,9 +7323,9 @@ function LimitReachedScreen({ quota, onBack, backToReview = false }) {
         )}
       </MoodCard>
 
-      {/* Subscription card (v6 value framing). edition_required → upsell Advanced;
-          license_required (no plan) → both editions; fair-use (dormant Managed) → Standard. */}
-      {(standardPrice || advancedPrice) && (
+      {/* Subscription card. license_required (no plan) → subscribe; fair-use (dormant Managed
+          per-user cap) → switch to the unlimited BYOK edition. Single edition (Standard). */}
+      {standardPrice && (
         <div
           className="rounded-lg p-4 mb-4"
           style={{
@@ -7392,40 +7337,23 @@ function LimitReachedScreen({ quota, onBack, backToReview = false }) {
             className="text-xs font-medium uppercase tracking-wider mb-2"
             style={{ color: "var(--s2j-text-muted)" }}
           >
-            {isEditionRequired ? "Upgrade" : isFairUse ? "For unlimited" : "Choose a plan"}
+            {isFairUse ? "For unlimited" : "Choose a plan"}
           </p>
 
-          {isEditionRequired ? (
-            <EditionRow
-              name="Advanced"
-              price={advancedPrice}
-              blurb="+ test-case generation + capacity planner"
-            />
-          ) : isFairUse ? (
-            <EditionRow
-              name="Standard"
-              price={standardPrice}
-              blurb="unlimited — use your own Anthropic key"
-            />
-          ) : (
-            <>
-              <EditionRow
-                name="Standard"
-                price={standardPrice}
-                blurb="core breakdown + push + Project Context"
-              />
-              <EditionRow
-                name="Advanced"
-                price={advancedPrice}
-                blurb="+ test-case generation + capacity planner"
-              />
-            </>
-          )}
+          <EditionRow
+            name="Standard"
+            price={standardPrice}
+            blurb={
+              isFairUse
+                ? "unlimited — use your own Anthropic key"
+                : "everything included — use your own Anthropic key"
+            }
+          />
 
           {UPGRADE_URL && (
             <>
               <button onClick={openUpgrade} className="btn-primary mt-3">
-                {isEditionRequired ? "Upgrade to Advanced" : isFairUse ? "Switch to Standard" : "Subscribe"}
+                {isFairUse ? "Switch to Standard" : "Subscribe"}
               </button>
               <p
                 className="text-xs"
@@ -7438,7 +7366,7 @@ function LimitReachedScreen({ quota, onBack, backToReview = false }) {
         </div>
       )}
 
-      <button onClick={onBack} className="btn-secondary">
+      <button onClick={onBack} className="btn-nav">
         {backLabel}
       </button>
     </div>
@@ -7521,14 +7449,35 @@ function ErrorScreen({ error, jobId = null, onRetry, onBackToPicker, onOpenDiagn
  *   - Navigation path: how to reach Settings to configure them
  */
 function SetupScreen({ message, onOpenSettings }) {
+  // A `message` is passed when the user is bounced here mid-flow — most commonly after the
+  // frictionless $5 managed trial credit is spent (trial_credit_exhausted). In that case the
+  // screen must read as a friendly "add your key to keep going", NOT a first-run "must configure
+  // before first use". First-run (no message) keeps the original onboarding copy.
+  const hasMessage = !!message;
+  // A trial-on-managed user can also be routed here for a missing default JIRA PROJECT KEY (deferred
+  // past the mount gate) — they need NO Anthropic key. Detect that from the backend-controlled message so
+  // the heading/prerequisite don't wrongly tell them to add an API key (code-review fix). The strings are ours.
+  const isProjectKey = typeof message === "string" && /project key/i.test(message);
   return (
     <div className="p-6" style={SCREEN_MAX_WIDTH_STYLE}>
       {/* moodboard (Phase 1) — onboarding earns clarity: navy header + a light glass
           prerequisites card with the green "Open Settings" commit CTA, then a quieter
           utility card for the secondary admin-route steps. */}
       <ScreenHeader
-        title="Setup required"
-        subtitle="Spec2Tickets needs to be configured before first use."
+        title={
+          isProjectKey
+            ? "Set your Jira project key to continue"
+            : hasMessage
+              ? "Add your API key to continue"
+              : "Setup required"
+        }
+        subtitle={
+          isProjectKey
+            ? "Set your Default Jira project key in Settings, then push your breakdown."
+            : hasMessage
+              ? "Add your own Anthropic API key to keep going — unlimited, and billed to your own account."
+              : "Spec2Tickets needs to be configured before first use."
+        }
         icon={
           <svg width="18" height="18" viewBox="0 0 20 20" fill="none">
             <circle cx="10" cy="10" r="9" stroke="currentColor" strokeWidth="2" />
@@ -7541,6 +7490,14 @@ function SetupScreen({ message, onOpenSettings }) {
           </svg>
         }
       />
+
+      {/* Mid-flow prompt (e.g. the $5 trial credit is spent) — surface the backend-provided
+          friendly message prominently, above the standard BYOK guidance below. */}
+      {hasMessage && (
+        <SignalCallout kind="info" style={{ marginBottom: 16 }} fontSize={13}>
+          {message}
+        </SignalCallout>
+      )}
 
       {/* v6 value-split: both editions are BYOK → always show the Anthropic-key
           prerequisite (the old "no key needed" Managed branch was removed). */}
