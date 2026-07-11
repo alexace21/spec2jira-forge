@@ -29,7 +29,7 @@ function mdToPlain(md) {
 
 const OBJECTIVE_LABEL = { mvp: "Ship the MVP fastest", min_risk: "Minimize delivery risk", max_value: "Maximize early value" }; // P12 (balanced → omitted)
 
-export function renderPlanBrief({ plan, assumptions, warnings, cost, slimFeatures, form, usedLlm, stale, pageTitle, generatedAt, objective } = {}) {
+export function renderPlanBrief({ plan, assumptions, warnings, cost, slimFeatures, form, usedLlm, stale, pageTitle, generatedAt, objective, trialActive } = {}) {
   const L = []; // markdown lines
   if (!plan || !Array.isArray(plan.sprints)) {
     const md = "# Sprint plan\n\n_No plan to summarise yet._";
@@ -178,7 +178,7 @@ export function renderPlanBrief({ plan, assumptions, warnings, cost, slimFeature
 
   // ── 9. FOOTER ──
   L.push("---");
-  L.push(`_${llmUsed ? "Ordered by Claude" : "Ordered deterministically"} · sprint math is deterministic · human-reviewed.${cost && cost.total_usd != null ? ` This plan’s ranking used ${fmtUsd(cost.total_usd)} of your Anthropic key.` : ""}_`);
+  L.push(`_${llmUsed ? "Ordered by Claude" : "Ordered deterministically"} · sprint math is deterministic · human-reviewed.${cost && cost.total_usd != null ? ` This plan’s ranking used ${fmtUsd(cost.total_usd)} ${trialActive ? "of your free trial credit" : "of your Anthropic key"}.` : ""}_`);
 
   const markdown = L.join("\n");
 

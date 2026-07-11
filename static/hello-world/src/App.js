@@ -2377,6 +2377,7 @@ function App() {
       <SetupScreen
         message={error}
         onOpenSettings={handleOpenSettings}
+        trialActive={usage?.trial?.onManaged === true}
       />
     );
 
@@ -2652,6 +2653,7 @@ function App() {
         <PagePickerScreen
           onSelect={handlePageSelected}
           onOpenSettings={handleOpenSettings}
+          trialActive={usage?.trial?.onManaged === true}
         />
       );
     case "ready":
@@ -2692,6 +2694,7 @@ function App() {
       return (
         <TestCasesScreen
           testCaseResults={testCaseResults}
+          trialActive={usage?.trial?.onManaged === true}
           breakdown={pendingBreakdown || results?.breakdown}
           pageTitle={pageData?.title}
           jobId={jobId}
@@ -2769,6 +2772,7 @@ function App() {
           result={planResult}
           busy={planBusy}
           estimate={planEstimate}
+          trialActive={usage?.trial?.onManaged === true}
           armed={planArmed}
           elapsed={planElapsed}
           pageTitle={pageData?.title}
@@ -3140,6 +3144,7 @@ function ReadyScreen({
         defaultProjectKey={defaultProjectKey}
         selectedProfile={selectedProfile}
         pageData={pageData}
+        trialActive={usage?.trial?.onManaged === true}
       />
 
       {/* Project Context selector — pick which named context applies to THIS spec, so
@@ -3472,7 +3477,7 @@ function PreflightOutline({ outline }) {
 // how many top-level section pills to show inline before collapsing the rest into "+N more".
 const OUTLINE_PILL_CAP = 9;
 
-function PreflightCard({ outline, timeBand, defaultProjectKey, selectedProfile, pageData }) {
+function PreflightCard({ outline, timeBand, defaultProjectKey, selectedProfile, pageData, trialActive }) {
   const verdict = preflightVerdict(outline);
   const amberCount = preflightAmberCount(outline);
   const tone = PREFLIGHT_TONE[verdict] || PREFLIGHT_TONE.green;
@@ -3633,7 +3638,7 @@ function PreflightCard({ outline, timeBand, defaultProjectKey, selectedProfile, 
 
         <PreflightTile icon={IconClock} label="THIS RUN">
           <div style={{ fontWeight: 700, fontSize: 14, color: "var(--s2j-text)" }}>{timeBand}</div>
-          <div style={{ marginTop: 2 }}>On your Anthropic key</div>
+          <div style={{ marginTop: 2 }}>{trialActive ? "On your free trial credit" : "On your Anthropic key"}</div>
           <div style={{ ...TYPE.micro, marginTop: 1 }}>
             {(pageData.body_length || 0).toLocaleString()} chars in
           </div>
@@ -5139,6 +5144,9 @@ function ConfirmScreen({
   // now wrongly suppresses the pre-flight cost estimate for an entitled user on a getUsage glitch (the
   // Generate button is un-gated anyway). Mirrors the TestCasesScreen flip; backend stays the authority.
   const hasTestCases = usage?.hasTestCases !== false;
+  // ⭐ 2026-07-11: a trial-on-managed user reaches this screen and runs test-cases on OUR $5 credit, not their
+  // own key — so the "billed to your own API key" cost copy below is FALSE + a forbidden BYOK scare for them.
+  const trialActive = usage?.trial?.onManaged === true;
   // v6 cost-transparency: pre-flight Anthropic-usage estimate for a test-case run. Fetched
   // (read-only resolver, NO spend) only when test-cases are offered and not already fresh-generated;
   // re-fetched when the breakdown goes stale (edited ACs → new estimate). Best-effort: on any error
@@ -5612,7 +5620,7 @@ function ConfirmScreen({
               return (
                 <p className="text-xs mt-1" style={{ color: "var(--s2j-green-dark)" }}>
                   <IconCost size={12} /> This run used <strong>{fmtUsd(actual)}</strong> of Anthropic usage —
-                  billed to your own API key, no markup.
+                  {trialActive ? " drawn from your $5 free trial credit." : " billed to your own API key, no markup."}
                 </p>
               );
             }
@@ -5623,7 +5631,7 @@ function ConfirmScreen({
                   {tcEstimate.expected_usd
                     ? ` (typically ~${fmtUsd(tcEstimate.expected_usd)})`
                     : ""}{" "}
-                  on your own API key, no markup - exact amount shown after the run.
+                  {trialActive ? "drawn from your free trial credit" : "on your own API key, no markup"} - exact amount shown after the run.
                   {tcEstimate.has_spec_source === false
                     ? " (excludes source-spec context; actual may be lower)"
                     : ""}
@@ -7448,7 +7456,7 @@ function ErrorScreen({ error, jobId = null, onRetry, onBackToPicker, onOpenDiagn
  *   - Prerequisite: an Anthropic API key + a JIRA project key
  *   - Navigation path: how to reach Settings to configure them
  */
-function SetupScreen({ message, onOpenSettings }) {
+function SetupScreen({ message, onOpenSettings, trialActive }) {
   // A `message` is passed when the user is bounced here mid-flow — most commonly after the
   // frictionless $5 managed trial credit is spent (trial_credit_exhausted). In that case the
   // screen must read as a friendly "add your key to keep going", NOT a first-run "must configure
@@ -7499,41 +7507,62 @@ function SetupScreen({ message, onOpenSettings }) {
         </SignalCallout>
       )}
 
-      {/* v6 value-split: both editions are BYOK → always show the Anthropic-key
-          prerequisite (the old "no key needed" Managed branch was removed). */}
+      {/* ⭐ 2026-07-11 credit-aware prerequisite: a trial user routed here needs ONLY a Jira project key
+          (they run on our $5 free credit — no Anthropic key yet). We deliberately DON'T show the BYOK
+          key/billing narrative until the free trial is spent, so they aren't scared off mid-trial. */}
       <MoodCard density="minor" style={{ marginBottom: 16 }}>
         <p style={{ ...TYPE.body, fontWeight: 600, marginBottom: 8 }}>
           You will need:
         </p>
-        <ul
-          style={{ ...TYPE.body, margin: 0, paddingLeft: 18, listStyle: "disc" }}
-        >
-          <li style={{ marginBottom: 6 }}>
-            An Anthropic API key (sign up at{" "}
-            <a
-              href="https://console.anthropic.com/settings/keys"
-              target="_blank"
-              rel="noopener noreferrer"
-              style={{ color: "var(--s2j-blue)", textDecoration: "underline" }}
-            >
-              console.anthropic.com → API Keys
-            </a>
-            ; billed pay-as-you-go to your own Anthropic account)
-          </li>
-          <li>A Jira project key where the breakdown will be created</li>
-        </ul>
-        <p style={{ ...TYPE.sub, marginTop: 10 }}>
-          New to API keys? Our plain-English walkthrough (no technical background
-          needed) covers it step by step:{" "}
-          <a
-            href="https://spec2jira.com/get-api-key"
-            target="_blank"
-            rel="noopener noreferrer"
-            style={{ color: "var(--s2j-blue)", textDecoration: "underline" }}
-          >
-            spec2jira.com/get-api-key
-          </a>
-        </p>
+        {isProjectKey ? (
+          <>
+            <ul style={{ ...TYPE.body, margin: 0, paddingLeft: 18, listStyle: "disc" }}>
+              <li>A Jira project key where the breakdown will be created</li>
+            </ul>
+            {/* The "$5 free trial, no key needed" claim is gated on trialActive — a PAID user with no
+                project key also lands here (no_project_key), and must NOT be told they're on a free trial. */}
+            {trialActive ? (
+              <p style={{ ...TYPE.sub, marginTop: 10 }}>
+                You're on your $5 free trial, so no Anthropic API key is needed yet — just set your Default Jira
+                Project Key in Settings and you're ready to push.
+              </p>
+            ) : (
+              <p style={{ ...TYPE.sub, marginTop: 10 }}>
+                Set your Default Jira Project Key in Settings, then push your breakdown.
+              </p>
+            )}
+          </>
+        ) : (
+          <>
+            <ul style={{ ...TYPE.body, margin: 0, paddingLeft: 18, listStyle: "disc" }}>
+              <li style={{ marginBottom: 6 }}>
+                An Anthropic API key (sign up at{" "}
+                <a
+                  href="https://console.anthropic.com/settings/keys"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  style={{ color: "var(--s2j-blue)", textDecoration: "underline" }}
+                >
+                  console.anthropic.com → API Keys
+                </a>
+                ; billed pay-as-you-go to your own Anthropic account)
+              </li>
+              <li>A Jira project key where the breakdown will be created</li>
+            </ul>
+            <p style={{ ...TYPE.sub, marginTop: 10 }}>
+              New to API keys? Our plain-English walkthrough (no technical background
+              needed) covers it step by step:{" "}
+              <a
+                href="https://spec2jira.com/get-api-key"
+                target="_blank"
+                rel="noopener noreferrer"
+                style={{ color: "var(--s2j-blue)", textDecoration: "underline" }}
+              >
+                spec2jira.com/get-api-key
+              </a>
+            </p>
+          </>
+        )}
 
         {/* Primary call-to-action — open the app's OWN in-app Settings. This is the
             reliable path: the globalSettings "Configure" page is unreachable in the
@@ -7564,15 +7593,21 @@ function SetupScreen({ message, onOpenSettings }) {
           <li>
             Find <strong>Spec2Tickets Settings</strong> in the left sidebar
           </li>
+          {/* Step 4 + the "your own key" footer are Anthropic-key-specific — for a project-key-only route
+              they'd reintroduce the BYOK ask the change set out to remove, so they go project-key-aware. */}
           <li>
-            Paste your Anthropic API key + Jira Project Key, then Test &amp; Save
+            {isProjectKey
+              ? "Set your Default Jira Project Key, then Save"
+              : "Paste your Anthropic API key + Jira Project Key, then Test & Save"}
           </li>
         </ol>
-        <p style={{ ...TYPE.micro, marginTop: 8, fontStyle: "italic" }}>
-          Powered by Claude Sonnet 4.6 — your page content flows directly from
-          Forge to the Anthropic API using your own key. No data on Spec2Tickets
-          servers.
-        </p>
+        {!isProjectKey && (
+          <p style={{ ...TYPE.micro, marginTop: 8, fontStyle: "italic" }}>
+            Powered by Claude Sonnet 4.6 — your page content flows directly from
+            Forge to the Anthropic API using your own key. No data on Spec2Tickets
+            servers.
+          </p>
+        )}
       </MoodCard>
     </div>
   );

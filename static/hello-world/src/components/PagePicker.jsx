@@ -169,7 +169,7 @@ function spaceChipLabel(page) {
   return "—";
 }
 
-function PagePickerScreen({ onSelect, onOpenSettings }) {
+function PagePickerScreen({ onSelect, onOpenSettings, trialActive = false }) {
   const [recent, setRecent] = useState([]);
   const [recentLoaded, setRecentLoaded] = useState(false);
   const [recentDegraded, setRecentDegraded] = useState(false);
@@ -610,6 +610,7 @@ function PagePickerScreen({ onSelect, onOpenSettings }) {
                   existingJob={jobByPageId.get(p.id)}
                   onPick={handlePick}
                   onOpenJob={openJob}
+                  trialActive={trialActive}
                 />
               ))}
             </ul>
@@ -1358,16 +1359,18 @@ function ShownAboveNote({ status }) {
 // Search result row — space chip + title + edited-date + excerpt + Open
 // (+ resume-guard when the page already has a job).
 // ════════════════════════════════════════════════════════════════════
-function SearchResultRow({ page, existingJob, onPick, onOpenJob }) {
+function SearchResultRow({ page, existingJob, onPick, onOpenJob, trialActive = false }) {
   // Per-state resume guard. A COMPLETED / in-progress job would be double-spent by regenerating (warn);
   // a FAILED job produced NO reusable breakdown, so retrying is the correct action — no "spends twice"
   // scare, and the CTA reopens to retry. (deep-audit fix)
+  // 2026-07-11: on the $5 managed trial credit the cost attribution is the trial credit, not the user's own key.
+  const spendsTwice = trialActive ? "spends your free trial credit twice" : "spends your key twice";
   const guard = !existingJob ? null
     : existingJob.status === "failed"
       ? { msg: "This page's last breakdown failed. Reopen to retry, or start fresh below.", btn: "Reopen to retry" }
       : existingJob.status === "completed"
-        ? { msg: "You already have a ready breakdown for this page. Generating again spends your key twice.", btn: "Open existing" }
-        : { msg: "A breakdown for this page is already generating. Generating again spends your key twice.", btn: "Open in progress" };
+        ? { msg: `You already have a ready breakdown for this page. Generating again ${spendsTwice}.`, btn: "Open existing" }
+        : { msg: `A breakdown for this page is already generating. Generating again ${spendsTwice}.`, btn: "Open in progress" };
   const edited = shortDate(page.lastModified);
 
   return (

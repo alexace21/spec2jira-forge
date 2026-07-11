@@ -1384,6 +1384,7 @@ function PlanHealthStrip({ signals, hasWarning, featureCount, routes, onOpen, sp
 
 export default function PlanScreen({
   featureCount, slimFeatures, form, result, busy, estimate, armed, elapsed, pageTitle, jobId, onArmToggle, onFormChange, onGenerate, onRepack, onApplyScenario, onBack,
+  trialActive = false, // 2026-07-11: on the $5 managed trial credit — reframe BYOK cost/key copy to free-trial-credit framing.
 }) {
   // SELF-DESCRIBING DISPLAY (reload fix 2026-06-20): every uid→name resolver (byUid, nameOfUid, the brief,
   // the what-if lists) funnels through this. The persisted plan is uid-keyed; on a hard RELOAD the LIVE
@@ -1509,8 +1510,9 @@ export default function PlanScreen({
     return renderPlanBrief({
       plan, assumptions: r.assumptions, warnings: r.warnings, cost: r.cost,
       slimFeatures: nameFeatures, form, usedLlm: r.usedLlm, stale: r.stale, pageTitle, generatedAt: when, objective: r.objective,
+      trialActive, // 2026-07-11: so the copy-out brief footer says "free trial credit", not "your Anthropic key", on a managed trial run
     });
-  }, [result, nameFeatures, form, pageTitle, isKanban]);
+  }, [result, nameFeatures, form, pageTitle, isKanban, trialActive]);
 
   // ── WIZARD (4 steps): Mode → Capacity → Review&generate → Plan. One focus per step (the screen was
   // overloaded). Step 4 IS the plan; "generating" is its loading sub-state. An existing plan lands on 4.
@@ -1764,7 +1766,7 @@ export default function PlanScreen({
         {!hasPlan && estimate && estimate.upper_usd > 0 ? (
           <SignalCallout kind="info" title="Estimated Anthropic usage" style={{ marginBottom: 14 }} iconTitle="Pre-flight cost estimate">
             <span style={{ fontSize: 12.5 }}>
-              Up to <strong>~{fmtUsd(estimate.upper_usd)}</strong>{estimate.expected_usd ? ` (typically ~${fmtUsd(estimate.expected_usd)})` : ""} — billed to your own key, no markup. Exact cost is echoed after the run.
+              Up to <strong>~{fmtUsd(estimate.upper_usd)}</strong>{estimate.expected_usd ? ` (typically ~${fmtUsd(estimate.expected_usd)})` : ""}{trialActive ? " — drawn from your $5 free trial credit. Exact cost is echoed after the run." : " — billed to your own key, no markup. Exact cost is echoed after the run."}
             </span>
           </SignalCallout>
         ) : null}
@@ -1786,7 +1788,7 @@ export default function PlanScreen({
         </button>
         {armed ? (
           <p style={{ fontSize: 11, color: "var(--s2j-orange)", margin: "8px 0 0", textAlign: "center", lineHeight: 1.5 }}>
-            Click again to confirm — this runs a billed Claude call on your own key.
+            {trialActive ? "Click again to confirm — this runs a Claude call on your free trial credit." : "Click again to confirm — this runs a billed Claude call on your own key."}
           </p>
         ) : null}
 
@@ -1957,7 +1959,7 @@ export default function PlanScreen({
 
             {r.cost && r.cost.total_usd != null ? (
               <p className="text-xs" style={{ marginTop: 12, color: "var(--s2j-text-light)" }}>
-                <IconCost size={12} /> This ranking used {fmtUsd(r.cost.total_usd)} of your Anthropic key. Re-pack is free; only Re-rank with Claude is billed.
+                <IconCost size={12} /> This ranking used {fmtUsd(r.cost.total_usd)}{trialActive ? " of your free trial credit. Re-pack is free; only Re-rank with Claude uses it." : " of your Anthropic key. Re-pack is free; only Re-rank with Claude is billed."}
               </p>
             ) : null}
           </>
@@ -2005,7 +2007,7 @@ export default function PlanScreen({
 
             {r.cost && r.cost.total_usd != null ? (
               <p className="text-xs" style={{ marginTop: 12, color: "var(--s2j-text-light)" }}>
-                <IconCost size={12} /> This ranking used {fmtUsd(r.cost.total_usd)} of your Anthropic key. Re-pack is free; only Re-rank with Claude is billed.
+                <IconCost size={12} /> This ranking used {fmtUsd(r.cost.total_usd)}{trialActive ? " of your free trial credit. Re-pack is free; only Re-rank with Claude uses it." : " of your Anthropic key. Re-pack is free; only Re-rank with Claude is billed."}
               </p>
             ) : null}
           </>

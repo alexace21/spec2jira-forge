@@ -335,11 +335,12 @@ export default function AdminSettings({ initialTab = "settings", diagRefFilter =
       return;
     }
 
-    // v6 value-split: BOTH editions are BYOK → a key is always required. The old Managed
-    // (edition==='advanced') "no key needed" exemption is GONE — under v6 'advanced' is a
-    // BYOK edition (byokAdvanced), so exempting it would let a paying Advanced customer save
-    // with no key and then dead-end at generate-time.
-    if (!trimmedKey && !apiKeyConfigured) {
+    // A key is required UNLESS the user is on the $5 free MANAGED trial credit (2026-07-11). A trialActive
+    // user runs on OUR key, so the ONLY required config is the Jira project key — skip the key guard for them
+    // (mirrors computeConfigVerdict's keyRequired=!trialActive; without this the display layer says "just set
+    // the project" but Save silently refuses — the fresh-army HIGH). A paying BYOK customer still needs a key.
+    const trialActiveSave = account?.trial?.onManaged === true;
+    if (!trialActiveSave && !trimmedKey && !apiKeyConfigured) {
       setFieldErrors({
         apiKey: "Please paste your Anthropic API key. Get one from console.anthropic.com → API Keys.",
       });
@@ -396,6 +397,10 @@ export default function AdminSettings({ initialTab = "settings", diagRefFilter =
           setApiKeyLastSetAt(new Date().toISOString());
           setAnthropicApiKey(""); // clear input field so it shows configured state
           setKeyStorageFault(false); // a fresh save supersedes a prior key-read fault
+          // A newly-saved BYOK key flips the backend off the $5 managed trial (resolveAnthropicKey now
+          // returns byok) → re-fetch usage so the trial narrative (hero/header/Step 1) clears in-session
+          // instead of going stale until a reload (fresh-army LOW). Fire-and-forget; loadUsage is fail-soft.
+          loadUsage();
         }
         // The config just changed — a prior verify is now stale. Drop it so the hero
         // honestly reads "run the check" (and the auto-verify can re-fire on a first-time
@@ -603,6 +608,11 @@ export default function AdminSettings({ initialTab = "settings", diagRefFilter =
   // the verdict; nothing below re-derives it inline. ──
   const licenseGate = computeLicenseGate(account);
   const blocked = licenseGate.state === "blocked"; // [A1] folded into readiness display, tiles
+  // ⭐ 2026-07-11 trial-credit onboarding: a trial user still on the $5 free MANAGED credit needs NO Anthropic
+  // key (the app runs on OUR key) — so the whole BYOK "connect a key" narrative is OPTIONAL/deferred and the
+  // only REQUIRED config is the Jira project key. `trial.onManaged` is the exact signal (true only for a trial
+  // user with credit remaining + no key of their own). Once the $5 is spent it flips false → BYOK becomes required.
+  const trialActive = account?.trial?.onManaged === true;
   const projectKeyClean = (defaultProjectKey || "").trim().toUpperCase(); // LIVE input (edit-time hint)
   const savedProjectClean = (savedProjectKey || "").trim().toUpperCase(); // SAVED destination (verdict/hero/tiles) [A2]
   const verdict = computeConfigVerdict({
@@ -610,6 +620,7 @@ export default function AdminSettings({ initialTab = "settings", diagRefFilter =
     projectKey: savedProjectKey, // [A4] verdict keys on the SAVED project the check probes
     keyStorageFault,
     health,
+    trialActive,
   });
   const tiles = computeTiles({
     verdict: { ...verdict, projectKey: savedProjectClean }, // [A2] PROJECT tile = SAVED destination
@@ -618,8 +629,9 @@ export default function AdminSettings({ initialTab = "settings", diagRefFilter =
     profilesCount: contextProfiles.length,
     hasCustomFields: !!(requiredCustomFieldsJson || "").trim(),
     licenseBlocked: blocked, // [A1] blocked → VERIFIED tile neutral "plan inactive", not stale-verified
+    trialActive,
   });
-  const hero = heroBanner({ verdict, licenseGate, verifying, health, projectKey: savedProjectClean }); // [A5] hero interpolates SAVED key
+  const hero = heroBanner({ verdict, licenseGate, verifying, health, projectKey: savedProjectClean, trialActive }); // [A5] hero interpolates SAVED key
   const keyStepDone = apiKeyConfigured && !keyStorageFault;
   const projectStepDone = !!savedProjectClean; // [A2] step 2 done keys on the SAVED project
   const projectValid = /^[A-Z][A-Z0-9]{1,9}$/.test(projectKeyClean);
@@ -703,7 +715,11 @@ export default function AdminSettings({ initialTab = "settings", diagRefFilter =
           )}
         </MoodCard>
 
-        {/* 4.3 Cost + trust row */}
+        {/* 4.3 Cost + trust row — ⭐ 2026-07-11: this whole BYOK cost/data-path row ("billed to YOUR
+            Anthropic account", "Anthropic · your key") is FALSE + scary for a trial user running on OUR
+            $5 free credit, so it is HIDDEN while trialActive. It reappears once they add their own key /
+            the trial ends (the managed-path trust/compliance lives on the site's re-activated Managed DPA). */}
+        {!trialActive && (
         <div
           style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: 12, marginBottom: 16 }}
         >
@@ -745,6 +761,7 @@ export default function AdminSettings({ initialTab = "settings", diagRefFilter =
             </p>
           </MoodCard>
         </div>
+        )}
 
         {/* 4.4 Plan / model card — or degraded (unknown) / not-licensed (blocked). */}
         {!usageLoaded ? (
@@ -769,6 +786,7 @@ export default function AdminSettings({ initialTab = "settings", diagRefFilter =
             account={account}
             model={model}
             hasPlanner={hasPlanner}
+            trialActive={trialActive}
           />
         )}
 
@@ -802,17 +820,29 @@ export default function AdminSettings({ initialTab = "settings", diagRefFilter =
             <h3 style={{ ...TYPE.heading, color: MOOD.navy }}>Set up in order</h3>
             <span style={{ ...TYPE.micro }}>
               {ready ? (
-                <strong>All set · verified</strong>
+                <strong>All set{trialActive ? " · on free trial" : " · verified"}</strong>
+              ) : trialActive ? (
+                <>
+                  On your free trial — {verdict.configComplete ? "verify to finish" : "just set your Jira project"}. <strong>{verdict.requiredDone} of {verdict.requiredTotal} required done</strong>
+                </>
               ) : (
                 <>
-                  Two required steps, then two optional. <strong>{verdict.requiredDone} of 2 required done</strong>
+                  Two required steps, then two optional. <strong>{verdict.requiredDone} of {verdict.requiredTotal} required done</strong>
                 </>
               )}
             </span>
           </div>
 
-          {/* Step 1 — Connect Anthropic */}
-          <Step n={1} done={keyStepDone} title="Connect Anthropic" tag="REQUIRED">
+          {/* Step 1 — Connect Anthropic. ⭐ 2026-07-11: while a trial user is still on the $5 free managed
+              credit, this whole step is OPTIONAL and the scary BYOK field/info is HIDDEN behind a calm note
+              (only the Jira project below is required). It becomes REQUIRED once the trial credit is spent. */}
+          <Step
+            n={1}
+            done={keyStepDone}
+            title="Connect Anthropic"
+            tag={trialActive && !keyStepDone ? "OPTIONAL" : "REQUIRED"}
+            optional={trialActive && !keyStepDone}
+          >
             {keyStepDone && !editingKey ? (
               <StepSummary
                 text={`Key configured${
@@ -820,6 +850,21 @@ export default function AdminSettings({ initialTab = "settings", diagRefFilter =
                 }${model ? ` · model ${model}` : ""}`}
                 onEdit={() => setEditingKey(true)}
               />
+            ) : trialActive && !editingKey ? (
+              <div>
+                <SignalCallout kind="info" fontSize={12.5} style={{ marginBottom: 8 }}>
+                  You're on your $5 free trial — Spec2Tickets runs on our Anthropic key, so you don't need a key
+                  of your own yet. When the free credit runs out we'll prompt you to add one for unlimited use.
+                </SignalCallout>
+                <button
+                  type="button"
+                  onClick={() => setEditingKey(true)}
+                  className="text-xs"
+                  style={{ color: "var(--s2j-blue)", textDecoration: "underline", background: "none", border: "none", cursor: "pointer", padding: 0 }}
+                >
+                  Prefer to use your own Anthropic key now? Add it &rarr;
+                </button>
+              </div>
             ) : (
               <div>
                 <p style={{ ...TYPE.micro, marginBottom: 8 }}>
@@ -952,7 +997,9 @@ export default function AdminSettings({ initialTab = "settings", diagRefFilter =
             <ContextProfilesEditor
               profiles={contextProfiles}
               setProfiles={setContextProfiles}
-              apiKeyConfigured={apiKeyConfigured}
+              /* "may distill" — a trial user on the $5 managed credit CAN distill on OUR key (the backend
+                 supports managed distill), so don't block a feature they're entitled to (fresh-army fix). */
+              apiKeyConfigured={apiKeyConfigured || trialActive}
               onMessage={setMessage}
             />
           </Step>
@@ -1018,11 +1065,22 @@ export default function AdminSettings({ initialTab = "settings", diagRefFilter =
               A blocked (unlicensed) instance must NEVER read "You're done", even with passing probes. */}
           <Step n={5} done={ready} title="Verify & hand off">
             {ready ? (
-              <p style={{ ...TYPE.micro, color: "var(--s2j-text)" }}>
-                <strong>You're done.</strong> All four checks passed against your session. <strong>Verified
-                from here — the key and project apply to everyone; each BA still needs their own
-                Confluence/Jira access.</strong>
-              </p>
+              verdict.verified === "verified" ? (
+                <p style={{ ...TYPE.micro, color: "var(--s2j-text)" }}>
+                  <strong>You're done.</strong> All four checks passed against your session. <strong>Verified
+                  from here — {trialActive ? "your project applies" : "the key and project apply"} to everyone;
+                  each BA still needs their own Confluence/Jira access.</strong>
+                </p>
+              ) : (
+                /* A trial user is "ready" once the project is set — but NO health check ran (they have no key),
+                   so we must NOT claim "all four checks passed" (fresh-army fix; that drifted from the neutral
+                   VERIFIED tile). Honest trial copy instead, with an optional Verify. */
+                <p style={{ ...TYPE.micro, color: "var(--s2j-text)" }}>
+                  <strong>You're set{trialActive ? " — running on your free trial" : ""}.</strong>{" "}
+                  {savedProjectClean ? `Pushes to ${savedProjectClean} by default. ` : ""}
+                  Run <strong>Verify</strong> anytime to confirm Jira responds from your session.
+                </p>
+              )
             ) : blocked ? (
               <p style={{ ...TYPE.micro }}>
                 Generation is blocked — see the <strong>Not licensed</strong> notice above.{" "}
@@ -2141,9 +2199,9 @@ function DiagnosticsTab({ refFilter = "", onRefFilterChange, onFixInSettings }) 
 // row: name + context textarea + "Distill with Claude" (condense a long paste) + live
 // counter + remove. The user later picks which profile applies per generation
 // (ReadyScreen), so a multi-project workspace never gets the wrong project's context.
-// NOTE: `apiKeyConfigured` here means "MAY DISTILL". v6 value-split: both editions are
-// BYOK, so distill needs the customer's own key for everyone — the parent passes plain
-// `apiKeyConfigured` (the old `|| isManaged` term was removed; there is no managed key now).
+// NOTE: `apiKeyConfigured` here means "MAY DISTILL". 2026-07-11: a trial user on the $5 free MANAGED
+// credit CAN distill on OUR key (the backend supports managed distill), so the parent passes
+// `apiKeyConfigured || trialActive` — otherwise a trial user would be blocked from a feature they're entitled to.
 function ContextProfilesEditor({ profiles, setProfiles, apiKeyConfigured, onMessage }) {
   const [distillingId, setDistillingId] = useState(null);
   const [distillProgress, setDistillProgress] = useState(null); // { label, current, total } while a 6-step distill runs
@@ -2672,7 +2730,7 @@ const linkStyle = { color: "var(--s2j-blue)", textDecoration: "underline" };
 
 // The hero verdict banner content — derives ONLY from the two orthogonal signals; the
 // blocked license gate dominates. Nothing else re-derives the verdict (single source).
-function heroBanner({ verdict, licenseGate, verifying, health, projectKey }) {
+function heroBanner({ verdict, licenseGate, verifying, health, projectKey, trialActive }) {
   if (verifying) {
     return { kind: "info", title: "Verifying...", body: "Running the 4 live checks against your own session.", spinner: true };
   }
@@ -2684,14 +2742,34 @@ function heroBanner({ verdict, licenseGate, verifying, health, projectKey }) {
     };
   }
   const v = verdict;
-  if (v.key === "storage_fault") {
+  // ⭐ 2026-07-11 Trial-on-managed: the app runs on OUR key while the $5 free credit lasts, so NEVER surface
+  // the "API key required" / storage-fault errors (the key is optional). The one required step is the Jira
+  // project; a real project/permission problem still surfaces via the shared verify branches below.
+  if (trialActive) {
+    if (v.project === "not_set") {
+      return {
+        kind: "warning",
+        title: "One step to push — set your Jira project",
+        body: "You're on your $5 free trial, so Spec2Tickets runs on our key — no Anthropic key needed yet. Add a default Jira project key and you're ready to push.",
+      };
+    }
+    if (v.verified !== "failed" && v.verified !== "unavailable") {
+      return {
+        kind: "success",
+        title: "You're set — running on your free trial",
+        body: `Generating on our key until your $5 free credit runs out${projectKey ? ` · pushes to ${projectKey}` : ""}. When it ends, we'll prompt you to add your own Anthropic key for unlimited use.`,
+      };
+    }
+    // else fall through to the verify-failed / unavailable branches (surface the real problem)
+  }
+  if (!trialActive && v.key === "storage_fault") {
     return {
       kind: "error",
       title: "Can't read your API key",
       body: "Forge returned a storage fault reading the stored secret — this is not the same as 'no key'. Re-enter the key in step 1 and Test.",
     };
   }
-  if (v.key === "not_set") {
+  if (!trialActive && v.key === "not_set") {
     return {
       kind: "error",
       title: "API key required — nothing can generate yet",
@@ -2840,7 +2918,7 @@ function PathArrow() {
 }
 
 // Plan / model card (§4.4). Price comes from pricing[] (single source), model from Test/verify.
-function PlanModelCard({ account, model, hasPlanner }) {
+function PlanModelCard({ account, model, hasPlanner, trialActive }) {
   const price = accountPrice(account);
   const breakdowns = account?.unlimited
     ? "Unlimited"
@@ -2854,7 +2932,9 @@ function PlanModelCard({ account, model, hasPlanner }) {
         <PlanCol label="MEMBER SINCE" value={account?.memberSinceLabel || "—"} />
       </div>
       <p style={{ ...TYPE.micro, marginTop: 10 }}>
-        Your Standard plan includes everything: unlimited breakdowns on your own Anthropic key, AI test-case generation, and the capacity planner.
+        {trialActive
+          ? "Your Standard plan includes everything: unlimited breakdowns (running on your $5 free trial credit for now), AI test-case generation, and the capacity planner."
+          : "Your Standard plan includes everything: unlimited breakdowns on your own Anthropic key, AI test-case generation, and the capacity planner."}
       </p>
       <div className="flex gap-2 flex-wrap" style={{ marginTop: 8 }}>
         <FeatureChip>Test-case generation</FeatureChip>

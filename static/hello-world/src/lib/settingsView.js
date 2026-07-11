@@ -27,7 +27,7 @@ export function computeLicenseGate(account) {
 // ── 2. Config verdict ───────────────────────────────────────────────────────
 // keyConfigured/projectKey from getSettings; keyStorageFault = FE flag set when a key-read storage fault was
 // detected (distinct from "no key"); health = last runHealthCheck { ok, probes } | null (not run).
-export function computeConfigVerdict({ keyConfigured, projectKey, keyStorageFault, health } = {}) {
+export function computeConfigVerdict({ keyConfigured, projectKey, keyStorageFault, health, trialActive } = {}) {
   const key = keyStorageFault ? "storage_fault" : keyConfigured ? "configured" : "not_set";
   const project = projectKey && String(projectKey).trim() ? "set" : "not_set";
   // 'unavailable' = the check COULD NOT complete (Forge-bridge/resolver error → health.failed or no probes) —
@@ -39,22 +39,27 @@ export function computeConfigVerdict({ keyConfigured, projectKey, keyStorageFaul
       : health.ok
         ? "verified"
         : "failed";
-  const configComplete = key === "configured" && project === "set";
+  // ⭐ 2026-07-11 trial-credit onboarding: while a trial user still has free MANAGED credit (trialActive),
+  // the Anthropic KEY is OPTIONAL — the app runs on OUR key, so the ONLY required config is the Project Key.
+  // A missing/absent key must NOT read as an error, must NOT block "ready", and must NOT scare the user with
+  // BYOK setup. Once the $5 is spent (trialActive false), the key becomes required as before.
+  const keyRequired = !trialActive;
+  const configComplete = project === "set" && (keyRequired ? key === "configured" : true);
 
-  // Ordered severity resolution (storage-fault + no-key are the hard blockers; a missing project is a
-  // warning; a failed verify is an error; a check-that-could-not-run is a warning; a green verify is ok;
-  // complete-but-unverified is neutral).
+  // Ordered severity resolution. The key blockers (storage-fault + no-key) only apply when a key is REQUIRED
+  // (a trial user on our credit has no key and that is fine); a missing project is a warning; a failed verify
+  // is an error; a check-that-could-not-run is a warning; a green verify is ok; complete-but-unverified neutral.
   let level;
-  if (key === "storage_fault") level = "error";
-  else if (key === "not_set") level = "error";
+  if (keyRequired && key === "storage_fault") level = "error";
+  else if (keyRequired && key === "not_set") level = "error";
   else if (project === "not_set") level = "warning";
   else if (verified === "failed") level = "error";
   else if (verified === "unavailable") level = "warning";
   else if (verified === "verified") level = "ok";
   else level = "neutral";
 
-  const requiredDone = (key === "configured" ? 1 : 0) + (project === "set" ? 1 : 0);
-  return { level, key, project, verified, configComplete, requiredDone, requiredTotal: 2 };
+  const requiredDone = (project === "set" ? 1 : 0) + (keyRequired && key === "configured" ? 1 : 0);
+  return { level, key, project, verified, configComplete, requiredDone, requiredTotal: keyRequired ? 2 : 1, keyRequired, trialActive: !!trialActive };
 }
 
 // ── 2b. Fully-ready / "done" — a FUNCTION of BOTH signals ─────────────────────
@@ -66,13 +71,20 @@ export function computeConfigVerdict({ keyConfigured, projectKey, keyStorageFaul
 export function computeReady({ licenseGate, verdict } = {}) {
   const lg = licenseGate || {};
   const v = verdict || {};
-  return lg.state !== "blocked" && v.configComplete === true && v.verified === "verified";
+  if (lg.state === "blocked" || v.configComplete !== true) return false;
+  // A trial user on our free managed credit has NO key to verify — config-complete (= project set) IS ready
+  // WITHOUT a green check... BUT a verify that actually RAN and FAILED (or could-not-run) must still block
+  // "ready" (fresh-army fix: a trial user who runs Verify against a nonexistent project must NOT read "All set"
+  // while the hero/tile show the red failure). not_run/verified both pass; only failed/unavailable block.
+  if (v.keyRequired === false) return v.verified !== "failed" && v.verified !== "unavailable";
+  // A non-trial (BYOK) user still needs a green health check.
+  return v.verified === "verified";
 }
 
 // ── 3. Answer tiles ─────────────────────────────────────────────────────────
 // Five tiles; status ∈ ok|warn|error|neutral → the UI paints the icon/tint (neutral = a hollow grey circle,
 // so OPTIONALS never read as an amber gap). value/sub are display strings.
-export function computeTiles({ verdict, apiKeyLastSetAt, health, profilesCount = 0, hasCustomFields = false, licenseBlocked = false } = {}) {
+export function computeTiles({ verdict, apiKeyLastSetAt, health, profilesCount = 0, hasCustomFields = false, licenseBlocked = false, trialActive = false } = {}) {
   const v = verdict || {};
   const probes = health && Array.isArray(health.probes) ? health.probes : [];
   const probeCount = probes.length;
@@ -83,7 +95,10 @@ export function computeTiles({ verdict, apiKeyLastSetAt, health, profilesCount =
       ? { status: "error", value: "Storage fault", sub: "can't read secret" }
       : v.key === "configured"
         ? { status: "ok", value: "Configured", sub: apiKeyLastSetAt ? `last set ${formatDate(apiKeyLastSetAt)}` : "configured" }
-        : { status: "error", value: "Not set", sub: "paste to connect" };
+        : trialActive
+          // While on the $5 free trial the key is OPTIONAL — a NEUTRAL tile (never a red "Not set" gap).
+          ? { status: "neutral", value: "On free trial", sub: "optional — add when it ends" }
+          : { status: "error", value: "Not set", sub: "paste to connect" };
 
   const project =
     v.project === "set"
@@ -135,7 +150,7 @@ const PROBE_CLASS = {
   rate_limited: { severity: "warning", fixField: null, hint: "Anthropic rate limit hit (429). Wait a moment and Re-verify." },
   permission_denied: { severity: "warning", fixField: null, hint: "Your Jira/Confluence account lacks access. The key is fine — this probe checks YOUR session, so fixing a field here would be wrong." },
   egress_blocked: { severity: "warning", fixField: null, hint: "Forge blocked an outbound request (app config). Contact support@spec2jira.com." },
-  managed_unavailable: { severity: "warning", fixField: "apiKey", hint: "No Anthropic key was available. Both editions use your own key — add it in step 1." },
+  managed_unavailable: { severity: "warning", fixField: "apiKey", hint: "No Anthropic key was available for this run. Add your own Anthropic key in step 1 (if you're on the free trial, our key was briefly unavailable — try again, or add your own to continue)." },
   confluence_http: { severity: "warning", fixField: null, hint: "A live Confluence call failed. Usually transient — Re-verify in a moment." },
   jira_http: { severity: "warning", fixField: null, hint: "A live Jira call failed. Usually transient — Re-verify in a moment." },
   network_failure: { severity: "warning", fixField: null, hint: "A network call never got a response. Check connectivity and Re-verify." },

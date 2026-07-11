@@ -214,7 +214,7 @@ function fmtUsd(usd) {
   return `$${usd.toFixed(2)}`;
 }
 
-function SummaryBar({ testCaseResults, onRegenerate, hasTestCases = true }) {
+function SummaryBar({ testCaseResults, onRegenerate, hasTestCases = true, trialActive = false }) {
   if (!testCaseResults) return null;
   const { perStory = [], total = 0, failedCount = 0 } = testCaseResults;
   const storyCount = perStory.length;
@@ -267,7 +267,7 @@ function SummaryBar({ testCaseResults, onRegenerate, hasTestCases = true }) {
       </Chip>
       {/* v6 cost-transparency: exact post-run Anthropic-usage echo for this run (your own key, no markup) */}
       {typeof testCaseResults?.cost?.total_usd === "number" && (
-        <Chip tone="neutral" icon={<IconCost size={13} />} title="Anthropic API usage for this run -- billed to your own API key, no markup">
+        <Chip tone="neutral" icon={<IconCost size={13} />} title={trialActive ? "Anthropic API usage for this run -- drawn from your $5 free trial credit" : "Anthropic API usage for this run -- billed to your own API key, no markup"}>
           {fmtUsd(testCaseResults.cost.total_usd)} used
         </Chip>
       )}
@@ -383,6 +383,7 @@ function TestCasesScreen({
   onSaveTestCase,
   regenStates = {},
   hasTestCases = true, // v6: false => a downgraded user viewing RETAINED cases (edit/regen need Advanced). Default true = back-compat / entitled.
+  trialActive = false, // 2026-07-11: on the $5 managed trial credit — reframe BYOK cost/key copy to free-trial-credit framing.
 }) {
   // Stale detection: testCaseResults.breakdownPageVersion < currentVersion
   const tcPageVersion = testCaseResults?.breakdownPageVersion;
@@ -695,7 +696,7 @@ function TestCasesScreen({
                     </button>
                   );
                 })()}
-                <SummaryBar testCaseResults={testCaseResults} onRegenerate={handleRegenerate} hasTestCases={hasTestCases} />
+                <SummaryBar testCaseResults={testCaseResults} onRegenerate={handleRegenerate} hasTestCases={hasTestCases} trialActive={trialActive} />
                 <div>
                   {perStory.map((entry) => (
                     <StoryRow

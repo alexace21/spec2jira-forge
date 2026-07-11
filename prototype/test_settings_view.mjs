@@ -88,6 +88,51 @@ eq(v.level, 'neutral', 'complete-but-unverified -> neutral');
 eq(v.verified, 'not_run', 'neutral verified=not_run');
 ok(v.configComplete === true, 'neutral is config-complete (drives auto-verify eligibility)');
 
+// ── 2b. TRIAL-CREDIT onboarding — while on the $5 free MANAGED credit, the KEY is OPTIONAL ──
+// (2026-07-11) trialActive softens the key requirement: only the Jira project is required, a missing key is
+// NOT an error / NOT a blocker, and the API-KEY tile reads NEUTRAL (never a red "Not set" that scares the
+// trial user into BYOK setup they don't need yet). Non-trial behavior is unchanged (regression guard T4).
+let t = computeConfigVerdict({ keyConfigured: false, projectKey: 'SDTY', health: null, trialActive: true });
+ok(t.level !== 'error', 'T1 trial + no key + project set -> NOT error (key optional)');
+ok(t.configComplete === true, 'T1 configComplete on the project alone (key optional)');
+eq(t.requiredTotal, 1, 'T1 only 1 required (the project) while on free trial');
+eq(t.requiredDone, 1, 'T1 1 of 1 required done');
+eq(t.keyRequired, false, 'T1 keyRequired=false while on trial credit');
+ok(computeReady({ licenseGate: { state: 'licensed' }, verdict: t }) === true, 'T1 trial + project set -> ready (no key to verify)');
+
+// T2: trial + no key + NO project -> the project is the ONE required step (warning, NOT a no-key error)
+t = computeConfigVerdict({ keyConfigured: false, projectKey: '', health: null, trialActive: true });
+eq(t.level, 'warning', 'T2 trial + no project -> warning (project is the one required step), NOT a no-key error');
+ok(t.configComplete === false, 'T2 not complete (project missing)');
+eq(t.requiredDone, 0, 'T2 0 of 1 required done');
+ok(computeReady({ licenseGate: { state: 'licensed' }, verdict: t }) === false, 'T2 no project -> not ready');
+
+// T3: trial API-KEY tile is NEUTRAL "On free trial" (never a red "Not set")
+let tt = Object.fromEntries(computeTiles({ verdict: computeConfigVerdict({ keyConfigured: false, projectKey: 'SDTY', health: null, trialActive: true }), trialActive: true, health: null }).map((x) => [x.id, x]));
+eq(tt.apiKey.status, 'neutral', 'T3 trial API-KEY tile neutral (not the red "Not set" error)');
+eq(tt.apiKey.value, 'On free trial', 'T3 trial API-KEY tile value "On free trial"');
+
+// T4 REGRESSION: NON-trial (default) is UNCHANGED — no key is still a hard error, 2 required, keyRequired true
+t = computeConfigVerdict({ keyConfigured: false, projectKey: 'SDTY', health: null });
+eq(t.level, 'error', 'T4 non-trial no key -> error (unchanged)');
+eq(t.requiredTotal, 2, 'T4 non-trial requiredTotal 2 (unchanged)');
+eq(t.keyRequired, true, 'T4 non-trial keyRequired true (unchanged)');
+
+// T5: trial + a verify that RAN and FAILED -> NOT ready (a real project/permission failure must block "All set",
+// not be swallowed by keyRequired=false — the fresh-army fix). not_run still passes (T1); only failed/unavailable block.
+t = computeConfigVerdict({ keyConfigured: false, projectKey: 'SDTY', trialActive: true, health: health(false, [P('anthropic_key', true), P('jira_project', false, 'project_not_found'), P('confluence_read', true), P('kvs_rw', true)]) });
+eq(t.verified, 'failed', 'T5 trial + a failing probe -> verified failed');
+ok(computeReady({ licenseGate: { state: 'licensed' }, verdict: t }) === false, 'T5 trial + FAILED verify -> NOT ready (failure not swallowed)');
+
+// T6: trial + verify UNAVAILABLE (bridge/resolver error) -> NOT ready
+t = computeConfigVerdict({ keyConfigured: false, projectKey: 'SDTY', trialActive: true, health: { ok: false, probes: [], failed: true } });
+eq(t.verified, 'unavailable', 'T6 trial + could-not-run -> verified unavailable');
+ok(computeReady({ licenseGate: { state: 'licensed' }, verdict: t }) === false, 'T6 trial + verify unavailable -> NOT ready');
+
+// T7: trial + verify PASSED -> ready (a green check is fine too, not only not_run)
+t = computeConfigVerdict({ keyConfigured: false, projectKey: 'SDTY', trialActive: true, health: health(true, [P('anthropic_key', true), P('jira_project', true), P('confluence_read', true), P('kvs_rw', true)]) });
+ok(computeReady({ licenseGate: { state: 'licensed' }, verdict: t }) === true, 'T7 trial + PASSED verify -> ready');
+
 // ── 3. ORTHOGONALITY — config verdict is independent of the license/account ───
 // The verdict function takes NO account arg; state #10 (getUsage failed) keeps the config verdict green.
 v = computeConfigVerdict({ keyConfigured: true, projectKey: 'SDTY', health: health(true, ALL_OK) });
