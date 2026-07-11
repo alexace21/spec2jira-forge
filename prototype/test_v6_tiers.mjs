@@ -101,14 +101,22 @@ check('pricingTable Standard is priced ($6.70)', /6\.70/.test(pt[0].price || '')
 check('pricingTable Standard carries hasTestCases true', pt[0].hasTestCases === true);
 check('pricingTable Standard carries hasPlanner true', pt[0].hasPlanner === true);
 
-// 12. isTrialLicense — only the 30-day Atlassian evaluation counts (gates the $5 managed credit)
+// 12. isTrialLicense — gates the $5 managed credit. The 30-day trial is signalled by isEvaluation===true
+// (real Marketplace) OR — when isEvaluation is UNDEFINED — a FUTURE trialEndDate (dev `forge install
+// --license trial` sets trialEndDate but NOT isEvaluation, verified on dev 2026-07-11). isEvaluation===false
+// is ALWAYS not-a-trial (the margin-leak guard: a paid customer never draws free credit).
 const FUTURE = new Date(Date.now() + 7 * 864e5).toISOString();
 const PAST = new Date(Date.now() - 7 * 864e5).toISOString();
 check('isEvaluation true ⇒ trial', isTrialLicense({ active: true, isEvaluation: true }) === true);
 check('isEvaluation true + future trialEndDate ⇒ trial', isTrialLicense({ isEvaluation: true, trialEndDate: FUTURE }) === true);
 check('isEvaluation true + PAST trialEndDate ⇒ NOT trial (stale flag guard)', isTrialLicense({ isEvaluation: true, trialEndDate: PAST }) === false);
+// ⭐ dev `--license trial`: isEvaluation UNDEFINED + a future trialEndDate ⇒ trial (the fix)
+check('isEvaluation undefined + FUTURE trialEndDate ⇒ trial (dev --license trial)', isTrialLicense({ active: true, trialEndDate: FUTURE }) === true);
+check('isEvaluation undefined + PAST trialEndDate ⇒ NOT trial', isTrialLicense({ active: true, trialEndDate: PAST }) === false);
+check('isEvaluation undefined + NO trialEndDate ⇒ NOT trial (no signal → safe polarity)', isTrialLicense({ active: true }) === false);
+// ⭐ margin-leak guard: an EXPLICITLY paid license is NEVER a trial, even with a lingering future trialEndDate
 check('paid (isEvaluation false) ⇒ NOT trial', isTrialLicense({ active: true, isEvaluation: false }) === false);
-check('isEvaluation absent ⇒ NOT trial', isTrialLicense({ active: true }) === false);
+check('paid (isEvaluation false) + FUTURE trialEndDate ⇒ NOT trial (margin-leak guard)', isTrialLicense({ isEvaluation: false, trialEndDate: FUTURE }) === false);
 check('null license ⇒ NOT trial', isTrialLicense(null) === false);
 
 console.log(`\n${pass} passed, ${fail} failed`);

@@ -246,13 +246,22 @@ export function resolveLicense(context) {
  * @param {object|null} license - a Forge License object (see resolveLicense).
  */
 export function isTrialLicense(license) {
-  if (!license || license.isEvaluation !== true) return false;
-  const end = license.trialEndDate;
-  if (end) {
-    const t = Date.parse(end);
-    if (Number.isFinite(t) && t < Date.now()) return false; // stale isEvaluation past trialEndDate
-  }
-  return true;
+  if (!license) return false;
+  const endT = license.trialEndDate ? Date.parse(license.trialEndDate) : NaN;
+  const endInFuture = Number.isFinite(endT) && endT > Date.now();
+  const endInPast = Number.isFinite(endT) && endT < Date.now();
+  // (1) The canonical Marketplace flag. A trialEndDate in the PAST = a stale isEvaluation past the trial end
+  //     → NOT a trial (never keep granting free managed credit after the trial actually ended).
+  if (license.isEvaluation === true) return !endInPast;
+  // (2) EXPLICITLY paid/non-eval (isEvaluation === false) → NEVER a trial, regardless of any lingering
+  //     trialEndDate. THE margin-leak guard: a paid customer must never draw the free managed credit.
+  if (license.isEvaluation === false) return false;
+  // (3) isEvaluation UNDEFINED → fall back to a FUTURE trialEndDate as the trial signal. ⭐ Verified on dev
+  //     2026-07-11: `forge install --license trial` sets trialEndDate (≈30 days out) but leaves isEvaluation
+  //     UNDEFINED — so the strict isEvaluation-only check made the whole $5-trial path untestable on dev AND
+  //     would miss any prod license shape that omits isEvaluation. A future end = an active trial; an
+  //     absent/past end = not a trial. Safe polarity: ambiguity (no signal) → not a trial (no free credit).
+  return endInFuture;
 }
 
 /**
