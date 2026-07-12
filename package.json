@@ -1,6 +1,6 @@
 {
   "name": "spec2tickets",
-  "version": "7.0.0",
+  "version": "6.6.0",
   "main": "index.js",
   "license": "MIT",
   "private": true,
