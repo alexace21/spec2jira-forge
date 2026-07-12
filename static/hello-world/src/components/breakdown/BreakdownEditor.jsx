@@ -1,308 +1,477 @@
-import { useState, useMemo, useEffect } from 'react';
-import EditableField from './EditableField.jsx';
-import { newStoryUid } from '../../lib/v3Schema';
-import CapabilityCard from './CapabilityCard.jsx';
-import SharedACPanel from './SharedACPanel.jsx';
-import LabelsEditor from './LabelsEditor.jsx';
+import { useState, useMemo, useEffect, useCallback } from 'react';
+import {
+  computeReviewReadiness,
+  setConcernDisposition,
+  addFeatureDependency,
+  removeFeatureDependency,
+  sharedAcInjected,
+  acIsSharedFor,
+  findFeatureByUid,
+  newStoryUid,
+} from '../../lib/v3Schema';
+import EpicEditView from './EpicEditView.jsx';
+import SharedACView from './SharedACView.jsx';
+import ReviewReadinessBar from './ReviewReadinessBar.jsx';
+import ComplianceLandmine from './ComplianceLandmine.jsx';
+import Worklist, { buildWorklistGroups } from './Worklist.jsx';
+import FocusedStory from './FocusedStory.jsx';
+import ConcernRail from './ConcernRail.jsx';
+import Wizard from './Wizard.jsx';
 import { glassSurface } from '../moodboard';
 
-export default function BreakdownEditor({ initialBreakdown, onPush, isPushing = false, breakdownRef }) {
+/**
+ * BreakdownEditor — the 6A THREE-PANE review-and-sign-off WORKBENCH.
+ *
+ * The BA's job is to FIND AND FIX the ~10-20% the AI got wrong, not re-author every card. So the editor
+ * leads with a review-readiness read + a pinned compliance landmine (span the width), then a THREE-PANE
+ * body: a LEFT "BREAKDOWN" worklist (2 pinned entries — Epic + Shared-AC — above a flag-sorted story list),
+ * a CENTER pane switched by the left selection (story / shared-AC / epic), and a RIGHT concern rail. The
+ * worklist + rail are `position: sticky` and the center FLOWS — everything is one page-scroll (NO 100vh, NO
+ * internal-scroll trap; a prior vh collapsed the editor to ~0 live). Wizards are FIXED-position overlays.
+ *
+ * The breakdown is the SINGLE immutable object: field edits, concern dispositions (editor-only, never
+ * pushed), and dependency edits all ride it, and it is mirrored up via breakdownRef so "Back to AI insights"
+ * lifts unsaved edits across the key="screen-reviewing" remount.
+ */
+export default function BreakdownEditor({ initialBreakdown, onPush, isPushing = false, breakdownRef, defaultProjectKey = null }) {
   const [breakdown, setBreakdown] = useState(() => JSON.parse(JSON.stringify(initialBreakdown)));
+
+  // ── 6A selection + wizard state ──
+  //   mode: which entry drives the center ('story' | 'shared' | 'epic')
+  //   selectedUid: the focused story's _uid (only meaningful when mode==='story')
+  //   wizard: null | { kind:'assign', sacId } | { kind:'newstory' }
+  const [mode, setMode] = useState('story');
+  const [selectedUid, setSelectedUid] = useState(null);
+  const [wizard, setWizard] = useState(null);
 
   useEffect(() => {
     setBreakdown(JSON.parse(JSON.stringify(initialBreakdown)));
   }, [initialBreakdown]);
 
-  // Mirror the current working copy up to App via the ref (2026-06-26) so the reviewing
-  // top-bar "Back to AI insights" can lift these unsaved edits to pendingBreakdown before
-  // navigating away (the key="screen-reviewing" remount would otherwise drop them). A
-  // ref-write, not state — no re-render cost on every edit.
+  // Mirror the current working copy up to App via the ref (2026-06-26) so "Back to AI insights" lifts
+  // these unsaved edits to pendingBreakdown before the remount. A ref-write, not state (no re-render).
   useEffect(() => {
     if (breakdownRef) breakdownRef.current = breakdown;
   }, [breakdown, breakdownRef]);
 
-  const stats = useMemo(() => {
+  // ── readiness rollup (top bar + worklist badges + landmine) ──
+  const readiness = useMemo(() => computeReviewReadiness(breakdown), [breakdown]);
+
+  // openByUid: uid -> {openCount, totalCount, reviewed} for the worklist row badges.
+  const openByUid = useMemo(() => {
+    const m = new Map();
+    for (const pf of readiness.perFeature || []) m.set(pf.uid, { openCount: pf.openCount, totalCount: pf.totalCount, reviewed: pf.reviewed });
+    return m;
+  }, [readiness]);
+
+  const worklistGroups = useMemo(
+    () => buildWorklistGroups(breakdown.capabilities || [], openByUid),
+    [breakdown.capabilities, openByUid]
+  );
+
+  // Default focus: the highest-weight story that needs review (readiness.perFeature is weight-sorted
+  // desc), else the first story. Re-anchor if the selected story was deleted.
+  useEffect(() => {
+    const allUids = (breakdown.capabilities || []).flatMap((c) => (c.features || []).map((f) => f._uid));
+    if (selectedUid && allUids.includes(selectedUid)) return;
+    const firstFlagged = (readiness.perFeature || []).find(
+      (pf) => pf.openCount > 0 || pf.indicator === '✗' || pf.indicator === '⚠'
+    );
+    const fallback = (readiness.perFeature && readiness.perFeature[0]) || null;
+    setSelectedUid((firstFlagged && firstFlagged.uid) || (fallback && fallback.uid) || allUids[0] || null);
+  }, [breakdown.capabilities, readiness.perFeature, selectedUid]);
+
+  // When the selection changes (esp. via the ComplianceLandmine "jump to story"), scroll the matching
+  // sticky worklist row into view so the focused story is visible in the left pane (best-effort).
+  useEffect(() => {
+    if (mode === 'story' && selectedUid) {
+      const el = document.querySelector('[data-worklist-uid="' + selectedUid + '"]');
+      if (el && el.scrollIntoView) el.scrollIntoView({ block: 'nearest' });
+    }
+  }, [selectedUid, mode]);
+
+  const focusedFeature = useMemo(
+    () => (selectedUid ? findFeatureByUid(breakdown, selectedUid) : null),
+    [breakdown, selectedUid]
+  );
+
+  // Category of the focused feature (for read-only context in the detail).
+  const focusedCategory = useMemo(() => {
+    if (!selectedUid) return '';
+    for (const cap of breakdown.capabilities || []) {
+      if ((cap.features || []).some((f) => f._uid === selectedUid)) return cap.name;
+    }
+    return '';
+  }, [breakdown.capabilities, selectedUid]);
+
+  // ── item tally (for the push bar copy) ──
+  const totalItems = useMemo(() => {
     const caps = breakdown.capabilities || [];
     const features = caps.flatMap((c) => c.features || []);
     const tasks = features.flatMap((f) => f.tasks || []);
-    // Story points live on the feature in v3 (tasks carry none); mirror
-    // CapabilityCard's feature-level sum. Tasks are kept only for the count.
-    const totalSP = features.reduce((s, f) => s + (f.story_points || 0), 0);
-    return {
-      capCount: caps.length, featureCount: features.length,
-      taskCount: tasks.length, totalSP,
-      totalItems: caps.length + features.length + tasks.length,
-    };
+    return caps.length + features.length + tasks.length;
   }, [breakdown]);
 
-  function updateEpic(f, v) { setBreakdown((p) => ({ ...p, epic: { ...p.epic, [f]: v } })); }
-  function updateCapability(i, u) { setBreakdown((p) => { const c = [...p.capabilities]; c[i] = u; return { ...p, capabilities: c }; }); }
-  function deleteCapability(i) { if (breakdown.capabilities.length <= 1) return; setBreakdown((p) => ({ ...p, capabilities: p.capabilities.filter((_, idx) => idx !== i) })); }
-  function addCapability() {
-    setBreakdown((p) => ({ ...p, capabilities: [...p.capabilities, {
-      name: 'New Category', features: [{ _uid: newStoryUid(), _orig_name: 'New Feature', name: 'New Feature', user_story: 'As a user, I want [goal], so that [benefit].',
-        acceptance_criteria: ['Acceptance criterion'], priority: 'Medium', story_points: 3, complexity_score: 3,
-        tasks: [{ type: 'API', summary: 'New task' }] }]
-    }] }));
-  }
-  function resetBreakdown() { setBreakdown(JSON.parse(JSON.stringify(initialBreakdown))); }
+  // ── Epic stats tiles (read-only): stories / sub-tasks / acceptance criteria / target project ──
+  const epicStats = useMemo(() => {
+    const caps = breakdown.capabilities || [];
+    const features = caps.flatMap((c) => c.features || []);
+    const subtasks = features.reduce((n, f) => n + (f.tasks || []).length, 0);
+    const acs = features.reduce((n, f) => n + (f.acceptance_criteria || []).length, 0);
+    const project =
+      breakdown.project_key || breakdown.projectKey || (breakdown.epic && breakdown.epic.project_key) || defaultProjectKey || null;
+    return { stories: features.length, subtasks, acs, project };
+  }, [breakdown, defaultProjectKey]);
 
-  // Shared AC
-  const availableFeatures = useMemo(() => {
+  // ── all-features list for the dependency picker + shared-AC assign (current name + frozen orig + uid) ──
+  const allFeatures = useMemo(() => {
     const r = [];
-    (breakdown.capabilities || []).forEach((cap, ci) => {
-      (cap.features || []).forEach((f, fi) => { r.push({ capName: cap.name, featName: f.name, capIndex: ci, featIndex: fi }); });
-    });
+    for (const cap of breakdown.capabilities || []) {
+      for (const f of cap.features || []) {
+        r.push({ uid: f._uid, name: f.name, origName: f._orig_name || f.name, category: cap.name });
+      }
+    }
     return r;
   }, [breakdown.capabilities]);
 
-  function assignSharedAC(sacId, featureName) {
+  // ── unallocated shared-AC count (the Worklist pinned-entry badge) ──
+  const unallocatedSharedAC = useMemo(() => {
+    const items = breakdown.shared_acceptance_criteria?.items || [];
+    return items.filter((i) => !i.removed_by_user && !i.assigned_feature).length;
+  }, [breakdown.shared_acceptance_criteria]);
+
+  // ════════════════════════════════════════════════════════════
+  // SELECTION handlers (drive the center pane)
+  // ════════════════════════════════════════════════════════════
+  const selectStory = useCallback((uid) => { setSelectedUid(uid); setMode('story'); }, []);
+  const selectEpic = useCallback(() => setMode('epic'), []);
+  const selectShared = useCallback(() => setMode('shared'), []);
+
+  // ════════════════════════════════════════════════════════════
+  // MUTATORS
+  // ════════════════════════════════════════════════════════════
+
+  // Epic
+  const updateEpic = useCallback((field, value) => {
+    setBreakdown((p) => ({ ...p, epic: { ...p.epic, [field]: value } }));
+  }, []);
+
+  // Update a single feature (by uid) with a shallow field patch. Immutable: rebuild the containing
+  // capability + features array so React sees a new reference and every derived read re-runs.
+  const updateFeatureByUid = useCallback((uid, patch) => {
+    setBreakdown((p) => ({
+      ...p,
+      capabilities: (p.capabilities || []).map((cap) => {
+        if (!(cap.features || []).some((f) => f._uid === uid)) return cap;
+        return {
+          ...cap,
+          features: cap.features.map((f) => (f._uid === uid ? { ...f, ...patch } : f)),
+        };
+      }),
+    }));
+  }, []);
+
+  // Concern disposition — editor-side only, NEVER pushed. setConcernDisposition returns a NEW breakdown.
+  const setConcern = useCallback((concernId, state, reason) => {
+    setBreakdown((p) => setConcernDisposition(p, concernId, state, reason));
+  }, []);
+
+  // Reset — revert the working copy to the pristine initialBreakdown (fresh deep clone).
+  const resetBreakdown = useCallback(() => {
+    const clean = JSON.parse(JSON.stringify(initialBreakdown));
+    delete clean._concern_dispositions;
+    for (const cap of clean.capabilities || []) {
+      for (const f of cap.features || []) { if (f) delete f._removed_dependencies; }
+    }
+    setBreakdown(clean);
+  }, [initialBreakdown]);
+
+  // Dependency add / remove — apply the immutable helpers (they rebuild every shape the push reads).
+  // sourceName MUST be the CURRENT feature name (mapFeatureDependencies matches by f.name).
+  const addDependency = useCallback((sourceName, targetName) => {
+    setBreakdown((p) => addFeatureDependency(p, sourceName, targetName));
+  }, []);
+
+  // Durable trimmed-dependency restore (survives a story switch / FocusedStory remount): the trimmed
+  // target's frozen _orig_name is recorded on the feature as the editor-only `_removed_dependencies`
+  // array. ⚠ Editor-only: never sent to Jira.
+  const trimDependency = useCallback((uid, sourceName, targetOrig) => {
+    setBreakdown((p) => {
+      let next = removeFeatureDependency(p, sourceName, targetOrig);
+      next = {
+        ...next,
+        capabilities: (next.capabilities || []).map((cap) => {
+          if (!(cap.features || []).some((f) => f._uid === uid)) return cap;
+          return {
+            ...cap,
+            features: cap.features.map((f) => {
+              if (f._uid !== uid) return f;
+              const prev = Array.isArray(f._removed_dependencies) ? f._removed_dependencies : [];
+              return prev.includes(targetOrig) ? f : { ...f, _removed_dependencies: [...prev, targetOrig] };
+            }),
+          };
+        }),
+      };
+      return next;
+    });
+  }, []);
+
+  const restoreDependency = useCallback((uid, sourceName, targetOrig) => {
+    setBreakdown((p) => {
+      let next = addFeatureDependency(p, sourceName, targetOrig);
+      next = {
+        ...next,
+        capabilities: (next.capabilities || []).map((cap) => {
+          if (!(cap.features || []).some((f) => f._uid === uid)) return cap;
+          return {
+            ...cap,
+            features: cap.features.map((f) => {
+              if (f._uid !== uid) return f;
+              const prev = Array.isArray(f._removed_dependencies) ? f._removed_dependencies : [];
+              if (!prev.includes(targetOrig)) return f;
+              return { ...f, _removed_dependencies: prev.filter((t) => t !== targetOrig) };
+            }),
+          };
+        }),
+      };
+      return next;
+    });
+  }, []);
+
+  // ── Shared-AC assign / unassign / remove / restore (bind by _uid; inject/remove prefix-exact) ──
+  const assignSharedAC = useCallback((sacId, uid) => {
     setBreakdown((p) => {
       const u = JSON.parse(JSON.stringify(p));
       const item = u.shared_acceptance_criteria?.items?.find((i) => i.id === sacId);
       if (!item) return p;
-      if (item.assigned_feature) _removeACFromFeature(u, item.assigned_feature, item.text);
-      item.assigned_feature = featureName;
-      _addACToFeature(u, featureName, `${item.id}: ${item.text}`);
+      // Guard: bail unchanged if the target story no longer exists (a stale uid would otherwise
+      // set assigned_feature but inject no AC — an orphaned assignment).
+      if (!findFeatureByUid(u, uid)) return p;
+      if (item.assigned_feature) _removeInjectedAC(u, item.assigned_feature, item);
+      item.assigned_feature = uid;
+      _addInjectedAC(u, uid, item);
       return u;
     });
-  }
-  function unassignSharedAC(sacId) {
+  }, []);
+
+  const unassignSharedAC = useCallback((sacId) => {
     setBreakdown((p) => {
       const u = JSON.parse(JSON.stringify(p));
       const item = u.shared_acceptance_criteria?.items?.find((i) => i.id === sacId);
       if (!item?.assigned_feature) return p;
-      _removeACFromFeature(u, item.assigned_feature, item.text);
+      _removeInjectedAC(u, item.assigned_feature, item);
       item.assigned_feature = null;
       return u;
     });
-  }
+  }, []);
 
-  // Soft-delete a shared AC: stamp removed_by_user=true; if it was assigned to a
-  // feature, unassign + remove it from that feature.acceptance_criteria (so no
-  // ghost AC lingers). The item stays in the breakdown JSON (restorable from the
-  // "Removed" subsection) but, being unassigned, is part of no feature and so is
-  // never pushed to JIRA. `removed_by_user` is a public field so it survives JSON
-  // serialization.
-  function removeSharedACItem(sacId) {
+  const removeSharedACItem = useCallback((sacId) => {
     setBreakdown((p) => {
       const u = JSON.parse(JSON.stringify(p));
       const item = u.shared_acceptance_criteria?.items?.find((i) => i.id === sacId);
       if (!item) return p;
-      // If assigned, remove from feature.AC + clear assigned_feature so
-      // restoration starts clean. (User reassigns после restore if needed.)
       if (item.assigned_feature) {
-        _removeACFromFeature(u, item.assigned_feature, item.text);
+        _removeInjectedAC(u, item.assigned_feature, item);
         item.assigned_feature = null;
       }
       item.removed_by_user = true;
       return u;
     });
-  }
+  }, []);
 
-  function restoreSharedACItem(sacId) {
+  const restoreSharedACItem = useCallback((sacId) => {
     setBreakdown((p) => {
       const u = JSON.parse(JSON.stringify(p));
       const item = u.shared_acceptance_criteria?.items?.find((i) => i.id === sacId);
       if (!item) return p;
       delete item.removed_by_user;
-      // Item returns to the regular AC list. assigned_feature was cleared on
-      // remove; the user reassigns it if desired.
       return u;
     });
-  }
+  }, []);
 
-  // 2026-06-26 UX (live-validated): content-flow, NOT a bounded flex-fill. The editor
-  // page-scrolls with the host page like every other screen — the reviewing wrapper has
-  // no height pin, so there is no definite height for a flex-1/overflow-y-auto pane to
-  // resolve against (that combination collapsed the editor to ~0 live). `flex flex-col`
-  // just stacks the three zones (stats bar · content · push bar) at natural height.
+  const jumpToFeature = useCallback((uid) => selectStory(uid), [selectStory]);
+
+  // ── Add a new placeholder story into a target category (the newstory wizard passes it). Mints
+  //    _uid + _orig_name via newStoryUid so the dep-name->uid binding invariant holds. Focuses it. ──
+  const addStory = useCallback((category, name, storyPoints) => {
+    const uid = newStoryUid();
+    // A user-typed name is used verbatim; a blank one falls back to a UNIQUE placeholder (two unrenamed
+    // additions must NOT share a name/_orig_name, or the dep-name->uid binding goes ambiguous). The
+    // "New Feature" prefix keeps isPlaceholderName catching a blank-named add until it's renamed.
+    const trimmed = String(name || '').trim();
+    const finalName = trimmed || `New Feature ${uid.slice(2, 6)}`;
+    const sp = typeof storyPoints === 'number' ? storyPoints : 3;
+    const newFeature = {
+      _uid: uid,
+      _orig_name: finalName,
+      name: finalName,
+      user_story: 'As a user, I want [goal], so that [benefit].',
+      description: '',
+      acceptance_criteria: ['Acceptance criterion'],
+      priority: 'Medium',
+      story_points: sp,
+      complexity_score: 3,
+      labels: [],
+      dependencies: [],
+      concerns: [],
+      tasks: [{ _uid: newStoryUid(), type: 'API', summary: 'New task', description: '' }],
+    };
+    setBreakdown((p) => {
+      const caps = p.capabilities || [];
+      if (caps.length === 0) {
+        newFeature.category = category || 'Uncategorised';
+        return { ...p, capabilities: [{ name: newFeature.category, features: [newFeature] }] };
+      }
+      // Target the requested category, else the category holding the current selection, else the first.
+      let targetIdx = -1;
+      if (category) targetIdx = caps.findIndex((c) => c.name === category);
+      if (targetIdx < 0 && selectedUid) {
+        targetIdx = caps.findIndex((c) => (c.features || []).some((f) => f._uid === selectedUid));
+      }
+      if (targetIdx < 0) targetIdx = 0;
+      newFeature.category = caps[targetIdx].name;
+      return {
+        ...p,
+        capabilities: caps.map((cap, i) =>
+          i === targetIdx ? { ...cap, features: [...(cap.features || []), newFeature] } : cap
+        ),
+      };
+    });
+    setSelectedUid(uid);
+    setMode('story');
+  }, [selectedUid]);
+
+  // ── Wizard open/close/submit ──
+  const openAssignWizard = useCallback((sacId) => setWizard({ kind: 'assign', sacId }), []);
+  const openNewStoryWizard = useCallback(() => setWizard({ kind: 'newstory' }), []);
+  const closeWizard = useCallback(() => setWizard(null), []);
+
+  const submitWizard = useCallback((payload) => {
+    setWizard((w) => {
+      if (!w) return null;
+      if (w.kind === 'assign' && payload && payload.uid) {
+        assignSharedAC(w.sacId, payload.uid);
+      } else if (w.kind === 'newstory' && payload) {
+        addStory(payload.category, payload.name, payload.storyPoints);
+      }
+      return null;
+    });
+  }, [assignSharedAC, addStory]);
+
+  // Default category for the newstory wizard = the current selection's category.
+  const defaultNewStoryCategory = focusedCategory || '';
+
+  const epicTitle = breakdown.epic?.summary || 'Your breakdown';
+
   return (
-    // transparent so the app's ambient ice field (body) shows through — the glass cards float on ice.
-    <div className="flex flex-col" style={{ background: 'transparent' }}>
-      {/* Stats bar */}
-      <div className="shrink-0 px-4 py-2.5" style={{
-        borderBottom: '1px solid var(--s2j-border)',
-        background: 'var(--s2j-bg-section)',
-      }}>
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-4 text-xs">
-            <StatChip label="Categories"  value={stats.capCount}     color="var(--s2j-blue)" />
-            <StatChip label="Stories" value={stats.featureCount} color="var(--s2j-green)" />
-            <StatChip label="Tasks"  value={stats.taskCount}    color="var(--s2j-orange)" />
-            <StatChip label="Total SP" value={stats.totalSP}    color="var(--s2j-text)" highlight />
-            <span className="text-[11px]" style={{ color: 'var(--s2j-text-muted)' }}>
-              {stats.totalItems} Jira items
-            </span>
-          </div>
-          {/* Re-reading AI insights mid-edit lives on the reviewing top-bar's "Back to AI
-              insights" button now (2026-06-26) — the natural top-left back position; it
-              lifts edits via editorBreakdownRef so nothing is lost. */}
-          <button onClick={resetBreakdown}
-            className="rounded px-2 py-1 text-[11px] transition-colors"
-            style={{ color: 'var(--s2j-text-muted)' }}
-            onMouseEnter={e => { e.target.style.background = 'var(--s2j-border)'; e.target.style.color = 'var(--s2j-text)'; }}
-            onMouseLeave={e => { e.target.style.background = 'transparent'; e.target.style.color = 'var(--s2j-text-muted)'; }}>
-            Reset
-          </button>
+    <div className="px-4 py-4 space-y-4" style={{ background: 'transparent' }}>
+      {/* ── Top: review readiness (spans width) ── */}
+      <ReviewReadinessBar
+        readiness={readiness}
+        epicTitle={epicTitle}
+        itemCount={totalItems}
+        breakdown={breakdown}
+        onPush={() => onPush(breakdown)}
+        onReset={resetBreakdown}
+        isPushing={isPushing}
+      />
+
+      {/* ── Pinned compliance landmine (always visually first among content; red, informational) ── */}
+      {readiness.landmine && (
+        <ComplianceLandmine landmine={readiness.landmine} onJumpToFeature={jumpToFeature} />
+      )}
+
+      {/* ── THREE-PANE body: worklist (left, sticky) · center (mode-switched) · concern rail (right, sticky).
+          s2j-editor-3pane (index.css) is a 3-col grid that drops the rail below center under 1080px and
+          stacks fully under 900px. Page-scroll only — no column is an overflow container. ── */}
+      <div className="s2j-editor-3pane">
+        {/* LEFT */}
+        <Worklist
+          groups={worklistGroups}
+          mode={mode}
+          selectedUid={selectedUid}
+          unallocatedCount={unallocatedSharedAC}
+          onSelectStory={selectStory}
+          onSelectEpic={breakdown.epic ? selectEpic : null}
+          onSelectShared={selectShared}
+          onNewStory={openNewStoryWizard}
+        />
+
+        {/* CENTER — mode-switched */}
+        <div style={{ minWidth: 0 }}>
+          {mode === 'epic' && breakdown.epic ? (
+            <EpicEditView epic={breakdown.epic} onUpdate={updateEpic} stats={epicStats} />
+          ) : mode === 'shared' ? (
+            <SharedACView
+              sharedAC={breakdown.shared_acceptance_criteria}
+              availableFeatures={allFeatures}
+              onAssign={openAssignWizard}
+              onUnassign={unassignSharedAC}
+              onRemove={removeSharedACItem}
+              onRestore={restoreSharedACItem}
+            />
+          ) : focusedFeature ? (
+            <FocusedStory
+              // key on _uid so the detail REMOUNTS per story — no DependsOn "removed this session" state
+              // leaks across a story switch. The whole breakdown object still carries edits/disposition.
+              key={selectedUid}
+              feature={focusedFeature}
+              categoryName={focusedCategory}
+              breakdown={breakdown}
+              allFeatures={allFeatures}
+              onUpdateFeature={(patch) => updateFeatureByUid(selectedUid, patch)}
+              onAddDependency={addDependency}
+              onTrimDependency={(sourceName, targetOrig) => trimDependency(selectedUid, sourceName, targetOrig)}
+              onRestoreDependency={(sourceName, targetOrig) => restoreDependency(selectedUid, sourceName, targetOrig)}
+            />
+          ) : (
+            <div className="rounded-lg" style={{ ...glassSurface('minor'), padding: 24, textAlign: 'center' }}>
+              <p className="text-sm" style={{ color: 'var(--s2j-text-muted)' }}>
+                Select a story on the left to review it.
+              </p>
+            </div>
+          )}
         </div>
-      </div>
 
-      {/* Content — flows naturally (the host page scrolls; see the root comment). No
-          flex-1/overflow-y-auto: with a content-driven (no-vh) reviewing wrapper, an
-          internal scroll pane has no definite height and collapses to ~0. */}
-      <div className="px-4 py-4 space-y-4">
-        {/* Epic metadata */}
-        {breakdown.epic && (
-          <div className="rounded-lg space-y-3" style={{
-            // moodboard (Phase 4) — the Epic is the breakdown's top scope, so it gets the
-            // glass surface with its blue left-accent (consistent in both A/B variants).
-            ...glassSurface('minor'),
-            borderLeft: '4px solid var(--s2j-blue)',
-            padding: 16,
-          }}>
-            <div className="flex items-center gap-2 mb-1">
-              <span className="rounded px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider"
-                style={{ background: 'var(--s2j-blue-bg)', color: 'var(--s2j-blue)' }}>
-                Epic
-              </span>
-              <span className="text-[10px]" style={{ color: 'var(--s2j-text-muted)' }}>
-                Top-level scope
-              </span>
-            </div>
-            <div>
-              <label className="text-[11px] font-medium uppercase tracking-wider mb-1 block"
-                style={{ color: 'var(--s2j-text-muted)' }}>Summary</label>
-              <EditableField value={breakdown.epic.summary}
-                onChange={(v) => updateEpic('summary', v)}
-                className="text-base font-semibold"
-                style={{ color: 'var(--s2j-text)' }} />
-            </div>
-            <div>
-              <label className="text-[11px] font-medium uppercase tracking-wider mb-1 block"
-                style={{ color: 'var(--s2j-text-muted)' }}>Description</label>
-              <EditableField value={breakdown.epic.description}
-                onChange={(v) => updateEpic('description', v)}
-                multiline className="text-sm leading-relaxed"
-                style={{ color: 'var(--s2j-text-light)' }} />
-            </div>
-            <div>
-              <label className="text-[11px] font-medium uppercase tracking-wider mb-1 block"
-                style={{ color: 'var(--s2j-text-muted)' }}>Labels (pushed to the Epic)</label>
-              <LabelsEditor labels={breakdown.epic.labels || []}
-                onChange={(v) => updateEpic('labels', v)} />
-            </div>
-          </div>
-        )}
-
-        {/* Shared AC */}
-        {breakdown.shared_acceptance_criteria?.items?.length > 0 && (
-          <SharedACPanel
-            sharedAC={breakdown.shared_acceptance_criteria}
-            availableFeatures={availableFeatures}
-            onAssign={assignSharedAC}
-            onUnassign={unassignSharedAC}
-            onRemove={removeSharedACItem}
-            onRestore={restoreSharedACItem}
+        {/* RIGHT — concern rail (sticky). s2j-rail-col lets the grid drop it under center on narrow widths. */}
+        <div className="s2j-rail-col s2j-rail-sticky" style={{ '--s2j-rail-top': '8px', alignSelf: 'flex-start' }}>
+          <ConcernRail
+            feature={mode === 'story' ? focusedFeature : null}
+            breakdown={breakdown}
+            onSetConcern={setConcern}
+            mode={mode}
           />
-        )}
-
-        {/* Categories (each groups Stories; pushes as а single root JIRA Epic per Spec2Tickets v3.0.0) */}
-        <div className="space-y-3">
-          <div className="flex items-center justify-between">
-            <h3 className="text-xs font-semibold uppercase tracking-wider"
-              style={{ color: 'var(--s2j-text-muted)' }}>
-              Categories ({stats.capCount})
-            </h3>
-            <button onClick={addCapability} className="text-xs transition-colors"
-              style={{ color: 'var(--s2j-green)' }}
-              onMouseEnter={e => e.target.style.color = 'var(--s2j-green-dark)'}
-              onMouseLeave={e => e.target.style.color = 'var(--s2j-green)'}>
-              + Add Category
-            </button>
-          </div>
-          {breakdown.capabilities.map((cap, i) => (
-            <CapabilityCard key={i} capability={cap} index={i}
-              onUpdate={(u) => updateCapability(i, u)} onDelete={() => deleteCapability(i)} />
-          ))}
         </div>
       </div>
 
-      {/* Push bar */}
-      <div className="shrink-0 px-4 py-3" style={{
-        borderTop: '1px solid var(--s2j-border)',
-        background: 'var(--s2j-bg-section)',
-      }}>
-        <div className="flex items-center justify-between gap-3">
-          <p className="text-xs" style={{ color: 'var(--s2j-text-light)' }}>
-            {stats.totalItems} items will be created
-          </p>
-          <div className="flex items-center gap-2">
-            {/* Test-case generation moved to the Review screen (ConfirmScreen) — the SINGLE
-                entry point, so the BA's edits are always lifted into pendingBreakdown (via this
-                Push→Review step) before generating. Removes the edits-trapped-in-editor bug (#1). */}
-            <button onClick={() => onPush(breakdown)} disabled={isPushing} className="btn-primary">
-              {isPushing ? (
-                <>
-                  <SpinnerInline />
-                  Creating in Jira...
-                </>
-              ) : (
-                'Continue to Review →'
-              )}
-            </button>
-          </div>
-        </div>
-      </div>
+      {/* ── Wizard overlay (assign shared-AC / new story) — fixed modal; does NOT displace the editor. ── */}
+      {wizard && (
+        <Wizard
+          kind={wizard.kind}
+          breakdown={breakdown}
+          allFeatures={allFeatures}
+          sacId={wizard.sacId}
+          defaultCategory={defaultNewStoryCategory}
+          onClose={closeWizard}
+          onSubmit={submitWizard}
+        />
+      )}
     </div>
   );
 }
 
-function StatChip({ label, value, color, highlight = false }) {
-  return (
-    <div className="flex items-center gap-1.5">
-      <span style={{ color: 'var(--s2j-text-muted)' }}>{label}</span>
-      <span className={`font-mono font-semibold ${highlight ? 'rounded px-1.5 py-0.5' : ''}`}
-        style={{
-          color,
-          ...(highlight ? { background: 'var(--s2j-blue-bg)' } : {}),
-        }}>
-        {value}
-      </span>
-    </div>
-  );
-}
-
-function SpinnerInline() {
-  return (
-    <svg width="14" height="14" viewBox="0 0 16 16" fill="none"
-      style={{ animation: 'spin 0.8s linear infinite' }}>
-      <circle cx="8" cy="8" r="6.5" stroke="rgba(255,255,255,0.3)" strokeWidth="2.5" />
-      <path d="M14.5 8a6.5 6.5 0 00-6.5-6.5" stroke="#fff" strokeWidth="2.5" strokeLinecap="round" />
-      <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
-    </svg>
-  );
-}
-
-function _addACToFeature(bd, featName, acText) {
-  for (const cap of bd.capabilities || []) {
-    for (const f of cap.features || []) {
-      if (f.name === featName) {
-        if (!f.acceptance_criteria) f.acceptance_criteria = [];
-        if (!f.acceptance_criteria.some((ac) => ac.includes(acText.split(': ').pop()))) f.acceptance_criteria.push(acText);
-        return;
-      }
-    }
+// ── prefix-exact injected-AC helpers (bind the shared AC to a story by _uid) ──
+function _addInjectedAC(bd, uid, item) {
+  const f = findFeatureByUid(bd, uid);
+  if (!f) return;
+  if (!Array.isArray(f.acceptance_criteria)) f.acceptance_criteria = [];
+  if (!f.acceptance_criteria.some((ac) => acIsSharedFor(ac, item))) {
+    f.acceptance_criteria.push(sharedAcInjected(item));
   }
 }
 
-function _removeACFromFeature(bd, featName, acText) {
-  for (const cap of bd.capabilities || []) {
-    for (const f of cap.features || []) {
-      if (f.name === featName && f.acceptance_criteria) {
-        f.acceptance_criteria = f.acceptance_criteria.filter((ac) => !ac.includes(acText));
-        return;
-      }
-    }
-  }
+function _removeInjectedAC(bd, uid, item) {
+  const f = findFeatureByUid(bd, uid);
+  if (!f || !Array.isArray(f.acceptance_criteria)) return;
+  f.acceptance_criteria = f.acceptance_criteria.filter((ac) => !acIsSharedFor(ac, item));
 }

@@ -84,6 +84,7 @@ import {
   priorityRankOf,
   planSourceHash,
   estimatePlanCost,
+  buildRationaleMap, // v6.x plan data-contract: derive { uid → Claude's "why here" } from record.ranking on read
 } from './planner.js';
 // P12: the planning-objective allow-list is OWNED by prompts.js (it must stay lock-step with the
 // OBJECTIVE_CLAUSES the ranker actually understands). Import it rather than re-hardcoding the set here
@@ -98,7 +99,20 @@ import {
   formatResetDate,
   pricingTable,
   getActiveTier,
+  resolveLicense, // 2026-07-11: raw license read for the trial gate (isEvaluation/trialEndDate)
+  isTrialLicense, // 2026-07-11: is this the 30-day Atlassian trial? (gates the $5 managed credit)
 } from './usage.js';
+// $5 managed trial-credit ledger (src/trialCredit.js — per-install dollar reservation, node-testable).
+// resolveAnthropicKey decides managed-vs-byok credit-awarely; the start/finalize legs charge/reconcile it.
+import {
+  creditStatus,
+  chargeSpend,
+  managedRunBlocker,
+  BREAKDOWN_EST_USD,
+  PLAN_EST_USD,
+  REGEN_EST_USD,
+  DISTILL_EST_USD,
+} from './trialCredit.js';
 // Diagnostic ledger (Phase 0 wiring — docs/DIAGNOSTICS-LEDGER-DESIGN.md). Both write helpers
 // are FAIL-OPEN by contract (never throw into the caller); records are codes/ids/counts only,
 // verbatim detail goes ONLY through writeDiagnosticDetail (the separate §2b zone).
@@ -156,9 +170,114 @@ async function anthropicKeyForSource(source) {
  */
 async function resolveAnthropicKey(context) {
   const tier = getActiveTier(context);
-  const keySource = tier.keySource || 'byok'; // v6: explicit field, default BYOK (was: edition==='advanced'?'managed':'byok')
-  const { key: apiKey, fault: keyFault } = await anthropicKeyInfoForSource(keySource);
-  return { apiKey, keySource, keyFault, tier };
+  // Fault-aware BYOK read — used BOTH for the managed decision (a stored key ⇒ never spend our
+  // money) and as the byok fallback. A storage FAULT counts as "has key" so a transient storage
+  // glitch is surfaced (keyFault) rather than silently switching a keyed user to our managed key.
+  const byok = await getStoredApiKeyInfo();
+  const hasByokKey = !!byok.key || byok.fault === true;
+
+  // ── 2026-07-11 $5 managed trial credit — THE dynamic managed-vs-byok decision ──
+  // Resolve OUR MANAGED_ANTHROPIC_KEY ONLY for a new TRIAL user with credit remaining and no key of
+  // their own. ALL must hold: no BYOK key · MANAGED_ANTHROPIC_KEY set · trial license (isEvaluation,
+  // trialEndDate not past) · credit available AND under the hard ceiling AND the ledger read OK. Any
+  // glitch/ambiguity → BYOK (fail-open: never strand a payer, never spend our key on a read glitch).
+  // ⚠ This is the ONLY place the decision is made — the poll/fetch/cycle/test-gen legs reuse the
+  // STAMPED job.keySource and NEVER re-decide, so a batch stays bound to the key that created it.
+  let trial = { onManaged: false, available: 0, exhausted: true, grant: 0, spent: 0 };
+  if (!hasByokKey && process.env.MANAGED_ANTHROPIC_KEY) {
+    try {
+      if (isTrialLicense(resolveLicense(context))) {
+        const cs = await creditStatus();
+        trial = { onManaged: false, available: cs.availableUsd, exhausted: cs.exhausted, grant: cs.grantUsd, spent: cs.spentUsd };
+        if (cs.readOk && !cs.exhausted && !cs.overCeiling) {
+          console.log(`[resolveAnthropicKey] managed trial credit resolved (available≈$${cs.availableUsd.toFixed(2)} of $${cs.grantUsd})`);
+          return { apiKey: process.env.MANAGED_ANTHROPIC_KEY, keySource: 'managed', keyFault: false, tier, trial: { ...trial, onManaged: true } };
+        }
+      }
+    } catch (e) {
+      // Fail-open to BYOK — a trial/ledger read glitch degrades onboarding to the BYOK prompt,
+      // it never spends our key nor blocks a paying BYOK user.
+      console.error(`[resolveAnthropicKey] trial-credit read failed (BYOK fallback): ${String(e?.message || e)}`);
+    }
+  }
+  return { apiKey: byok.key, keySource: 'byok', keyFault: byok.fault, tier, trial };
+}
+
+// ── $5 managed trial credit — charge helpers (reservation model) ────────
+// The two choke points every managed-spend surface uses. Both FAIL-SAFE: a ledger glitch must
+// never break the generation itself (the Anthropic spend already happened; a missed charge is a
+// bounded, hard-ceiling-backstopped accounting error, never a user-facing failure).
+
+/**
+ * SUBMIT: charge a conservative estimate the moment a managed batch is accepted, so in-flight spend
+ * is visible to the next gate (closes the check-vs-charge race) and an abandoned run stays charged
+ * (caps our spend). Returns the amount ACTUALLY charged (0 if not managed or the charge glitched) —
+ * the caller stamps it as `creditEstimateUsd` so the finalize reconcile always converges the ledger
+ * to the echoed actual (estimate + (actual−estimate) = actual; or 0 + actual = actual on a hold glitch).
+ */
+async function holdManagedCredit(keySource, estimateUsd) {
+  if (keySource !== 'managed') return 0;
+  try {
+    await chargeSpend(estimateUsd);
+    return estimateUsd;
+  } catch (e) {
+    console.error(`[trialCredit] submit hold failed (non-fatal): ${String(e?.message || e)}`);
+    return 0;
+  }
+}
+
+/**
+ * FINALIZE: reconcile a managed run's stamped estimate to the echoed ACTUAL dollars, exactly ONCE.
+ * Idempotency is guarded by a DEDICATED per-run marker (`trial:charged:<ref>`) claimed BEFORE the
+ * debit — so a persistFailed re-poll (which re-runs the whole finalize block) or a terminal re-poll
+ * never double-charges, independent of whether the job record's own completed-persist succeeded (the
+ * adversarial-audit persistFailed-loop fix). If the marker guard can't be read/written we SKIP the
+ * charge (a missed charge is the safe error vs a double-charge). Concurrent finalizes racing between
+ * the marker read and set can still double-charge by one delta — bounded, hard-ceiling backstopped.
+ * Returns true when the run is (now or already) reconciled.
+ *
+ * ⚠ `ref` MUST uniquely identify THIS billing event — namespaced by SURFACE (and, for repeatable
+ * surfaces, by attempt). Breakdown/test-gen/plan all sit on the SAME breakdown jobId, so their refs are
+ * prefixed `bd:` / `tc:` / `plan:`; regen adds the batchId per attempt; distill adds session+step. A
+ * bare shared jobId would let the first surface's marker silently no-op the others' reconcile (a real
+ * margin leak the deep audit caught — the whole point of per-surface refs).
+ */
+async function reconcileManagedCredit(record, ref, actualUsd) {
+  if (!record || record.keySource !== 'managed') return false;
+  const markerKey = `trial:charged:${ref}`;
+  try {
+    const existing = await kvs.get(markerKey);
+    if (existing) return true; // already reconciled — idempotent no-op
+    await kvs.set(markerKey, { at: new Date().toISOString() }); // claim BEFORE the debit
+  } catch (e) {
+    console.error(`[trialCredit] charge-marker guard failed (skipping reconcile to avoid double-charge): ${String(e?.message || e)}`);
+    return false;
+  }
+  const est = Number.isFinite(record.creditEstimateUsd) ? record.creditEstimateUsd : 0;
+  const delta = (Number.isFinite(actualUsd) ? actualUsd : 0) - est;
+  try {
+    await chargeSpend(delta);
+  } catch (e) {
+    console.error(`[trialCredit] finalize reconcile failed (non-fatal): ${String(e?.message || e)}`);
+  }
+  return true;
+}
+
+/**
+ * Charge a managed SYNC-surface spend directly (NO marker). Sync surfaces (distill step, cycle-repair)
+ * have no poll loop that re-enters the SAME call, so — unlike a batch that is billed once but polled N
+ * times — each invocation IS one distinct real Anthropic spend and must be charged once. A marker here
+ * would only DROP a legitimate retry/re-run charge (an under-count = OUR margin leak, the WRONG polarity),
+ * which the code-review army flagged. Charge-once-per-real-call is the correct model. Fail-safe (never
+ * breaks the surface — the spend already happened; a missed charge is bounded + hard-ceiling backstopped).
+ */
+async function chargeManagedSpendSafe(usd) {
+  if (!(Number.isFinite(usd) && usd > 0)) return;
+  try {
+    await chargeSpend(usd);
+  } catch (e) {
+    console.error(`[trialCredit] sync-surface charge failed (non-fatal): ${String(e?.message || e)}`);
+  }
 }
 
 /**
@@ -184,6 +303,22 @@ function buildQuotaExceeded(quota) {
 }
 
 /**
+ * $5 managed trial credit exhausted (or one expensive test-case run won't fit the remaining
+ * credit). The user WAS onboarding on OUR key and has now spent the grant — route them to BYOK
+ * (their own key, unlimited). routeToSetup on the FE. Distinct from not_configured (a paid user
+ * who never had trial credit) so the copy reads "your free trial credit is used", not the alarming
+ * "configure a key". `estimateUsd`/`availableUsd` present ⇒ the test-gen pre-flight blocked a run
+ * that would overshoot the near-hard $5 ceiling — name the numbers honestly.
+ */
+function buildTrialCreditExhausted({ estimateUsd = null, availableUsd = null, runLabel = 'This run' } = {}) {
+  const detail =
+    estimateUsd != null && availableUsd != null
+      ? `${runLabel} needs about $${estimateUsd.toFixed(2)} of Anthropic usage, but only about $${availableUsd.toFixed(2)} of your free trial credit is left. Add your own Anthropic API key to run it — unlimited, you pay Anthropic directly (see spec2jira.com/get-api-key).`
+      : "You've used your $5 free trial credit. Add your own Anthropic API key to keep going — unlimited, you pay Anthropic directly (see spec2jira.com/get-api-key).";
+  return { error: 'trial_credit_exhausted', detail };
+}
+
+/**
  * Defensive license_required payload (tier === 'unlicensed' — no subscription and
  * no active trial). A Paid-via-Atlassian app is licensed-only by default, so this
  * is a backstop that turns the no-license case into a clean "subscribe or start a
@@ -199,30 +334,10 @@ function buildLicenseRequired() {
   };
 }
 
-/**
- * v6 value-split: edition_required payload — returned when a user WITHOUT the test-case
- * capability (Standard edition) reaches a test-case WRITE path (generate / regenerate /
- * save). This is an UPGRADE prompt (the user IS licensed, just on the wrong edition), so
- * the frontend routes it to the upgrade screen, NOT the generic error screen. Carries the
- * pricing table so the UI can present the Advanced edition. `feature` lets the UI tailor copy.
- */
-function buildUpgradeRequired(feature = 'test_cases') {
-  // Feature-aware detail so the upgrade prompt names the RIGHT premium feature — both test-case
-  // generation AND the Capacity-Sheet Planner are Advanced-only (v6.1). `feature` also lets the UI
-  // tailor copy. Unknown feature → the test-case message (back-compat default).
-  const detailByFeature = {
-    test_cases:
-      'Test-case generation is an Advanced feature. Upgrade to the Advanced edition to generate acceptance test cases for your stories.',
-    planner:
-      'The Capacity-Sheet Planner is an Advanced feature. Upgrade to the Advanced edition to turn your backlog into a Scrum or Kanban delivery plan and push it to Jira.',
-  };
-  return {
-    error: 'edition_required',
-    feature,
-    detail: detailByFeature[feature] || detailByFeature.test_cases,
-    pricing: pricingTable(),
-  };
-}
+// ⭐ 2026-07-11 STANDARD-ONLY: buildUpgradeRequired (the edition_required "Upgrade to Advanced" payload)
+// was REMOVED — no feature is gated behind an edition anymore, so no resolver returns edition_required.
+// The FE edition_required handlers are stripped in lockstep. (Access is governed by the license gate
+// [unlicensed → license_required] and, on the $5 managed trial path, the credit gate [→ trial_credit_exhausted].)
 
 const resolver = new Resolver();
 
@@ -301,7 +416,16 @@ const PLAN_BATCH_PREFIX = 'planjob:';
 // + a daily scheduled sweep (sweepHandler) — NOT a creation-anchored TTL, which would silently expire
 // a deliverable still under review (the trap above).
 const JOB_META_PREFIX = 'jobmeta:';
-async function setJob(jobId, value) {
+// setJob(jobId, value[, metaExtra]) — centralizes the job: write + the lean jobmeta mirror.
+// `metaExtra` (optional) is a small object of EXTRA display fields merged into the jobmeta
+// mirror ONLY at the terminal transitions (completed/failed) — the picker dashboard reads
+// them without dereferencing the ~240KB job: record. Contract fields (page-picker redesign):
+// completedAt (epoch ms), features (breakdown.features.length), costUsd (the diagnostics-path
+// estimateCost, computed once), truncated (bool), errorReason (short human string, NO page
+// content). Only pass the keys that apply; the base mirror (status/pageTitle/startedAt/
+// lastAccessedAt) is unchanged. Keeping them in the lean mirror preserves getDashboardJobs'
+// pure-read invariant (no heavy deref) + the sweep's enumeration key shape.
+async function setJob(jobId, value, metaExtra) {
   const jobKey = `${JOB_KEY_PREFIX}${jobId}`;
   await kvs.set(jobKey, value);
   // Best-effort lean mirror — a jobmeta failure must never break generation (job: is authoritative).
@@ -315,10 +439,71 @@ async function setJob(jobId, value) {
       // on read-access via touchJobAccess so an actively-reviewed breakdown is never
       // swept; the scheduled orphan sweep deletes a never-pushed job 7 days after this.
       lastAccessedAt: Date.now(),
+      // Terminal display fields (page-picker) merged last so an explicit metaExtra always wins.
+      ...(metaExtra && typeof metaExtra === 'object' ? metaExtra : {}),
     });
   } catch (e) {
     console.warn(`[setJob] jobmeta mirror failed (non-fatal): ${String(e?.message || e)}`);
   }
+}
+
+// shortErrorReason — a terse, human, CONTENT-FREE failure string for the picker "Needs
+// attention" row (jobmeta.errorReason). Derived from the structured error CODE + a curated
+// map; the raw `detail` is NEVER used verbatim (it can echo page-derived text). Falls back to
+// a generic line. Capped defensively.
+function shortErrorReason(error, httpStatus) {
+  const code = String(error || '').trim();
+  const map = {
+    no_results_url: 'Anthropic returned no results — reopen to retry',
+    batch_request_expired: 'Anthropic batch expired — reopen to retry',
+    batch_expired: 'Anthropic batch expired — reopen to retry',
+    refused: 'The model declined this request — reopen to retry',
+    truncated: 'Output hit the length limit — reopen to retry',
+    parse_failed: 'Couldn\'t parse the result — reopen to retry',
+    result_row_missing: 'The result was missing — reopen to retry',
+    network_failure: 'Network error reaching Anthropic — reopen to retry',
+    kvs_persist_failed: 'Storage error — reopen to review and push',
+    kvs_write_failed: 'Storage error — reopen to retry',
+  };
+  if (map[code]) return map[code];
+  // results_fetch_<NNN> / anthropic_http style — surface the HTTP status if we have one.
+  if (Number.isFinite(httpStatus) && httpStatus > 0) {
+    if (httpStatus === 429) return 'Anthropic rate limit (429) — reopen to retry';
+    if (httpStatus === 401 || httpStatus === 403) return 'Anthropic rejected the API key — check Settings';
+    if (httpStatus >= 500) return `Anthropic service error (${httpStatus}) — reopen to retry`;
+    return `Anthropic error (${httpStatus}) — reopen to retry`;
+  }
+  const m = code.match(/results_fetch_(\d{3})/);
+  if (m) {
+    const s = Number(m[1]);
+    if (s === 429) return 'Anthropic rate limit (429) — reopen to retry';
+    if (s === 401 || s === 403) return 'Anthropic rejected the API key — check Settings';
+    if (s >= 500) return `Anthropic service error (${s}) — reopen to retry`;
+    return `Anthropic error (${s}) — reopen to retry`;
+  }
+  return 'Generation failed — reopen to retry';
+}
+
+// buildTerminalMeta — derive the page-picker jobmeta display fields from an authoritative
+// terminal `job` record. Used by the pollJobStatus terminal re-sync (self-healing) so a
+// re-assert can't strip the enriched fields. `costUsd` is not on the job record (computed at
+// completion) → the caller passes the previously-persisted value (or null). Returns only the
+// keys that apply to the job's terminal status; content-free by construction (errorReason via
+// shortErrorReason from the error CODE, never `detail`).
+function buildTerminalMeta(job, costUsdFromPrev) {
+  if (!job || (job.status !== 'completed' && job.status !== 'failed')) return {};
+  const completedAt = job.completedAt ? Date.parse(job.completedAt) : null;
+  const extra = { completedAt: Number.isFinite(completedAt) ? completedAt : null };
+  if (job.status === 'completed') {
+    const features = Array.isArray(job.breakdown?.features) ? job.breakdown.features.length : null;
+    extra.features = features;
+    // Prefer the cost persisted on the heavy record (from completion); else the carried prevMeta value. (deep-audit fix)
+    extra.costUsd = Number.isFinite(job.costUsd) ? job.costUsd : (Number.isFinite(costUsdFromPrev) ? costUsdFromPrev : null);
+    extra.truncated = job.stop_reason === 'max_tokens' || !!job.truncated;
+  } else {
+    extra.errorReason = shortErrorReason(job.error);
+  }
+  return extra;
 }
 
 // ── Task #13: never-pushed-orphan cleanup (access-renewed + scheduled sweep) ────────
@@ -729,7 +914,15 @@ resolver.define('saveSettings', async ({ payload, context }) => {
         surfaced: true,
       },
     });
-    return { error: 'Could not save settings (storage error). Try shortening your Project Context profiles, then save again.' };
+    // Surface apiKeyUpdated on the ERROR return too, so the FE can honestly tell the admin the KEY
+    // was saved even though the other settings could not be stored (the §5.13 partial-commit state);
+    // otherwise the UI reads "nothing saved" while the secret is committed server-side.
+    return {
+      error: apiKeyUpdated
+        ? 'Your API key was saved, but the other settings could not be stored. Try shortening your Project Context profiles, then Save again.'
+        : 'Could not save settings (storage error). Try shortening your Project Context profiles, then save again.',
+      apiKeyUpdated,
+    };
   }
 
   return { success: true, apiKeyUpdated };
@@ -776,6 +969,9 @@ resolver.define('testConnection', async ({ payload, context }) => {
     return {
       status: 'ok',
       message: `Connected to Anthropic API (${result.model})`,
+      // [settings redesign] surface the real model as a structured field so the Settings
+      // plan card + verdict can show "AI model: <real model from the API>", not a hard-coded label.
+      model: result.model,
     };
   }
 
@@ -839,9 +1035,9 @@ resolver.define('startDistillSession', async ({ payload, context }) => {
   const text = (payload?.text || '').trim();
   if (!text) return { error: 'empty', code: 'UNEXPECTED', detail: 'Nothing to distill.' };
 
-  // Distill (Project Context) is an Anthropic call too — resolve the key by tier
-  // so Managed installs (no BYOK key) distill with OUR key, BYOK with theirs.
-  const { apiKey, keySource, keyFault } = await resolveAnthropicKey(context);
+  // Distill (Project Context) is an Anthropic call too — resolve the key credit-awarely
+  // so a trial user (no BYOK key) distills on OUR key while $5 credit remains, BYOK with theirs.
+  const { apiKey, keySource, keyFault, trial } = await resolveAnthropicKey(context);
   if (!apiKey) {
     // [diag Phase 4, A4] storage-fault FIRST: a thrown secret read must not be misdiagnosed
     // as "no key configured" (keyFault is BYOK-only, so this never masks managed_unavailable).
@@ -857,31 +1053,22 @@ resolver.define('startDistillSession', async ({ payload, context }) => {
       console.error('[distill] managed key unavailable (MANAGED_ANTHROPIC_KEY not configured)');
       return { error: 'managed_unavailable', code: 'NOT_CONFIGURED', detail: 'The Managed service is temporarily unavailable. Please contact support@spec2jira.com, or switch to your own Anthropic API key in Settings.' };
     }
+    // A trial user out of $5 managed credit → the friendly BYOK prompt (routed to setup by the FE).
+    if (trial && trial.exhausted && trial.grant > 0) return { ...buildTrialCreditExhausted(), code: 'NOT_CONFIGURED' };
     return { error: 'not_configured', code: 'NOT_CONFIGURED', detail: 'Anthropic API key not configured. Save your key first.' };
   }
 
-  // §13 security-review fix: Managed distill spends OUR key but has no breakdown
-  // counter of its own → gate it on the per-USER fair-use cap (MANAGED_USER_CAP) so
-  // it cannot run on our key once this user is over their monthly cap. BYOK
-  // distill on the customer's own key → no gate. Fail-OPEN on a check glitch (never
-  // block a payer). NOTE (accepted 2026-06-03, partner decision): distill UNDER the
-  // cap is gated-but-not-consumed — a low-risk residual (cheap Haiku, requires a
-  // paid seat); add a dedicated distill cap only if abuse is ever observed.
+  // ⭐ 2026-07-11 STANDARD-ONLY + $5 trial: distill (Project Context) is included in Standard. On the
+  // managed trial path it draws on the SAME $5 dollar ledger (charged per step below), so gate it on
+  // remaining credit here — exhausted → route to BYOK. (Replaces the old dormant per-user COUNT-cap
+  // gate; creditStatus fails-closed on a glitch so a blip never spends our key.) BYOK is unlimited.
   if (keySource === 'managed') {
-    try {
-      const q = await checkQuota(context);
-      if (!q.allowed) {
-        return { error: 'managed_unavailable', code: 'NOT_CONFIGURED', detail: `You've used this month's Managed breakdowns — summarizing is paused until ${q.resetsAtLabel}. For unlimited, switch to BYOK Pro (your own key).` };
-      }
-    } catch (e) {
-      console.error(`[distill] managed pool check failed (allowing): ${String(e?.message || e)} ref=-`);
-      // [deep-audit P4 F4] the THIRD silent fail-open gate (license/quota at the two
-      // generation flows already record) — a persistent metering glitch silently
-      // admits Managed distill on OUR key; support must be able to see it happened.
-      await recordDiagnostic({
-        context,
-        record: { op: 'distill.step', error_class: 'gate_fail_open', level: 'warn', ref: null, surfaced: false },
-      });
+    // ⭐ 2026-07-12 PRE-FLIGHT STOPPER — the whole distill (6 Haiku steps) must fit the remaining credit
+    // before the first step spends; subsumes the old exhausted/overCeiling check (available 0 → block).
+    const cs = await creditStatus();
+    const blocker = managedRunBlocker({ keySource, availableUsd: cs.availableUsd, spentUsd: cs.spentUsd, estimateUsd: DISTILL_EST_USD });
+    if (blocker) {
+      return { ...buildTrialCreditExhausted({ estimateUsd: blocker.estimateUsd, availableUsd: blocker.availableUsd, runLabel: 'This project-context distillation' }), code: 'NOT_CONFIGURED' };
     }
   }
 
@@ -899,7 +1086,10 @@ resolver.define('startDistillSession', async ({ payload, context }) => {
       ? crypto.randomUUID()
       : `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 
-  const session = { input, clipped, sections: {}, createdAt: Date.now() };
+  // Stamp keySource on the SESSION (mirrors the batch stamp/reuse chain) — distillStep REUSES this,
+  // never re-resolving per step, so credit exhausting mid-session can't flip managed→byok and dead-end
+  // a trial user after we already paid for the earlier steps.
+  const session = { input, clipped, sections: {}, createdAt: Date.now(), keySource };
   // [diag Phase 5, §7-deferred] this session write used to throw OPAQUELY out of the
   // resolver (the FE catch showed a raw invoke error). Structured return instead; the
   // AdminSettings distill flow handles {error} returns (shows detail, offers retry).
@@ -948,7 +1138,12 @@ resolver.define('distillStep', async ({ payload, context }) => {
     return { error: 'session_not_found', code: 'UNEXPECTED', detail: 'Distill session expired or not found. Start over.' };
   }
 
-  const { apiKey, keySource, keyFault } = await resolveAnthropicKey(context);
+  // Reuse the keySource STAMPED on the session at start — do NOT re-resolve per step (else credit
+  // exhausting between steps would flip managed→byok and dead-end the session after we paid for the
+  // earlier steps). Mirrors the batch poll legs (anthropicKeyForSource by the stamped source). A legacy
+  // pre-2026-07-11 session with no stamp defaults to 'byok'. Fault-aware (a storage fault ≠ "no key").
+  const keySource = s.keySource || 'byok';
+  const { key: apiKey, fault: keyFault } = await anthropicKeyInfoForSource(keySource);
   if (!apiKey) {
     // [diag Phase 4, A4] storage-fault FIRST (see startDistillSession). ref = the distill
     // sessionId — the §1 schema's distill correlation id (a real minted id: the session
@@ -1014,6 +1209,18 @@ resolver.define('distillStep', async ({ payload, context }) => {
       record: { op: 'distill.step', error_class: 'kvs_write_failed', level: 'warn', ref: sessionId, surfaced: true },
     });
     return { error: 'kvs_write_failed', detail: 'Could not store the distill session in Forge storage. Please try again.', step, label: category.label };
+  }
+
+  // $5 managed trial credit — charge THIS distill step's real (sync Haiku) cost to the ledger, AFTER the
+  // section is durably stored (audit LOW fix): we meter the call whose OUTPUT we kept. Distill is a 6-step
+  // SYNC pipeline (no batch/finalize), so we charge per step, marker-guarded by session:step (retry-safe).
+  // reconcileManagedCredit with a hold-less synthetic record (estimate 0) charges the full actual once.
+  // Managed only; a no-op for BYOK. Fail-safe (never breaks the step — the section is already saved).
+  if (keySource === 'managed' && result && result.usage) {
+    const stepCost = estimateCost(result.usage, MODEL_FALLBACK, { batch: false }); // sync Haiku — NOT batched
+    // Direct charge (NO marker): each distillStep invocation is a distinct real Haiku call — a retry after a
+    // lost response IS new spend that must be charged (a marker would wrongly no-op it → under-count). See chargeManagedSpendSafe.
+    if (stepCost && Number.isFinite(stepCost.total_usd)) await chargeManagedSpendSafe(stepCost.total_usd);
   }
 
   const isLast = step === DISTILL_CATEGORIES.length - 1;
@@ -1178,12 +1385,20 @@ resolver.define('searchPages', async ({ payload }) => {
     const data = await response.json();
     const results = (data.results || []).map((r) => {
       const c = r.content || {};
-      return {
+      const out = {
         id: String(c.id || ''),
         title: c.title || r.title || '(untitled)',
         spaceKey: c.space?.key || r.resultGlobalContainer?.key || '',
         spaceName: c.space?.name || r.resultGlobalContainer?.title || '',
       };
+      // DEFENSIVE widen (page-picker): the CQL /wiki/rest/api/search result object carries a
+      // top-level `lastModified` (ISO 8601) and a plain-text `excerpt` snippet. Only add the
+      // keys when actually present + non-empty — omit gracefully so a leaner envelope is safe.
+      const lastModified = typeof r.lastModified === 'string' ? r.lastModified.trim() : '';
+      if (lastModified) out.lastModified = lastModified;
+      const excerpt = typeof r.excerpt === 'string' ? r.excerpt.trim() : '';
+      if (excerpt) out.excerpt = excerpt;
+      return out;
     }).filter((r) => r.id);
     return { results };
   } catch (e) {
@@ -1193,8 +1408,16 @@ resolver.define('searchPages', async ({ payload }) => {
 });
 
 resolver.define('getRecentPages', async () => {
-  const list = await kvs.get(RECENT_PAGES_KEY);
-  return { recent: Array.isArray(list) ? list : [] };
+  // Wrap the read: a KVS fault used to throw silently → the frontend couldn't tell a failed
+  // read from a genuinely-empty recent list. degraded:true surfaces a "couldn't load recent
+  // pages — retry" note instead of a silent gap. (Recent entry shape is unchanged.)
+  try {
+    const list = await kvs.get(RECENT_PAGES_KEY);
+    return { recent: Array.isArray(list) ? list : [] };
+  } catch (e) {
+    console.warn(`[getRecentPages] recent-pages read failed (returning degraded): ${String(e?.message || e)}`);
+    return { recent: [], degraded: true };
+  }
 });
 
 resolver.define('getLastSelectedPage', async () => {
@@ -1270,7 +1493,9 @@ resolver.define('getDashboardJobs', async ({ context }) => {
       context,
       record: { op: 'dashboard.read', error_class: 'kvs_read_failed', level: 'warn', ref: null, surfaced: false },
     });
-    return { jobs: [] };
+    // degraded:true lets the frontend distinguish a READ FAILURE from a genuinely-empty
+    // dashboard (both were {jobs:[]} before) — a failed read must never render as calm-empty.
+    return { jobs: [], degraded: true };
   }
   if (!Array.isArray(list) || list.length === 0) return { jobs: [] };
   // PURE READ (deep-audit fix). Dereference each ref against its job: record for LIVE status;
@@ -1295,7 +1520,16 @@ resolver.define('getDashboardJobs', async ({ context }) => {
       if (!meta) {
         const job = await kvs.get(`${JOB_KEY_PREFIX}${ref.jobId}`).catch(() => null);
         if (!job) return null; // purged/lost → filtered (never shown)
-        meta = { status: job.status, pageTitle: job.pageTitle, startedAt: job.submittedAt || job.createdAt };
+        // Legacy back-compat: derive the picker display fields from the heavy record too
+        // (still a READ, no backfill write) so a pre-jobmeta-enrichment terminal job isn't
+        // blank. costUsd is unavailable here (a computed estimate, never stored) → null.
+        meta = {
+          status: job.status,
+          pageTitle: job.pageTitle,
+          startedAt: job.submittedAt || job.createdAt,
+          lastAccessedAt: null,
+          ...buildTerminalMeta(job, null),
+        };
       }
       return {
         jobId: ref.jobId,
@@ -1303,6 +1537,13 @@ resolver.define('getDashboardJobs', async ({ context }) => {
         pageTitle: ref.pageTitle || meta.pageTitle || 'Untitled',
         status: meta.status, // live: pending | batched | completed | failed
         startedAt: meta.startedAt || ref.trackedAt,
+        // NEW (page-picker) — from the enriched jobmeta; degrade to null/false on legacy rows.
+        lastAccessedAt: Number.isFinite(meta.lastAccessedAt) ? meta.lastAccessedAt : null,
+        completedAt: Number.isFinite(meta.completedAt) ? meta.completedAt : null,
+        features: Number.isFinite(meta.features) ? meta.features : null,
+        costUsd: Number.isFinite(meta.costUsd) ? meta.costUsd : null,
+        truncated: !!meta.truncated,
+        errorReason: typeof meta.errorReason === 'string' ? meta.errorReason : null,
       };
     }),
   );
@@ -1484,13 +1725,15 @@ const MAX_CYCLE_RESOLVES = 3;
  * cutting the softest edge (a tiny LLM call), and surface anything unresolved as a
  * spec_concern. Mutates `breakdown.features[].dependencies` + `breakdown.spec_concerns`
  * in place. Fail-safe — the caller wraps it so generation never fails on repair.
+ * RETURNS the accumulated usage of the cycle-resolve LLM calls (or null if none ran) so the caller
+ * can meter that extra managed spend against the $5 trial ledger (audit MED fix — it was unmetered).
  */
 async function verifyAndRepairCycles(breakdown, apiKey, model) {
   const features = breakdown?.features;
-  if (!Array.isArray(features) || features.length === 0) return;
+  if (!Array.isArray(features) || features.length === 0) return null;
 
   let cycles = detectCycles(features); // pure, deterministic, exhaustive
-  if (cycles.length === 0) return;
+  if (cycles.length === 0) return null;
   console.log(`[cycle] detected ${cycles.length} dependency cycle(s)`);
 
   const byName = new Map(features.map((f) => [f.name, f]));
@@ -1499,6 +1742,7 @@ async function verifyAndRepairCycles(breakdown, apiKey, model) {
   const unresolvable = new Set(); // node-set signatures already surfaced as NOT auto-resolved (loop guard)
   const sigOf = (p) => [...p].sort().join('|');
   let resolves = 0;
+  let cycleUsage = null; // accumulated usage of the resolveDependencyCycle calls (for the $5 trial ledger)
 
   // Process ONE live cycle at a time, RE-DETECTING after each cut. detectCycles returns every cycle of
   // the CURRENT graph (deduped by node-set), but a single cut can break SEVERAL overlapping cycles (a
@@ -1517,6 +1761,8 @@ async function verifyAndRepairCycles(breakdown, apiKey, model) {
       const involved = path.map((n) => byName.get(n)).filter(Boolean);
       try {
         const r = await resolveDependencyCycle({ cyclePath: path, features: involved, apiKey, model });
+        // Meter the call's spend even if its cut wasn't used (we still paid Anthropic for it).
+        if (r && r.usage) cycleUsage = sumUsage([cycleUsage, r.usage]);
         if (r && !r.error && !r.uncertain && r.cut_from && r.cut_to) cut = r;
       } catch (e) {
         console.error(`[cycle] resolve threw: ${String(e?.message || e)}`);
@@ -1564,6 +1810,7 @@ async function verifyAndRepairCycles(breakdown, apiKey, model) {
   if (concerns.length) {
     breakdown.spec_concerns = [...(breakdown.spec_concerns || []), ...concerns];
   }
+  return cycleUsage;
 }
 
 /**
@@ -1637,7 +1884,7 @@ resolver.define('startGeneration', async ({ payload, context }) => {
   // quota gate, so a Managed user — who has no BYOK key by design — is never
   // wrongly told to "configure a key". keySource is stored on the job below so
   // the poll leg reuses the SAME key the batch was created with.
-  const { apiKey, keySource, keyFault } = await resolveAnthropicKey(context);
+  const { apiKey, keySource, keyFault, trial } = await resolveAnthropicKey(context);
   if (!apiKey) {
     // [diag Phase 4, A4 — worst offender #2] storage-fault FIRST: the stored-key READ threw,
     // so "not configured" would be a misdiagnosis (the key may still be saved — support used
@@ -1666,11 +1913,31 @@ resolver.define('startGeneration', async ({ payload, context }) => {
           'The Managed service is temporarily unavailable. Please contact support@spec2jira.com, or switch to your own Anthropic API key in Settings.',
       };
     }
+    // A trial user whose $5 managed credit is spent (keySource fell back to byok, no key of their
+    // own) → the friendly "add your key to continue" prompt, NOT the alarming generic not_configured.
+    // trial.grant>0 means the managed branch actually ran (trial license, no key, managed configured)
+    // and found the credit exhausted/over-ceiling — the honest exhaustion case.
+    if (trial && trial.exhausted && trial.grant > 0) {
+      return buildTrialCreditExhausted();
+    }
     return {
       error: 'not_configured',
       detail:
         'Anthropic API key not configured. Ask your Confluence admin to open Settings → Spec2Tickets and provide an Anthropic API key.',
     };
+  }
+
+  // ⭐ 2026-07-12 PRE-FLIGHT STOPPER — a managed trial breakdown must fit the remaining credit BEFORE it
+  // spends. The `!apiKey` block above catches a FULLY-exhausted user (apiKey fell back to a null BYOK key),
+  // but a trial user with a FEW CENTS left still resolves to the (non-null) managed key → without this it
+  // would run and spend a full ~$0.24 PAST the grant (the overrun caught in live testing at $0.01 left).
+  // Route to BYOK gracefully instead — the grant stays a real cap, not "grant + one run".
+  if (keySource === 'managed') {
+    const blocker = managedRunBlocker({ keySource, availableUsd: trial?.available, spentUsd: trial?.spent, estimateUsd: BREAKDOWN_EST_USD });
+    if (blocker) {
+      console.log(`[startGeneration] managed trial credit gate (${blocker.reason}): need≈$${blocker.estimateUsd.toFixed(2)} > avail≈$${blocker.availableUsd.toFixed(2)} → BYOK`);
+      return buildTrialCreditExhausted({ estimateUsd: blocker.estimateUsd, availableUsd: blocker.availableUsd, runLabel: 'This breakdown' });
+    }
   }
 
   // Record install provenance (grandfathering signal — see usage.js
@@ -1944,16 +2211,20 @@ resolver.define('startGeneration', async ({ payload, context }) => {
     // failure here must NEVER mask the original error the user needs to see: record + still
     // return the original structured error below.
     try {
+      // Page-picker jobmeta enrichment (failed-at-submit): completedAt + a terse content-free
+      // reason so this tracked row surfaces under "Needs attention" with a cause.
+      const submitHttp = classifyDiagGenerationError(submitResult.error)?.counts?.http_status;
       await setJob(jobId,{
         jobId,
         pageId: String(pageId),
         pageTitle,
         ownerAccountId,
         status: 'failed',
+        completedAt: new Date().toISOString(),
         createdAt: new Date().toISOString(),
         error: submitResult.error,
         detail: submitResult.detail,
-      });
+      }, { completedAt: Date.now(), errorReason: shortErrorReason(submitResult.error, submitHttp) });
     } catch (e) {
       console.error('[diag] failed-state bookkeeping write failed ref=' + jobId, e);
       await recordDiagnostic({
@@ -1977,6 +2248,9 @@ resolver.define('startGeneration', async ({ payload, context }) => {
   // is spent, so NEVER abort on a KVS failure: record tracking_degraded + proceed to the
   // normal success response (the batch is fine; polling/reconnect degrade until the record
   // self-heals, which without a batchId it won't — that is exactly the support signal).
+  // $5 managed trial credit — reserve a conservative estimate now that the batch is submitted
+  // (managed only; a no-op for BYOK). Reconciled to the echoed actual at finalize (pollJobStatus).
+  const creditEstimateUsd = await holdManagedCredit(keySource, BREAKDOWN_EST_USD);
   let trackingDegraded = false;
   try {
     await setJob(jobId,{
@@ -1995,6 +2269,8 @@ resolver.define('startGeneration', async ({ payload, context }) => {
       keySource, // 'managed'|'byok' — the poll/fetch/cycle-repair legs MUST reuse
       //            the SAME key the batch was created with (Anthropic batches are
       //            scoped to the creating key). See pollJobStatus.
+      creditEstimateUsd, // $5 trial: the estimate held at submit (managed only; 0 for BYOK)
+      creditReconciled: false, // flipped true when pollJobStatus reconciles the estimate to actual
     });
   } catch (e) {
     trackingDegraded = true;
@@ -2101,11 +2377,21 @@ resolver.define('pollJobStatus', async ({ payload, context }) => {
       // back to now only if absent, so the setJob invariant (jobmeta always carries lastAccessedAt)
       // holds at every write site and a swept-too-early silent loss can't sneak in via this path.
       const prevMeta = await kvs.get(`${JOB_META_PREFIX}${jobId}`).catch(() => null);
+      // Preserve the terminal DISPLAY fields (page-picker) too, else this re-sync would strip
+      // the completedAt/features/costUsd/truncated/errorReason a prior terminal setJob wrote.
+      // Rebuild them from the authoritative `job` (self-healing if the enriched mirror write
+      // itself failed); costUsd is not stored on `job` (it's a computed estimate) so carry it
+      // from prevMeta if present.
+      const terminalExtra = buildTerminalMeta(
+        job,
+        prevMeta && Number.isFinite(prevMeta.costUsd) ? prevMeta.costUsd : null,
+      );
       await kvs.set(`${JOB_META_PREFIX}${jobId}`, {
         status: job.status,
         pageTitle: job.pageTitle,
         startedAt: job.submittedAt || job.createdAt,
         lastAccessedAt: prevMeta && Number.isFinite(prevMeta.lastAccessedAt) ? prevMeta.lastAccessedAt : Date.now(),
+        ...terminalExtra,
       });
     } catch (_) {}
     return job;
@@ -2188,7 +2474,8 @@ resolver.define('pollJobStatus', async ({ payload, context }) => {
         // [diag Phase 0, §3 site :1545] Bookkeeping write for an ALREADY-failed state — a KVS
         // failure must never mask the original error: record + still return the original below.
         try {
-          await setJob(jobId,failed);
+          // Page-picker jobmeta enrichment (failed): completedAt + a terse content-free reason.
+          await setJob(jobId, failed, { completedAt: Date.now(), errorReason: shortErrorReason(failed.error) });
         } catch (e) {
           console.error('[diag] failed-state bookkeeping write failed ref=' + jobId, e);
           await recordDiagnostic({
@@ -2247,7 +2534,10 @@ resolver.define('pollJobStatus', async ({ payload, context }) => {
         };
         // [diag Phase 0, §3 site :1564] Same contract as :1545 — never mask the original error.
         try {
-          await setJob(jobId,failed);
+          // Page-picker jobmeta enrichment (failed): completedAt + a terse content-free reason
+          // (surface the HTTP status from the closed diag registry when the error carries one).
+          const httpStatus = classifyDiagGenerationError(failed.error)?.counts?.http_status;
+          await setJob(jobId, failed, { completedAt: Date.now(), errorReason: shortErrorReason(failed.error, httpStatus) });
         } catch (e) {
           console.error('[diag] failed-state bookkeeping write failed ref=' + jobId, e);
           await recordDiagnostic({
@@ -2291,6 +2581,15 @@ resolver.define('pollJobStatus', async ({ payload, context }) => {
       const elapsedMs =
         Date.now() - new Date(job.submittedAt || job.createdAt).getTime();
 
+      // $5 managed trial credit — reconcile the submit estimate to the echoed ACTUAL, exactly once
+      // (managed jobs only; creditReconciled guards re-entry). Skip when the actual is unknown so the
+      // held estimate stands (SAFE polarity — never refund a spend we can't price). Persisted below.
+      const breakdownActualUsd =
+        costEstimate && Number.isFinite(costEstimate.total_usd) ? costEstimate.total_usd : null;
+      const creditReconciled =
+        job.creditReconciled === true ||
+        (breakdownActualUsd != null ? await reconcileManagedCredit(job, `bd:${jobId}`, breakdownActualUsd) : false);
+
       // Synthesize Epic от Confluence page title + spec summary.
       // v3 schema doesn't emit а top-level `epic` field; Option A push pattern
       // (1 Epic + N Stories) requires we manufacture it here. push_handler.js
@@ -2310,7 +2609,17 @@ resolver.define('pollJobStatus', async ({ payload, context }) => {
       // sequencing and creates false confidence (§11). Fail-safe — non-fatal.
       try {
         // Cycle-repair LLM call reuses the job's key (Managed ⇒ our key, same as submit).
-        await verifyAndRepairCycles(breakdown, jobApiKey, fetchResult.model);
+        const cycleUsage = await verifyAndRepairCycles(breakdown, jobApiKey, fetchResult.model);
+        // $5 managed trial credit — cycle-repair is EXTRA managed spend not in fetchResult.usage (so the
+        // breakdown reconcile above missed it). Meter it separately (managed only; sync calls → {batch:false};
+        // its own marker cyc:<jobId>). Audit MED fix — previously an unmetered leak (bounded, but real).
+        if (job.keySource === 'managed' && cycleUsage) {
+          const cycCost = estimateCost(cycleUsage, fetchResult.model, { batch: false });
+          // Direct charge (NO marker): cycle-repair is a set of SYNC calls; if a rare re-run (double-KVS-fail
+          // or concurrent double-poll) re-incurs the cost, that is real new spend that must be charged. A marker
+          // would drop it (under-count = margin leak, wrong polarity). Over-count on a race is the SAFE polarity.
+          if (cycCost && Number.isFinite(cycCost.total_usd)) await chargeManagedSpendSafe(cycCost.total_usd);
+        }
       } catch (e) {
         console.error(`[pollJobStatus] cycle repair failed (non-fatal): ${String(e?.message || e)} ref=${jobId}`);
         // [diag Phase 3, §2.1 :1590] C-class (§11 worst bug): the whole verify pass threw,
@@ -2340,6 +2649,10 @@ resolver.define('pollJobStatus', async ({ payload, context }) => {
         model: fetchResult.model,
         elapsedMs,
         stop_reason: fetchResult.stop_reason,
+        // costUsd persisted ON the heavy record (not only the lean mirror) so the terminal re-sync +
+        // legacy dashboard fallback recover it without depending on a prevMeta read. (deep-audit fix)
+        costUsd: (costEstimate && Number.isFinite(costEstimate.total_usd)) ? costEstimate.total_usd : null,
+        creditReconciled, // $5 trial: true once the managed estimate was reconciled to actual (idempotency guard)
         // Partial-recovery flag когато output hit max_tokens but features salvaged.
         ...(fetchResult.truncated
           ? { truncated: true, truncation_note: fetchResult.truncation_note }
@@ -2354,8 +2667,20 @@ resolver.define('pollJobStatus', async ({ payload, context }) => {
       // `completed`, which is what just failed to fit), record the diagnostic, and hand the
       // breakdown forward INLINE (persistFailed: true) so the user can still review + push it
       // from this tab (push consumes the frontend copy — fully in-memory).
+      // Page-picker jobmeta enrichment (completed): mirror the display fields the dashboard
+      // reads without dereferencing the ~240KB job:. costUsd REUSES the SAME estimateCost the
+      // diagnostics breadcrumb below records (computed once, at ~2290) — no new estimate.
+      // Number.isFinite (not `|| Date.now()`) so a hypothetical epoch-0 parse isn't clobbered —
+      // consistent with buildTerminalMeta; Date.now() is the right fallback here (the job just completed).
+      const completedAtMs = Date.parse(completed.completedAt);
+      const completedMeta = {
+        completedAt: Number.isFinite(completedAtMs) ? completedAtMs : Date.now(),
+        features: Array.isArray(breakdown.features) ? breakdown.features.length : null,
+        costUsd: (costEstimate && Number.isFinite(costEstimate.total_usd)) ? costEstimate.total_usd : null,
+        truncated: fetchResult.stop_reason === 'max_tokens' || !!fetchResult.truncated,
+      };
       try {
-        await setJob(jobId,completed);
+        await setJob(jobId, completed, completedMeta);
       } catch (persistErr) {
         let approxBytes = 0;
         try {
@@ -2377,11 +2702,12 @@ resolver.define('pollJobStatus', async ({ payload, context }) => {
           await setJob(jobId,{
             ...job,
             status: 'failed',
+            completedAt: new Date().toISOString(),
             error: 'kvs_persist_failed',
             detail: persistLikelySize
               ? 'The generated breakdown was too large to store (~' + Math.round(approxBytes / 1024) + ' KB). Review and push it now — and consider splitting the page into smaller sections for next time.'
               : 'The generated breakdown could not be stored (a storage error — not a size problem). Review and push it now; if this repeats, contact support@spec2jira.com.',
-          });
+          }, { completedAt: Date.now(), errorReason: shortErrorReason('kvs_persist_failed') });
         } catch (terminalErr) {
           console.error('[diag] small terminal write ALSO failed ref=' + jobId + ' (KVS may be down)', terminalErr);
         }
@@ -2619,11 +2945,33 @@ resolver.define('getUsage', async ({ context }) => {
   } catch (e) {
     console.error(`[getUsage] firstSeen record failed (non-fatal): ${String(e?.message || e)}`);
   }
+  // $5 managed trial credit — surface the credit state for the FE (the badge + the setup-gate
+  // relaxation). Reuse the SAME decision resolveAnthropicKey makes so the FE and the backend never
+  // disagree about whether this run is on managed credit. Independently try/caught so a ledger glitch
+  // hides the badge rather than erroring the whole account panel. Non-null ONLY for a trial user with
+  // no BYOK key on a managed-configured install (trial.grant>0) — a paid/keyed user gets null (no badge).
+  let trialCredit = null;
+  try {
+    const { keySource, trial } = await resolveAnthropicKey(context);
+    if (trial && trial.grant > 0) {
+      trialCredit = {
+        onManaged: keySource === 'managed',
+        grantUsd: trial.grant,
+        spentUsd: trial.spent,
+        availableUsd: trial.available,
+        exhausted: trial.exhausted,
+      };
+    }
+  } catch (e) {
+    console.error(`[getUsage] trial-credit read failed (badge hidden, non-fatal): ${String(e?.message || e)}`);
+  }
   try {
     const quota = await checkQuota(context);
     return {
       ...quota,
       pricing: pricingTable(),
+      // $5 managed trial credit state (null unless a trial user is on the managed-credit onboarding path).
+      trial: trialCredit,
       // Install provenance for the customer-facing Account panel (the
       // grandfathering signal, surfaced). null until the first capture.
       memberSince: firstSeenAt,
@@ -2679,6 +3027,43 @@ resolver.define('purgeJob', async ({ payload, context }) => {
       context,
       record: { op: 'purge', error_class: 'purge_incomplete', level: 'warn', ref: diagJobRef, surfaced: false },
     });
+    return { ok: false };
+  }
+});
+
+/**
+ * purgePageSnapshot — Task C surgical privacy purge for a PARTIAL push.
+ *
+ * A partial push is NOT terminal: a Resume may follow, so the DERIVED data (job:/tcjob:/
+ * testcases:/jobmeta:) must SURVIVE so the resume can re-create the unwritten items and
+ * re-embed test cases on the resumed Stories. But the raw source-page snapshot (pagesnap:,
+ * ~180KB — the privacy-critical item) is no longer needed once a push has run, so we delete
+ * ONLY it here to keep the "raw page content is removed when you push" claim HONEST while
+ * retaining everything a resume needs. The FULL purge (deleteJobKeys, via purgeJob) runs
+ * later, when the run reaches a CLEAN terminal (a resume that lands everything, or a clean
+ * first push). An abandoned partial's derived keys are swept by the existing 7-day orphan
+ * sweep (jobmeta: survives; startPush already touchJobAccess'd). Best-effort, non-fatal.
+ */
+resolver.define('purgePageSnapshot', async ({ payload, context }) => {
+  const jobId = payload?.jobId;
+  if (!jobId) return { ok: false };
+  try {
+    await kvs.delete(`${PAGE_SNAP_PREFIX}${jobId}`);
+    // NOTE (DPA follow-up): a partial push also retains the plan:/planjob: derived data (alongside
+    // job:/tcjob:/testcases:/jobmeta:) for up to 7 days, until a resume terminates or the orphan sweep runs.
+    console.log(`[purgePageSnapshot] removed raw page snapshot for job ${jobId} (partial push; derived data retained for resume)`);
+    return { ok: true };
+  } catch (e) {
+    console.error(`[purgePageSnapshot] failed (non-fatal): ${String(e?.message || e)} ref=${jobId}`);
+    // The raw-page delete failed → the "removed when you push" privacy claim is at risk; mirror
+    // purgeJob's incomplete-purge ledger record so support can see it. Best-effort — must not throw
+    // out of the resolver (recordDiagnostic is fail-open by contract; the extra try is belt-and-braces).
+    try {
+      await recordDiagnostic({
+        context,
+        record: { op: 'purge', error_class: 'purge_incomplete', level: 'warn', ref: cleanClientRef(jobId), surfaced: false },
+      });
+    } catch (_) { /* fail-open — the purge already failed; never let the trace throw */ }
     return { ok: false };
   }
 });
@@ -2772,6 +3157,16 @@ async function finalizePlanJob(planjob, ranking, usage, llmNote) {
     llmNote = 'Claude’s prioritization could not be matched to your features, so the plan is ordered by dependencies and priority.';
   }
   const cost = usage ? estimateCost(usage, planjob.model || MODEL_PRIMARY, { batch: true }) : null; // Batches API = 50%
+  // $5 managed trial credit — reconcile the submit hold to the echoed ACTUAL, once (managed only,
+  // marker-guarded). Only the success path passes `usage` (⇒ cost); the deterministic-fallback callers
+  // pass usage=null ⇒ no batch spent ⇒ no reconcile. finalizePlanJob is the single completion point, and
+  // it deletes the PLAN_BATCH record below so a re-poll returns the done plan without re-finalizing.
+  if (cost && Number.isFinite(cost.total_usd)) {
+    // per-ATTEMPT ref (+batchId): switching the planning objective RE-RANKS on the SAME jobId with a fresh
+    // managed batch — a bare plan:<jobId> marker would no-op the 2nd reconcile (fresh-army fix). The reconcile
+    // only runs on the success path (usage present ⇒ cost), where planjob.batchId is set.
+    await reconcileManagedCredit(planjob, `plan:${planjob.jobId}:${planjob.batchId || 'x'}`, cost.total_usd);
+  }
   const warnings = Array.isArray(planjob.warnings) ? planjob.warnings : [];
   // deep-audit KVS-footprint dedup (2026-06-20): do NOT persist `risk` separately — riskByFeature +
   // specConcernSummary are ALREADY sibling keys on `plan`. Storing them twice pushed a 300-feature
@@ -2784,7 +3179,7 @@ async function finalizePlanJob(planjob, ranking, usage, llmNote) {
   await touchJobAccess(planjob.jobId);
   // SELF-DESCRIBING PLAN (reload fix 2026-06-20): every completion return carries the lean features so the
   // FE name-source (result.features) survives a reload/re-pack regardless of the live in-memory breakdown.
-  return { ok: true, status: 'completed', plan, features: planjob.features, assumptions: capacity.assumptions, warnings, perSprintCapacityPoints: capacity.perSprintCapacityPoints, sourceHash: planjob.sourceHash, usedLlm, llmNote, cost, objective, methodology: planMethodology(planjob.capacityForm) };
+  return { ok: true, status: 'completed', plan, features: planjob.features, rationaleByUid: buildRationaleMap(ranking), assumptions: capacity.assumptions, warnings, perSprintCapacityPoints: capacity.perSprintCapacityPoints, sourceHash: planjob.sourceHash, usedLlm, llmNote, cost, objective, methodology: planMethodology(planjob.capacityForm) };
 }
 
 /**
@@ -2796,11 +3191,10 @@ async function finalizePlanJob(planjob, ranking, usage, llmNote) {
 resolver.define('startPlan', async ({ payload, context }) => {
   const tier = getActiveTier(context);
   if (tier.key === 'unlicensed') return buildLicenseRequired();
-  // v6.1 value-split: the Capacity-Sheet Planner is an Advanced-edition feature (bundled with test-cases).
-  // FAIL-CLOSED by construction (POLICY §3 cost-asymmetry): a license-read FAULT resolves to UNLICENSED (caught
-  // by the line above → license_required); an unknown/garbage ACTIVE capabilitySet defaults to Standard (no
-  // hasPlanner → upgrade). Either way the premium planner is denied, never leaked.
-  if (!tier.hasPlanner) return buildUpgradeRequired('planner');
+  // ⭐ 2026-07-11 STANDARD-ONLY: the Capacity-Sheet Planner is included in the single Standard edition —
+  // the former Advanced-only gate (buildUpgradeRequired on !hasPlanner) is REMOVED. Only the license
+  // gate above applies; on the $5 managed trial path the credit gate below (in resolveAnthropicKey /
+  // the not_configured branch) routes an out-of-credit trial user to BYOK.
   const { jobId, features, capacityForm, specSummary, specConcerns } = payload || {};
   // P12: the planning OBJECTIVE rides capacityForm.objective. SANITIZE against the frozen allow-list (never
   // trust a raw client string into the prompt) — unknown/missing → 'balanced' (no clause; today's behaviour).
@@ -2832,9 +3226,23 @@ resolver.define('startPlan', async ({ payload, context }) => {
     return { ok: true, status: 'completed', empty: true, plan: null, objective, methodology, assumptions: capacity.assumptions, warnings: capacity.warnings };
   }
 
-  const { apiKey, keyFault, keySource } = await resolveAnthropicKey(context);
+  const { apiKey, keyFault, keySource, trial } = await resolveAnthropicKey(context);
   if (keyFault) return { ok: false, stage: 'key', error: 'key_fault', detail: KEY_STORAGE_FAILED_DETAIL };
-  if (!apiKey) return { ok: false, stage: 'key', error: 'not_configured', detail: 'Add your Anthropic API key in Settings to generate a plan.' };
+  if (!apiKey) {
+    // A trial user out of $5 managed credit → the friendly BYOK prompt (routed by the FE), not the raw
+    // not_configured. The plan is a managed-spend surface, so it draws on the same $5 ledger.
+    if (trial && trial.exhausted && trial.grant > 0) return { ok: false, stage: 'key', ...buildTrialCreditExhausted() };
+    return { ok: false, stage: 'key', error: 'not_configured', detail: 'Add your Anthropic API key in Settings to generate a plan.' };
+  }
+
+  // ⭐ 2026-07-12 PRE-FLIGHT STOPPER — a managed trial plan must fit the remaining credit before it spends.
+  if (keySource === 'managed') {
+    const blocker = managedRunBlocker({ keySource, availableUsd: trial?.available, spentUsd: trial?.spent, estimateUsd: PLAN_EST_USD });
+    if (blocker) {
+      console.log(`[startPlan] managed trial credit gate (${blocker.reason}): need≈$${blocker.estimateUsd.toFixed(2)} > avail≈$${blocker.availableUsd.toFixed(2)} → BYOK`);
+      return { ok: false, stage: 'key', ...buildTrialCreditExhausted({ estimateUsd: blocker.estimateUsd, availableUsd: blocker.availableUsd, runLabel: 'This plan' }) };
+    }
+  }
 
   // §8 ranking input (pure). Wrapped so a MALFORMED payload can never throw an unhandled resolver 500.
   try {
@@ -2901,8 +3309,12 @@ resolver.define('startPlan', async ({ payload, context }) => {
       return await finalizePlanJob(planjob, null, null, planLlmNote(submit.error));
     }
 
+    // $5 managed trial credit — reserve a small estimate now the ranking batch is accepted (managed
+    // only; no-op for BYOK). Reconciled to actual in finalizePlanJob. NOT charged on the submit-error
+    // deterministic fallback above (no batch = no Anthropic spend).
+    const planCreditEstimateUsd = await holdManagedCredit(keySource, PLAN_EST_USD);
     // Store the in-flight batch record (keySource stamped once, reused by poll — gotcha). UI polls pollPlanStatus.
-    const batchRecord = { ...planjob, batchId: submit.batchId, status: 'batched', batchStatus: submit.status, submittedAt: Date.now(), expiresAt: submit.expiresAt };
+    const batchRecord = { ...planjob, batchId: submit.batchId, status: 'batched', batchStatus: submit.status, submittedAt: Date.now(), expiresAt: submit.expiresAt, creditEstimateUsd: planCreditEstimateUsd, creditReconciled: false };
     try { await kvs.set(`${PLAN_BATCH_PREFIX}${jobId}`, batchRecord); } catch (e) { console.warn(`[startPlan] planjob persist failed (non-fatal): ${String(e?.message || e)} ref=${jobId}`); }
     await touchJobAccess(jobId);
     return { ok: true, status: 'batched', planJobId: jobId, sourceHash: planjob.sourceHash, assumptions: capacity.assumptions, warnings: planWarnings, perSprintCapacityPoints: capacity.perSprintCapacityPoints, methodology };
@@ -2928,7 +3340,7 @@ resolver.define('pollPlanStatus', async ({ payload, context }) => {
     let done; try { done = await kvs.get(`${PLAN_KEY_PREFIX}${jobId}`); } catch (_) { done = null; }
     if (done && done.plan) {
       await touchJobAccess(jobId);
-      return { ok: true, status: 'completed', plan: done.plan, features: done.features, assumptions: done.assumptions, warnings: done.warnings, sourceHash: done.sourceHash, usedLlm: done.usedLlm, llmNote: done.llmNote, cost: done.cost, objective: done.objective || 'balanced', methodology: planMethodology(done.capacityForm) }; // G1 (deep-audit): top-level methodology parity with the other completion paths (latent race-trap close)
+      return { ok: true, status: 'completed', plan: done.plan, features: done.features, rationaleByUid: buildRationaleMap(done.ranking), assumptions: done.assumptions, warnings: done.warnings, sourceHash: done.sourceHash, usedLlm: done.usedLlm, llmNote: done.llmNote, cost: done.cost, objective: done.objective || 'balanced', methodology: planMethodology(done.capacityForm) }; // G1 (deep-audit): top-level methodology parity with the other completion paths (latent race-trap close)
     }
     return { ok: true, status: 'idle' };
   }
@@ -2964,7 +3376,7 @@ resolver.define('pollPlanStatus', async ({ payload, context }) => {
 resolver.define('repackPlan', async ({ payload, context }) => {
   const tier = getActiveTier(context);
   if (tier.key === 'unlicensed') return buildLicenseRequired();
-  if (!tier.hasPlanner) return buildUpgradeRequired('planner'); // v6.1: Advanced-only planner (re-pack is core planner VALUE; it re-runs the deterministic packer over the CACHED ranking — no spend)
+  // 2026-07-11 STANDARD-ONLY: planner included in Standard — Advanced gate removed (re-pack is free anyway; no spend).
   const { jobId, capacityForm } = payload || {};
   // Cross-tab race (gate finding): if a re-rank BATCH is in flight (e.g. another tab fired it), refuse the
   // free re-pack — its write over the CACHED ranking could clobber the FRESH ranking finalizePlanJob is
@@ -2996,7 +3408,7 @@ resolver.define('repackPlan', async ({ payload, context }) => {
 
   // SELF-DESCRIBING PLAN (gate HIGH 2026-06-20): a free re-pack REPLACES the FE planResult, so it MUST
   // re-carry features — else a reload→re-pack drops the name source and the chips re-render raw uids.
-  return { ok: true, plan, features: record.features, assumptions: capacity.assumptions, warnings: capacity.warnings, perSprintCapacityPoints: capacity.perSprintCapacityPoints, sourceHash: record.sourceHash, usedLlm: record.usedLlm, llmNote: record.llmNote, cost: record.cost, objective: record.objective || 'balanced', methodology: planMethodology(capacityForm), repacked: true };
+  return { ok: true, plan, features: record.features, rationaleByUid: buildRationaleMap(record.ranking), assumptions: capacity.assumptions, warnings: capacity.warnings, perSprintCapacityPoints: capacity.perSprintCapacityPoints, sourceHash: record.sourceHash, usedLlm: record.usedLlm, llmNote: record.llmNote, cost: record.cost, objective: record.objective || 'balanced', methodology: planMethodology(capacityForm), repacked: true };
 });
 
 /**
@@ -3019,7 +3431,7 @@ resolver.define('getPlan', async ({ payload }) => {
     // riskByFeature) — the human names live in record.features (the lean projection: _uid/name/SP/priority).
     // Return them so the FE can resolve uid→name on RELOAD without the live in-memory breakdown (which is
     // lost on a hard reload → names were rendering as raw uids). Lean + already capped → bounded payload.
-    return { ok: true, status: 'completed', plan: record.plan, features: record.features, capacityForm: record.capacityForm, assumptions: record.assumptions, warnings: record.warnings, sourceHash: record.sourceHash, usedLlm: record.usedLlm, llmNote: record.llmNote, cost: record.cost, objective: record.objective || 'balanced', methodology: planMethodology(record.capacityForm), stale };
+    return { ok: true, status: 'completed', plan: record.plan, features: record.features, rationaleByUid: buildRationaleMap(record.ranking), capacityForm: record.capacityForm, assumptions: record.assumptions, warnings: record.warnings, sourceHash: record.sourceHash, usedLlm: record.usedLlm, llmNote: record.llmNote, cost: record.cost, objective: record.objective || 'balanced', methodology: planMethodology(record.capacityForm), stale };
   }
   // 2) an IN-FLIGHT ranking batch? (reconnect mid-plan → the UI resumes polling)
   let planjob;
@@ -3048,7 +3460,7 @@ resolver.define('estimatePlanCost', async ({ payload }) => {
 resolver.define('previewCapacity', async ({ payload, context }) => {
   const tier = getActiveTier(context);
   if (tier.key === 'unlicensed') return buildLicenseRequired();
-  if (!tier.hasPlanner) return buildUpgradeRequired('planner'); // v6.1: planner-only — capacity/throughput preview IS planner value (deep-audit parity with startPlan/repackPlan; the only never-Advanced-reachable planner surface)
+  // 2026-07-11 STANDARD-ONLY: planner included in Standard — Advanced gate removed (preview is free; no spend).
   const form = payload && payload.capacityForm;
   // Kanban: preview the quarter throughput + reach band (the SAME computeThroughput the plan uses → can't drift).
   if (planMethodology(form) === 'kanban') {
@@ -3089,7 +3501,7 @@ resolver.define('previewCapacity', async ({ payload, context }) => {
 resolver.define('previewWhatIf', async ({ payload, context }) => {
   const tier = getActiveTier(context);
   if (tier.key === 'unlicensed') return buildLicenseRequired();
-  if (!tier.hasPlanner) return buildUpgradeRequired('planner'); // v6.1: planner-only — what-if is the TWIN of the gated repackPlan (re-packs the CACHED ranking, "core planner VALUE, no spend"); the deep audit caught this was left open
+  // 2026-07-11 STANDARD-ONLY: planner included in Standard — Advanced gate removed (what-if is free; no spend).
   const { jobId, scenario } = payload || {};
   let record;
   try { record = await kvs.get(`${PLAN_KEY_PREFIX}${jobId}`); } catch (_) { record = null; }
@@ -3132,6 +3544,7 @@ resolver.define('previewWhatIf', async ({ payload, context }) => {
     ok: true,
     scenarioMetrics: scenarioPlan.metrics,
     delta,
+    rationaleByUid: buildRationaleMap(record.ranking), // the CACHED ranking's rationales carry into the scenario (same frozen order, minus deferred)
     assumptions: capacity.assumptions,
     warnings: capacity.warnings,
     perSprintCapacityPoints: capacity.perSprintCapacityPoints,
@@ -3169,6 +3582,31 @@ function buildPushFailureDetailText(details) {
     return ''; // zone-2 is best-effort — a malformed struct must never break the push response
   }
 }
+
+/**
+ * getProjectDisplay — best-effort destination project NAME for the Confirm screen.
+ *
+ * Given { projectKey }, calls push_handler's lookupProject (the same preflight the
+ * health check + push use; it runs asUser().requestJira internally) and returns
+ * { ok:true, key, name } so the reviewer can verify the push TARGET by name (the
+ * #1 wrong-project fear), not just the key. Best-effort: a missing key or ANY
+ * failure returns { ok:false } (never throws) — the UI falls back to key-only.
+ * Content-free logging only: the project NAME is never logged. boardType is
+ * intentionally omitted — lookupProject does not fetch boards, and the spec forbids
+ * a second Jira call solely to obtain it.
+ */
+resolver.define('getProjectDisplay', async ({ payload }) => {
+  const { projectKey } = payload || {};
+  if (!projectKey || typeof projectKey !== 'string') return { ok: false };
+  try {
+    const lookup = await lookupProject(projectKey);
+    if (!lookup || !lookup.ok || !lookup.project) return { ok: false };
+    return { ok: true, key: projectKey, name: lookup.project.name || null };
+  } catch (e) {
+    console.warn(`[getProjectDisplay] lookup failed (fail-open): ${String(e?.message || e)}`);
+    return { ok: false };
+  }
+});
 
 /**
  * startPush — begin a chunked JIRA push session.
@@ -3294,6 +3732,140 @@ resolver.define('startPush', async ({ payload, context }) => {
   };
 });
 
+// Task C — issue-key shape for validating the untrusted priorKeys/epicKey the FE replays
+// from created_issues (mirrors push_handler's ISSUE_KEY_SHAPE, which is not exported).
+const RESUME_ISSUE_KEY_SHAPE = /^[A-Z][A-Z0-9_]*-\d+$/;
+// Defensive cap on the replayed prior-keys array (a breakdown is dozens of features; this
+// bounds a malicious/oversized payload before it seeds the session maps).
+const RESUME_PRIORKEYS_CAP = 500;
+
+/**
+ * startResumePush — Task C. Begin a RESUME of a partial push: re-create ONLY the items
+ * that did not land the first time, never duplicating the ones that did. Reuses the SAME
+ * chunked engine as startPush (startPushSession + the UI-looped pushStep, which stays
+ * intent-agnostic) with a `resumeCtx` seed so the engine SKIPS any uid already keyed
+ * (idempotency by uid) and RESOLVES links/subtasks to the already-created endpoints.
+ *
+ * The FE replays `priorKeys` = pushResult.created_issues ([{name,key,uid}]) + the created
+ * `epicKey`; both are untrusted payload → validated + capped + malformed entries dropped.
+ * The Epic is NOT re-created (resumeCtx.epicKey rebinds it). Returns the same shape as
+ * startPush: { session_id, phase, totals, epic_key, progress }.
+ */
+resolver.define('startResumePush', async ({ payload, context }) => {
+  const { breakdown, projectKey: payloadProjectKey, jobId, priorKeys, epicKey } = payload || {};
+  const diagJobRef = cleanClientRef(jobId);
+  if (jobId) await touchJobAccess(jobId); // a resume attempt is activity on this breakdown — renew its inactivity timer (mirror startPush)
+  if (!breakdown) {
+    await recordDiagnostic({
+      context,
+      record: { op: 'push.resume', error_class: 'no_breakdown', level: 'warn', ref: diagJobRef, surfaced: true },
+    });
+    return { error: 'no_breakdown', detail: 'No breakdown payload provided' };
+  }
+  // A resume MUST rebind to the already-created Epic; without it we would create a second
+  // Epic. A partial push that reaches the success screen always carries an epic_key (an
+  // Epic-create failure aborts before Pushed), so this is a defensive guard.
+  if (!epicKey || !RESUME_ISSUE_KEY_SHAPE.test(String(epicKey))) {
+    await recordDiagnostic({
+      context,
+      record: { op: 'push.resume', error_class: 'unknown_error', level: 'warn', ref: diagJobRef, surfaced: true },
+    });
+    return { error: 'resume_invalid', detail: 'Resume needs the created Epic key. Regenerate and push again.' };
+  }
+  // Validate + sanitise the replayed prior keys (untrusted payload): keep {name,key,uid}
+  // only when the key is issue-key-shaped; drop malformed entries; cap the length.
+  const cleanPriorKeys = [];
+  if (Array.isArray(priorKeys)) {
+    for (const pk of priorKeys.slice(0, RESUME_PRIORKEYS_CAP)) {
+      if (!pk || typeof pk !== 'object') continue;
+      if (typeof pk.key !== 'string' || !RESUME_ISSUE_KEY_SHAPE.test(pk.key)) continue;
+      cleanPriorKeys.push({
+        name: typeof pk.name === 'string' ? pk.name : null,
+        key: pk.key,
+        uid: typeof pk.uid === 'string' ? pk.uid : null,
+      });
+    }
+  }
+
+  const projectKey = await getProjectKey(payloadProjectKey);
+  if (!projectKey) {
+    await recordDiagnostic({
+      context,
+      record: { op: 'push.resume', error_class: 'no_project_key', level: 'error', ref: diagJobRef, surfaced: true },
+    });
+    return {
+      error: 'no_project_key',
+      detail:
+        'No Jira project key configured. Open Settings → Spec2Tickets and set Default Jira Project Key.',
+    };
+  }
+
+  const settings = await loadSettings();
+  const cfParse = parseRequiredCustomFields(settings.requiredCustomFieldsJson);
+  const customFields = cfParse.ok ? cfParse.value : null;
+  if (!cfParse.ok) {
+    await recordDiagnostic({
+      context,
+      record: { op: 'push.resume', error_class: 'config_invalid', level: 'warn', ref: null, surfaced: false },
+    });
+  }
+
+  let outcome;
+  try {
+    outcome = await startPushSession(breakdown, projectKey, customFields, jobId || null, {
+      priorKeys: cleanPriorKeys,
+      epicKey: String(epicKey),
+    });
+  } catch (e) {
+    console.error(`[startResumePush] threw: ${String(e?.message || e)} ref=${jobId || '-'}`);
+    await recordDiagnostic({
+      context,
+      record: { op: 'push.resume', error_class: 'push_exception', level: 'error', ref: diagJobRef, surfaced: true },
+    });
+    await writeDiagnosticDetail({ ref: diagJobRef, text: String(e?.message || e) });
+    return { error: 'push_exception', detail: String(e?.message || e) };
+  }
+  if (!outcome.ok) {
+    // Same error mapping as startPush (project lookup arrives through this return; the
+    // Epic-create block is skipped on resume so an Epic failure cannot occur here).
+    let errorClass = 'unknown_error';
+    let jira;
+    const code = String(outcome.error || '');
+    if (code === 'project_not_found') errorClass = 'project_not_found';
+    else if (code === 'permission_denied') errorClass = 'permission_denied';
+    else if (code === 'jira_fetch_failed') errorClass = 'network_failure';
+    else {
+      const m = /^jira_(\d+)$/.exec(code);
+      if (m) {
+        errorClass = 'jira_http';
+        jira = [{ status: parseInt(m[1], 10) }];
+      }
+    }
+    await recordDiagnostic({
+      context,
+      record: {
+        op: 'push.resume',
+        error_class: errorClass,
+        level: 'error',
+        ref: diagJobRef,
+        ...(jira ? { jira } : {}),
+        surfaced: true,
+      },
+    });
+    if (outcome.detail) {
+      await writeDiagnosticDetail({ ref: diagJobRef, text: String(outcome.detail) });
+    }
+    return { error: outcome.error, detail: outcome.detail };
+  }
+  return {
+    session_id: outcome.sessionId,
+    phase: outcome.phase,
+    totals: outcome.totals,
+    epic_key: outcome.epicKey,
+    progress: 0,
+  };
+});
+
 /**
  * pushStep — advance a push session by one bounded chunk. UI loops this until
  * { done: true }. Each call stays under the 25-sec resolver timeout.
@@ -3375,15 +3947,22 @@ resolver.define('pushStep', async ({ payload, context }) => {
     const res = outcome.result || {};
     const d = res.diag || {};
     const jobRef = outcome.job_id || null;
+    // Spec C.2: a RESUME's terminal record carries a DISTINCT op (push.resume.final) so support can
+    // tell it from a fresh push's push.final. Fresh pushes (res.isResume falsy) stay byte-identical.
+    const finalOp = res.isResume ? 'push.resume.final' : 'push.final';
     if (outcome.partial) {
       await recordDiagnostic({
         context,
         record: {
-          op: 'push.final',
+          op: finalOp,
           error_class: 'partial_push',
           level: 'error',
           ref: jobRef,
           session_ref: diagSessionRef,
+          // [diagnostics redesign T2] the DESTINATION Epic ("Into MOBILE-100") — reuse the whitelisted
+          // `subject` singular field with kind:'issue' (privacy-safe issue key, degrades to no "Into" when
+          // absent). Distinct from subject_keys below, which are the FAILURE keys ("Affected:").
+          subject: res.epic_key ? { kind: 'issue', id: res.epic_key } : undefined,
           // Union of failed STORY idxs + failed subtasks' PARENT feature idxs —
           // the same index space (feature idx), per §1 "story/task indices"
           // (gate F3: the subtask idxs were accumulated but write-only). Cap 20
@@ -3423,11 +4002,14 @@ resolver.define('pushStep', async ({ payload, context }) => {
       await recordDiagnostic({
         context,
         record: {
-          op: 'push.final',
+          op: finalOp,
           error_class: 'push_completed',
           level: 'info',
           ref: jobRef,
           session_ref: diagSessionRef,
+          // [diagnostics redesign T2] the DESTINATION Epic ("Into MOBILE-100") — the whitelisted `subject`
+          // singular (kind:'issue'); degrades to no "Into" line when the epic key is absent.
+          subject: res.epic_key ? { kind: 'issue', id: res.epic_key } : undefined,
           counts: {
             stories_created: res.total_stories || 0,
             subtasks_created: res.total_subtasks || 0,
@@ -3468,7 +4050,7 @@ resolver.define('pushStep', async ({ payload, context }) => {
 resolver.define('startPlanPush', async ({ payload, context }) => {
   const tier = getActiveTier(context);
   if (tier.key === 'unlicensed') return buildLicenseRequired();
-  if (!tier.hasPlanner) return buildUpgradeRequired('planner'); // v6.1: Advanced-only planner (Jira write path)
+  // 2026-07-11 STANDARD-ONLY: planner included in Standard — Advanced gate removed (this is the Jira write path; no Anthropic spend — it pushes the already-computed plan).
   const { jobId, createdIssues, projectKey: payloadProjectKey, namePrefix, boardId, plan: payloadPlan, capacityForm: payloadForm } = payload || {};
   // ⭐ POST-PUSH LIFECYCLE FIX (live-acceptance 2026-06-21): "Assign sprints in Jira" runs from the POST-PUSH
   // success screen — but purgeJob (data-min on push) has ALREADY deleted plan:<jobId> by then, so a KVS read
@@ -3595,20 +4177,14 @@ resolver.define('startTestCaseGeneration', async ({ payload, context }) => {
     });
   }
 
-  // v6 value-split FEATURE GATE — test-case generation is an Advanced-edition feature.
-  // FAIL-CLOSED (deny on a license-read fault) — the OPPOSITE polarity of the unlicensed
-  // gate above (which fails OPEN). Cost asymmetry (POLICY §3): silently leaking the
-  // Advanced-only feature to a Standard user is a value leak; a transient denial is merely
-  // retriable. Do NOT normalise this to the surrounding fail-open pattern.
-  try {
-    if (!getActiveTier(context).hasTestCases) return buildUpgradeRequired();
-  } catch (e) {
-    console.error(`[startTCGen] edition gate read failed (failing CLOSED — deny premium feature) ref=${jobId}: ${String(e?.message || e)}`);
-    return buildUpgradeRequired();
-  }
+  // ⭐ 2026-07-11 STANDARD-ONLY: test-case generation is included in the single Standard edition —
+  // the former Advanced-only FEATURE GATE (buildUpgradeRequired on !hasTestCases) is REMOVED. Access
+  // is governed only by the license gate above (unlicensed → license_required) and, on the $5 managed
+  // trial path, by the credit gate below (a managed run that would overshoot the near-hard $5 ceiling
+  // is routed to BYOK). A BYOK user is unlimited.
 
   // Resolve the Anthropic key by tier (#5: keySource-stamp enables same-key reuse at poll)
-  const { apiKey, keySource, keyFault } = await resolveAnthropicKey(context);
+  const { apiKey, keySource, keyFault, trial } = await resolveAnthropicKey(context);
   if (!apiKey) {
     // [diag Phase 4, A4] storage-fault FIRST (BYOK-only; never masks managed_unavailable) —
     // a thrown secret read is NOT "no key configured".
@@ -3624,6 +4200,8 @@ resolver.define('startTestCaseGeneration', async ({ payload, context }) => {
       console.error('[startTCGen] managed key unavailable (MANAGED_ANTHROPIC_KEY not configured)');
       return { error: 'managed_unavailable', detail: 'The Managed service is temporarily unavailable. Please contact support@spec2jira.com, or switch to your own Anthropic API key in Settings.' };
     }
+    // A trial user whose $5 managed credit is spent → friendly "add your key", not not_configured.
+    if (trial && trial.exhausted && trial.grant > 0) return buildTrialCreditExhausted();
     return { error: 'not_configured', detail: 'Anthropic API key not configured. Ask your Confluence admin to open Settings → Spec2Tickets and provide an Anthropic API key.' };
   }
 
@@ -3664,7 +4242,12 @@ resolver.define('startTestCaseGeneration', async ({ payload, context }) => {
       const { features: editedFeatures } = flattenBreakdown(payload.breakdown);
       if (Array.isArray(editedFeatures) && editedFeatures.length > 0) {
         job.breakdown = { ...job.breakdown, features: editedFeatures };
-        await setJob(jobId,{ ...job });
+        // Re-persist the picker jobmeta display fields (this job is completed + tracked): a plain
+        // setJob would strip completedAt/features/costUsd/truncated. Rebuild from the (edited) job;
+        // costUsd isn't on the record (a computed estimate) → carry it from the existing jobmeta.
+        const prevMeta = await kvs.get(`${JOB_META_PREFIX}${jobId}`).catch(() => null);
+        const prevCost = prevMeta && Number.isFinite(prevMeta.costUsd) ? prevMeta.costUsd : null;
+        await setJob(jobId, { ...job }, buildTerminalMeta(job, prevCost));
       } else {
         console.warn(`[startTCGen] edited breakdown flattened to 0 features — keeping stored breakdown for ${jobId} ref=${jobId}`);
         // [diag Phase 4, (E) §2.2 :1998 — worst offender #11] BOTH soft-fallback branches are the
@@ -3709,7 +4292,12 @@ resolver.define('startTestCaseGeneration', async ({ payload, context }) => {
       return { jobId, status: existingTcJob.status, total: existingTcJob.total };
     }
     console.log(`[startTCGen] breakdown edited since generation — re-generating tcjob ${jobId}`);
-    // fall through → re-stamp the edited ACs + submit a fresh batch
+    // fall through → re-stamp the edited ACs + submit a fresh batch.
+    // ⭐ $5-trial ACCEPTED RESIDUAL (code-review): if the PRIOR batch is still 'batched' here, overwriting the
+    // tcjob record orphans it — its ACTUAL is never reconciled (only its submit hold was charged). Under-count =
+    // one orphaned batch's (actual − estimate). Accepted: the reservation model already treats an abandoned run
+    // as "hold stays charged", and the test-gen upper-vs-hard-ceiling admission gate above bounds even the
+    // orphan so the install still can't blow past ~$10. Guarding it (block re-gen while 'batched') would cost UX.
   }
 
   const total = stories.length;
@@ -3791,6 +4379,31 @@ resolver.define('startTestCaseGeneration', async ({ payload, context }) => {
     });
   }
 
+  // ── $5 managed trial credit — pre-flight gate (the ONE expensive surface) ──
+  // Test-gen varies 16× ($0.22–3.67), so unlike a cheap breakdown a single run could blow the whole
+  // grant in one shot. When on the managed key, project the run's EXPECTED cost and BLOCK it if it
+  // would overshoot the credit still available (routing the user to BYOK) — keeping $5 a near-hard
+  // ceiling on the expensive path. A BYOK user is unlimited and never gated. `tcCreditEstimate` is
+  // reused as the submit hold below (no recompute). `trial.available` is the ledger snapshot from
+  // resolveAnthropicKey (this run's spend isn't charged yet).
+  let tcCreditEstimate = 0;
+  if (keySource === 'managed') {
+    const storyACcounts = stories.map((s) => (Array.isArray(s && s.acceptance_criteria) ? s.acceptance_criteria.length : 0));
+    const specSourceChars = typeof specSourceText === 'string' ? Math.min(specSourceText.trim().length, TC_SPEC_SOURCE_MAX_CHARS) : 0;
+    const projection = projectTestCaseCost({ storyACcounts, specSourceChars, model: MODEL_PRIMARY });
+    tcCreditEstimate = Number.isFinite(projection.expected_usd) ? projection.expected_usd : 0;
+    // Shared pre-flight stopper (managedRunBlocker) — the SAME two gates test-gen has always run, now via the
+    // one helper every managed surface uses (no drift): SOFT = the EXPECTED cost must fit the remaining grant;
+    // HARD = test-gen is the ONE surface whose ACTUAL can be 16-22× the expected (low-AC stories each near the
+    // 24K cap) and the reconcile charges the full echoed actual, so its WORST case (projection.upper) must not
+    // breach the $10 absolute ceiling — keeping $10 a true per-install cap on the only surface that can blow it.
+    const blocker = managedRunBlocker({ keySource, availableUsd: trial?.available, spentUsd: trial?.spent, estimateUsd: tcCreditEstimate, upperUsd: projection.upper_usd });
+    if (blocker) {
+      console.log(`[startTCGen] managed trial credit gate (${blocker.reason}): need≈$${blocker.estimateUsd.toFixed(2)} avail≈$${blocker.availableUsd.toFixed(2)} → BYOK ref=${jobId}`);
+      return buildTrialCreditExhausted({ estimateUsd: blocker.estimateUsd, availableUsd: blocker.availableUsd, runLabel: 'This test-case run' });
+    }
+  }
+
   // Submit the N-request batch to Anthropic
   const specConcerns = (job.breakdown && Array.isArray(job.breakdown.spec_concerns)) ? job.breakdown.spec_concerns : [];
   const submitResult = await submitTestCaseBatch({ stories, sharedAcceptanceCriteria: sharedACs, specConcerns, specSummary, specSourceText, apiKey });
@@ -3859,6 +4472,10 @@ resolver.define('startTestCaseGeneration', async ({ payload, context }) => {
   // success response. Without a batchId the tcjob stays 'pending' and won't self-heal (the
   // poll returns it untouched; a re-click re-submits a fresh billed batch) — that is exactly
   // the support signal this record carries.
+  // $5 managed trial credit — reserve the projected estimate now the batch is accepted (managed only;
+  // no-op for BYOK). Reconciled to the echoed actual at finalize (pollTCStatus). Uses the SAME
+  // projection the pre-flight gate computed above.
+  const creditEstimateUsd = await holdManagedCredit(keySource, tcCreditEstimate);
   let trackingDegraded = false;
   try {
     await kvs.set(`${TC_JOB_KEY_PREFIX}${jobId}`, {
@@ -3875,6 +4492,8 @@ resolver.define('startTestCaseGeneration', async ({ payload, context }) => {
       createdAt,
       submittedAt: new Date().toISOString(),
       expiresAt: submitResult.expiresAt,
+      creditEstimateUsd, // $5 trial: estimate held at submit (managed only; 0 for BYOK)
+      creditReconciled: false, // flipped true when pollTCStatus reconciles the estimate to actual
     });
   } catch (e) {
     trackingDegraded = true;
@@ -4090,6 +4709,17 @@ resolver.define('pollTestCaseStatus', async ({ payload, context }) => {
     // existing tcjob write, no per-story KVS bloat. A regen later ACCUMULATES into this (see
     // pollRegenerateTestCase) so the displayed run total stays honest as the BA re-runs stories.
     const batchUsage = sumUsage(perStory.map((e) => e.usage));
+    // $5 managed trial credit — reconcile the submit estimate to the echoed ACTUAL, once (managed
+    // only; marker-guarded idempotency). Cost is otherwise derived on READ (getTestCases:4778 uses
+    // the SAME estimateCost(usage, MODEL_PRIMARY, {batch}) authority) — we price it HERE to charge the
+    // ledger at finalize. Skip when the actual is unknown so the held estimate stands (SAFE polarity).
+    const tcCost = estimateCost(batchUsage, MODEL_PRIMARY, { batch: true });
+    const tcActualUsd = tcCost && Number.isFinite(tcCost.total_usd) ? tcCost.total_usd : null;
+    const tcCreditReconciled =
+      tcJob.creditReconciled === true ||
+      // per-ATTEMPT ref (+batchId): a BA who edits an AC and RE-GENERATES submits a fresh managed batch on
+      // the SAME breakdown jobId — a bare tc:<jobId> marker would no-op the 2nd reconcile (fresh-army fix).
+      (tcActualUsd != null ? await reconcileManagedCredit(tcJob, `tc:${jobId}:${tcJob.batchId || 'x'}`, tcActualUsd) : false);
     const completed = {
       ...tcJob,
       status: 'completed',
@@ -4097,6 +4727,7 @@ resolver.define('pollTestCaseStatus', async ({ payload, context }) => {
       batchStatus: 'ended',
       failedCount,
       usage: batchUsage,
+      creditReconciled: tcCreditReconciled, // $5 trial: idempotency guard for the managed reconcile
     };
     // #10 — do NOT merge perStory payloads into tcjob (240KB KVS value-size guard)
     // [diag F1, (d) completed-flip wrap — same retry contract as (F)] the per-story results
@@ -4281,8 +4912,10 @@ resolver.define('getTestCases', async ({ payload }) => {
  * Computed backend-side because only here can we read the cached source-spec size (pagesnap) that
  * materially drives input cost. Accepts the SAME edited `breakdown` payload startTestCaseGeneration
  * does (read-only — never persists), so the estimate tracks the ACs the run will actually use.
- * No hasTestCases gate: it is a harmless number with no spend/output; the frontend only offers it
- * to Advanced (the Generate button is gated), and the real spend gate is on startTestCaseGeneration.
+ * No hasTestCases gate: it is a harmless number with no spend/output. 2026-07-11 Standard-only —
+ * test-case generation is INCLUDED in Standard, so the FE offers Generate to every entitled user (no
+ * edition gate). The real gates are the license check + the $5 managed-trial credit gate, both on
+ * startTestCaseGeneration (the actual spend path).
  */
 resolver.define('estimateTestCaseCost', async ({ payload }) => {
   const { jobId } = payload || {};
@@ -4362,15 +4995,9 @@ resolver.define('saveTestCases', async ({ payload, context }) => {
     console.error(`[saveTC] license check failed (failing open): ${String(e?.message || e)}`);
   }
 
-  // v6 value-split FEATURE GATE (fail-CLOSED) — editing test cases is an active use of the
-  // Advanced feature (a downgraded user may still READ/EXPORT prior output, but EDITING
-  // requires the entitlement). Fail CLOSED on a license-read fault (see startTestCaseGeneration).
-  try {
-    if (!getActiveTier(context).hasTestCases) return buildUpgradeRequired();
-  } catch (e) {
-    console.error(`[saveTC] edition gate read failed (failing CLOSED): ${String(e?.message || e)}`);
-    return buildUpgradeRequired();
-  }
+  // ⭐ 2026-07-11 STANDARD-ONLY: editing test cases is included in Standard — the former Advanced-only
+  // gate is REMOVED. saveTestCases persists hand-edits (no Anthropic spend), so the $5 trial ledger is
+  // not involved. Only the license gate above applies.
 
   const tcJob = await kvs.get(`${TC_JOB_KEY_PREFIX}${jobId}`);
   if (!tcJob) return { error: 'not_found', detail: `Test-case set ${jobId} not found — it may have expired. Regenerate test cases.` };
@@ -4468,15 +5095,9 @@ resolver.define('regenerateTestCase', async ({ payload, context }) => {
     console.error(`[regenTC] license check failed (failing open): ${String(e?.message || e)}`);
   }
 
-  // v6 value-split FEATURE GATE (fail-CLOSED) — regenerating a test case is a test-case
-  // WRITE/spend path, so it requires the Advanced capability just like the bulk generate.
-  // Fail CLOSED on a license-read fault (deny the premium feature; see startTestCaseGeneration).
-  try {
-    if (!getActiveTier(context).hasTestCases) return buildUpgradeRequired();
-  } catch (e) {
-    console.error(`[regenTC] edition gate read failed (failing CLOSED): ${String(e?.message || e)}`);
-    return buildUpgradeRequired();
-  }
+  // ⭐ 2026-07-11 STANDARD-ONLY: test-case regeneration is included in Standard — the former
+  // Advanced-only gate is REMOVED. This IS an Anthropic spend path, so on the $5 managed trial it is
+  // metered against the ledger below (hold at submit → reconcile at finalize). Only the license gate applies.
 
   // Resolve the key (#5: regen key must match the bulk batch's keySource for cost/auth consistency)
   const tcJob = await kvs.get(`${TC_JOB_KEY_PREFIX}${jobId}`);
@@ -4514,6 +5135,22 @@ resolver.define('regenerateTestCase', async ({ payload, context }) => {
     if (keySource === 'managed') return { error: 'managed_unavailable', detail: 'The Managed service is temporarily unavailable. Please contact support@spec2jira.com.' };
     return { error: 'not_configured', detail: 'Anthropic API key not configured.' };
   }
+  // $5 managed trial credit — a regen IS a managed-spend surface. It reuses the bulk run's keySource
+  // for billing consistency (bypassing resolveAnthropicKey's gate above), so re-apply the credit gate
+  // HERE: an out-of-credit trial user is routed to BYOK. creditStatus fails-closed on a glitch
+  // (readOk:false ⇒ exhausted) so a metering blip never spends our key. A BYOK regen is unlimited.
+  if (keySource === 'managed') {
+    // ⭐ 2026-07-12 PRE-FLIGHT STOPPER — subsumes the old exhausted/overCeiling check: block when this
+    // regen's estimate won't fit the remaining credit (est > available, which is also true once exhausted),
+    // so a near-empty trial never spends a regen past the grant. Fresh creditStatus (regen reuses the bulk
+    // run's keySource, so no `trial` snapshot from resolveAnthropicKey here); fails-closed on a glitch.
+    const cs = await creditStatus();
+    const blocker = managedRunBlocker({ keySource, availableUsd: cs.availableUsd, spentUsd: cs.spentUsd, estimateUsd: REGEN_EST_USD });
+    if (blocker) {
+      console.log(`[regenTC] managed trial credit gate (${blocker.reason}): need≈$${blocker.estimateUsd.toFixed(2)} > avail≈$${blocker.availableUsd.toFixed(2)} → BYOK ref=${jobId}`);
+      return buildTrialCreditExhausted({ estimateUsd: blocker.estimateUsd, availableUsd: blocker.availableUsd, runLabel: 'This regeneration' });
+    }
+  }
 
   // Load the full story from the breakdown job
   const job = await kvs.get(`${JOB_KEY_PREFIX}${jobId}`);
@@ -4533,7 +5170,11 @@ resolver.define('regenerateTestCase', async ({ payload, context }) => {
         const acSig = (fs) => (Array.isArray(fs) ? fs : []).flatMap((s) => (Array.isArray(s && s.acceptance_criteria) ? s.acceptance_criteria : [])).map(normAC).sort().join('|');
         if (acSig(editedFeatures) !== acSig(job.breakdown && job.breakdown.features)) {
           job.breakdown = { ...job.breakdown, features: editedFeatures };
-          await setJob(jobId,job);
+          // Preserve the picker jobmeta display fields (completed + tracked job) on re-persist —
+          // a plain setJob would strip them. Carry costUsd from the existing jobmeta.
+          const prevMeta = await kvs.get(`${JOB_META_PREFIX}${jobId}`).catch(() => null);
+          const prevCost = prevMeta && Number.isFinite(prevMeta.costUsd) ? prevMeta.costUsd : null;
+          await setJob(jobId, job, buildTerminalMeta(job, prevCost));
         }
       } else {
         // [diag Phase 4, gate symmetry] a 0-features flatten is the SAME silent
@@ -4675,6 +5316,9 @@ resolver.define('regenerateTestCase', async ({ payload, context }) => {
   // record tracking_degraded + proceed to the normal success response. Without a batchId
   // the control record stays 'pending' (the poll returns it untouched; a re-click
   // re-submits a fresh billed batch) — exactly the support signal this record carries.
+  // $5 managed trial credit — reserve a small per-story estimate now the regen batch is accepted
+  // (managed only; no-op for BYOK). Reconciled to actual at finalize (pollRegenerateTestCase).
+  const regenCreditEstimateUsd = await holdManagedCredit(keySource, REGEN_EST_USD);
   let trackingDegraded = false;
   try {
     await kvs.set(`${TC_REGEN_KEY_PREFIX}${jobId}:${storyIdx}`, {
@@ -4683,6 +5327,8 @@ resolver.define('regenerateTestCase', async ({ payload, context }) => {
       batchId: submitResult.batchId,
       batchStatus: submitResult.status,
       createdAt, submittedAt: new Date().toISOString(), expiresAt: submitResult.expiresAt,
+      creditEstimateUsd: regenCreditEstimateUsd, // $5 trial: estimate held at submit (managed only; 0 for BYOK)
+      creditReconciled: false, // flipped true when pollRegenerateTestCase reconciles to actual
     });
   } catch (e) {
     trackingDegraded = true;
@@ -4892,7 +5538,20 @@ resolver.define('pollRegenerateTestCase', async ({ payload, context }) => {
       return freshRg3;
     }
 
-    const completed = { ...regenJob, status: 'completed', completedAt: new Date().toISOString(), batchStatus: 'ended' };
+    // $5 managed trial credit — reconcile THIS regen's hold to the echoed ACTUAL (managed only, once;
+    // marker-guarded by the composite ref jobId:storyIdx). Priced with the same estimateCost(usage,
+    // MODEL_PRIMARY,{batch}) authority the bulk run uses. Independent of the bulk-usage display echo
+    // accumulated below (different store: the ledger tracks OUR $5, the echo shows the run's token total).
+    let regenCreditReconciled = regenJob.creditReconciled === true;
+    if (!regenCreditReconciled && regenJob.keySource === 'managed' && entry && entry.usage) {
+      const regenCost = estimateCost(entry.usage, MODEL_PRIMARY, { batch: true });
+      if (regenCost && Number.isFinite(regenCost.total_usd)) {
+        // per-ATTEMPT ref (include the batchId): a BA regenerating the SAME story twice submits a fresh
+        // managed batch each time — a bare jobId:storyIdx marker would no-op the 2nd reconcile (LOW audit finding).
+        regenCreditReconciled = await reconcileManagedCredit(regenJob, `regen:${jobId}:${storyIdx}:${regenJob.batchId || 'x'}`, regenCost.total_usd);
+      }
+    }
+    const completed = { ...regenJob, status: 'completed', completedAt: new Date().toISOString(), batchStatus: 'ended', creditReconciled: regenCreditReconciled };
     try {
       await kvs.set(`${TC_STORY_KEY_PREFIX}${jobId}:${storyIdx}`, storyKvsValue);
       await kvs.set(regenKey, completed);
@@ -5349,6 +6008,10 @@ function healthJiraCode(error) {
  */
 resolver.define('runHealthCheck', async ({ context }) => {
   const probes = [];
+  // [settings redesign] capture the resolved model from the anthropic_key probe's testConnection
+  // so the Settings verdict can show the real billing model after an auto-verify (not only after a
+  // manual Test Connection). Additive — omitted from the response when the key probe did not succeed.
+  let healthModel = null;
   try {
     // ── Probe 1: 'anthropic_key' — the key path THIS tier generates with (Managed ⇒
     // OUR env key, BYOK ⇒ the stored secret), tested exactly the way the Settings
@@ -5367,8 +6030,14 @@ resolver.define('runHealthCheck', async ({ context }) => {
           // stored key = the honest "never set".
           code: keySource === 'managed' ? 'managed_unavailable' : 'not_configured',
         });
+      } else if (keySource === 'managed') {
+        // $5 managed trial credit — the managed key is OUR own env var. Do NOT burn an UNMETERED live
+        // Anthropic probe on it (every "Verify" click would bill our key without touching the $5 ledger —
+        // fresh-army fix). Its presence is already confirmed (apiKey truthy); report ok without a billed call.
+        probes.push({ name: 'anthropic_key', ok: true, code: 'ok' });
       } else {
         const result = await anthropicTestConnection(apiKey);
+        if (result.ok && result.model) healthModel = result.model;
         probes.push(
           result.ok
             ? { name: 'anthropic_key', ok: true, code: 'ok' }
@@ -5454,10 +6123,10 @@ resolver.define('runHealthCheck', async ({ context }) => {
         surfaced: true,
       },
     });
-    return { ok: allOk, probes };
+    return { ok: allOk, probes, ...(healthModel ? { model: healthModel } : {}) };
   } catch (e) {
     console.warn(`[diag] runHealthCheck failed (fail-open): ${String(e?.message || e)}`);
-    return { ok: false, probes }; // whatever completed before the (unexpected) throw
+    return { ok: false, probes, ...(healthModel ? { model: healthModel } : {}) }; // whatever completed before the (unexpected) throw
   }
 });
 

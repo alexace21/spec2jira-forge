@@ -118,7 +118,7 @@ export function SignalCallout({ kind = "info", title, children, style, iconTitle
       <span style={{ color: c.fg, display: "inline-flex", flexShrink: 0, marginTop: 1 }}>
         <Glyph kind={kind} size={18} title={iconTitle} />
       </span>
-      <div style={{ color: "var(--s2j-text)", fontSize, lineHeight: 1.5, minWidth: 0 }}>
+      <div style={{ color: "var(--s2j-text)", fontSize, lineHeight: 1.5, minWidth: 0, flex: 1 }}>
         {title ? (
           <div style={{ fontWeight: 500, marginBottom: children ? 2 : 0 }}>{title}</div>
         ) : null}

@@ -107,6 +107,30 @@ export function overflowReasonText(o, nameOf) {
   return "no capacity left";
 }
 
+// The oversized "why" — the CONCRETE by-how-much. SHARED so the on-screen panel, the step-5 block AND the copy-out
+// brief read the SAME string (BRIEF-DRIFT); mirrors overflowReasonText (no leading dash; the caller frames it).
+// ⚠ In SKILL mode the binding constraint is a single BUCKET's demand vs THAT bucket's per-sprint cap — comparing
+// the feature TOTAL vs the POOLED cap can read "fits" (total < pooled) while a bucket overflows, AND mislabels the
+// total as one skill. So when the packer recorded per-bucket detail, phrase it bucket-vs-bucket. Otherwise (pooled
+// mode) use total-vs-pooled ONLY when it truly exceeds the cap; else fall back to the vague phrasing.
+export function oversizedReasonText(o) {
+  if (!o) return "larger than one sprint - split it";
+  const detail = Array.isArray(o.bucketDetail)
+    ? o.bucketDetail.filter((b) => b && Number.isFinite(Number(b.demand)) && Number.isFinite(Number(b.cap)) && Number(b.demand) > Number(b.cap))
+    : [];
+  if (detail.length) {
+    const parts = detail.map((b) => `needs ${fmt1(b.demand)} ${skillLabel(b.bucket)} pts vs a ${fmt1(b.cap)}-pt ${skillLabel(b.bucket)} cap per sprint`);
+    const addWord = detail.map((b) => skillLabel(b.bucket)).join(" + ");
+    return `${parts.join("; ")}. Split it, or add ${addWord} capacity.`;
+  }
+  const pts = Number(o.points);
+  const cap = Number(o.maxCapacity);
+  if (Number.isFinite(pts) && Number.isFinite(cap) && cap > 0 && pts > cap) {
+    return `needs ${fmt1(pts)} pts vs a ${fmt1(cap)}-pt single-sprint cap. Split it.`;
+  }
+  return "larger than one sprint - split it";
+}
+
 // ── the capacity verdict (deficit headline / fragmentation note) — exact screen strings, shared ──
 // deficitHeadline: when the backlog exceeds capacity. fragmentationNote: when it fits overall but gaps
 // stranded some items. Both return {title, body} | null. The brief and the screen render the SAME text.
@@ -128,14 +152,21 @@ export function fragmentationNote(metrics) {
 }
 
 // One-line grounded executive verdict (the brief's headline; also a clean "fits/exceeds" summary).
-export function capacityVerdict(metrics, sprintCount) {
+export function capacityVerdict(metrics, sprintCount, oversizedCount = 0) {
   const m = metrics || {};
   const sc = Number(sprintCount) || 0;
   const totalBacklog = fmt1(m.totalBacklogPoints || 0);
   const totalCap = fmt1(m.totalCapacity || 0);
   if (m.deficitPoints > 0) {
     const oc = m.overflowCount || 0;
-    return `Backlog ${totalBacklog} pts exceeds ${sc}-sprint capacity ${totalCap} pts by ${fmt1(m.deficitPoints)} pts — ${oc} feature${oc === 1 ? "" : "s"} won’t fit.`;
+    const ovc = Number(oversizedCount) || 0;
+    // A deficit with overflowCount 0 comes ENTIRELY from a force-placed oversized feature — never say "0 won't
+    // fit" (a provable falsehood while capacity is exceeded). Name each channel honestly.
+    const parts = [];
+    if (oc > 0) parts.push(`${oc} feature${oc === 1 ? "" : "s"} won’t fit`);
+    if (ovc > 0) parts.push(`${ovc} feature${ovc === 1 ? "" : "s"} ${ovc === 1 ? "is" : "are"} larger than one sprint`);
+    const tail = parts.length ? ` — ${parts.join(" and ")} — see What doesn’t fit.` : ".";
+    return `Backlog ${totalBacklog} pts exceeds ${sc}-sprint capacity ${totalCap} pts by ${fmt1(m.deficitPoints)} pts${tail}`;
   }
   const spare = fmt1(Math.max(0, (Number(m.totalCapacity) || 0) - (Number(m.totalBacklogPoints) || 0)));
   const oc = m.overflowCount || 0;
@@ -145,6 +176,13 @@ export function capacityVerdict(metrics, sprintCount) {
     // reconcile with "What doesn’t fit" — an unqualified "fits within … to spare" over-promises to a
     // stakeholder. The "spare overall" + "don’t fit" tension is the honest story (total slack, fragmented).
     return `Backlog ${totalBacklog} pts is within ${sc}-sprint total capacity ${totalCap} pts (${spare} pts spare overall), but ${oc} feature${oc === 1 ? "" : "s"} ${oc === 1 ? "doesn’t" : "don’t"} fit the sprint layout — see What doesn’t fit.`;
+  }
+  const ovc = Number(oversizedCount) || 0;
+  if (ovc > 0) {
+    // POLICY 11: an oversized feature is force-placed into a sprint but exceeds one sprint's capacity — the total
+    // can fit overall while an item still needs splitting. The headline must NOT read a clean "to spare" above the
+    // "What doesn't fit" list; reconcile it, mirroring the overflow branch.
+    return `Backlog ${totalBacklog} pts is within ${sc}-sprint total capacity ${totalCap} pts (${spare} pts spare overall), but ${ovc} feature${ovc === 1 ? "" : "s"} ${ovc === 1 ? "is" : "are"} larger than one sprint — see What doesn’t fit.`;
   }
   return `Backlog ${totalBacklog} pts fits within ${sc}-sprint capacity ${totalCap} pts (${spare} pts to spare).`;
 }
@@ -164,6 +202,40 @@ export function kanbanReachVerdict(metrics) {
     return `Backlog ${total} pts · likely reach this quarter is ${cons}–${opt} pts (conservative–optimistic), so ${laterCount} feature${laterCount === 1 ? "" : "s"} (${fmt1(beyond)} pts) ${laterCount === 1 ? "is" : "are"} beyond likely reach — a forecast, not a commitment.`;
   }
   return `Backlog ${total} pts · likely reach this quarter is ${cons}–${opt} pts (conservative–optimistic) — the whole backlog is within optimistic reach. A forecast, not a commitment.`;
+}
+
+// ── critical-path + leverage derivations (SHARED so the on-screen Plan summary and the copy-out brief read
+// ONE story — BRIEF-DRIFT). Both read plan.signals (T0). criticalPathInfo ALSO exposes the ORDERED chain when
+// the backend supplied plan.criticalPathUids (T0): the brief uses only { len, endName }, the on-screen panel
+// additionally renders the chain — a superset, never a contradiction. `nameOf(id)` resolves the display name.
+export function criticalPathInfo(plan, nameOf) {
+  const signals = (plan && plan.signals) || {};
+  const entries = Object.entries(signals);
+  if (!entries.length) return null;
+  let cp = null;
+  for (const [id, s] of entries) if (s && (cp === null || (s.criticalPathLen || 0) > (cp.len || 0))) cp = { id, len: s.criticalPathLen || 0 };
+  if (!cp || cp.len <= 1) return null;
+  const name = (id) => (typeof nameOf === "function" && nameOf(id)) || id;
+  const chainUids = Array.isArray(plan && plan.criticalPathUids) && plan.criticalPathUids.length ? plan.criticalPathUids : null;
+  // When the backend supplied the ordered chain, its LAST uid is the authoritative end — plan.criticalPathUids
+  // uses a smallest-uid tie-break the panel renders, whereas the `cp` scan above breaks a tied max-depth by
+  // POSITION (first-encountered). On a tied max depth those pick DIFFERENT nodes → the brief's "ends at X" would
+  // name a different feature than the panel's chain end (invariant #4 drift). Derive endId/len FROM the rendered
+  // chain so "ends at" and the chain end are the SAME node by construction. No chain (legacy) → fall back to cp.
+  const endId = chainUids ? chainUids[chainUids.length - 1] : cp.id;
+  const len = chainUids ? chainUids.length : cp.len;
+  return { len, endId, endName: name(endId), chainNames: chainUids ? chainUids.map(name) : null };
+}
+
+// Top-N features by downstream unblock count (leverage) — the "highest leverage" list the brief + panel share.
+export function highestLeverage(plan, nameOf, limit = 3) {
+  const signals = (plan && plan.signals) || {};
+  const name = (id) => (typeof nameOf === "function" && nameOf(id)) || id;
+  return Object.entries(signals)
+    .map(([id, s]) => ({ id, name: name(id), n: (s && s.downstreamUnblockCount) || 0 }))
+    .filter((x) => x.n > 0)
+    .sort((a, b) => b.n - a.n)
+    .slice(0, limit);
 }
 
 // ── HARDENED CSV (ported VERBATIM from src/testcases.js — keep the guard identical; BRIEF-CSV-RUNTIME) ──

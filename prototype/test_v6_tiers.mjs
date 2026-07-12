@@ -1,19 +1,23 @@
 #!/usr/bin/env node
 /**
- * Offline truth-table test for the v6 value-split tier decouple (src/usage.js).
+ * Offline truth-table test for the STANDARD-ONLY tier model + the trial-license gate (src/usage.js).
  *
- * THE make-or-break invariants (a wrong one is a margin leak, a silent mis-gate, or a
- * dead-end on a LIVE app):
- *   - capabilityAdvanced ⇒ Advanced = BYOK + test-cases + unlimited (NOT our managed key).
- *   - safe default: any unknown/absent active capabilitySet ⇒ Standard (BYOK, no test-cases).
- *   - NO capabilitySet-resolved (live) tier is keySource 'managed' — managed is dormant only.
- *   - EXACTLY one live tier grants hasTestCases (Advanced); Standard must NOT.
- *   - TIERS are frozen (shared by reference; a mutation would corrupt the singleton).
+ * ⭐ 2026-07-11 STANDARD-ONLY PIVOT (supersedes the v6 value-split invariants this file used to assert):
+ * editions collapsed to a SINGLE offer — Standard includes EVERYTHING. The make-or-break invariants now:
+ *   - Standard (byokPro) grants BOTH hasTestCases AND hasPlanner (no feature is gated behind an edition).
+ *   - A pending/existing capabilityAdvanced subscriber STILL resolves to a FULL-featured tier (byokAdvanced,
+ *     retained as an internal alias) — nobody loses access.
+ *   - safe default: any unknown/absent ACTIVE capabilitySet ⇒ Standard (full-featured; no dead-end).
+ *   - NO capabilitySet-resolved (live) tier is keySource 'managed' — the $5 managed trial credit is a SEPARATE
+ *     dynamic mechanism (resolveAnthropicKey + src/trialCredit.js), NOT a tier. Managed stays dormant data.
+ *   - pricingTable advertises ONE edition (Standard).
+ *   - inactive/null ⇒ unlicensed (blocked, never our key).
+ *   - isTrialLicense: only isEvaluation===true (and trialEndDate not past) counts as the 30-day trial.
  *
- * resolveTier/pricingTable are pure (they take the license; never call kvs/getAppContext),
- * so this exercises the real exported code. Usage: node prototype/test_v6_tiers.mjs
+ * resolveTier/pricingTable/isTrialLicense are pure, so this exercises the real exported code.
+ * Usage: node prototype/test_v6_tiers.mjs
  */
-import { resolveTier, pricingTable, TIERS, MANAGED_USER_CAP } from '../src/usage.js';
+import { resolveTier, pricingTable, TIERS, isTrialLicense } from '../src/usage.js';
 
 let pass = 0, fail = 0;
 function check(name, cond) {
@@ -21,91 +25,99 @@ function check(name, cond) {
   else { fail++; console.error(`  XX  ${name}`); }
 }
 
-console.log('v6 tier truth-table:');
+console.log('standard-only tier truth-table:');
 
-// 1. capabilityAdvanced ⇒ Advanced: BYOK + test-cases + unlimited (NOT managed)
-const adv = resolveTier({ active: true, capabilitySet: 'capabilityAdvanced' });
-check('Advanced.key === byokAdvanced', adv.key === 'byokAdvanced');
-check('Advanced.keySource === byok (NOT managed — margin-leak guard)', adv.keySource === 'byok');
-check('Advanced.hasTestCases === true', adv.hasTestCases === true);
-check('Advanced.limit === null (unlimited)', adv.limit === null);
-check('Advanced.edition === advanced', adv.edition === 'advanced');
-
-// 2. capabilityStandard ⇒ Standard: BYOK, no test-cases, unlimited
+// 1. capabilityStandard ⇒ Standard: BYOK, EVERYTHING included, unlimited
 const std = resolveTier({ active: true, capabilitySet: 'capabilityStandard' });
 check('Standard.key === byokPro', std.key === 'byokPro');
 check('Standard.keySource === byok', std.keySource === 'byok');
-check('Standard.hasTestCases === false (feature paywall)', std.hasTestCases === false);
+check('Standard.hasTestCases === true (included — no paywall)', std.hasTestCases === true);
+check('Standard.hasPlanner === true (included — no paywall)', std.hasPlanner === true);
 check('Standard.limit === null (unlimited)', std.limit === null);
 
-// 3. safe default: unknown active capabilitySet ⇒ Standard (never grants premium by accident)
+// 2. capabilityAdvanced STILL resolves to a FULL-featured tier (no existing subscriber loses access)
+const adv = resolveTier({ active: true, capabilitySet: 'capabilityAdvanced' });
+check('Advanced still full-featured: hasTestCases', adv.hasTestCases === true);
+check('Advanced still full-featured: hasPlanner', adv.hasPlanner === true);
+check('Advanced.keySource === byok (NOT managed — margin-leak guard)', adv.keySource === 'byok');
+check('Advanced.limit === null (unlimited)', adv.limit === null);
+
+// 3. safe default: unknown active capabilitySet ⇒ Standard (full-featured; never a dead-end)
 const unknown = resolveTier({ active: true, capabilitySet: 'capabilityGarbage' });
-check('unknown set ⇒ Standard (safe default)', unknown.key === 'byokPro');
-check('unknown set ⇒ hasTestCases false (no accidental premium)', unknown.hasTestCases === false);
-check('unknown set ⇒ keySource byok (never our key)', unknown.keySource === 'byok');
+check('unknown set ⇒ Standard', unknown.key === 'byokPro');
+check('unknown set ⇒ hasTestCases true (full features)', unknown.hasTestCases === true);
+check('unknown set ⇒ hasPlanner true (full features)', unknown.hasPlanner === true);
+check('unknown set ⇒ keySource byok (never our key by tier)', unknown.keySource === 'byok');
 
-// 4. absent capabilitySet (active) ⇒ Standard
+// 4. absent capabilitySet (active) ⇒ Standard, full-featured
 const noset = resolveTier({ active: true });
-check('absent capabilitySet ⇒ Standard', noset.key === 'byokPro' && noset.hasTestCases === false);
+check('absent capabilitySet ⇒ Standard full-featured', noset.key === 'byokPro' && noset.hasTestCases === true && noset.hasPlanner === true);
 
-// 5. case-insensitive (documented casing drift)
+// 5. case-insensitive (documented casing drift) still full-featured
 const advCi = resolveTier({ active: true, capabilitySet: 'CapabilityAdvanced' });
-check('case-insensitive: CapabilityAdvanced ⇒ Advanced', advCi.key === 'byokAdvanced' && advCi.hasTestCases === true);
+check('case-insensitive: CapabilityAdvanced ⇒ full-featured', advCi.hasTestCases === true && advCi.hasPlanner === true);
 
 // 6. inactive / null ⇒ unlicensed (blocked, never our key)
 const inactive = resolveTier({ active: false, capabilitySet: 'capabilityAdvanced' });
 check('inactive ⇒ unlicensed', inactive.key === 'unlicensed');
 check('unlicensed.limit === 0 (blocked)', inactive.limit === 0);
 check('unlicensed.hasTestCases === false', inactive.hasTestCases === false);
+check('unlicensed.hasPlanner === false', inactive.hasPlanner === false);
 check('unlicensed.keySource === byok (never our key, even defensively)', inactive.keySource === 'byok');
 check('null license ⇒ unlicensed', resolveTier(null).key === 'unlicensed');
 check('isActive alias also counts as active', resolveTier({ isActive: true, capabilitySet: 'capabilityStandard' }).key === 'byokPro');
 
-// 7. EXACTLY one LIVE (capabilitySet-resolvable) tier grants hasTestCases — and it is Advanced
+// 7. EVERY live (capabilitySet-resolvable) tier grants BOTH features (no feature gated behind an edition)
 const liveTiers = [
   resolveTier({ active: true, capabilitySet: 'capabilityStandard' }),
   resolveTier({ active: true, capabilitySet: 'capabilityAdvanced' }),
+  resolveTier({ active: true, capabilitySet: 'capabilityGarbage' }),
+  resolveTier({ active: true }),
 ];
-check('exactly ONE live tier has hasTestCases', liveTiers.filter((t) => t.hasTestCases).length === 1);
+check('EVERY live tier has hasTestCases (no edition paywall)', liveTiers.every((t) => t.hasTestCases === true));
+check('EVERY live tier has hasPlanner (no edition paywall)', liveTiers.every((t) => t.hasPlanner === true));
 
-// 8. NO capabilitySet input resolves to a managed key-source (managed is dormant only)
+// 8. NO capabilitySet input resolves to a managed key-source (the $5 credit is NOT a tier)
 const sweep = ['capabilityStandard', 'capabilityAdvanced', 'capabilityGarbage', '', undefined]
   .map((cs) => resolveTier({ active: true, capabilitySet: cs }));
-check('NO live tier is keySource managed (managed dormant)', sweep.every((t) => t.keySource === 'byok'));
+check('NO live tier is keySource managed (managed is not a tier)', sweep.every((t) => t.keySource === 'byok'));
 
-// 9. dormant managedPro is NOT reachable by resolveTier, and its edition is decoupled
+// 9. dormant managedPro stays as data but is NOT reachable by resolveTier
 check('managedPro exists as dormant data', TIERS.managedPro && TIERS.managedPro.keySource === 'managed');
-check('dormant managedPro.edition === managed (NOT advanced — decouple guard)', TIERS.managedPro.edition === 'managed');
 check('no live tier object IS the managed tier', sweep.every((t) => t !== TIERS.managedPro));
 
 // 10. TIERS frozen (shared by reference — mutation must not corrupt the singleton)
 check('TIERS is frozen', Object.isFrozen(TIERS));
-check('TIERS.byokAdvanced is frozen', Object.isFrozen(TIERS.byokAdvanced));
-let mutated = false;
-try { TIERS.byokAdvanced.hasTestCases = false; } catch (e) { /* strict throws */ }
-mutated = TIERS.byokAdvanced.hasTestCases === false;
-check('frozen tier resists mutation (still hasTestCases true)', resolveTier({ active: true, capabilitySet: 'capabilityAdvanced' }).hasTestCases === true);
+check('TIERS.byokPro is frozen', Object.isFrozen(TIERS.byokPro));
+try { TIERS.byokPro.hasTestCases = false; } catch (e) { /* strict throws */ }
+check('frozen Standard resists mutation (still hasTestCases true)', resolveTier({ active: true, capabilitySet: 'capabilityStandard' }).hasTestCases === true);
 
-// 11. pricingTable = the two LIVE editions, both BYOK, both priced; managed NOT listed
+// 11. pricingTable = a SINGLE offer (Standard); managed NOT listed
 const pt = pricingTable();
-check('pricingTable lists exactly 2 editions', pt.length === 2);
-check('pricingTable keys are byokPro + byokAdvanced', pt[0].key === 'byokPro' && pt[1].key === 'byokAdvanced');
+check('pricingTable lists exactly 1 edition (Standard-only)', pt.length === 1);
+check('pricingTable key is byokPro', pt[0].key === 'byokPro');
 check('pricingTable does NOT list managedPro', !pt.some((p) => p.key === 'managedPro'));
-check('pricingTable Advanced is priced ($13.40)', /13\.40/.test(pt[1].price || ''));
 check('pricingTable Standard is priced ($6.70)', /6\.70/.test(pt[0].price || ''));
-check('pricingTable carries hasTestCases per edition', pt[0].hasTestCases === false && pt[1].hasTestCases === true);
+check('pricingTable Standard carries hasTestCases true', pt[0].hasTestCases === true);
+check('pricingTable Standard carries hasPlanner true', pt[0].hasPlanner === true);
 
-// 12. v6.1: the Capacity-Sheet Planner is Advanced-only too — hasPlanner MIRRORS hasTestCases on every tier.
-// (Standard must NOT get the planner; Advanced must; an unknown/inactive set must default to no-planner.)
-check('Advanced.hasPlanner === true', adv.hasPlanner === true);
-check('Standard.hasPlanner === false (feature paywall)', std.hasPlanner === false);
-check('unknown set ⇒ hasPlanner false (no accidental premium)', unknown.hasPlanner === false);
-check('absent capabilitySet ⇒ hasPlanner false', noset.hasPlanner === false);
-check('inactive/unlicensed ⇒ hasPlanner false', inactive.hasPlanner === false);
-check('exactly ONE live tier has hasPlanner', liveTiers.filter((t) => t.hasPlanner).length === 1);
-check('hasPlanner mirrors hasTestCases on every LIVE tier', liveTiers.every((t) => t.hasPlanner === t.hasTestCases));
-check('pricingTable carries hasPlanner per edition', pt[0].hasPlanner === false && pt[1].hasPlanner === true);
-check('dormant managedPro.hasPlanner === true (mirrors hasTestCases)', TIERS.managedPro.hasPlanner === true);
+// 12. isTrialLicense — gates the $5 managed credit. The 30-day trial is signalled by isEvaluation===true
+// (real Marketplace) OR — when isEvaluation is UNDEFINED — a FUTURE trialEndDate (dev `forge install
+// --license trial` sets trialEndDate but NOT isEvaluation, verified on dev 2026-07-11). isEvaluation===false
+// is ALWAYS not-a-trial (the margin-leak guard: a paid customer never draws free credit).
+const FUTURE = new Date(Date.now() + 7 * 864e5).toISOString();
+const PAST = new Date(Date.now() - 7 * 864e5).toISOString();
+check('isEvaluation true ⇒ trial', isTrialLicense({ active: true, isEvaluation: true }) === true);
+check('isEvaluation true + future trialEndDate ⇒ trial', isTrialLicense({ isEvaluation: true, trialEndDate: FUTURE }) === true);
+check('isEvaluation true + PAST trialEndDate ⇒ NOT trial (stale flag guard)', isTrialLicense({ isEvaluation: true, trialEndDate: PAST }) === false);
+// ⭐ dev `--license trial`: isEvaluation UNDEFINED + a future trialEndDate ⇒ trial (the fix)
+check('isEvaluation undefined + FUTURE trialEndDate ⇒ trial (dev --license trial)', isTrialLicense({ active: true, trialEndDate: FUTURE }) === true);
+check('isEvaluation undefined + PAST trialEndDate ⇒ NOT trial', isTrialLicense({ active: true, trialEndDate: PAST }) === false);
+check('isEvaluation undefined + NO trialEndDate ⇒ NOT trial (no signal → safe polarity)', isTrialLicense({ active: true }) === false);
+// ⭐ margin-leak guard: an EXPLICITLY paid license is NEVER a trial, even with a lingering future trialEndDate
+check('paid (isEvaluation false) ⇒ NOT trial', isTrialLicense({ active: true, isEvaluation: false }) === false);
+check('paid (isEvaluation false) + FUTURE trialEndDate ⇒ NOT trial (margin-leak guard)', isTrialLicense({ isEvaluation: false, trialEndDate: FUTURE }) === false);
+check('null license ⇒ NOT trial', isTrialLicense(null) === false);
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

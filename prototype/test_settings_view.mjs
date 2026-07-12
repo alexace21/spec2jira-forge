@@ -1,0 +1,298 @@
+/**
+ * Offline test for the Admin Settings verdict state machine
+ * (static/hello-world/src/lib/settingsView.js).
+ *
+ * Plain-Node ESM, self-contained. Run:
+ *   node prototype/test_settings_view.mjs
+ *
+ * Guards the load-bearing correctness of the Claude-Design Admin Settings redesign (screen 5):
+ *   - the TWO ORTHOGONAL signals never interleave (license gate independent of config verdict);
+ *   - each of the 13 mockup states maps to the right {level, key, project, verified};
+ *   - optionals (context/custom-fields) tiles stay NEUTRAL (never an amber gap);
+ *   - probe classification: field-fixable -> error + fixField (deep-link); not-field-fixable
+ *     (billing/permission/network/storage) -> warning + honest hint + fixField null (no wrong jump);
+ *   - the getUsage-failed path is 'unknown' and never claims 'licensed'.
+ */
+import {
+  computeLicenseGate,
+  computeConfigVerdict,
+  computeReady,
+  computeSetupGuidance,
+  computeTiles,
+  classifyProbe,
+  probeLabel,
+  COST_ANCHOR,
+} from '../static/hello-world/src/lib/settingsView.js';
+
+let pass = 0;
+let fail = 0;
+function ok(cond, msg) {
+  if (cond) { pass++; console.log('  PASS  ' + msg); }
+  else { fail++; console.error('  FAIL  ' + msg); }
+}
+function eq(a, b, msg) {
+  ok(a === b, `${msg} (got ${JSON.stringify(a)}, want ${JSON.stringify(b)})`);
+}
+
+const health = (ok_, probes) => ({ ok: ok_, probes: probes || [] });
+const P = (name, okp, code) => ({ name, ok: okp, code });
+const ALL_OK = [P('anthropic_key', true), P('confluence_read', true), P('jira_project', true), P('kvs_rw', true)];
+
+// ── 1. License gate (3 states) ────────────────────────────────────────────────
+eq(computeLicenseGate({ allowed: true }).state, 'licensed', 'allowed:true -> licensed');
+eq(computeLicenseGate({ allowed: false, limit: 0 }).state, 'blocked', 'allowed:false -> blocked (Not licensed)');
+eq(computeLicenseGate({ error: 'usage_unavailable' }).state, 'unknown', 'getUsage error -> unknown');
+eq(computeLicenseGate(null).state, 'unknown', 'null account -> unknown');
+// a trial reads as an ACTIVE paid tier (allowed true) -> licensed, NOT blocked
+eq(computeLicenseGate({ allowed: true, tier: 'byokPro', unlimited: true }).state, 'licensed', 'trial/paid -> licensed (not blocked)');
+
+// ── 2. Config verdict — the 13-state coverage ─────────────────────────────────
+// S1 configured & verified (green)
+let v = computeConfigVerdict({ keyConfigured: true, projectKey: 'SDTY', keyStorageFault: false, health: health(true, ALL_OK) });
+eq(v.level, 'ok', 'S1 configured+verified -> level ok');
+eq(v.verified, 'verified', 'S1 verified');
+ok(v.configComplete === true, 'S1 configComplete');
+eq(v.requiredDone, 2, 'S1 2 of 2 required done');
+
+// S2/S6/S7 verify failed (any probe not ok) -> error verdict
+v = computeConfigVerdict({ keyConfigured: true, projectKey: 'SDTY', health: health(false, [P('anthropic_key', false, 'insufficient_credits'), P('confluence_read', true), P('jira_project', true), P('kvs_rw', true)]) });
+eq(v.level, 'error', 'S2 verify-failed -> level error');
+eq(v.verified, 'failed', 'S2 verified=failed');
+ok(v.configComplete === true, 'S2 config still complete (only the live check failed)');
+
+// S3 configured & verified is the same verdict as S1 (auto-verify note is a FE-only overlay)
+v = computeConfigVerdict({ keyConfigured: true, projectKey: 'SDTY', health: health(true, ALL_OK) });
+eq(v.level, 'ok', 'S3 auto-verifying settles to ok');
+
+// S4 key set, project missing
+v = computeConfigVerdict({ keyConfigured: true, projectKey: '', health: null });
+eq(v.level, 'warning', 'S4 key set, project missing -> warning');
+eq(v.project, 'not_set', 'S4 project not_set');
+eq(v.verified, 'not_run', 'S4 not verified yet');
+eq(v.requiredDone, 1, 'S4 1 of 2 required done');
+ok(v.configComplete === false, 'S4 not complete');
+
+// S5 first-time (empty)
+v = computeConfigVerdict({ keyConfigured: false, projectKey: '', health: null });
+eq(v.level, 'error', 'S5 first-time empty -> error (no key = hard blocker)');
+eq(v.key, 'not_set', 'S5 key not_set');
+eq(v.requiredDone, 0, 'S5 0 of 2 required done');
+
+// S8 API key storage fault (distinct from not_set)
+v = computeConfigVerdict({ keyConfigured: true, projectKey: 'SDTY', keyStorageFault: true, health: health(false, [P('anthropic_key', false, 'key_storage_failed'), P('confluence_read', true), P('jira_project', true), P('kvs_rw', true)]) });
+eq(v.level, 'error', 'S8 storage fault -> error');
+eq(v.key, 'storage_fault', 'S8 key=storage_fault (NOT not_set)');
+
+// complete-but-unverified -> neutral (run the check)
+v = computeConfigVerdict({ keyConfigured: true, projectKey: 'SDTY', health: null });
+eq(v.level, 'neutral', 'complete-but-unverified -> neutral');
+eq(v.verified, 'not_run', 'neutral verified=not_run');
+ok(v.configComplete === true, 'neutral is config-complete (drives auto-verify eligibility)');
+
+// ── 2b. TRIAL-CREDIT onboarding — while on the $5 free MANAGED credit, the KEY is OPTIONAL ──
+// (2026-07-11) trialActive softens the key requirement: only the Jira project is required, a missing key is
+// NOT an error / NOT a blocker, and the API-KEY tile reads NEUTRAL (never a red "Not set" that scares the
+// trial user into BYOK setup they don't need yet). Non-trial behavior is unchanged (regression guard T4).
+let t = computeConfigVerdict({ keyConfigured: false, projectKey: 'SDTY', health: null, trialActive: true });
+ok(t.level !== 'error', 'T1 trial + no key + project set -> NOT error (key optional)');
+ok(t.configComplete === true, 'T1 configComplete on the project alone (key optional)');
+eq(t.requiredTotal, 1, 'T1 only 1 required (the project) while on free trial');
+eq(t.requiredDone, 1, 'T1 1 of 1 required done');
+eq(t.keyRequired, false, 'T1 keyRequired=false while on trial credit');
+ok(computeReady({ licenseGate: { state: 'licensed' }, verdict: t }) === true, 'T1 trial + project set -> ready (no key to verify)');
+
+// T2: trial + no key + NO project -> the project is the ONE required step (warning, NOT a no-key error)
+t = computeConfigVerdict({ keyConfigured: false, projectKey: '', health: null, trialActive: true });
+eq(t.level, 'warning', 'T2 trial + no project -> warning (project is the one required step), NOT a no-key error');
+ok(t.configComplete === false, 'T2 not complete (project missing)');
+eq(t.requiredDone, 0, 'T2 0 of 1 required done');
+ok(computeReady({ licenseGate: { state: 'licensed' }, verdict: t }) === false, 'T2 no project -> not ready');
+
+// T3: trial API-KEY tile is NEUTRAL "On free trial" (never a red "Not set")
+let tt = Object.fromEntries(computeTiles({ verdict: computeConfigVerdict({ keyConfigured: false, projectKey: 'SDTY', health: null, trialActive: true }), trialActive: true, health: null }).map((x) => [x.id, x]));
+eq(tt.apiKey.status, 'neutral', 'T3 trial API-KEY tile neutral (not the red "Not set" error)');
+eq(tt.apiKey.value, 'On free trial', 'T3 trial API-KEY tile value "On free trial"');
+
+// T4 REGRESSION: NON-trial (default) is UNCHANGED — no key is still a hard error, 2 required, keyRequired true
+t = computeConfigVerdict({ keyConfigured: false, projectKey: 'SDTY', health: null });
+eq(t.level, 'error', 'T4 non-trial no key -> error (unchanged)');
+eq(t.requiredTotal, 2, 'T4 non-trial requiredTotal 2 (unchanged)');
+eq(t.keyRequired, true, 'T4 non-trial keyRequired true (unchanged)');
+
+// T5: trial + a verify that RAN and FAILED -> NOT ready (a real project/permission failure must block "All set",
+// not be swallowed by keyRequired=false — the fresh-army fix). not_run still passes (T1); only failed/unavailable block.
+t = computeConfigVerdict({ keyConfigured: false, projectKey: 'SDTY', trialActive: true, health: health(false, [P('anthropic_key', true), P('jira_project', false, 'project_not_found'), P('confluence_read', true), P('kvs_rw', true)]) });
+eq(t.verified, 'failed', 'T5 trial + a failing probe -> verified failed');
+ok(computeReady({ licenseGate: { state: 'licensed' }, verdict: t }) === false, 'T5 trial + FAILED verify -> NOT ready (failure not swallowed)');
+
+// T6: trial + verify UNAVAILABLE (bridge/resolver error) -> NOT ready
+t = computeConfigVerdict({ keyConfigured: false, projectKey: 'SDTY', trialActive: true, health: { ok: false, probes: [], failed: true } });
+eq(t.verified, 'unavailable', 'T6 trial + could-not-run -> verified unavailable');
+ok(computeReady({ licenseGate: { state: 'licensed' }, verdict: t }) === false, 'T6 trial + verify unavailable -> NOT ready');
+
+// T7: trial + verify PASSED -> ready (a green check is fine too, not only not_run)
+t = computeConfigVerdict({ keyConfigured: false, projectKey: 'SDTY', trialActive: true, health: health(true, [P('anthropic_key', true), P('jira_project', true), P('confluence_read', true), P('kvs_rw', true)]) });
+ok(computeReady({ licenseGate: { state: 'licensed' }, verdict: t }) === true, 'T7 trial + PASSED verify -> ready');
+
+// ── 3. ORTHOGONALITY — config verdict is independent of the license/account ───
+// The verdict function takes NO account arg; state #10 (getUsage failed) keeps the config verdict green.
+v = computeConfigVerdict({ keyConfigured: true, projectKey: 'SDTY', health: health(true, ALL_OK) });
+eq(v.level, 'ok', 'S10 getUsage-failed does NOT change the config verdict (stays ok/green)');
+eq(computeLicenseGate({ error: 'x' }).state, 'unknown', 'S10 license gate is unknown while config verdict is green');
+
+// ── 4. Tiles — optionals stay neutral; verified failCount ─────────────────────
+let tiles = computeTiles({
+  verdict: { ...computeConfigVerdict({ keyConfigured: true, projectKey: 'SDTY', health: health(true, ALL_OK) }), projectKey: 'SDTY' },
+  apiKeyLastSetAt: '2026-06-26T00:00:00Z',
+  health: health(true, ALL_OK),
+  profilesCount: 2,
+  hasCustomFields: false,
+});
+const byId = Object.fromEntries(tiles.map((t) => [t.id, t]));
+eq(byId.apiKey.status, 'ok', 'tile API KEY ok');
+eq(byId.project.status, 'ok', 'tile PROJECT ok');
+eq(byId.context.status, 'neutral', 'tile CONTEXT neutral (optional, never amber)');
+eq(byId.customFields.status, 'neutral', 'tile CUSTOM FIELDS neutral (optional, never amber)');
+eq(byId.context.value, '2 profiles', 'tile CONTEXT value plural');
+eq(byId.verified.status, 'ok', 'tile VERIFIED ok');
+
+// first-time tiles: key error, project warn, optionals still neutral
+tiles = computeTiles({
+  verdict: computeConfigVerdict({ keyConfigured: false, projectKey: '', health: null }),
+  profilesCount: 0, hasCustomFields: false, health: null,
+});
+const b2 = Object.fromEntries(tiles.map((t) => [t.id, t]));
+eq(b2.apiKey.status, 'error', 'first-time API KEY error (hard blocker)');
+eq(b2.project.status, 'warn', 'first-time PROJECT warn (required)');
+eq(b2.context.status, 'neutral', 'first-time CONTEXT still neutral');
+eq(b2.context.value, 'None', 'first-time CONTEXT None');
+eq(b2.verified.status, 'neutral', 'first-time VERIFIED neutral');
+
+// verify-failed tiles: VERIFIED shows failCount
+tiles = computeTiles({
+  verdict: computeConfigVerdict({ keyConfigured: true, projectKey: 'SDTY', health: health(false, [P('jira_project', false, 'project_not_found'), P('anthropic_key', true), P('confluence_read', true), P('kvs_rw', true)]) }),
+  health: health(false, [P('jira_project', false, 'project_not_found'), P('anthropic_key', true), P('confluence_read', true), P('kvs_rw', true)]),
+  profilesCount: 2,
+});
+const b3 = Object.fromEntries(tiles.map((t) => [t.id, t]));
+eq(b3.verified.status, 'error', 'verify-failed VERIFIED error');
+eq(b3.verified.value, '1 failed', 'verify-failed VERIFIED 1 failed');
+
+// singular profile label
+tiles = computeTiles({ verdict: computeConfigVerdict({ keyConfigured: true, projectKey: 'SDTY', health: null }), profilesCount: 1 });
+eq(Object.fromEntries(tiles.map((t) => [t.id, t])).context.value, '1 profile', 'CONTEXT singular');
+
+// ── 4e. req chip field (Required/Optional) + NO internal tier tag leaks (2026-07-12) ──────────────
+// The bare faint "required"/"optional" sub-words became a moodboard chip; the internal T0/T0-T1 tier tags
+// were REMOVED (leaked engineering jargon onto a PO screen). Trial: key OPTIONAL, project REQUIRED.
+let rq = Object.fromEntries(computeTiles({ verdict: computeConfigVerdict({ keyConfigured: false, projectKey: '', health: null, trialActive: true }), trialActive: true, health: null }).map((t) => [t.id, t]));
+eq(rq.apiKey.req, 'optional', 'req: trial API KEY optional (never a scary Required)');
+eq(rq.project.req, 'required', 'req: PROJECT required when not set (the one thing to do)');
+eq(rq.context.req, 'optional', 'req: CONTEXT optional');
+eq(rq.customFields.req, 'optional', 'req: CUSTOM FIELDS optional');
+eq(rq.verified.req, null, 'req: VERIFIED carries no chip (an action, not a config item)');
+ok(!('tier' in rq.apiKey) && !('tier' in rq.project), 'no internal tier tag leaks onto a tile (T0/T0-T1 removed)');
+// non-trial first-time: no key is a REQUIRED chip (was a bare faint "paste to connect")
+let rq2 = Object.fromEntries(computeTiles({ verdict: computeConfigVerdict({ keyConfigured: false, projectKey: '', health: null }), health: null }).map((t) => [t.id, t]));
+eq(rq2.apiKey.req, 'required', 'req: non-trial API KEY required when not set');
+// configured key + set project carry NO chip (only a descriptive sub)
+let rq3 = Object.fromEntries(computeTiles({ verdict: { ...computeConfigVerdict({ keyConfigured: true, projectKey: 'SDTY', health: health(true, ALL_OK) }), projectKey: 'SDTY' }, health: health(true, ALL_OK) }).map((t) => [t.id, t]));
+eq(rq3.apiKey.req, null, 'req: configured API KEY has no chip');
+eq(rq3.project.req, null, 'req: set PROJECT has no chip');
+
+// ── 4b. health.failed / could-not-run -> 'unavailable' (finding A3, NOT a counted failure) ──
+v = computeConfigVerdict({ keyConfigured: true, projectKey: 'SDTY', health: { ok: false, probes: [], failed: true } });
+eq(v.verified, 'unavailable', 'A3 health.failed -> verified=unavailable (not failed)');
+eq(v.level, 'warning', 'A3 unavailable -> level warning (not error)');
+v = computeConfigVerdict({ keyConfigured: true, projectKey: 'SDTY', health: { ok: false, probes: [] } });
+eq(v.verified, 'unavailable', 'A3 empty probes -> unavailable');
+// the unavailable VERIFIED tile reads "Could not run", not "1 failed"
+let ut = Object.fromEntries(computeTiles({ verdict: computeConfigVerdict({ keyConfigured: true, projectKey: 'SDTY', health: { ok: false, probes: [], failed: true } }), health: { ok: false, probes: [], failed: true } }).map((t) => [t.id, t]));
+eq(ut.verified.status, 'warn', 'A3 unavailable VERIFIED tile warn');
+eq(ut.verified.value, 'Could not run', 'A3 unavailable VERIFIED tile "Could not run" (not "1 failed")');
+
+// ── 4c. computeReady — a function of BOTH signals (finding A1) ────────────────
+const licVerdict = computeConfigVerdict({ keyConfigured: true, projectKey: 'SDTY', health: health(true, ALL_OK) });
+ok(computeReady({ licenseGate: { state: 'licensed' }, verdict: licVerdict }) === true, 'A1 licensed + verified + complete -> ready');
+ok(computeReady({ licenseGate: { state: 'blocked' }, verdict: licVerdict }) === false, 'A1 blocked instance is NEVER ready (even when config-verified)');
+ok(computeReady({ licenseGate: { state: 'unknown' }, verdict: licVerdict }) === true, 'A1 license-unknown + verified -> ready (do not assert blocked)');
+ok(computeReady({ licenseGate: { state: 'licensed' }, verdict: computeConfigVerdict({ keyConfigured: true, projectKey: '', health: null }) }) === false, 'A1 not-complete -> not ready');
+ok(computeReady({ licenseGate: { state: 'licensed' }, verdict: computeConfigVerdict({ keyConfigured: true, projectKey: 'SDTY', health: null }) }) === false, 'A1 complete-but-unverified -> not ready');
+
+// ── 4d. licenseBlocked forces VERIFIED tile neutral (§5.9, finding A1) ────────
+let bt = Object.fromEntries(computeTiles({ verdict: licVerdict, health: health(true, ALL_OK), licenseBlocked: true }).map((t) => [t.id, t]));
+eq(bt.verified.status, 'neutral', 'A1 blocked -> VERIFIED tile neutral (not green), even when config-verified');
+eq(bt.verified.sub, 'plan inactive', 'A1 blocked VERIFIED tile sub "plan inactive"');
+
+// ── 4f. computeSetupGuidance — HONEST across every not-ready sub-state (2026-07-12 regression guard) ──
+// The load-bearing invariant: once the project IS set, the guidance must NEVER say "just set your Jira
+// project" or claim "ready to push" — that contradicts a red verify failure in the hero (the exact regression
+// a 2-lens audit caught after the header restyle). Built from the REAL producers (computeConfigVerdict +
+// computeReady), not hand-crafted verdicts — a fabricated fixture would mask the very drift this guards.
+const lg = { state: 'licensed' };
+// ready → no guidance (the pill says All set)
+const gReady = computeSetupGuidance({ ready: true, trialActive: true, verdict: licVerdict });
+eq(gReady, null, 'setupGuidance: ready -> null (pill carries it)');
+// trial + project NOT set -> "just set your Jira project" is correct here (nothing done yet)
+let gv = computeConfigVerdict({ keyConfigured: false, projectKey: '', health: null, trialActive: true });
+let gg = computeSetupGuidance({ ready: computeReady({ licenseGate: lg, verdict: gv }), trialActive: true, verdict: gv });
+ok(/just set your Jira project/i.test(gg), 'setupGuidance: trial + no project -> tells them to set the project');
+// ⭐ REGRESSION GUARD: trial + project SET + verify FAILED -> must NOT say "just set your project"/"ready to push"
+gv = computeConfigVerdict({ keyConfigured: false, projectKey: 'SDTY', trialActive: true, health: health(false, [P('jira_project', false, 'project_not_found'), P('anthropic_key', true), P('confluence_read', true), P('kvs_rw', true)]) });
+gg = computeSetupGuidance({ ready: computeReady({ licenseGate: lg, verdict: gv }), trialActive: true, verdict: gv });
+ok(!/just set your Jira project/i.test(gg), 'setupGuidance: trial + project-set + verify-FAILED never says "just set your project" (honesty invariant)');
+ok(!/ready to push/i.test(gg), 'setupGuidance: trial + verify-FAILED never claims "ready to push" while a check failed');
+ok(/re-verify/i.test(gg), 'setupGuidance: trial + verify-FAILED points to re-verify');
+// trial + project SET + verify UNAVAILABLE -> "couldn't run", still no false readiness
+gv = computeConfigVerdict({ keyConfigured: false, projectKey: 'SDTY', trialActive: true, health: { ok: false, probes: [], failed: true } });
+gg = computeSetupGuidance({ ready: computeReady({ licenseGate: lg, verdict: gv }), trialActive: true, verdict: gv });
+ok(/couldn't run/i.test(gg) && !/ready to push/i.test(gg), 'setupGuidance: trial + verify-unavailable -> "couldn\'t run", no false readiness');
+// non-trial + key+project set + NOT yet verified -> "run the check to finish" (both required done)
+gv = computeConfigVerdict({ keyConfigured: true, projectKey: 'SDTY', health: null });
+gg = computeSetupGuidance({ ready: computeReady({ licenseGate: lg, verdict: gv }), trialActive: false, verdict: gv });
+ok(/run the check to finish/i.test(gg), 'setupGuidance: non-trial complete-but-unverified -> "run the check to finish"');
+// non-trial + nothing set -> the structural "two required steps" line
+gv = computeConfigVerdict({ keyConfigured: false, projectKey: '', health: null });
+gg = computeSetupGuidance({ ready: computeReady({ licenseGate: lg, verdict: gv }), trialActive: false, verdict: gv });
+ok(/Two required steps/i.test(gg), 'setupGuidance: non-trial first-time -> "Two required steps"');
+
+// ── 5. Probe classification — field-fixable vs honest-hint ────────────────────
+let c = classifyProbe(P('jira_project', false, 'project_not_found'));
+eq(c.severity, 'error', 'project_not_found -> error');
+eq(c.fixField, 'projectKey', 'project_not_found -> deep-link projectKey');
+
+c = classifyProbe(P('anthropic_key', false, 'key_storage_failed'));
+eq(c.severity, 'error', 'key_storage_failed -> error');
+eq(c.fixField, 'apiKey', 'key_storage_failed -> deep-link apiKey');
+
+c = classifyProbe(P('anthropic_key', false, 'insufficient_credits'));
+eq(c.severity, 'warning', 'insufficient_credits -> warning (billing, not a config error)');
+eq(c.fixField, null, 'insufficient_credits -> NO field jump (honest hint)');
+
+c = classifyProbe(P('confluence_read', false, 'permission_denied'));
+eq(c.severity, 'warning', 'permission_denied -> warning');
+eq(c.fixField, null, 'permission_denied -> NO field jump (fixing a field here would be wrong)');
+
+c = classifyProbe(P('jira_project', false, 'jira_500'));
+eq(c.severity, 'warning', 'jira_500 folds to jira_http -> warning');
+eq(c.fixField, null, 'jira_http -> no field jump');
+
+c = classifyProbe(P('kvs_rw', false, 'kvs_failed'));
+eq(c.severity, 'warning', 'kvs_failed -> warning');
+
+c = classifyProbe(P('x', false, 'some_unmapped_code'));
+eq(c.severity, 'warning', 'unknown code -> default warning');
+eq(c.fixField, null, 'unknown code -> no field jump');
+
+// ── 6. Probe label + cost anchor ──────────────────────────────────────────────
+eq(probeLabel('anthropic_key'), 'Anthropic API key', 'probeLabel anthropic_key');
+eq(probeLabel('confluence_read'), 'Confluence access', 'probeLabel confluence_read');
+eq(probeLabel('jira_project'), 'Jira project', 'probeLabel jira_project');
+eq(probeLabel('kvs_rw'), 'App storage', 'probeLabel kvs_rw');
+eq(probeLabel('weird_probe'), 'weird_probe', 'probeLabel fallback = raw name');
+eq(COST_ANCHOR.typical, '~$0.12', 'COST_ANCHOR typical');
+eq(COST_ANCHOR.max, '~$0.24', 'COST_ANCHOR max');
+
+// ── summary ───────────────────────────────────────────────────────────────────
+console.log(`\n${pass} passed, ${fail} failed`);
+process.exit(fail === 0 ? 0 : 1);

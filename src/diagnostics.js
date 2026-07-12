@@ -53,7 +53,7 @@ const DETAIL_TTL_DAYS = 30; // native @forge/kvs TTL ({ value, unit: 'DAYS' })
 // design §2.8). MUST equal package.json "version" — CI's tools/version-drift-guard.mjs FAILS the merge on
 // drift (the §11 backstop; bump BOTH at release). Still a support LABEL, never logic — and NOTE it is repo
 // BOOKKEEPING only: it does NOT equal the live Marketplace version (forge-auto-assigned at deploy).
-export const DIAG_APP_VERSION = '6.5.0';
+export const DIAG_APP_VERSION = '6.6.0';
 
 // Defensive ceiling for the admin "All users" enumeration (§2.10): a runaway
 // key-space can never melt the resolver — buckets beyond the cap are simply not
@@ -85,6 +85,8 @@ export const DIAG_OPS = Object.freeze([
   'generation.complete',
   'push.final',
   'push.step',
+  'push.resume', // Task C — a RESUME of a partial push (distinct op so support tells resume from a fresh push); its START-failure records carry this op
+  'push.resume.final', // Spec C.2 - the TERMINAL record of a RESUME (clean or still-partial), distinct from a fresh push's push.final so support can tell resume from fresh
   'testgen.batch',
   'testgen.poll', // [seams-audit J5] the TC poll leg — partitions the 7-site testgen.batch/kvs_write_failed junk-drawer tuple into flow legs (mirror of generation.start/.poll)
   'testgen.regen',

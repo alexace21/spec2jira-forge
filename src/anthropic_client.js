@@ -1182,9 +1182,13 @@ Identify the single softest edge to cut so the cycle is broken.`;
 
   const text = data?.content?.[0]?.text || '';
   try {
-    return JSON.parse(text);
+    const parsed = JSON.parse(text);
+    // usage attached (additive) so the $5 managed trial credit can meter cycle-repair spend on our key.
+    return { ...parsed, usage: data?.usage || null };
   } catch (_) {
-    return { error: 'parse_failed', detail: String(text).slice(0, 200) };
+    // Attach usage on the parse-fail path too (HTTP 200 was billed even if the text is unparseable —
+    // e.g. a max_tokens truncation) so the caller still meters the managed spend (fresh-army fix).
+    return { error: 'parse_failed', detail: String(text).slice(0, 200), usage: data?.usage || null };
   }
 }
 
@@ -1495,7 +1499,8 @@ export async function distillCategory({ text, category, apiKey, model }) {
   }
   // Length only — NEVER the content (privacy; keeps "Log End-User Data: No" true).
   console.log(`[distill] category=${category.key} extracted (${section.length} chars${truncated ? ', hit token cap → trimmed to clean boundary' : ''})`);
-  return { section, truncated };
+  // usage returned so the $5 managed trial credit can charge distill's real (sync Haiku) spend per step.
+  return { section, truncated, usage: data?.usage || null };
 }
 
 /**

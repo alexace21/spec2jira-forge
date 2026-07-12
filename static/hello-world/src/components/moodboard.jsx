@@ -100,10 +100,10 @@ export function MoodCard({ title, subtitle, badge, children, footer, density = "
 
 // ── ScreenHeader — navy title + optional blue BackButton + optional action (e.g. a settings gear). Centralizes
 // the Ready/Picker/Insights/Confirm header pattern. STATIC (the Forge page-scroll rule — never sticky). ──
-export function ScreenHeader({ title, subtitle, icon, onBack, backLabel = "Back", backTitle, action }) {
+export function ScreenHeader({ title, subtitle, icon, onBack, backLabel = "Back", backTitle, backAriaLabel, action }) {
   return (
     <div style={{ marginBottom: subtitle ? 14 : 16 }}>
-      {onBack ? <BackButton onClick={onBack} label={backLabel} title={backTitle} className="mb-2" /> : null}
+      {onBack ? <BackButton onClick={onBack} label={backLabel} title={backTitle} ariaLabel={backAriaLabel} className="mb-2" /> : null}
       <div className="flex items-center" style={{ gap: 10, justifyContent: "space-between", flexWrap: "wrap" }}>
         <h2 style={{ ...TYPE.title, fontSize: 22, display: "inline-flex", alignItems: "center", gap: 10 }}>
           {icon ? <span style={{ color: "var(--s2j-blue)", display: "inline-flex" }}>{icon}</span> : null}

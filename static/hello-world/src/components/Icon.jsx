@@ -184,6 +184,15 @@ export const IconLink = (p) => (
   </S>
 );
 
+// Epic — a stacked-layers glyph (the Epic groups the stories beneath it).
+export const IconLayers = (p) => (
+  <S {...p}>
+    <polygon points="12 2 2 7 12 12 22 7 12 2" />
+    <polyline points="2 17 12 22 22 17" />
+    <polyline points="2 12 12 17 22 12" />
+  </S>
+);
+
 export const IconMaximize = (p) => (
   <S {...p}>
     <polyline points="15 3 21 3 21 9" />
@@ -196,6 +205,22 @@ export const IconMaximize = (p) => (
 export const IconChevronRight = (p) => (
   <S {...p}>
     <polyline points="9 18 15 12 9 6" />
+  </S>
+);
+
+// Show/Hide + expand/collapse toggles: DOWN when collapsed ("Show all"), UP when
+// expanded ("Hide"). A real chevron (not a text arrow ▾/▸) so the toggle reads crisp
+// at any size + colour. Static per-state icons (no CSS transform:rotate — that reads
+// FROZEN in the Forge iframe; page-picker-redesign lesson).
+export const IconChevronDown = (p) => (
+  <S {...p}>
+    <polyline points="6 9 12 15 18 9" />
+  </S>
+);
+
+export const IconChevronUp = (p) => (
+  <S {...p}>
+    <polyline points="18 15 12 9 6 15" />
   </S>
 );
 
@@ -228,5 +253,19 @@ export const IconList = (p) => (
     <line x1="3" y1="6" x2="3.01" y2="6" />
     <line x1="3" y1="12" x2="3.01" y2="12" />
     <line x1="3" y1="18" x2="3.01" y2="18" />
+  </S>
+);
+
+// Data-path / privacy badge (Admin Settings "Your data path" — show this to security).
+export const IconShield = (p) => (
+  <S {...p}>
+    <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+  </S>
+);
+
+// Project-context profile row marker (a folder — a named standing context).
+export const IconFolder = (p) => (
+  <S {...p}>
+    <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
   </S>
 );

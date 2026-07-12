@@ -694,6 +694,66 @@ export function computeSchedulingSignals(graph, order) {
   return out;
 }
 
+/**
+ * The uids on the SINGLE longest dependency chain (the "critical path"), ordered root→end.
+ * Deterministic: start from the deepest node (max criticalPathLen; ties by smallest uid — the END of the
+ * longest chain, since that node's height is necessarily 1), then walk BACKWARD along effective-blocker
+ * edges that step the depth down by exactly 1 (ties by smallest uid). `effBlockers` mirrors
+ * computeSchedulingSignals — a blocker only counts when it is EARLIER in `order` — so a cut soft-cycle edge
+ * (whose blocker sits AFTER in the acyclic order) is excluded BY CONSTRUCTION; a cycle can never fabricate a
+ * bogus whole-graph path. The depths read from `signals` (criticalPathLen), so the returned chain is always
+ * consistent with the per-chip depth shown. Returns [] when there is no dependency chain of length >= 2
+ * (a plan with no real dependencies has no critical path to name → the FE marks/plots nothing).
+ *
+ * ⚠ MUST be given the SAME `order` + `signals` computeSchedulingSignals was given (baseTopo.order) so the
+ * depth values line up — otherwise the step-down trace can pick an inconsistent predecessor.
+ *
+ * @param {object} graph  from buildPlannerGraph
+ * @param {string[]} order  the acyclic order computeSchedulingSignals was given (baseTopo.order)
+ * @param {Map<string,{criticalPathLen:number}>} signals  from computeSchedulingSignals
+ * @returns {string[]}  root→end uids on the longest chain (length >= 2), or []
+ */
+export function computeCriticalPathUids(graph, order, signals) {
+  const ids = Array.isArray(graph && graph.ids) ? graph.ids : [];
+  const sig = signals instanceof Map ? signals : new Map();
+  if (ids.length === 0) return [];
+  const orderPos = new Map((Array.isArray(order) ? order : []).map((id, i) => [id, i]));
+  const depthOf = (id) => { const s = sig.get(id); return s && Number.isFinite(s.criticalPathLen) ? s.criticalPathLen : 1; };
+  // effective blockers = only those EARLIER in the acyclic order (mirrors computeSchedulingSignals →
+  // a cut soft-cycle edge is excluded by construction; no legal.cutEdges lookup needed).
+  const effBlockers = (id) => {
+    const pos = orderPos.has(id) ? orderPos.get(id) : Infinity;
+    return Array.from(graph.blockers.get(id) || []).filter((b) => orderPos.has(b) && orderPos.get(b) < pos);
+  };
+
+  // deepest node = the END of the single longest chain (max depth; ties by smallest uid)
+  let end = null;
+  let maxDepth = 0;
+  for (const id of ids) {
+    const d = depthOf(id);
+    if (end === null || d > maxDepth || (d === maxDepth && id < end)) { maxDepth = d; end = id; }
+  }
+  if (end === null || maxDepth < 2) return []; // no dependency chain of length >= 2 → no critical path
+
+  const chain = [];
+  const seen = new Set();
+  let cur = end;
+  while (cur != null && !seen.has(cur)) {
+    seen.add(cur);
+    chain.push(cur);
+    const d = depthOf(cur);
+    if (d <= 1) break;
+    // step DOWN one level: a blocker whose depth is exactly d-1 (a predecessor on the longest chain); ties → smallest uid
+    let nextNode = null;
+    for (const b of effBlockers(cur)) {
+      if (depthOf(b) === d - 1 && (nextNode === null || b < nextNode)) nextNode = b;
+    }
+    cur = nextNode;
+  }
+  chain.reverse(); // root (depth 1) → end (max depth)
+  return chain;
+}
+
 // ════════════════════════════════════════════════════════════════
 // 6. NORMALIZE RANKING  — make the advisory LLM output TOTAL + legal (ledger LLM-1/2/8)
 // ════════════════════════════════════════════════════════════════
@@ -744,6 +804,39 @@ export function normalizeRanking(ranking, graph, signals, priorityRank, complexi
   const usedLlm = ordered.length > 0;
   const preferenceOrder = ordered.concat(omittedIds);
   return { preferenceOrder, unknownIds, duplicateIds, omittedIds, usedLlm };
+}
+
+// A rationale string is capped defensively so a runaway model row can't bloat the response / KVS payload.
+export const RATIONALE_MAX_CHARS = 400;
+
+/**
+ * Build a compact { [feature_id]: rationale } map from the RAW LLM ranking array (record.ranking — rows of
+ * shape {feature_id, rank, rationale?}). Includes ONLY entries whose rationale is a non-empty TRIMMED string,
+ * each capped to RATIONALE_MAX_CHARS. A null / undefined / [] / non-array ranking (a deterministic-fallback
+ * plan has record.ranking === null) → {} — the STRUCTURAL absence the honesty firewall relies on (a plan with
+ * no Claude reasoning must show NO reasoning, never a fabricated one). PURE + derive-on-read: this is computed
+ * at RESPONSE time from record.ranking, NOT a new persisted KVS field. First rationale wins on a duplicate
+ * feature_id (deterministic; mirrors normalizeRanking keeping the first occurrence). feature_id == the plan-time
+ * _uid the chips already key on, so the map is directly consumable by the FeatureChip.
+ *
+ * @param {Array<{feature_id:string, rationale?:string}>|null|undefined} ranking
+ * @returns {{[feature_id:string]: string}}
+ */
+export function buildRationaleMap(ranking) {
+  const out = {};
+  const list = Array.isArray(ranking) ? ranking : [];
+  for (const row of list) {
+    if (!row || typeof row !== 'object') continue;
+    const id = row.feature_id;
+    if (typeof id !== 'string' || !id) continue;
+    if (Object.prototype.hasOwnProperty.call(out, id)) continue; // first rationale wins (dup feature_id)
+    const raw = row.rationale;
+    if (typeof raw !== 'string') continue;
+    const trimmed = raw.trim();
+    if (!trimmed) continue; // empty / whitespace-only → omitted (never a hollow "no reason" entry)
+    out[id] = trimmed.length > RATIONALE_MAX_CHARS ? trimmed.slice(0, RATIONALE_MAX_CHARS) : trimmed;
+  }
+  return out;
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -859,7 +952,14 @@ export function packSprints(preferenceOrder, perSprintCapacityPoints, graph, poi
       if (isOversized(top)) {
         place(top, s, true);
         const ov = { id: top, name: graph.nameOf.get(top), points: points.get(top), maxCapacity: maxCap };
-        if (sk) { const d = demandOf(top) || {}; ov.buckets = PLAN_BUCKETS.filter((k) => d[k] > EPS && maxBcap[k] > EPS && d[k] > maxBcap[k] + EPS); }
+        if (sk) {
+          const d = demandOf(top) || {};
+          ov.buckets = PLAN_BUCKETS.filter((k) => d[k] > EPS && maxBcap[k] > EPS && d[k] > maxBcap[k] + EPS);
+          // Per-bucket by-how-much: in skill mode the BINDING constraint is a single bucket's demand vs THAT
+          // bucket's per-sprint cap, NOT the feature total vs the pooled cap (that can read "fits"). Record it so
+          // the reason string is honest ("needs N backend pts vs an M-pt backend cap per sprint").
+          ov.bucketDetail = ov.buckets.map((k) => ({ bucket: k, demand: d[k], cap: maxBcap[k] }));
+        }
         oversized.push(ov);
         // CLOSE the sprint after a forced oversized placement (deep-audit PLAN-05): the sprint is already
         // over capacity, so don't cram more (incl. a 2nd oversized) into it — distribute one per sprint.
@@ -1353,6 +1453,10 @@ export function assemblePlan({ features, capacity, ranking, specConcerns, precom
 
   const baseTopo = topoSortAndCycles(graph, () => 0, prRank); // base acyclic order for signals (no LLM pref yet)
   const signals = computeSchedulingSignals(graph, baseTopo.order);
+  // The single longest dependency chain (the "critical path"), derived from the SAME order/signals so it stays
+  // consistent with the per-chip criticalPathLen. Excludes cut soft-cycle edges by construction; [] when there
+  // is no chain of length >= 2. Methodology-agnostic → returned on BOTH Scrum + Kanban plans (below).
+  const criticalPathUids = computeCriticalPathUids(graph, baseTopo.order, signals);
 
   const norm = normalizeRanking(ranking, graph, signals, prRank, cxRank);
   // re-derive the legal order honouring the LLM preference as the ready-tiebreak (ledger GRAPH-8)
@@ -1410,6 +1514,7 @@ export function assemblePlan({ features, capacity, ranking, specConcerns, precom
       cutEdges: legal.cutEdges,
     },
     signals: Object.fromEntries(signals),
+    criticalPathUids, // the single longest dependency chain (root→end uids); [] when there's no chain >= 2
     ranking: { usedLlm: norm.usedLlm, unknownIds: norm.unknownIds, duplicateIds: norm.duplicateIds, omittedCount: norm.omittedIds.length },
     ...packed,
     riskByFeature: Object.fromEntries(riskByFeature),
