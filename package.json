@@ -12,12 +12,12 @@
     "ci": "npm run check && npm test && npm run build:ui"
   },
   "devDependencies": {
-    "eslint": "^10.6.0",
+    "eslint": "^10.7.0",
     "eslint-plugin-react-hooks": "^7.1.1"
   },
   "dependencies": {
-    "@forge/api": "^8.0.0",
-    "@forge/kvs": "^2.0.0",
+    "@forge/api": "^8.0.1",
+    "@forge/kvs": "^2.0.1",
     "@forge/resolver": "1.7.1"
   }
 }
