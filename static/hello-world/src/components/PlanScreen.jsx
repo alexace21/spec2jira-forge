@@ -1752,9 +1752,18 @@ export default function PlanScreen({
         ) : null}
 
         {keyError ? (
-          <SignalCallout kind="error" title="Anthropic key needed" style={{ marginBottom: 12 }}>
-            {keyError.detail || "Add your Anthropic API key in Settings to generate a plan."}
-          </SignalCallout>
+          // A trial-credit block is NOT an error (the user is on the free trial and simply ran low) — frame it
+          // as an INFO prompt with a trial-aware title, matching the other surfaces' "add your key to continue"
+          // (the generic red "Anthropic key needed" stays for a real not_configured on a paid/keyless user).
+          keyError.error === "trial_credit_exhausted" ? (
+            <SignalCallout kind="info" title="Add your Anthropic key to continue" style={{ marginBottom: 12 }}>
+              {keyError.detail || "Your free trial credit is used — add your own Anthropic API key in Settings to keep going (unlimited, you pay Anthropic directly)."}
+            </SignalCallout>
+          ) : (
+            <SignalCallout kind="error" title="Anthropic key needed" style={{ marginBottom: 12 }}>
+              {keyError.detail || "Add your Anthropic API key in Settings to generate a plan."}
+            </SignalCallout>
+          )
         ) : null}
         {planError ? (
           <SignalCallout kind="error" title="Couldn’t build the plan" style={{ marginBottom: 12 }}>
