@@ -56,17 +56,22 @@ export const TRIAL_GRANT_USD =
 
 /**
  * Per-install kill-ceiling on managed dollars — the backstop that bounds worst-case spend. Independent
- * of the grant and of ENFORCEMENT_MODE. Default = 2× the grant. Enforced at ADMISSION per surface
- * (overCeiling); the ONE surface whose actual can massively exceed its estimate (test-gen) has an
- * ADDITIONAL upper-vs-ceiling admission gate (startTestCaseGeneration) so it can't single-handedly blow
- * past the ceiling. Net: an install's managed spend is materially bounded at ~$10 — not a hard mid-run
- * clamp, so a CHEAP surface admitted while under-ceiling can still reconcile a small estimate→actual tail
- * past it (breakdown ≤$0.24 / plan / regen / a distill step / a cycle-repair call), which is negligible.
+ * of the grant and of ENFORCEMENT_MODE. ⭐ 2026-07-12 (partner call): Default = 1.2× the grant (a MODEST
+ * buffer over the $5 grant → ~$6, NOT the old 2×/$10). The welcome credit is $5; our managed exposure per
+ * install must never materially exceed it — $10 was twice the welcome, too generous. Enforced at ADMISSION
+ * per surface (overCeiling); the ONE surface whose actual can massively exceed its estimate (test-gen) has
+ * an ADDITIONAL upper-vs-ceiling admission gate (startTestCaseGeneration): a run whose WORST case wouldn't
+ * fit under this ceiling routes to BYOK instead of drawing our key — the correct posture for a $5 welcome
+ * (we don't fund a >$6-worst-case single run on the free credit). Net: an install's managed spend is
+ * bounded at ~$6 — not a hard mid-run clamp, so a CHEAP surface admitted while under-ceiling can still
+ * reconcile a tiny estimate→actual tail past it (breakdown ≤$0.24 / plan / regen / distill / cycle-repair;
+ * these charge ≤ their estimate so the tail is cents). Override with MANAGED_HARD_CEILING_USD on prod
+ * (recommended: set it explicitly to 6 — or 5 for the tightest cap — so a grant typo can't scale it).
  */
 export const TRIAL_HARD_CEILING_USD =
   Number.parseFloat(process.env.MANAGED_HARD_CEILING_USD) > 0
     ? Number.parseFloat(process.env.MANAGED_HARD_CEILING_USD)
-    : TRIAL_GRANT_USD * 2;
+    : TRIAL_GRANT_USD * 1.2;
 
 // Conservative per-run SUBMIT estimates (reconciled to the echoed actual at finalize). These
 // only need to be in the right ballpark — the finalize reconcile corrects them to the truth.

@@ -29,7 +29,9 @@ console.log('trial-credit ledger math:');
 
 // The module defaults (env unset in a plain node run).
 check('default grant is $5', TRIAL_GRANT_USD === 5);
-check('default hard ceiling is $10 (2× grant)', TRIAL_HARD_CEILING_USD === 10);
+// ⭐ 2026-07-12 (partner call): the hard ceiling default is now 1.2× the grant (~$6), NOT 2×/$10 — our
+// managed exposure per install must never materially exceed the $5 welcome credit.
+check('default hard ceiling is $6 (1.2× grant, not 2×)', approx(TRIAL_HARD_CEILING_USD, 6));
 
 // 1. fresh install — full credit available, not exhausted, not over ceiling
 const fresh = computeCreditStatus(0);
@@ -47,15 +49,15 @@ const atGrant = computeCreditStatus(5);
 check('at grant: exhausted (>= boundary)', atGrant.exhausted === true);
 check('at grant: availableUsd clamped to 0', approx(atGrant.availableUsd, 0));
 
-// 4. overshoot past grant but below ceiling — exhausted but NOT over the hard ceiling
-const overshoot = computeCreditStatus(6.5);
+// 4. overshoot past grant ($5) but below the ceiling ($6) — exhausted but NOT over the hard ceiling
+const overshoot = computeCreditStatus(5.5);
 check('overshoot: exhausted', overshoot.exhausted === true);
 check('overshoot: availableUsd stays 0 (clamped, never negative)', approx(overshoot.availableUsd, 0));
-check('overshoot below ceiling: NOT overCeiling', overshoot.overCeiling === false);
+check('overshoot $5.5 (past $5 grant, below $6 ceiling): NOT overCeiling', overshoot.overCeiling === false);
 
-// 5. at/above the hard ceiling — overCeiling (the absolute backstop)
-check('at ceiling ($10): overCeiling', computeCreditStatus(10).overCeiling === true);
-check('above ceiling ($12): overCeiling', computeCreditStatus(12).overCeiling === true);
+// 5. at/above the hard ceiling ($6) — overCeiling (the absolute backstop)
+check('at ceiling ($6): overCeiling', computeCreditStatus(6).overCeiling === true);
+check('above ceiling ($8): overCeiling', computeCreditStatus(8).overCeiling === true);
 
 // 6. read glitch (readOk:false) ⇒ exhausted AND overCeiling regardless of spent (SAFE money polarity)
 const glitch = computeCreditStatus(0, false);
