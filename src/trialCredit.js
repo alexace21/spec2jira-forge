@@ -94,13 +94,19 @@ export const DISTILL_EST_USD = 0.1;
  *               `upperUsd` defaults to the estimate (the surfaces whose actual ≈ estimate); test-gen passes
  *               its projected upper (its actual can massively exceed the expected).
  *
- * NaN/absent inputs collapse to the SAFE polarity (available 0 → block), so a bad snapshot never grants
- * free managed spend. PURE — the caller reads the ledger snapshot and does the route.
+ * NaN/absent inputs collapse to the SAFE polarity (block), so a bad snapshot never grants free managed
+ * spend: a bad AVAILABLE reads as 0 (est > 0 → block) AND a bad ESTIMATE (non-finite / non-positive — we
+ * cannot price the run) blocks directly. PURE — the caller reads the ledger snapshot and does the route.
  */
 export function managedRunBlocker({ keySource, availableUsd, spentUsd, estimateUsd, upperUsd = null, hardCeilingUsd = TRIAL_HARD_CEILING_USD } = {}) {
   if (keySource !== 'managed') return null; // BYOK / paid — never gated on trial credit
-  const est = Number.isFinite(estimateUsd) && estimateUsd > 0 ? estimateUsd : 0;
   const avail = Number.isFinite(availableUsd) && availableUsd > 0 ? availableUsd : 0;
+  // A non-finite / non-positive estimate means we cannot reason about this run's cost → BLOCK (no managed
+  // surface has a legitimately free run; a bad estimate must never PROCEED ungated — safe money polarity).
+  if (!(Number.isFinite(estimateUsd) && estimateUsd > 0)) {
+    return { reason: 'insufficient', estimateUsd: 0, availableUsd: avail };
+  }
+  const est = estimateUsd;
   if (est > avail) return { reason: 'insufficient', estimateUsd: est, availableUsd: avail };
   const worst = Number.isFinite(upperUsd) && upperUsd > 0 ? upperUsd : est;
   const spent = Number.isFinite(spentUsd) && spentUsd > 0 ? spentUsd : 0;

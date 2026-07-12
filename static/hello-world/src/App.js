@@ -1831,6 +1831,22 @@ function App() {
           return;
         }
         if (submitResult.error) {
+          // ⭐ 2026-07-12: a trial-credit block (or a config gap) carries an honest, surface-aware detail
+          // ("This regeneration needs ~$X, only $Y of free trial credit left"). Route it to the setup screen
+          // like every other managed surface — otherwise the per-card error dot swallows the message and the
+          // user is dead-ended with no "add your key" affordance (audit-caught missed sibling).
+          const friendly = _classifyBackendError(submitResult, "Regenerate failed");
+          if (friendly.routeToSetup) {
+            // Clear this card's "pending" spinner BEFORE navigating away — regenStates persists across screens,
+            // so leaving it "pending" would show a stuck, disabled "Generating…" on this story if the user
+            // returns to Test Cases after adding a key (the test-gen sibling clears its flag before the same
+            // route; fix-verify caught this own-fix regression).
+            setRegenStates((prev) => { const next = { ...prev }; delete next[storyIdx]; return next; });
+            setSetupKind(friendly.setupKind || null);
+            setError(friendly.message);
+            setScreen("setup");
+            return;
+          }
           setRegenStates((prev) => ({ ...prev, [storyIdx]: "error" }));
           return;
         }

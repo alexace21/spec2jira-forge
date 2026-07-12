@@ -134,6 +134,12 @@ check('blocker: no upper → worst defaults to estimate (spent+est ≤ ceiling �
 const glitchCs = computeCreditStatus(0, false);
 const bglitch = managedRunBlocker({ keySource: 'managed', availableUsd: glitchCs.availableUsd, spentUsd: glitchCs.spentUsd, estimateUsd: 0.1 });
 check('blocker: read glitch (available 0) → BLOCK managed spend (money-safety regression guard)', !!bglitch && bglitch.reason === 'insufficient');
+// non-finite / non-positive ESTIMATE → BLOCK too (we cannot price the run — the SAFE polarity must hold for
+// estimate, not only available; audit-caught asymmetry where a NaN estimate PROCEEDED ungated).
+check('blocker: NaN estimate → BLOCK (cannot price the run → safe polarity)', managedRunBlocker({ keySource: 'managed', availableUsd: 5, estimateUsd: NaN })?.reason === 'insufficient');
+check('blocker: 0 estimate → BLOCK (no managed run is legitimately free)', managedRunBlocker({ keySource: 'managed', availableUsd: 5, estimateUsd: 0 })?.reason === 'insufficient');
+check('blocker: absent estimate → BLOCK', managedRunBlocker({ keySource: 'managed', availableUsd: 5 })?.reason === 'insufficient');
+check('blocker: BYOK + NaN estimate → null (BYOK still never gated)', managedRunBlocker({ keySource: 'byok', availableUsd: 5, estimateUsd: NaN }) === null);
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

@@ -2332,9 +2332,15 @@ function ContextProfilesEditor({ profiles, setProfiles, apiKeyConfigured, onMess
           text:
             start?.error === "managed_unavailable"
               ? start.detail || ERROR_MESSAGES.MANAGED_UNAVAILABLE
-              : ERROR_MESSAGES[start?.code] ||
-                start?.detail ||
-                "Couldn't start summarizing. Try again.",
+              // ⭐ 2026-07-12: a trial-credit block carries an honest surface-aware detail ("This project-context
+              // distillation needs ~$X, only $Y of free trial credit left"). It ships with code:'NOT_CONFIGURED',
+              // so prefer the detail here — else ERROR_MESSAGES.NOT_CONFIGURED ("No API key configured") would
+              // shadow it and mislead a trial user who simply ran low on credit (audit-caught missed sibling).
+              : start?.error === "trial_credit_exhausted"
+                ? start.detail || "Your free trial credit is used — add your own Anthropic API key in Settings."
+                : ERROR_MESSAGES[start?.code] ||
+                  start?.detail ||
+                  "Couldn't start summarizing. Try again.",
         });
         return;
       }
@@ -2830,7 +2836,9 @@ function SettingTile({ tile }) {
       {(tile.req || tile.sub) && (
         <div className="flex items-center" style={{ gap: 6, flexWrap: "wrap", rowGap: 3 }}>
           {tile.req ? <ReqChip req={tile.req} /> : null}
-          {tile.sub ? <span style={{ ...TYPE.micro, fontSize: 11, color: "var(--s2j-text-muted)" }}>{tile.sub}</span> : null}
+          {/* TYPE.micro is --s2j-text-light (#3c6193, ~5.8:1 = WCAG AA at this size); do NOT override to
+              --s2j-text-muted (#6285ad, ~3.5:1 = below AA) — that was a contrast regression. */}
+          {tile.sub ? <span style={{ ...TYPE.micro, fontSize: 11 }}>{tile.sub}</span> : null}
         </div>
       )}
     </div>
@@ -2851,7 +2859,9 @@ function ReqChip({ req }) {
         lineHeight: 1.4,
         padding: "1px 7px",
         borderRadius: 999,
-        color: required ? "var(--s2j-text)" : "var(--s2j-text-muted)",
+        // Both branches keep WCAG AA on the near-white tile: Required = --s2j-text (darkest) on amber;
+        // Optional = --s2j-text-light (#3c6193, ~5.8:1), NOT --s2j-text-muted (#6285ad, below AA at 9.5px).
+        color: required ? "var(--s2j-text)" : "var(--s2j-text-light)",
         background: required ? "var(--s2j-orange-bg)" : "var(--s2j-bg-section)",
         border: `1px solid ${required ? "var(--s2j-orange-border)" : "var(--s2j-border)"}`,
         whiteSpace: "nowrap",
