@@ -16,7 +16,7 @@
  *
  * Usage: node prototype/test_trial_credit.mjs
  */
-import { computeCreditStatus, TRIAL_GRANT_USD, TRIAL_HARD_CEILING_USD } from '../src/trialCredit.js';
+import { computeCreditStatus, managedRunBlocker, TRIAL_GRANT_USD, TRIAL_HARD_CEILING_USD } from '../src/trialCredit.js';
 
 let pass = 0, fail = 0;
 function check(name, cond) {
@@ -62,6 +62,9 @@ const glitch = computeCreditStatus(0, false);
 check('glitch: exhausted true even with 0 spent (never grant free spend on a glitch)', glitch.exhausted === true);
 check('glitch: overCeiling true (decision refuses managed)', glitch.overCeiling === true);
 check('glitch: readOk false surfaced', glitch.readOk === false);
+// ⭐ 2026-07-12 money-safety: availableUsd is 0 on a glitch (NOT the full grant) so the pre-flight stopper,
+// which gates on availableUsd, blocks a managed run on a read glitch (regressed once — the audit caught it).
+check('glitch: availableUsd === 0 (SAFE — never report the full grant when the read failed)', approx(glitch.availableUsd, 0));
 
 // 7. malformed spent (NaN / negative) treated as 0 — never fabricate a debit
 check('NaN spent ⇒ treated as 0 spent', approx(computeCreditStatus(NaN).spentUsd, 0));
@@ -102,6 +105,35 @@ s = finalizeOnce(s, 0.24, 0.30, false);   // first finalize
 const afterFirst = s;
 s = finalizeOnce(s, 0.24, 0.30, true);    // replay (marker present) → no-op
 check('idempotency: replay finalize does not re-charge', approx(s, afterFirst) && approx(s, 0.30));
+
+// ── 11. managedRunBlocker — the PRE-FLIGHT STOPPER (2026-07-12) ───────────────────────────────────
+// Closes the overrun a partner caught in live testing: a managed run admitted with only $0.01 left then
+// spent a full ~$0.24 PAST the grant, because admission only checked `exhausted`. Now every managed surface
+// blocks BEFORE spending when this run's estimate won't fit the remaining credit. BYOK is never gated.
+console.log('\nmanagedRunBlocker (pre-flight stopper):');
+check('blocker: BYOK keySource → null (unlimited, never gated)', managedRunBlocker({ keySource: 'byok', availableUsd: 0, estimateUsd: 0.24 }) === null);
+check('blocker: managed, est $0.10 ≤ avail $0.30 → null (proceed)', managedRunBlocker({ keySource: 'managed', availableUsd: 0.30, spentUsd: 0.20, estimateUsd: 0.10 }) === null);
+// ⭐ THE PARTNER'S CASE — $0.01 left, a $0.24 breakdown → BLOCK (was admitted → overran the grant)
+const b1 = managedRunBlocker({ keySource: 'managed', availableUsd: 0.01, spentUsd: 0.49, estimateUsd: 0.24 });
+check('blocker: $0.01 left + $0.24 breakdown → BLOCK (the overrun fix)', !!b1 && b1.reason === 'insufficient');
+check('blocker: reports the honest numbers (est 0.24 / avail 0.01)', !!b1 && approx(b1.estimateUsd, 0.24) && approx(b1.availableUsd, 0.01));
+check('blocker: est EXACTLY === avail → null (spend up to the grant, no overrun)', managedRunBlocker({ keySource: 'managed', availableUsd: 0.24, spentUsd: 0.26, estimateUsd: 0.24 }) === null);
+const bex = managedRunBlocker({ keySource: 'managed', availableUsd: 0, spentUsd: 5, estimateUsd: 0.10 });
+check('blocker: exhausted (avail 0) → block (subsumes the old exhausted gate)', !!bex && bex.reason === 'insufficient');
+const bnan = managedRunBlocker({ keySource: 'managed', availableUsd: NaN, estimateUsd: 0.10 });
+check('blocker: NaN available → SAFE polarity (treated as 0 → block)', !!bnan && bnan.reason === 'insufficient');
+const babsent = managedRunBlocker({ keySource: 'managed', estimateUsd: 0.10 });
+check('blocker: absent available → block (never grant free spend on a bad snapshot)', !!babsent && babsent.reason === 'insufficient');
+// hard-ceiling stopper — estimate fits available but the WORST case (upper) breaches the ceiling (test-gen path)
+const b2 = managedRunBlocker({ keySource: 'managed', availableUsd: 5, spentUsd: 9.5, estimateUsd: 0.4, upperUsd: 2, hardCeilingUsd: 10 });
+check('blocker: est fits avail but spent+upper > ceiling → ceiling block', !!b2 && b2.reason === 'ceiling');
+check('blocker: ceiling block reports headroom (upper 2 / ceiling−spent 0.5)', !!b2 && approx(b2.estimateUsd, 2) && approx(b2.availableUsd, 0.5));
+check('blocker: no upper → worst defaults to estimate (spent+est ≤ ceiling → proceed)', managedRunBlocker({ keySource: 'managed', availableUsd: 5, spentUsd: 3, estimateUsd: 0.24, hardCeilingUsd: 10 }) === null);
+// ⭐ INTEGRATION — a KVS read glitch must BLOCK a managed run (the audit-caught leak): creditStatus's
+// availableUsd is 0 on a glitch → the blocker sees est > 0 → block, matching the old exhausted/overCeiling gate.
+const glitchCs = computeCreditStatus(0, false);
+const bglitch = managedRunBlocker({ keySource: 'managed', availableUsd: glitchCs.availableUsd, spentUsd: glitchCs.spentUsd, estimateUsd: 0.1 });
+check('blocker: read glitch (available 0) → BLOCK managed spend (money-safety regression guard)', !!bglitch && bglitch.reason === 'insufficient');
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

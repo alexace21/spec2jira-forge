@@ -107,10 +107,11 @@ import {
 import {
   creditStatus,
   chargeSpend,
+  managedRunBlocker,
   BREAKDOWN_EST_USD,
   PLAN_EST_USD,
   REGEN_EST_USD,
-  TRIAL_HARD_CEILING_USD,
+  DISTILL_EST_USD,
 } from './trialCredit.js';
 // Diagnostic ledger (Phase 0 wiring — docs/DIAGNOSTICS-LEDGER-DESIGN.md). Both write helpers
 // are FAIL-OPEN by contract (never throw into the caller); records are codes/ids/counts only,
@@ -309,10 +310,10 @@ function buildQuotaExceeded(quota) {
  * "configure a key". `estimateUsd`/`availableUsd` present ⇒ the test-gen pre-flight blocked a run
  * that would overshoot the near-hard $5 ceiling — name the numbers honestly.
  */
-function buildTrialCreditExhausted({ estimateUsd = null, availableUsd = null } = {}) {
+function buildTrialCreditExhausted({ estimateUsd = null, availableUsd = null, runLabel = 'This run' } = {}) {
   const detail =
     estimateUsd != null && availableUsd != null
-      ? `This test-case run needs about $${estimateUsd.toFixed(2)} of Anthropic usage, but only about $${availableUsd.toFixed(2)} of your free trial credit is left. Add your own Anthropic API key to run it — unlimited, you pay Anthropic directly (see spec2jira.com/get-api-key).`
+      ? `${runLabel} needs about $${estimateUsd.toFixed(2)} of Anthropic usage, but only about $${availableUsd.toFixed(2)} of your free trial credit is left. Add your own Anthropic API key to run it — unlimited, you pay Anthropic directly (see spec2jira.com/get-api-key).`
       : "You've used your $5 free trial credit. Add your own Anthropic API key to keep going — unlimited, you pay Anthropic directly (see spec2jira.com/get-api-key).";
   return { error: 'trial_credit_exhausted', detail };
 }
@@ -1062,9 +1063,12 @@ resolver.define('startDistillSession', async ({ payload, context }) => {
   // remaining credit here — exhausted → route to BYOK. (Replaces the old dormant per-user COUNT-cap
   // gate; creditStatus fails-closed on a glitch so a blip never spends our key.) BYOK is unlimited.
   if (keySource === 'managed') {
+    // ⭐ 2026-07-12 PRE-FLIGHT STOPPER — the whole distill (6 Haiku steps) must fit the remaining credit
+    // before the first step spends; subsumes the old exhausted/overCeiling check (available 0 → block).
     const cs = await creditStatus();
-    if (cs.exhausted || cs.overCeiling) {
-      return { ...buildTrialCreditExhausted(), code: 'NOT_CONFIGURED' };
+    const blocker = managedRunBlocker({ keySource, availableUsd: cs.availableUsd, spentUsd: cs.spentUsd, estimateUsd: DISTILL_EST_USD });
+    if (blocker) {
+      return { ...buildTrialCreditExhausted({ estimateUsd: blocker.estimateUsd, availableUsd: blocker.availableUsd, runLabel: 'This project-context distillation' }), code: 'NOT_CONFIGURED' };
     }
   }
 
@@ -1921,6 +1925,19 @@ resolver.define('startGeneration', async ({ payload, context }) => {
       detail:
         'Anthropic API key not configured. Ask your Confluence admin to open Settings → Spec2Tickets and provide an Anthropic API key.',
     };
+  }
+
+  // ⭐ 2026-07-12 PRE-FLIGHT STOPPER — a managed trial breakdown must fit the remaining credit BEFORE it
+  // spends. The `!apiKey` block above catches a FULLY-exhausted user (apiKey fell back to a null BYOK key),
+  // but a trial user with a FEW CENTS left still resolves to the (non-null) managed key → without this it
+  // would run and spend a full ~$0.24 PAST the grant (the overrun caught in live testing at $0.01 left).
+  // Route to BYOK gracefully instead — the grant stays a real cap, not "grant + one run".
+  if (keySource === 'managed') {
+    const blocker = managedRunBlocker({ keySource, availableUsd: trial?.available, spentUsd: trial?.spent, estimateUsd: BREAKDOWN_EST_USD });
+    if (blocker) {
+      console.log(`[startGeneration] managed trial credit gate (${blocker.reason}): need≈$${blocker.estimateUsd.toFixed(2)} > avail≈$${blocker.availableUsd.toFixed(2)} → BYOK`);
+      return buildTrialCreditExhausted({ estimateUsd: blocker.estimateUsd, availableUsd: blocker.availableUsd, runLabel: 'This breakdown' });
+    }
   }
 
   // Record install provenance (grandfathering signal — see usage.js
@@ -3218,6 +3235,15 @@ resolver.define('startPlan', async ({ payload, context }) => {
     return { ok: false, stage: 'key', error: 'not_configured', detail: 'Add your Anthropic API key in Settings to generate a plan.' };
   }
 
+  // ⭐ 2026-07-12 PRE-FLIGHT STOPPER — a managed trial plan must fit the remaining credit before it spends.
+  if (keySource === 'managed') {
+    const blocker = managedRunBlocker({ keySource, availableUsd: trial?.available, spentUsd: trial?.spent, estimateUsd: PLAN_EST_USD });
+    if (blocker) {
+      console.log(`[startPlan] managed trial credit gate (${blocker.reason}): need≈$${blocker.estimateUsd.toFixed(2)} > avail≈$${blocker.availableUsd.toFixed(2)} → BYOK`);
+      return { ok: false, stage: 'key', ...buildTrialCreditExhausted({ estimateUsd: blocker.estimateUsd, availableUsd: blocker.availableUsd, runLabel: 'This plan' }) };
+    }
+  }
+
   // §8 ranking input (pure). Wrapped so a MALFORMED payload can never throw an unhandled resolver 500.
   try {
     const graph = buildPlannerGraph(list);
@@ -4366,23 +4392,15 @@ resolver.define('startTestCaseGeneration', async ({ payload, context }) => {
     const specSourceChars = typeof specSourceText === 'string' ? Math.min(specSourceText.trim().length, TC_SPEC_SOURCE_MAX_CHARS) : 0;
     const projection = projectTestCaseCost({ storyACcounts, specSourceChars, model: MODEL_PRIMARY });
     tcCreditEstimate = Number.isFinite(projection.expected_usd) ? projection.expected_usd : 0;
-    const availableUsd = trial && Number.isFinite(trial.available) ? trial.available : 0;
-    // SOFT gate — block when the EXPECTED cost already exceeds the $5 grant remaining (routes to BYOK).
-    if (tcCreditEstimate > availableUsd) {
-      console.log(`[startTCGen] managed trial credit too low for test-gen (need≈$${tcCreditEstimate.toFixed(2)} > $${availableUsd.toFixed(2)}) ref=${jobId}`);
-      return buildTrialCreditExhausted({ estimateUsd: tcCreditEstimate, availableUsd });
-    }
-    // ⭐ HARD backstop (code-review fix): test-gen is the ONE surface whose ACTUAL can massively exceed its
-    // EXPECTED (low-AC stories can each emit near the 24K-token cap → 16-22× the expected mean). The reconcile
-    // charges the FULL echoed actual, so gating only on EXPECTED lets a big low-AC batch settle the ledger past
-    // the $10 absolute ceiling. Block a run whose WORST case (upper) would breach the hard ceiling — this keeps
-    // "big-but-CHEAP runs proceed" (they only trip if their UPPER exceeds the $10 headroom, i.e. a pathologically
-    // large run) while making $10 a TRUE per-install absolute for the only surface that can single-handedly blow it.
-    const upperUsd = Number.isFinite(projection.upper_usd) ? projection.upper_usd : tcCreditEstimate;
-    const spentUsd = trial && Number.isFinite(trial.spent) ? trial.spent : 0;
-    if (spentUsd + upperUsd > TRIAL_HARD_CEILING_USD) {
-      console.log(`[startTCGen] test-gen worst-case would breach the $${TRIAL_HARD_CEILING_USD} hard ceiling (spent $${spentUsd.toFixed(2)} + upper $${upperUsd.toFixed(2)}) → BYOK ref=${jobId}`);
-      return buildTrialCreditExhausted({ estimateUsd: upperUsd, availableUsd: Math.max(0, TRIAL_HARD_CEILING_USD - spentUsd) });
+    // Shared pre-flight stopper (managedRunBlocker) — the SAME two gates test-gen has always run, now via the
+    // one helper every managed surface uses (no drift): SOFT = the EXPECTED cost must fit the remaining grant;
+    // HARD = test-gen is the ONE surface whose ACTUAL can be 16-22× the expected (low-AC stories each near the
+    // 24K cap) and the reconcile charges the full echoed actual, so its WORST case (projection.upper) must not
+    // breach the $10 absolute ceiling — keeping $10 a true per-install cap on the only surface that can blow it.
+    const blocker = managedRunBlocker({ keySource, availableUsd: trial?.available, spentUsd: trial?.spent, estimateUsd: tcCreditEstimate, upperUsd: projection.upper_usd });
+    if (blocker) {
+      console.log(`[startTCGen] managed trial credit gate (${blocker.reason}): need≈$${blocker.estimateUsd.toFixed(2)} avail≈$${blocker.availableUsd.toFixed(2)} → BYOK ref=${jobId}`);
+      return buildTrialCreditExhausted({ estimateUsd: blocker.estimateUsd, availableUsd: blocker.availableUsd, runLabel: 'This test-case run' });
     }
   }
 
@@ -5122,8 +5140,16 @@ resolver.define('regenerateTestCase', async ({ payload, context }) => {
   // HERE: an out-of-credit trial user is routed to BYOK. creditStatus fails-closed on a glitch
   // (readOk:false ⇒ exhausted) so a metering blip never spends our key. A BYOK regen is unlimited.
   if (keySource === 'managed') {
+    // ⭐ 2026-07-12 PRE-FLIGHT STOPPER — subsumes the old exhausted/overCeiling check: block when this
+    // regen's estimate won't fit the remaining credit (est > available, which is also true once exhausted),
+    // so a near-empty trial never spends a regen past the grant. Fresh creditStatus (regen reuses the bulk
+    // run's keySource, so no `trial` snapshot from resolveAnthropicKey here); fails-closed on a glitch.
     const cs = await creditStatus();
-    if (cs.exhausted || cs.overCeiling) return buildTrialCreditExhausted();
+    const blocker = managedRunBlocker({ keySource, availableUsd: cs.availableUsd, spentUsd: cs.spentUsd, estimateUsd: REGEN_EST_USD });
+    if (blocker) {
+      console.log(`[regenTC] managed trial credit gate (${blocker.reason}): need≈$${blocker.estimateUsd.toFixed(2)} > avail≈$${blocker.availableUsd.toFixed(2)} → BYOK ref=${jobId}`);
+      return buildTrialCreditExhausted({ estimateUsd: blocker.estimateUsd, availableUsd: blocker.availableUsd, runLabel: 'This regeneration' });
+    }
   }
 
   // Load the full story from the breakdown job

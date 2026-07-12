@@ -76,6 +76,38 @@ export const TRIAL_HARD_CEILING_USD =
 export const BREAKDOWN_EST_USD = 0.24;
 export const PLAN_EST_USD = 0.1;
 export const REGEN_EST_USD = 0.1;
+// The whole "Distill with Claude" project-context extraction (6 chunked Haiku category calls — cheap).
+// Gated ONCE at startDistillSession with this conservative total.
+export const DISTILL_EST_USD = 0.1;
+
+/**
+ * PRE-FLIGHT STOPPER (pure) — must a managed run be BLOCKED before it spends, because it can't fit the
+ * remaining trial credit? Returns a blocker `{ reason, estimateUsd, availableUsd }` (the numbers to show
+ * the user) or null (proceed). ⭐ 2026-07-12: this closes the overrun a partner caught in live testing —
+ * a breakdown admitted with only $0.01 left then spent a full ~$0.24 PAST the grant, because admission
+ * only checked `exhausted` (spent >= grant), never "does THIS run's estimate fit what's left". Every
+ * managed-spend surface now runs this BEFORE holding/spending, so the grant is a real cap (not grant + one
+ * run). Only applies to the managed key (keySource === 'managed'); a BYOK run is unlimited and never gated.
+ *
+ *   Stopper 1 — the run's estimate must fit the remaining grant (est > available → block).
+ *   Stopper 2 — the worst case must not breach the absolute hard ceiling (spent + upper > ceiling → block);
+ *               `upperUsd` defaults to the estimate (the surfaces whose actual ≈ estimate); test-gen passes
+ *               its projected upper (its actual can massively exceed the expected).
+ *
+ * NaN/absent inputs collapse to the SAFE polarity (available 0 → block), so a bad snapshot never grants
+ * free managed spend. PURE — the caller reads the ledger snapshot and does the route.
+ */
+export function managedRunBlocker({ keySource, availableUsd, spentUsd, estimateUsd, upperUsd = null, hardCeilingUsd = TRIAL_HARD_CEILING_USD } = {}) {
+  if (keySource !== 'managed') return null; // BYOK / paid — never gated on trial credit
+  const est = Number.isFinite(estimateUsd) && estimateUsd > 0 ? estimateUsd : 0;
+  const avail = Number.isFinite(availableUsd) && availableUsd > 0 ? availableUsd : 0;
+  if (est > avail) return { reason: 'insufficient', estimateUsd: est, availableUsd: avail };
+  const worst = Number.isFinite(upperUsd) && upperUsd > 0 ? upperUsd : est;
+  const spent = Number.isFinite(spentUsd) && spentUsd > 0 ? spentUsd : 0;
+  const ceiling = Number.isFinite(hardCeilingUsd) && hardCeilingUsd > 0 ? hardCeilingUsd : TRIAL_HARD_CEILING_USD;
+  if (spent + worst > ceiling) return { reason: 'ceiling', estimateUsd: worst, availableUsd: Math.max(0, ceiling - spent) };
+  return null;
+}
 
 /**
  * PURE status computation from a known spend (node-testable — no KVS). `readOk:false` forces the
@@ -84,7 +116,11 @@ export const REGEN_EST_USD = 0.1;
  */
 export function computeCreditStatus(spentUsd, readOk = true, grantUsd = TRIAL_GRANT_USD, hardCeilingUsd = TRIAL_HARD_CEILING_USD) {
   const spent = Number.isFinite(spentUsd) && spentUsd > 0 ? spentUsd : 0;
-  const availableUsd = Math.max(0, grantUsd - spent);
+  // ⭐ 2026-07-12: on a read GLITCH availableUsd is UNKNOWN → report 0 (SAFE money polarity). The pre-flight
+  // stopper (managedRunBlocker) gates on availableUsd, so reporting the full grant here would let a glitch
+  // SPEND the managed key (the old exhausted/overCeiling-only gate blocked it; the new estimate-vs-available
+  // gate would not). Zeroing available keeps the glitch path blocked everywhere the blocker is used.
+  const availableUsd = readOk ? Math.max(0, grantUsd - spent) : 0;
   return {
     readOk,
     grantUsd,
