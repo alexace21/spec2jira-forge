@@ -16,7 +16,14 @@
  *
  * Usage: node prototype/test_trial_credit.mjs
  */
-import { computeCreditStatus, managedRunBlocker, TRIAL_GRANT_USD, TRIAL_HARD_CEILING_USD } from '../src/trialCredit.js';
+import {
+  computeCreditStatus,
+  managedRunBlocker,
+  TRIAL_GRANT_USD,
+  TRIAL_HARD_CEILING_USD,
+  DISTILL_STEP_EST_USD,
+  distillRunEstimateUsd,
+} from '../src/trialCredit.js';
 
 let pass = 0, fail = 0;
 function check(name, cond) {
@@ -142,6 +149,142 @@ check('blocker: NaN estimate → BLOCK (cannot price the run → safe polarity)'
 check('blocker: 0 estimate → BLOCK (no managed run is legitimately free)', managedRunBlocker({ keySource: 'managed', availableUsd: 5, estimateUsd: 0 })?.reason === 'insufficient');
 check('blocker: absent estimate → BLOCK', managedRunBlocker({ keySource: 'managed', availableUsd: 5 })?.reason === 'insufficient');
 check('blocker: BYOK + NaN estimate → null (BYOK still never gated)', managedRunBlocker({ keySource: 'byok', availableUsd: 5, estimateUsd: NaN }) === null);
+
+// ── 12. DISTILL PER-STEP admission (money leak closed 2026-07-25) ─────────────────────────────────
+// THE LEAK: distillStep reuses the session-stamped keySource, so it never calls resolveAnthropicKey and
+// had NO admission control at all — its only gate was the ONE whole-pipeline DISTILL_EST_USD check at
+// startDistillSession. Open one session, then loop distillStep: every call a real billed Anthropic
+// request on OUR managed key, recorded by the ledger but never blocked. Each step is now gated with
+// DISTILL_STEP_EST_USD before it spends. These cases pin the shape of that gate.
+console.log('\ndistill per-step admission (leak regression):');
+check('distill: a per-step estimate exists and is a positive finite number', Number.isFinite(DISTILL_STEP_EST_USD) && DISTILL_STEP_EST_USD > 0);
+// ⭐ THE REGRESSION GUARD — an EXHAUSTED ledger must block a distill STEP. Before the fix this call ran
+// and billed our key; the ledger merely recorded the overspend.
+const dExhausted = managedRunBlocker({ keySource: 'managed', availableUsd: 0, spentUsd: TRIAL_GRANT_USD, estimateUsd: DISTILL_STEP_EST_USD });
+check('distill: exhausted grant → step BLOCKED (was: unbounded billed steps)', !!dExhausted && dExhausted.reason === 'insufficient');
+// Less than one step of credit left → block (the "grant + one more call" overrun, per step).
+const dThin = managedRunBlocker({ keySource: 'managed', availableUsd: DISTILL_STEP_EST_USD / 2, spentUsd: 4.99, estimateUsd: DISTILL_STEP_EST_USD });
+check('distill: less than one step of credit left → step BLOCKED', !!dThin && dThin.reason === 'insufficient');
+check('distill: block reports the honest per-step numbers', !!dThin && approx(dThin.estimateUsd, DISTILL_STEP_EST_USD) && approx(dThin.availableUsd, DISTILL_STEP_EST_USD / 2));
+// Enough credit for THIS step → proceed, even when the WHOLE remaining pipeline would not fit.
+// (Expressed in units of the per-step figure so it survives a re-derivation of that constant: more than
+// one step's worth left, less than the 6 steps a whole run needs.)
+check('distill: one step fits (mid-pipeline, whole run would not) → proceed', managedRunBlocker({ keySource: 'managed', availableUsd: DISTILL_STEP_EST_USD * 2, spentUsd: 1, estimateUsd: DISTILL_STEP_EST_USD }) === null);
+// FAIL CLOSED on a KVS read glitch — creditStatus reports availableUsd 0, so the step blocks.
+const dGlitch = computeCreditStatus(0, false);
+check('distill: ledger read glitch → step BLOCKED (fail closed, never a free managed call)', managedRunBlocker({ keySource: 'managed', availableUsd: dGlitch.availableUsd, spentUsd: dGlitch.spentUsd, estimateUsd: DISTILL_STEP_EST_USD })?.reason === 'insufficient');
+// The absolute hard ceiling still backstops a step admitted under the grant.
+const dCeil = managedRunBlocker({ keySource: 'managed', availableUsd: 5, spentUsd: TRIAL_HARD_CEILING_USD, estimateUsd: DISTILL_STEP_EST_USD });
+check('distill: at the hard ceiling → step BLOCKED (ceiling backstop)', !!dCeil && dCeil.reason === 'ceiling');
+// ⭐ BYOK is NEVER gated — a customer on their own key distills unlimited, credit state irrelevant.
+check('distill: BYOK step → never gated, even with 0 credit', managedRunBlocker({ keySource: 'byok', availableUsd: 0, spentUsd: 99, estimateUsd: DISTILL_STEP_EST_USD }) === null);
+
+// ── 13. ⭐ ADMISSION MUST GUARANTEE COMPLETION (audit HIGH, 2026-07-25) ───────────────────────────
+// THE BUG: the session gate ($0.10, an INDEPENDENT constant) and the per-step gate ($0.02 × 6 = $0.12)
+// disagreed, so a user admitted at session start could be BLOCKED at step 5 or 6 — after we had already
+// paid for steps 1-4 and after they had waited — and get nothing usable. Admission that does not
+// guarantee completion is worse than no admission: it spends OUR money AND wastes the user's time.
+// THE FIX: the session figure is DERIVED (stepCount × per-step), so the two can never disagree again.
+console.log('\ndistill admission-guarantees-completion (the HIGH):');
+const STEPS = 6; // DISTILL_CATEGORIES.length in production; the helper is parameterised, so assert on n
+const RUN_EST = distillRunEstimateUsd(STEPS);
+check('run estimate === stepCount × per-step estimate (derived, not an independent constant)', approx(RUN_EST, STEPS * DISTILL_STEP_EST_USD));
+check('run estimate carries no float dust (0.14×6 renders as 0.84, not 0.8400000000000001)', RUN_EST === 0.84);
+check('run estimate is monotonic in stepCount', distillRunEstimateUsd(7) > RUN_EST && distillRunEstimateUsd(1) < RUN_EST);
+// The old constant, pinned as a regression: $0.10 admitted a run that needed $0.12.
+check('REGRESSION: the retired independent $0.10 figure was SHORT of the real pipeline cost', 0.1 < STEPS * DISTILL_STEP_EST_USD);
+// ⭐ THE INVARIANT, walked end-to-end. Admit with EXACTLY the run estimate available, then run every
+// step charging the TRUE per-step worst case ($0.134 — at or below the $0.14 admission figure by design).
+// No step may be blocked. (Under the old numbers, starting from $0.10 this walk blocked at step 6.)
+// ⚠ $0.134 is the WORST CASE from the DISTILL_STEP_EST_USD derivation, not a typical cost: the 40,000-char
+// clip bounded as UTF-8 bytes (≤120K tokens) + ~10K tokens of fixed prompt + 800 output tokens, priced at
+// sync (un-batched) Haiku $1/$5 per MTok. The retired $0.016 assumed 4 chars/token — an English-prose
+// average, not a bound — so it sat BELOW real Cyrillic/CJK/dense-technical steps and the walk below
+// "passed" while the live invariant did not hold. Keep this at or under DISTILL_STEP_EST_USD.
+const TRUE_STEP_COST = 0.134; // the grounded worst case from the DISTILL_STEP_EST_USD derivation
+check('the modelled worst-case step cost is genuinely covered by the admission figure', TRUE_STEP_COST <= DISTILL_STEP_EST_USD);
+// Amounts are rounded to 6 dp after each step so the MODEL asserts the intended arithmetic rather than
+// IEEE-754 accumulation dust (0.12 − 6×0.02 drifts to −1.7e-17 and would fake a block on the last step).
+const r6 = (n) => Math.round(n * 1e6) / 1e6;
+function walkRun(startAvailable, startSpent, stepCost, steps, externalDrainPerStep = 0) {
+  let available = startAvailable;
+  let spent = startSpent;
+  for (let i = 0; i < steps; i++) {
+    const b = managedRunBlocker({ keySource: 'managed', availableUsd: available, spentUsd: spent, estimateUsd: DISTILL_STEP_EST_USD });
+    if (b) return { blockedAt: i, reason: b.reason };
+    available = r6(available - stepCost - externalDrainPerStep);
+    spent = r6(spent + stepCost + externalDrainPerStep);
+  }
+  return { blockedAt: null, reason: null };
+}
+check('⭐ a run admitted on the DERIVED figure completes all 6 steps un-blocked', walkRun(RUN_EST, TRIAL_GRANT_USD - RUN_EST, TRUE_STEP_COST, STEPS).blockedAt === null);
+// The STRONGER form of the guarantee: it holds even when every step costs its full admission estimate
+// (the worst a step may cost without the gate having mis-priced it). This is the invariant that makes
+// the per-step gate a backstop rather than a second admission test.
+check('⭐ …and still completes when every step costs its FULL estimate (the worst admissible run)', walkRun(RUN_EST, TRIAL_GRANT_USD - RUN_EST, DISTILL_STEP_EST_USD, STEPS).blockedAt === null);
+// ⚠ THE BUG CLASS, pinned structurally rather than by the retired literal: ANY whole-run admission figure
+// short of `stepCount × the per-step figure` blocks mid-pipeline. Expressed as "one step short" so it keeps
+// testing the same thing whatever either constant is re-derived to. Both cases the guarantee is defined
+// over — steps at their full estimate, and steps at the grounded worst case — must block on the LAST step:
+// the exact "we paid for steps 1-5, the user gets nothing" failure.
+const SHORT_ADMISSION = r6((STEPS - 1) * DISTILL_STEP_EST_USD); // one step short of the derived figure
+const shortAtEstimate = walkRun(SHORT_ADMISSION, TRIAL_GRANT_USD - SHORT_ADMISSION, DISTILL_STEP_EST_USD, STEPS);
+check('REGRESSION: an admission one step SHORT blocks on the last step when steps cost their estimate', shortAtEstimate.blockedAt === STEPS - 1 && shortAtEstimate.reason === 'insufficient');
+const shortAtWorstCase = walkRun(SHORT_ADMISSION, TRIAL_GRANT_USD - SHORT_ADMISSION, TRUE_STEP_COST, STEPS);
+check('REGRESSION: …and also blocks on the last step at the grounded worst-case step cost', shortAtWorstCase.blockedAt === STEPS - 1 && shortAtWorstCase.reason === 'insufficient');
+// The retired $0.10 whole-run constant, measured against the CORRECTED per-step figure: it cannot fund even
+// ONE step now — the clearest statement of how far the old chars/4 grounding was from a real upper bound.
+const retiredAtNewFigure = walkRun(0.1, TRIAL_GRANT_USD - 0.1, TRUE_STEP_COST, STEPS);
+check('REGRESSION: the retired $0.10 admission cannot fund even ONE step at the corrected per-step figure', retiredAtNewFigure.blockedAt === 0 && retiredAtNewFigure.reason === 'insufficient');
+const marginAfter = (start, cost) => start - STEPS * cost; // credit left once all 6 steps have run
+// ⭐ The completion guarantee restated as margin: admitted at the derived figure, a run paying the WORST
+// CASE every step still ends with credit to spare — where a one-step-short admission ends in deficit.
+check('⭐ the derived figure survives 6 worst-case steps with margin to spare', marginAfter(RUN_EST, TRUE_STEP_COST) >= 0);
+check('⭐ …and a one-step-short admission does not', marginAfter(SHORT_ADMISSION, TRUE_STEP_COST) < marginAfter(RUN_EST, TRUE_STEP_COST) && marginAfter(SHORT_ADMISSION, TRUE_STEP_COST) < 0);
+// The per-step gate is a BACKSTOP, not a second admission test: it fires only when ANOTHER surface
+// consumed credit concurrently mid-run.
+const drained = walkRun(RUN_EST, TRIAL_GRANT_USD - RUN_EST, TRUE_STEP_COST, STEPS, 0.02);
+check('backstop: concurrent consumption by another surface DOES block mid-pipeline (what the backstop is for)', drained.blockedAt !== null && drained.reason === 'insufficient');
+// Ceiling coherence: a run admitted under the hard ceiling never trips the ceiling on its own steps.
+const nearCeiling = TRIAL_HARD_CEILING_USD - RUN_EST; // admitted with exactly the run's worth of ceiling headroom
+check('ceiling coherence: session admission leaves ceiling headroom for every one of its own steps', walkRun(RUN_EST, nearCeiling, TRUE_STEP_COST, STEPS).blockedAt === null);
+// Degenerate inputs must never produce a 0/negative estimate (managedRunBlocker reads that as
+// "cannot price this run" and blocks outright — a code bug would dead-end a legitimate user).
+check('run estimate: 0 steps → falls back to one step (never 0 → never an outright block)', distillRunEstimateUsd(0) === DISTILL_STEP_EST_USD);
+check('run estimate: NaN/absent/negative/non-integer steps → one step', distillRunEstimateUsd(NaN) === DISTILL_STEP_EST_USD && distillRunEstimateUsd() === DISTILL_STEP_EST_USD && distillRunEstimateUsd(-3) === DISTILL_STEP_EST_USD && distillRunEstimateUsd(2.5) === DISTILL_STEP_EST_USD);
+check('run estimate: a bigger pipeline is admitted for MORE, so growth cannot re-open the gap', approx(distillRunEstimateUsd(9), 9 * DISTILL_STEP_EST_USD));
+
+// ── 14. SYNC-SURFACE HOLD/SETTLE (the check-vs-charge + unrecorded-spend fixes, 2026-07-25) ───────
+// distillStep now HOLDS a conservative estimate BEFORE the Anthropic call and SETTLES to the echoed
+// actual after (settleManagedHold). Model of that arithmetic: hold charges est; settle charges
+// (actual − held); a non-finite actual leaves the hold standing; actual 0 releases it in full.
+console.log('\ndistill sync hold/settle:');
+function holdThenSettle(startSpent, held, actual) {
+  let spent = Math.max(0, startSpent + held);            // HOLD (before the call)
+  if (!(Number.isFinite(actual) && actual >= 0)) return spent; // no usable actual → hold stands
+  return Math.max(0, spent + (actual - held));           // SETTLE (after the call)
+}
+check('settle: converges to the ACTUAL when the call succeeds ($0.14 held, $0.012 actual)', approx(holdThenSettle(0, DISTILL_STEP_EST_USD, 0.012), 0.012));
+check('settle: an actual ABOVE the hold tops up (never under-counts a costly step)', approx(holdThenSettle(0, DISTILL_STEP_EST_USD, DISTILL_STEP_EST_USD + 0.05), DISTILL_STEP_EST_USD + 0.05));
+check('settle: release (actual 0) refunds the whole hold — for classes that provably billed nothing', approx(holdThenSettle(0, DISTILL_STEP_EST_USD, 0), 0));
+// ⭐ THE UNRECORDED-SPEND FIX: a billed call whose section write (or usage echo) fails must still leave
+// the ledger charged. Under the OLD charge-after-the-write ordering it left ZERO.
+check('⭐ no usable actual (missing usage echo / lost output) → the HOLD still stands, spend is never lost', approx(holdThenSettle(0, DISTILL_STEP_EST_USD, null), DISTILL_STEP_EST_USD));
+// The retired ordering, pinned: it charged ONLY after the section write, so a write fault returned
+// early and a real, billed Anthropic call left NOTHING on the ledger the gate depends on.
+function chargeAfterWrite(startSpent, actual, writeOk) {
+  if (!writeOk) return startSpent; // old code returned before ever reaching the charge
+  return Math.max(0, startSpent + (Number.isFinite(actual) ? actual : 0));
+}
+check('REGRESSION: charge-AFTER-the-write recorded $0 for a billed call whose section write failed', approx(chargeAfterWrite(0, 0.012, false), 0));
+check('⭐ hold-then-settle records that same billed call ($0.012) even though the write failed', approx(holdThenSettle(0, DISTILL_STEP_EST_USD, 0.012), 0.012));
+check('REGRESSION: charge-AFTER-the-write also recorded $0 when the 200 echoed no usage', approx(chargeAfterWrite(0, null, true), 0));
+check('settle: hold GLITCH (held 0) still lands the full actual on the ledger', approx(holdThenSettle(0, 0, 0.012), 0.012));
+// A 6-step run settles to the sum of its actuals — the ledger converges, it does not accumulate estimates.
+let ledger = 0;
+for (let i = 0; i < STEPS; i++) ledger = holdThenSettle(ledger, DISTILL_STEP_EST_USD, TRUE_STEP_COST);
+check('settle: a full 6-step run converges to Σ actuals (no estimate residue)', approx(ledger, STEPS * TRUE_STEP_COST));
+check('settle: that total stays well inside the grant', ledger < TRIAL_GRANT_USD);
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

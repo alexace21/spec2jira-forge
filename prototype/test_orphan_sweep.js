@@ -9,7 +9,7 @@
  *
  * Usage: node prototype/test_orphan_sweep.js
  */
-import { isOrphanStale } from '../src/sweep_util.js';
+import { isOrphanStale, isDistillSessionStale } from '../src/sweep_util.js';
 
 let failures = 0;
 function check(name, cond, detail) {
@@ -47,6 +47,32 @@ check('NaN lastAccessedAt → falls back / KEEP', isOrphanStale({ lastAccessedAt
 
 console.log('\n■ defensive — ISO-string lastAccessedAt is still parsed');
 check('ISO-string lastAccessedAt, stale → SWEEP', isOrphanStale({ lastAccessedAt: iso(now - 8 * DAY) }, now, INACT) === true, 'parsed');
+
+// ── isDistillSessionStale — the distill-session retention sweep (privacy fix 2026-07-25) ──────────
+// `distill_session:` records hold up to DISTILL_MAX_INPUT_CHARS of the customer's PASTED TEXT and were
+// deleted ONLY by a run that reached its final step, so every abandoned session (closed tab, failed step
+// never retried, mid-pipeline credit block) retained customer content INDEFINITELY. The daily sweep now
+// enumerates the prefix. A distill session is a minutes-long scratch buffer, so the window is 24h.
+const SESSION_MAX_AGE = DAY; // DISTILL_SESSION_MAX_AGE_MS in production
+console.log('\n■ isDistillSessionStale — abandoned-session retention');
+check('in-flight (2 min old) → KEEP', isDistillSessionStale({ createdAt: now - 2 * 60 * 1000 }, now, SESSION_MAX_AGE) === false, 'a live pipeline must never be swept mid-run');
+check('abandoned (2 days old) → SWEEP', isDistillSessionStale({ createdAt: now - 2 * DAY }, now, SESSION_MAX_AGE) === true, 'the leak this closes');
+check('exactly at the window → KEEP (> not >=, matching isOrphanStale)', isDistillSessionStale({ createdAt: now - SESSION_MAX_AGE }, now, SESSION_MAX_AGE) === false, 'boundary keep');
+check('1 ms past the window → SWEEP', isDistillSessionStale({ createdAt: now - SESSION_MAX_AGE - 1 }, now, SESSION_MAX_AGE) === true, 'boundary sweep');
+check('a session carrying sections/input is judged on age alone', isDistillSessionStale({ createdAt: now - 3 * DAY, input: 'customer text', sections: { domain: { text: 'x' } } }, now, SESSION_MAX_AGE) === true, 'partial progress does not exempt content from retention');
+
+console.log('\n■ isDistillSessionStale — ⭐ the polarity is DELIBERATELY INVERTED vs isOrphanStale');
+// A jobmeta with no usable timestamp is KEPT (a breakdown is the user's deliverable). A distill session
+// is transient customer CONTENT, so an unreadable record — the kind that would otherwise sit in storage
+// forever — is swept. Asserting both directions keeps a future "consistency" refactor from silently
+// re-opening the retention hole.
+check('no createdAt → SWEEP (content, not a deliverable)', isDistillSessionStale({ input: 'x', sections: {} }, now, SESSION_MAX_AGE) === true, 'delete when in doubt');
+check('unparseable createdAt → SWEEP', isDistillSessionStale({ createdAt: 'not-a-date' }, now, SESSION_MAX_AGE) === true, 'delete when in doubt');
+check('NaN createdAt → SWEEP', isDistillSessionStale({ createdAt: NaN }, now, SESSION_MAX_AGE) === true, 'delete when in doubt');
+check('null session value → SWEEP', isDistillSessionStale(null, now, SESSION_MAX_AGE) === true, 'delete when in doubt');
+check('non-object session value → SWEEP', isDistillSessionStale('nope', now, SESSION_MAX_AGE) === true, 'delete when in doubt');
+check('the SAME shapes are KEPT by isOrphanStale (polarities stay opposite on purpose)', isOrphanStale({ input: 'x' }, now, INACT) === false && isOrphanStale(null, now, INACT) === false, 'jobmeta stays fail-safe-keep');
+check('ISO-string createdAt is still parsed (defensive)', isDistillSessionStale({ createdAt: iso(now - 2 * DAY) }, now, SESSION_MAX_AGE) === true, 'parsed');
 
 console.log('\n' + '='.repeat(64));
 if (failures === 0) console.log('✅ ALL PASS');

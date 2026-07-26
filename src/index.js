@@ -62,7 +62,7 @@ import {
   fetchPlanRankingResults,
 } from './anthropic_client.js';
 import { startPushSession, pushSessionStep, flattenBreakdown, lookupProject, startPlanPushSession, planPushSessionStep, startKanbanRankSession, kanbanRankSessionStep } from './push_handler.js';
-import { isOrphanStale } from './sweep_util.js'; // Task #13: pure staleness decision (unit-tested; index.js isn't node-importable)
+import { isOrphanStale, isDistillSessionStale } from './sweep_util.js'; // Task #13 + the distill-session retention sweep: pure staleness decisions (unit-tested; index.js isn't node-importable)
 import { detectCycles } from './graph.js';
 // Capacity-Sheet Planner pure-fn core (src/planner.js — node-testable; prototype/test_planner.mjs).
 // The planner's dispatch (POLICY §4): all of capacity math / graph / packing is deterministic here;
@@ -111,7 +111,8 @@ import {
   BREAKDOWN_EST_USD,
   PLAN_EST_USD,
   REGEN_EST_USD,
-  DISTILL_EST_USD,
+  DISTILL_STEP_EST_USD,   // per-STEP distill admission figure (the backstop each distillStep is gated on)
+  distillRunEstimateUsd,  // the SESSION admission figure — DERIVED as stepCount × the per-step figure, so an admitted run can always finish
 } from './trialCredit.js';
 // Diagnostic ledger (Phase 0 wiring — docs/DIAGNOSTICS-LEDGER-DESIGN.md). Both write helpers
 // are FAIL-OPEN by contract (never throw into the caller); records are codes/ids/counts only,
@@ -281,6 +282,57 @@ async function chargeManagedSpendSafe(usd) {
 }
 
 /**
+ * ⭐ SETTLE a SYNC-surface hold (2026-07-25) — the sync twin of reconcileManagedCredit.
+ *
+ * A sync surface (distill step) holds a conservative estimate BEFORE its Anthropic call and settles to
+ * the echoed ACTUAL after, so:
+ *   - the check-vs-charge window is the ledger's own read-modify-write (~ms), NOT the whole 3-13s call;
+ *   - a real billed call can no longer go UNRECORDED when a LATER step fails (the section write, a
+ *     missing `usage` echo, an unexpected throw) — the estimate is already on the ledger.
+ * `actualUsd = 0` RELEASES the hold in full — use it ONLY for the failure classes that provably never
+ * billed a token (Anthropic rejected the request outright). NO marker: unlike a batch (billed once,
+ * polled N times) each invocation IS one distinct real spend, so a marker could only DROP a legitimate
+ * retry charge (an under-count = our margin leak, the wrong polarity — see chargeManagedSpendSafe).
+ *
+ * Fail-safe: a ledger glitch never breaks the surface (the spend already happened; a missed settle
+ * leaves the conservative hold standing, which is the SAFE direction and hard-ceiling backstopped).
+ * A non-finite actual leaves the hold standing for the same reason.
+ */
+async function settleManagedHold(keySource, heldUsd, actualUsd) {
+  if (keySource !== 'managed') return;
+  const held = Number.isFinite(heldUsd) && heldUsd > 0 ? heldUsd : 0;
+  if (!(Number.isFinite(actualUsd) && actualUsd >= 0)) return; // no usable actual → the hold stands (conservative)
+  const delta = actualUsd - held;
+  if (delta === 0) return;
+  try {
+    await chargeSpend(delta);
+  } catch (e) {
+    console.error(`[trialCredit] sync-surface settle failed (non-fatal, hold stands): ${String(e?.message || e)}`);
+  }
+}
+
+/**
+ * Anthropic failure classes that provably billed NOTHING — the request was rejected before any tokens
+ * were produced (or was never sent at all). ONLY these release a distill step's hold. Everything else
+ * (network_failure — the request may have been processed before the socket died; parse_failed and
+ * empty_result — an HTTP 200, i.e. tokens WERE billed) keeps the hold: over-charging by one conservative
+ * step estimate is the safe polarity, silently leaking a real spend is not.
+ */
+const UNBILLED_DISTILL_ERRORS = new Set([
+  'not_configured',
+  'bad_category',
+  'empty',
+  'auth_rejected',        // HTTP 401 — key rejected, nothing generated
+  'insufficient_credits', // HTTP 402
+  'rate_limited',         // HTTP 429
+]);
+function distillErrorWasUnbilled(error) {
+  const e = String(error || '');
+  // `anthropic_<status>` = a non-2xx the client mapped verbatim → the request errored, no output billed.
+  return UNBILLED_DISTILL_ERRORS.has(e) || /^anthropic_\d{3}$/.test(e);
+}
+
+/**
  * Managed-Pro fair-use cap payload. The cap is fair-use (we pay compute), so the
  * user is routed to BYOK (unlimited with their own key) or to higher-volume
  * Managed access — NOT "subscribe to a higher tier". This is the ONLY
@@ -324,10 +376,17 @@ function buildTrialCreditExhausted({ estimateUsd = null, availableUsd = null, ru
  * is a backstop that turns the no-license case into a clean "subscribe or start a
  * trial" prompt rather than a raw error. Carries the pricing table so the UI can
  * present the two editions.
+ *
+ * ⭐ `code` (added 2026-07-25): the screens that consume {error}-shaped resolver payloads route on
+ * `error`, but the AdminSettings distill flow maps `code` → ERROR_MESSAGES and, on an unrecognised
+ * code, falls through to a GENERIC branch that appends "You can retry from where it stopped" — a lie
+ * for a missing license (retrying can only re-block). Carrying an explicit code lets that surface
+ * render this terminally. Additive: no existing consumer reads `code` on this payload.
  */
 function buildLicenseRequired() {
   return {
     error: 'license_required',
+    code: 'LICENSE_REQUIRED',
     detail:
       'This app requires an active subscription or trial. Subscribe to the Standard or Advanced edition.',
     pricing: pricingTable(),
@@ -519,6 +578,14 @@ const SWEEP_PAGE_LIMIT = 50;                           // jobmeta keys per query
 const SWEEP_MAX_DELETES = 50;                          // cap deletions per daily run; the daily cadence clears any backlog over a few days
 const SWEEP_HEARTBEAT_KEY = 'spec2jira_sweep:last';    // app-scoped (install-wide) — the vendor's "did the daily orphan-sweep fire" signal; counts + ts ONLY, no content, no egress
 const SWEEP_STALE_MS = 36 * 60 * 60 * 1000;            // a daily trigger silent >36h reads as "missed" (computed at READ time; no push alert — a missed daily hygiene run is low-severity)
+// ⭐ Distill-session retention (privacy fix 2026-07-25). A distill session is a MINUTES-long scratch
+// buffer (6 sync calls, each well under the 25-sec resolver limit) that holds up to
+// DISTILL_MAX_INPUT_CHARS of the customer's PASTED TEXT; only a completed run deletes it, so every
+// abandoned one used to persist forever. 24h is ~two orders of magnitude beyond any legitimate
+// in-flight pipeline, and deliberately STRICTER than the 7-day orphan window (that window bounds a
+// DELIVERABLE under review; this is transient input we promised not to keep).
+const DISTILL_SESSION_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const SWEEP_DISTILL_MAX_DELETES = 200;                 // per run; these are single-key deletes (no siblings), so a far higher cap than the job sweep costs little
 
 // readSweepHeartbeat — the vendor-side "did the daily orphan-sweep fire" read (strategy §4.1, docs/MONITORING-CICD-STRATEGY.md).
 // Reads the app-scoped heartbeat the sweep writes; computes "stale" at READ time (no push alert — a PULL signal
@@ -1035,6 +1102,26 @@ resolver.define('startDistillSession', async ({ payload, context }) => {
   const text = (payload?.text || '').trim();
   if (!text) return { error: 'empty', code: 'UNEXPECTED', detail: 'Nothing to distill.' };
 
+  // ⭐ Defensive license gate (2026-07-25 — the ONE spend surface that lacked it; the twin is in
+  // distillStep). Every other Anthropic-spend resolver has this (startGeneration / plan / test-gen /
+  // regen); distill did not, and `isTrialLicense` is INDEPENDENT of the license being active — a
+  // license carrying `isEvaluation:true` while inactive resolves to tier 'unlicensed' AND passes the
+  // trial check, so an unlicensed invocation could reach OUR managed key through distill alone.
+  // Fail-OPEN on a license-read throw (identical polarity to the other gates): a read glitch must
+  // never block a paying user — the key check + Atlassian's own platform gate are the backstops.
+  try {
+    if (getActiveTier(context).key === 'unlicensed') return buildLicenseRequired();
+  } catch (e) {
+    console.error(`[distill] license check failed (failing open): ${String(e?.message || e)}`);
+    // [diag Phase 3, gate MUST-1] a silent fail-open gate admits work on only a console trace —
+    // record it like the startGeneration / test-gen twins do. ref:null (no sessionId minted yet);
+    // the (op, error_class) null-ref dedupe absorbs repeats into occurrences.
+    await recordDiagnostic({
+      context,
+      record: { op: 'distill.step', error_class: 'gate_fail_open', level: 'warn', ref: null, surfaced: false },
+    });
+  }
+
   // Distill (Project Context) is an Anthropic call too — resolve the key credit-awarely
   // so a trial user (no BYOK key) distills on OUR key while $5 credit remains, BYOK with theirs.
   const { apiKey, keySource, keyFault, trial } = await resolveAnthropicKey(context);
@@ -1063,10 +1150,16 @@ resolver.define('startDistillSession', async ({ payload, context }) => {
   // remaining credit here — exhausted → route to BYOK. (Replaces the old dormant per-user COUNT-cap
   // gate; creditStatus fails-closed on a glitch so a blip never spends our key.) BYOK is unlimited.
   if (keySource === 'managed') {
-    // ⭐ 2026-07-12 PRE-FLIGHT STOPPER — the whole distill (6 Haiku steps) must fit the remaining credit
-    // before the first step spends; subsumes the old exhausted/overCeiling check (available 0 → block).
+    // ⭐ 2026-07-12 PRE-FLIGHT STOPPER — the whole distill must fit the remaining credit before the
+    // first step spends; subsumes the old exhausted/overCeiling check (available 0 → block).
+    // ⭐⭐ 2026-07-25 (audit HIGH): the admission figure is DERIVED from the per-step figure ×
+    // the REAL number of category calls this pipeline will make — so ADMISSION GUARANTEES COMPLETION.
+    // It used to be an independent $0.10 while each step was gated at $0.02 (6 × $0.02 = $0.12 > $0.10),
+    // which meant a user admitted here could be blocked at step 5 or 6 with nothing usable — after we
+    // had already paid for steps 1-4 and after they had waited. See distillRunEstimateUsd.
+    const runEstimateUsd = distillRunEstimateUsd(DISTILL_CATEGORIES.length);
     const cs = await creditStatus();
-    const blocker = managedRunBlocker({ keySource, availableUsd: cs.availableUsd, spentUsd: cs.spentUsd, estimateUsd: DISTILL_EST_USD });
+    const blocker = managedRunBlocker({ keySource, availableUsd: cs.availableUsd, spentUsd: cs.spentUsd, estimateUsd: runEstimateUsd });
     if (blocker) {
       return { ...buildTrialCreditExhausted({ estimateUsd: blocker.estimateUsd, availableUsd: blocker.availableUsd, runLabel: 'This project-context distillation' }), code: 'NOT_CONFIGURED' };
     }
@@ -1132,6 +1225,24 @@ resolver.define('distillStep', async ({ payload, context }) => {
     return { error: 'bad_step', code: 'UNEXPECTED', detail: `Invalid distill step ${payload?.step}.` };
   }
 
+  // ⭐ Defensive license gate (2026-07-25) — see the twin in startDistillSession. This resolver is the
+  // one that actually SPENDS, and it is payload-driven (sessionId + step), so it must carry the gate
+  // itself: a session opened while licensed must not keep billing our key after the license lapses.
+  // Fail-OPEN on a read throw, exactly like the other surfaces.
+  try {
+    if (getActiveTier(context).key === 'unlicensed') {
+      return { ...buildLicenseRequired(), step, label: DISTILL_CATEGORIES[step].label };
+    }
+  } catch (e) {
+    console.error(`[distill] license check failed (failing open): ${String(e?.message || e)} ref=${sessionId}`);
+    // [diag Phase 3, gate MUST-1] see the startDistillSession twin — a fail-open gate on a SPEND
+    // surface must leave a durable trace, not only a console line. ref = the distill sessionId.
+    await recordDiagnostic({
+      context,
+      record: { op: 'distill.step', error_class: 'gate_fail_open', level: 'warn', ref: sessionId, surfaced: false },
+    });
+  }
+
   const key = DISTILL_SESSION_PREFIX + sessionId;
   const s = await kvs.get(key);
   if (!s) {
@@ -1142,6 +1253,9 @@ resolver.define('distillStep', async ({ payload, context }) => {
   // exhausting between steps would flip managed→byok and dead-end the session after we paid for the
   // earlier steps). Mirrors the batch poll legs (anthropicKeyForSource by the stamped source). A legacy
   // pre-2026-07-11 session with no stamp defaults to 'byok'. Fault-aware (a storage fault ≠ "no key").
+  // ⚠ Reusing the stamp is about WHICH KEY signs the call — it is NOT an exemption from admission
+  // control. Because this leg skips resolveAnthropicKey (the one place the credit decision is made),
+  // the per-step credit gate below is what keeps a managed session from billing without a bound.
   const keySource = s.keySource || 'byok';
   const { key: apiKey, fault: keyFault } = await anthropicKeyInfoForSource(keySource);
   if (!apiKey) {
@@ -1163,11 +1277,98 @@ resolver.define('distillStep', async ({ payload, context }) => {
   }
 
   const category = DISTILL_CATEGORIES[step];
+  // How much of this run we have ALREADY paid for (persisted sections) — used only for honest copy
+  // on the backstop path below. Not an index: a retried step overwrites its own section.
+  const completedSteps =
+    s.sections && typeof s.sections === 'object' ? Object.keys(s.sections).length : 0;
+
+  // ⭐⭐ PER-STEP BACKSTOP (money leak closed 2026-07-25) — admission control BEFORE the spend.
+  //
+  // THE LEAK THIS CLOSES: distillStep REUSES the session-stamped keySource (above) and therefore never
+  // calls resolveAnthropicKey — the one place the managed-vs-byok credit decision is made. The only gate
+  // was a SINGLE whole-pipeline check at startDistillSession, so opening one session bought an UNBOUNDED
+  // number of billed steps: each distillStep is a real Anthropic call, faithfully recorded by the ledger
+  // and never blocked. Every managed step now passes here before it can spend.
+  //
+  // ⚠ THIS IS A BACKSTOP, NOT A SECOND ADMISSION TEST (audit HIGH, 2026-07-25). The session gate admits
+  // on `distillRunEstimateUsd(DISTILL_CATEGORIES.length)` = stepCount × THIS figure, and the per-step
+  // WORST CASE ($0.134 — bounded from the 40,000-char clip in the DISTILL_STEP_EST_USD derivation) is at
+  // or below this figure — so an admitted run always has enough left for every one of its
+  // own steps and this gate CANNOT fire on a solo run. (It used to: $0.10 admitted the run while 6 × $0.02
+  // = $0.12 was needed, so step 5 or 6 could be refused after we had already paid for steps 1-4.) What it
+  // still catches is credit consumed CONCURRENTLY by another surface (a breakdown/test-gen run in another
+  // tab) mid-pipeline — and the payload below says exactly that, honestly.
+  //
+  // FAILS CLOSED: creditStatus reports availableUsd 0 on a KVS read glitch (readOk:false), so the blocker
+  // sees est > available and blocks — a glitch never buys a free managed call. BYOK is NEVER gated
+  // (managedRunBlocker short-circuits on keySource !== 'managed'), so a customer on their own key is
+  // untouched. Fresh read rather than a `trial` snapshot, mirroring the regen surface, which likewise
+  // inherits a stamped keySource.
+  //
+  // THE SESSION IS KEPT (like every other per-step error path): the sections we ALREADY paid for stay in
+  // KVS rather than being silently destroyed. They are bounded by the daily sweep (a distill session left
+  // behind is deleted after DISTILL_SESSION_MAX_AGE_MS), so "kept" never means "kept forever".
+  if (keySource === 'managed') {
+    const cs = await creditStatus();
+    const blocker = managedRunBlocker({
+      keySource,
+      availableUsd: cs.availableUsd,
+      spentUsd: cs.spentUsd,
+      estimateUsd: DISTILL_STEP_EST_USD,
+    });
+    if (blocker) {
+      console.log(
+        `[distill] managed credit BACKSTOP (${blocker.reason}) at step ${step} of ${DISTILL_CATEGORIES.length} (${completedSteps} step(s) already paid for): need≈$${blocker.estimateUsd.toFixed(2)} > avail≈$${blocker.availableUsd.toFixed(2)} → BYOK ref=${sessionId}`,
+      );
+      const base = buildTrialCreditExhausted({
+        estimateUsd: blocker.estimateUsd,
+        availableUsd: blocker.availableUsd,
+        runLabel: `This project-context step (${category.label})`,
+      });
+      // §11 — never let a PARTIAL read as a clean stop. Say plainly that the run stopped part-way,
+      // that the finished steps are kept, and that continuing needs a fresh run on their own key
+      // (this session is bound to the managed key, so retrying it can only re-block). NOTE the FE
+      // appends "Then run Summarize again." to this detail — so state the FACTS here and leave the
+      // instruction to the caller rather than duplicating it.
+      const partialNote =
+        completedSteps > 0
+          ? ` This run stopped after ${completedSteps} of ${DISTILL_CATEGORIES.length} steps — those steps are saved for now, but the run can't finish on the free credit, and the earlier steps will re-run on your own key.`
+          : '';
+      return {
+        ...base,
+        detail: `${base.detail}${partialNote}`,
+        code: 'NOT_CONFIGURED',
+        step,
+        label: category.label,
+        // Additive honesty fields — the FE renders `detail`; these let any surface report the partial
+        // state without re-deriving it (and make the "kept, but not resumable on this session" fact explicit).
+        midPipeline: completedSteps > 0,
+        completedSteps,
+        totalSteps: DISTILL_CATEGORIES.length,
+        sessionKept: true,
+        resumable: false,
+      };
+    }
+  }
+
+  // ⭐ RESERVATION (2026-07-25) — hold a conservative estimate BEFORE the call, settle to the echoed
+  // ACTUAL after. Deliberately inverts the previous "charge only after the section is durably stored"
+  // ordering, which left two paths where a REAL billed call went UNRECORDED in the very ledger the gate
+  // depends on (the section kvs.set failing after a successful call, and a 200 that echoed no `usage`) —
+  // an unrecorded spend silently raises our real exposure above the ceiling. Recording first and settling
+  // on EVERY exit path keeps "meter the call whose output we kept" true (we still settle to the actual
+  // when the write fails) while making a lost spend structurally impossible. It also shrinks the
+  // check-vs-charge window from the whole 3-13s Anthropic call to the ledger's own read-modify-write.
+  // Managed-only; a no-op for BYOK. Fail-safe: a hold glitch returns 0 and the settle then charges the
+  // full actual (same convergence as the batch surfaces).
+  const heldUsd = await holdManagedCredit(keySource, DISTILL_STEP_EST_USD);
 
   let result;
   try {
     result = await distillCategory({ text: s.input, category, apiKey });
   } catch (e) {
+    // The hold STANDS: an unexpected throw gives us no evidence the request was not processed
+    // (over-charging by one conservative step estimate is the safe polarity — a silent leak is not).
     console.error(`[distill] step ${step} (${category.key}) threw: ${String(e?.message || e)} ref=${sessionId}`);
     // [Q2 fix] the unexpected-throw twin of the API-rejection record below — durable
     // trace for support (we don't know the class → unknown_error; detail → zone-2).
@@ -1190,8 +1391,22 @@ resolver.define('distillStep', async ({ payload, context }) => {
       record: { op: 'distill.step', error_class, level: 'error', ref: sessionId, ...(counts ? { counts } : {}), surfaced: true },
     });
     await writeDiagnosticDetail({ ref: sessionId, text: String(result.detail || result.error) });
+    // RELEASE the hold ONLY for the classes that provably billed nothing (the request was rejected
+    // before any tokens were produced). Everything else — notably network_failure (the request may
+    // have been processed before the socket died) and any HTTP-200 failure (parse_failed /
+    // empty_result: tokens WERE billed) — keeps the hold. Over-charge is the safe polarity here.
+    if (distillErrorWasUnbilled(result.error)) await settleManagedHold(keySource, heldUsd, 0);
     // Keep the session so the UI can retry THIS step with the same sessionId.
     return { ...mapDistillError(result), step, label: category.label };
+  }
+
+  // The call SUCCEEDED and is billed from this point on. Price it now so every exit path below can
+  // settle the hold to the truth — including the section-write failure (a lost output is still a
+  // real spend). A missing/unusable `usage` echo leaves the conservative hold standing.
+  let actualUsd = null;
+  if (keySource === 'managed' && result.usage) {
+    const stepCost = estimateCost(result.usage, MODEL_FALLBACK, { batch: false }); // sync Haiku — NOT batched
+    if (stepCost && Number.isFinite(stepCost.total_usd)) actualUsd = stepCost.total_usd;
   }
 
   // Persist this section. Track per-section truncation so the UI can nudge "expand".
@@ -1208,20 +1423,20 @@ resolver.define('distillStep', async ({ payload, context }) => {
       context,
       record: { op: 'distill.step', error_class: 'kvs_write_failed', level: 'warn', ref: sessionId, surfaced: true },
     });
+    // ⭐ Settle BEFORE returning (2026-07-25). This was THE unrecorded-spend path: the Anthropic call
+    // succeeded and WAS billed, and the old code charged only after this write — so a write fault made a
+    // real spend vanish from the ledger the gate depends on, silently raising our exposure above the
+    // ceiling. The output is lost; the money is not, so the ledger must carry it.
+    await settleManagedHold(keySource, heldUsd, actualUsd);
     return { error: 'kvs_write_failed', detail: 'Could not store the distill session in Forge storage. Please try again.', step, label: category.label };
   }
 
-  // $5 managed trial credit — charge THIS distill step's real (sync Haiku) cost to the ledger, AFTER the
-  // section is durably stored (audit LOW fix): we meter the call whose OUTPUT we kept. Distill is a 6-step
-  // SYNC pipeline (no batch/finalize), so we charge per step, marker-guarded by session:step (retry-safe).
-  // reconcileManagedCredit with a hold-less synthetic record (estimate 0) charges the full actual once.
+  // $5 managed trial credit — settle THIS step's hold to its real (sync Haiku) cost. Distill is a
+  // 6-step SYNC pipeline (no batch/finalize), so hold-and-settle happens inside the one invocation;
+  // NO marker, because each distillStep invocation is a distinct real Haiku call and a retry after a
+  // lost response IS new spend (a marker would wrongly no-op it → under-count → our margin leak).
   // Managed only; a no-op for BYOK. Fail-safe (never breaks the step — the section is already saved).
-  if (keySource === 'managed' && result && result.usage) {
-    const stepCost = estimateCost(result.usage, MODEL_FALLBACK, { batch: false }); // sync Haiku — NOT batched
-    // Direct charge (NO marker): each distillStep invocation is a distinct real Haiku call — a retry after a
-    // lost response IS new spend that must be charged (a marker would wrongly no-op it → under-count). See chargeManagedSpendSafe.
-    if (stepCost && Number.isFinite(stepCost.total_usd)) await chargeManagedSpendSafe(stepCost.total_usd);
-  }
+  await settleManagedHold(keySource, heldUsd, actualUsd);
 
   const isLast = step === DISTILL_CATEGORIES.length - 1;
   if (!isLast) {
@@ -6208,6 +6423,9 @@ resolver.define('clearDiagnostics', async ({ context }) => {
 // neither is swept (this is the access-renewed alternative to a creation-anchored TTL, which
 // would silently lose a deliverable under review). Bounded (SWEEP_MAX_DELETES/run; the daily
 // cadence clears any backlog over a few days) + idempotent. Fail-open — never throws to the platform.
+// ⭐ A SECOND, independent pass (2026-07-25) enumerates `distill_session:` and deletes abandoned
+// sessions past DISTILL_SESSION_MAX_AGE_MS — they hold the customer's pasted text and only a COMPLETED
+// distill deleted them, so an abandoned run used to retain content indefinitely.
 export async function sweepHandler() {
   const now = Date.now();
   let scanned = 0;
@@ -6256,16 +6474,63 @@ export async function sweepHandler() {
     sweepOk = false;
     console.error(`[sweep] orphan sweep failed (non-fatal): ${String(e?.message || e)}`);
   }
+
+  // ⭐ SECOND PASS — abandoned distill sessions (privacy fix 2026-07-25). Same enumeration pattern as
+  // the jobmeta pass above (beginsWith + cursor pagination + a hard page/delete bound). Separate try so
+  // a failure in either pass never suppresses the other; its own counters feed the heartbeat.
+  // ⚠ NOTE FOR FUTURE SWEEP WORK: `trial:managed-credit` (the $5 ledger) and `trial:charged:*` (the
+  // idempotency markers) must NEVER be enumerated or deleted here — deleting the ledger re-grants the
+  // credit, deleting a marker re-charges (or double-charges) a settled run. Content-bearing keys get
+  // swept; money-bearing keys do not.
+  let distillScanned = 0;
+  let distillDeleted = 0;
+  try {
+    let dCursor;
+    const maxPages = 500;
+    for (let page = 0; page < maxPages && distillDeleted < SWEEP_DISTILL_MAX_DELETES; page++) {
+      let q = kvs.query().where('key', WhereConditions.beginsWith(DISTILL_SESSION_PREFIX)).limit(SWEEP_PAGE_LIMIT);
+      if (dCursor) q = q.cursor(dCursor);
+      const res = await q.getMany();
+      const results = res && Array.isArray(res.results) ? res.results : [];
+      for (const r of results) {
+        if (distillDeleted >= SWEEP_DISTILL_MAX_DELETES) break;
+        if (!r || typeof r.key !== 'string' || !r.key.startsWith(DISTILL_SESSION_PREFIX)) continue;
+        distillScanned++;
+        if (!isDistillSessionStale(r.value, now, DISTILL_SESSION_MAX_AGE_MS)) continue;
+        // kvs.query() is EVENTUALLY consistent (see the jobmeta pass) — but unlike a breakdown, a
+        // distill session's createdAt is IMMUTABLE (never renewed), so a lagging index cannot make a
+        // fresh session look old. No strict re-read needed; the age decision is monotonic.
+        try {
+          await kvs.delete(r.key);
+          distillDeleted++;
+        } catch (delErr) {
+          // Feeds the SHARED degraded counter deliberately: it is the run-level health flag the admin
+          // heartbeat turns amber on ("this sweep had deletion problems"), not a per-prefix statistic.
+          degraded++;
+          console.warn(`[sweep] distill-session delete failed (non-fatal): ${String(delErr?.message || delErr)}`);
+        }
+      }
+      dCursor = res ? res.nextCursor : undefined;
+      if (!dCursor || results.length === 0) break;
+    }
+    // Counts only — NEVER the session content or ids (privacy; keeps "Log End-User Data: No" true).
+    console.log(`[sweep] distill-session sweep: scanned=${distillScanned} deleted=${distillDeleted}`);
+  } catch (e) {
+    sweepOk = false;
+    console.error(`[sweep] distill-session sweep failed (non-fatal): ${String(e?.message || e)}`);
+  }
   // ⭐ Native vendor heartbeat (strategy §4.1): persist last-ran + the counts so the vendor can confirm the
   // daily sweep FIRED (surfaced read-only on the admin Diagnostics view; "missed" computed at read-time).
   // NO egress, NO content — app-scoped counts + a timestamp only → the no-egress / "Log End-User Data: No"
   // posture is untouched. Fail-safe: a heartbeat write error NEVER affects the sweep (its work + return are done).
   try {
-    await kvs.set(SWEEP_HEARTBEAT_KEY, { at: Date.now(), scanned, deleted, degraded, ok: sweepOk });
+    // distillScanned/distillDeleted are ADDITIVE (the admin callout renders the job-sweep counts only —
+    // readSweepHeartbeat's shape is unchanged); they give the vendor evidence the retention pass ran.
+    await kvs.set(SWEEP_HEARTBEAT_KEY, { at: Date.now(), scanned, deleted, degraded, ok: sweepOk, distillScanned, distillDeleted });
   } catch (hbErr) {
     console.warn(`[sweep] heartbeat write failed (non-fatal): ${String(hbErr?.message || hbErr)}`);
   }
-  return { scanned, deleted, degraded };
+  return { scanned, deleted, degraded, distillScanned, distillDeleted };
 }
 
 export const handler = resolver.getDefinitions();

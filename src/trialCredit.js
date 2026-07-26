@@ -81,9 +81,88 @@ export const TRIAL_HARD_CEILING_USD =
 export const BREAKDOWN_EST_USD = 0.24;
 export const PLAN_EST_USD = 0.1;
 export const REGEN_EST_USD = 0.1;
-// The whole "Distill with Claude" project-context extraction (6 chunked Haiku category calls — cheap).
-// Gated ONCE at startDistillSession with this conservative total.
-export const DISTILL_EST_USD = 0.1;
+/**
+ * ⭐ PER-STEP distill estimate — the admission figure for ONE distillStep call, and (via
+ * `distillRunEstimateUsd` below) the ONLY input to the whole-run admission figure too.
+ *
+ * WHY IT EXISTS (money leak closed 2026-07-25). Distill is the one spend surface with no batch:
+ * `distillStep` reuses the session-STAMPED keySource and therefore never calls resolveAnthropicKey
+ * (the one place the managed-vs-byok credit decision is made). The only admission check used to be
+ * ONE whole-pipeline gate at startDistillSession, so a caller could open a single session and then
+ * loop `distillStep` indefinitely: every call a real billed Anthropic request on OUR managed key,
+ * faithfully recorded by the ledger and never blocked. Each step is now gated with THIS figure,
+ * before it spends.
+ *
+ * ⚠ IT MUST BE A TRUE UPPER BOUND, NOT A TYPICAL COST (audit MEDIUM, 2026-07-25). Everything below —
+ * "admission guarantees completion", the per-step gate being a mere backstop — holds ONLY while a step's
+ * REAL cost stays at or below this figure. The retired $0.02 was derived by reading the 40,000-char clip
+ * as ~10K tokens, i.e. an assumed 4 chars/token — an ENGLISH-PROSE average, not a bound. Dense technical
+ * text runs ~2-3 chars/token and non-Latin scripts far denser (Bulgarian/Cyrillic content is explicitly
+ * in scope for this product), which alone put a real step at ~$0.031 — above the figure that admitted it.
+ * So the number below is derived from a WORST-CASE TOKEN BOUND instead.
+ *
+ * DERIVATION (re-checkable from first principles; re-run it if any input changes):
+ *   1. Input is clipped to DISTILL_MAX_INPUT_CHARS = 40000 (anthropic_client.js) via String.slice —
+ *      so 40,000 UTF-16 code units, NOT 40,000 tokens and NOT 40,000 bytes.
+ *   2. TOKENS ≤ UTF-8 BYTES. Claude's tokenizer is a byte-level BPE: all 256 single bytes are in the
+ *      vocabulary and merges only ever JOIN bytes into longer tokens, so no input can ever tokenize to
+ *      more tokens than it has bytes. This is the property that makes the bound tokenizer-version-proof —
+ *      unlike a chars/token ratio, it cannot be falsified by a script, a domain, or a model update.
+ *   3. BYTES ≤ 3 × CODE UNITS. UTF-8 costs 1 byte for ASCII, 2 for U+0080-U+07FF (Cyrillic, Greek,
+ *      Hebrew, Arabic), 3 for U+0800-U+FFFF (CJK, Thai, Devanagari), and 4 for astral code points —
+ *      but astral chars are surrogate PAIRS, i.e. 2 code units, so they cost only 2 bytes per unit.
+ *      The maximum is therefore 3 bytes per code unit → the clip is ≤ 120,000 bytes ≤ 120,000 tokens.
+ *   4. Fixed prompt overhead: DISTILL_SHARED_PREAMBLE (1,614 chars) + the longest category
+ *      instruction+userAsk (3,908 — `glossary`) + the "Text:\n---\n…\n---" wrapper ≈ 5.6K ASCII bytes.
+ *      Allow 10,000 tokens (~2× headroom, so editing the prompts cannot silently break the bound).
+ *   5. Price it as the code does — estimateCost(usage, MODEL_FALLBACK, { batch: false }): distill is a
+ *      SYNC Haiku 4.5 call, NOT batched, so no 50% batch discount. Haiku sync = $1.00/MTok in, $5.00/MTok out.
+ *      Input ≤ 130,000 tok → $0.130.  Output ≤ 800 tok (the largest DISTILL_CATEGORIES.maxTokens, a hard
+ *      `max_tokens` cap) → $0.004.  WORST CASE ≤ $0.134  →  rounded UP to $0.14.
+ *
+ * The reserve this asks of a $5 grant is ~$0.84 for a 6-category run (see distillRunEstimateUsd) while a
+ * typical English run really costs ~$0.10 — deliberate: over-estimating only routes a nearly-spent trial
+ * user to BYOK slightly early (graceful, and the endgame anyway), while under-estimating breaks the
+ * completion invariant and spends past the grant. The hold is reconciled to the echoed ACTUAL at settle,
+ * so a conservative figure gates admission WITHOUT over-charging anyone. ⭐ THE LEVER if that reserve ever
+ * proves too tight: clip by UTF-8 BYTES rather than UTF-16 code units (Buffer.byteLength) — that alone
+ * collapses step 3 to ≤ 40,000 tokens and the bound to ~$0.05/step. It is a product call (non-Latin users
+ * would get less text distilled per run), so it is NOT taken here.
+ */
+export const DISTILL_STEP_EST_USD = 0.14;
+
+/**
+ * ⭐ WHOLE-RUN distill estimate — the SESSION admission figure, DERIVED from the per-step figure.
+ *
+ * ⚠ THE INVARIANT THIS EXISTS TO ENFORCE (audit HIGH, 2026-07-25): **admission must guarantee
+ * completion.** The session gate and the per-step gate used to be two INDEPENDENT numbers ($0.10 for
+ * the whole run, $0.02 per step) — and 6 × $0.02 = $0.12 > $0.10, so a user admitted at session start
+ * could be BLOCKED at step 5 or 6, after we had already paid for steps 1-4 and after they had waited,
+ * and get nothing usable. Admission that does not guarantee completion is worse than no admission: it
+ * spends OUR money AND wastes the user's time. So the whole-run figure is now `stepCount × the
+ * per-step figure` BY CONSTRUCTION — the two can never disagree again, whatever either number becomes
+ * and however many categories the pipeline grows.
+ *
+ * CONSEQUENCE — the per-step gate becomes a genuine BACKSTOP rather than a second, stricter admission
+ * test. Admitted with `available ≥ n × stepEst`, and with the per-step WORST CASE ($0.134, derived
+ * above) at or below `stepEst` ($0.14), the credit left before step k is `available − Σ(actual so far)`
+ * ≥ `n×0.14 − (k−1)×0.134` ≥ `0.14` for every k ≤ n=6 — so a run that is admitted can always finish on
+ * its own. ⚠ That chain is only as good as `stepEst ≥ the real per-step cost`: if the per-step figure is
+ * ever lowered below its worst-case derivation, THIS guarantee is what breaks first (silently — the
+ * symptom is a user blocked mid-pipeline after we already paid for the earlier steps). The per-step gate
+ * can then only fire when ANOTHER surface consumed credit concurrently mid-run, which is exactly what a
+ * backstop is for (and distillStep reports that case honestly and KEEPS the session).
+ *
+ * @param {number} stepCount how many category calls this pipeline will make (DISTILL_CATEGORIES.length)
+ * @returns {number} the conservative whole-run estimate in USD
+ */
+export function distillRunEstimateUsd(stepCount) {
+  // A non-integer/absent count means the caller is broken; fall back to ONE step rather than 0 — the
+  // per-step gate still guards every subsequent call, and a 0 estimate would be read as "cannot price
+  // this run" and block outright (managedRunBlocker), dead-ending a legitimate user on a code bug.
+  const n = Number.isInteger(stepCount) && stepCount > 0 ? stepCount : 1;
+  return Math.round(DISTILL_STEP_EST_USD * n * 1e6) / 1e6; // kill float dust (0.14×6 = 0.8400000000000001)
+}
 
 /**
  * PRE-FLIGHT STOPPER (pure) — must a managed run be BLOCKED before it spends, because it can't fit the
