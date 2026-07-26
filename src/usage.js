@@ -13,10 +13,12 @@
  * now BYOK). Evaluation is the 30-day Atlassian trial (a trial reads as an ACTIVE
  * license at runtime → resolves to a paid tier; the in-app Free 3/mo tier was removed
  * 2026-06-03):
- *   - Standard:   "Standard" edition, $6.70/user/mo, BYOK → UNLIMITED. Core breakdown
- *                 + push + Project Context. The customer's own Anthropic key pays
- *                 compute, so unlimited is no cost liability for us.
- *   - Advanced:   "Advanced" edition, $13.40/user/mo, BYOK → UNLIMITED + TEST-CASE
+ *   - Standard:   "Standard" edition, BYOK → UNLIMITED. Core breakdown + push +
+ *                 Project Context. The customer's own Anthropic key pays compute,
+ *                 so unlimited is no cost liability for us. The subscription price is
+ *                 the GRADUATED Marketplace band table (see PRICING COPY below) — the
+ *                 app cannot know which band an install sits in, so it never states a rate.
+ *   - Advanced:   "Advanced" edition, BYOK → UNLIMITED + TEST-CASE
  *                 GENERATION (the SINGLE headline anchor TODAY; custom prompts + the
  *                 Capacity-Sheet vision are FUTURE — do NOT advertise them until built).
  *                 Still BYOK → still $0 compute cost to us, so still no cap. The ONLY
@@ -74,8 +76,11 @@ import { getAppContext } from '@forge/api';
 // CAP = 25 (raised from 10, 2026-06-16). v5.4.0 Managed ships BREAKDOWN-ONLY
 // (test-case generation is a v5.5.0 feature, NOT in this build), and a breakdown
 // costs only ~$0.118 avg / $0.24 max on our key → 25 × $0.24 = $6.00 worst-case
-// vs $13/seat revenue ⇒ ~54% margin FLOOR (cap × max cost; typical use stays
-// well under the cap → ~90%+ margin). The cap is pure
+// vs the RETIRED $13/seat Managed Pro price ⇒ ~54% margin FLOOR (cap × max cost;
+// typical use stays well under the cap → ~90%+ margin). ⚠ That $13/seat is a
+// HISTORICAL figure kept only so the margin math stays readable — Managed is
+// dormant and carries price: null today, and it is NOT the live Standard model
+// (which is graduated per-user bands — see PRICING COPY below). The cap is pure
 // cost-protection / abuse circuit-breaker, NOT a value gate, so it is set
 // GENEROUS: a real BA (typ. 1-3 specs/mo, power 5-8, PLUS each regeneration
 // consuming one) effectively never reaches 25, so Managed feels "unlimited" — its
@@ -107,16 +112,60 @@ export const MANAGED_USER_CAP =
 //                   (the v6 headline value anchor) — gate features on THIS, never on `edition`.
 //   `limit`       : breakdowns / calendar month. null = unlimited, 0 = blocked. A cap is
 //                   needed ONLY when WE pay (keySource 'managed'); BYOK is always unlimited.
-//   `price`       : the Marketplace SUBSCRIPTION price shown in the UI (NOT API cost — under
+//   `price`       : the SHORT subscription-price line shown in the UI (NOT API cost — under
 //                   BYOK the customer pays Anthropic; the subscription buys the app).
+//                   ⭐ It states a SHAPE and defers the figure — it must NEVER assert a
+//                   per-user rate as "your price" (see PRICING COPY below for why).
+//                   ⚠ Keep it SHORT (≲25 chars): LimitReachedScreen's EditionRow renders it
+//                   in a `shrink-0` flex cell, so a full sentence there overflows the card.
+//                   null ⇒ the whole subscription CTA card is hidden (EditionRow returns null
+//                   on a falsy price), which is why the live tiers must keep a non-null string.
+//   `priceNote`   : the LONGER shape sentence, rendered where there IS room (the Settings
+//                   Account panel + the LimitReached subscription card). This is what carries
+//                   the whole-instance qualifier — see PRICING COPY. null = render nothing.
 // Object.freeze: the resolved tier is shared BY REFERENCE across the resolver and spread
 // into getUsage — a mutating consumer would corrupt the singleton for later callers.
+//
+// ── PRICING COPY — why these strings state a SHAPE and never a rate ──
+// VERIFIED against the Atlassian vendor portal 2026-07-24. Paid via Atlassian, per user per
+// month, GRADUATED like tax brackets — each rate applies ONLY to the users inside its own
+// band. NEVER multiply one rate by the whole headcount.
+//   single instance : up to 10  FREE ($0, flat)    ·  1-100     $6.70 (band max $670)
+//                     101-250   $5.10 ($1,435)     ·  251-1000  $3.80 ($4,285)
+//                     1001-2500 $3.50 ($9,535)     ·  2501-7500 $3.25 · 7501-10000 $2.85
+//                     ... declining to $1.15 at 45001+
+//   multi-instance  : 1.5x the single-instance rate ($10.05 / $7.65 / $5.70 ...)
+//   bracket proof   : $670 + 150x$5.10 = $1,435 ; $1,435 + 750x$3.80 = $4,285 ;
+//                     $4,285 + 1500x$3.50 = $9,535 — all match the portal's "max total"
+//                     column, i.e. the bands really are cumulative, not one flat rate.
+//
+// ⚠ THE QUALIFIER THAT MUST TRAVEL WITH EVERY "FREE" MENTION: Paid via Atlassian licenses the
+// WHOLE Confluence instance. "Free up to 10 users" means the ENTIRE Confluence site has 10 or
+// fewer users — NOT "a small team inside a big company". A 4-person team on a 900-user site is
+// NOT free. Copy that says "free" without that qualifier is a false promise.
+//
+// ⭐ WHY THE STRINGS DEFER TO THE MARKETPLACE: the app CANNOT know which band an install is in.
+// The Forge License object exposes NO seat count, NO user count and NO price band (probe-verified
+// on dev 2026-07-25 — the raw shape is recorded above resolveLicense). Asserting one band as
+// "your price" is therefore wrong for every customer in a different band, so the UI states the
+// SHAPE and sends them to the Marketplace listing, which shows each customer their real price.
+// The retired '$6.70/user/mo' + "≤10 users = $57/mo flat" strings were BOTH stale (the ≤10 band
+// is FREE now and there is no $57 floor) AND unknowable from inside the app.
+//
+// ⛔ Do NOT put the $5 welcome credit or a "start without an API key" angle into PRICING copy —
+// decided, but not shipped as a public offer.
 export const TIERS = Object.freeze({
   byokPro: Object.freeze({
     key: 'byokPro', // KEY kept 'byokPro' (not renamed) so every findPrice/tier-literal site is churn-free
     label: 'Standard', // v6: relabeled BYOK Pro → "Standard" (value framing)
     limit: null, // unlimited — customer's own key pays compute
-    price: '$6.70/user/mo', // matches the live Marketplace portal (USD; ≤10 users = $57/mo flat)
+    // SHAPE, not a rate (see PRICING COPY above): the runtime exposes no seat count or band, so
+    // the app cannot know this install's price — the Marketplace listing shows the customer theirs.
+    price: 'See Marketplace pricing',
+    priceNote:
+      'Free while the whole Confluence site has 10 or fewer users — the site, not just your team. ' +
+      'Above that it is priced per user across the site, on a rate that declines as the site grows. ' +
+      'The Marketplace listing shows the exact price for your site.',
     edition: 'standard',
     keySource: 'byok',
     // ⭐ 2026-07-11 STANDARD-ONLY PIVOT: Standard now includes EVERYTHING. Editions collapsed to a
@@ -134,7 +183,13 @@ export const TIERS = Object.freeze({
     key: 'byokAdvanced',
     label: 'Advanced',
     limit: null, // unlimited — BYOK, customer's key pays compute
-    price: '$13.40/user/mo', // 2× Standard via the declining curve (live portal figure)
+    // Retired as an OFFER (2026-07-11 Standard-only pivot) but still RESOLVABLE for an existing or
+    // pending subscriber — so it needs honest copy, not a stale rate. Deliberately makes NO free-band
+    // claim: only the live Standard offer's bands are portal-verified.
+    price: 'See Marketplace pricing',
+    priceNote:
+      'Priced per user across the whole Confluence site, on a rate that declines as the site grows. ' +
+      'The Marketplace listing shows the exact price for your site.',
     edition: 'advanced',
     keySource: 'byok',
     hasTestCases: true,
@@ -150,6 +205,7 @@ export const TIERS = Object.freeze({
     label: 'Managed Pro',
     limit: MANAGED_USER_CAP, // we pay compute → per-USER fair-use cap (see above)
     price: null, // dormant — never advertised
+    priceNote: null, // no price rendered ⇒ no note either
     edition: 'managed', // v6: was 'advanced' — decoupled so it can't re-couple to the edition flag
     keySource: 'managed',
     hasTestCases: true, // if ever re-enabled, Managed Advanced would include test-cases on their OWN budget
@@ -163,6 +219,7 @@ export const TIERS = Object.freeze({
     label: 'Unlicensed',
     limit: 0, // blocked — no breakdowns without an active license/trial
     price: null,
+    priceNote: null,
     edition: null,
     keySource: 'byok', // never our key, even defensively
     hasTestCases: false,
@@ -232,6 +289,34 @@ export function resolveLicense(context) {
   }
   return (context && context.license) || null;
 }
+
+// ⚠⚠ TEMPORARY DEV DIAGNOSTIC — 2026-07-24. DELETE BEFORE ANY PRODUCTION DEPLOY. ⚠⚠
+// WHY: the welcome-credit design (docs/IMPL-SPEC-PER-USER-WELCOME-CREDIT.md §3) asks a question the
+// docs cannot answer — does the Forge License object let us tell a FREE-band install (≤10 users, $0)
+// from a PAID one? The declared fields carry no seat count and no price band. So we log the RAW shape
+// and read it back with `forge logs` under each `forge install --license …` variant.
+//
+// ⚠ v2 FIX: v1 gated on `process.env.FORGE_ENVIRONMENT === 'development'` — that variable DOES NOT
+// EXIST in the Forge runtime (an unverified assumption), so the probe never fired. The real signal is
+// `getAppContext().environmentType` (declared `string` in @forge/api runtime.d.ts:139). Its exact
+// casing is itself unverified, so we do NOT gate on a guessed value: we log unless the environment
+// reads PRODUCTION (case-insensitive) — safe by default, and it logs environmentType so we learn it.
+//
+// SAFE TO LOG: entitlement metadata (flags, dates, opaque ids) — NOT end-user content and NOT personal
+// data, so the "Log End-User Data: No" listing answer still holds. Temporary: REVERT once §3.4 is answered.
+// ⭐ WHAT THE PROBE FOUND (dev, 2026-07-25 — kept as the durable record; the probe itself is removed):
+//   --license active : {active, billingPeriod:"MONTHLY", state:"active", supportEntitlementNumber:null,
+//                       type:"commercial", isActive:true}
+//   --license trial  : the same PLUS state:"trial" and trialEndDate:"<+30d>"
+//   appContext keys  : appAri, appVersion, environmentAri, environmentType, installationAri, invocationId,
+//                      invocationRemainingTimeInMillis, moduleKey, license, installation, permissions
+// ⇒ There is NO seat count, NO user count and NO price band anywhere — so the app CANNOT tell a free-band
+//   install (≤10 users, $0) from a paid one. `state` separates trial from active but is NOT in the declared
+//   @forge/api License type (runtime.d.ts:44-56) — the declared type is a LOWER BOUND on what the runtime
+//   returns. `type` was "commercial" in BOTH, so it does not discriminate trial-vs-paid; whether a real
+//   free-band install reports something else is UNVERIFIABLE on dev (`--license` cannot simulate it).
+//   The welcome-credit design deliberately does not depend on that answer — see
+//   docs/IMPL-SPEC-PER-USER-WELCOME-CREDIT.md §3.
 
 /**
  * Is this license in the 30-day Atlassian evaluation trial? (2026-07-11 — gates the $5 managed
@@ -381,6 +466,7 @@ export async function checkQuota(context) {
     // price), independent of pricingTable (which now lists only Standard for the upgrade CTA). Without
     // it, a grandfathered Advanced subscriber's tier isn't in pricingTable → their price rendered blank.
     price: tier.price,
+    priceNote: tier.priceNote, // the shape sentence (whole-instance qualifier) for the Account panel
     edition: tier.edition, // 'standard'|'advanced'|'managed'(dormant)|null — LABEL only, for messaging
     keySource: tier.keySource, // v6 decouple: 'byok'|'managed' — explicit, never inferred from edition
     hasTestCases: tier.hasTestCases, // 2026-07-11 Standard-only: INCLUDED in Standard (always true for a live tier) — kept in the payload so the FE reads "entitled" (removing it would re-paywall via default-FALSE logic)
@@ -494,7 +580,8 @@ export function pricingTable() {
     key: t.key,
     label: t.label,
     limit: t.limit, // null = unlimited
-    price: t.price,
+    price: t.price, // SHORT shape line — never a per-user rate (see PRICING COPY)
+    priceNote: t.priceNote, // the qualified shape sentence, for surfaces with room
     edition: t.edition,
     hasTestCases: t.hasTestCases, // v6: drives the value-framing "+ test cases" copy from the capability (so marketing can't drift from code)
     hasPlanner: t.hasPlanner, // v6.1: same — drives the "+ capacity planner" value-framing from the capability

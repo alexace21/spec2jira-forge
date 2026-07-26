@@ -7321,6 +7321,7 @@ function LimitReachedScreen({ quota, onBack, backToReview = false }) {
     quota?.resetsAtLabel ||
     (quota?.resetsAt ? String(quota.resetsAt).slice(0, 10) : null);
   const standardPrice = findPrice(quota, "byokPro"); // Standard edition (the only edition)
+  const standardPriceNote = findPriceNote(quota, "byokPro"); // the shape sentence (whole-site qualifier)
 
   // Headline + intro. Prefer the backend-composed `detail` for the body (it is
   // already tier-correct and mentions the reset date / prices); fall back to a
@@ -7395,6 +7396,19 @@ function LimitReachedScreen({ quota, onBack, backToReview = false }) {
                 : "everything included — use your own Anthropic key"
             }
           />
+
+          {/* The price SHAPE. EditionRow's cell only fits a short line, and the app cannot know
+              this site's price band (the Forge License object carries no seat count), so the
+              honest detail sits here — including the qualifier that "free" is about the WHOLE
+              Confluence site, not the size of the team using Spec2Tickets. */}
+          {standardPriceNote && (
+            <p
+              className="text-xs"
+              style={{ color: "var(--s2j-text-light)", marginTop: 6 }}
+            >
+              {standardPriceNote}
+            </p>
+          )}
 
           {UPGRADE_URL && (
             <>
@@ -7669,14 +7683,24 @@ function fmtUsd(usd) {
 }
 
 // Look up a tier's display price from a getUsage/quota pricing[] array. The
-// pricing table is the SINGLE source of USD prices (composed server-side) — the UI
-// never hardcodes prices, so a price change in usage.js flows through everywhere.
+// pricing table is the SINGLE source of pricing copy (composed server-side) — the UI
+// never hardcodes prices, so a change in usage.js flows through everywhere.
 // Accepts the full usage/quota object OR a raw pricing array. Returns null if absent.
+// ⭐ `price` is a SHORT SHAPE line ("See Marketplace pricing"), NOT a per-user rate: the Forge
+// License object carries no seat count and no price band, so the app cannot know which band an
+// install is in (src/usage.js PRICING COPY). findPriceNote returns the fuller sentence that
+// carries the whole-instance qualifier — render it wherever there is room for a sentence.
 function findPrice(usageOrPricing, key) {
   const pricing = Array.isArray(usageOrPricing)
     ? usageOrPricing
     : usageOrPricing?.pricing;
   return (pricing || []).find((t) => t.key === key)?.price || null;
+}
+function findPriceNote(usageOrPricing, key) {
+  const pricing = Array.isArray(usageOrPricing)
+    ? usageOrPricing
+    : usageOrPricing?.pricing;
+  return (pricing || []).find((t) => t.key === key)?.priceNote || null;
 }
 
 function fmtTime(s) {

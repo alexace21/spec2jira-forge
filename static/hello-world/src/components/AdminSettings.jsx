@@ -79,6 +79,11 @@ const ERROR_MESSAGES = {
   // the backend detail and fall back to this Managed-correct message.
   MANAGED_UNAVAILABLE:
     "The Managed service is temporarily unavailable (server key not configured). Contact support, or switch to BYOK and save your own Anthropic API key.",
+  // The defensive unlicensed backstop (buildLicenseRequired). Terminal, NOT retryable — see the
+  // distill handlers below: without an explicit code this fell through to the generic branch and
+  // wrongly offered "You can retry from where it stopped".
+  LICENSE_REQUIRED:
+    "This app needs an active subscription or trial. Ask your site admin to subscribe, then try again.",
 };
 
 function getErrorText(result) {
@@ -87,9 +92,13 @@ function getErrorText(result) {
   return result?.detail || "Connection test failed";
 }
 
-// Price lookups off the getUsage `pricing[]` array (single source of USD prices — the
+// Price lookups off the getUsage `pricing[]` array (single source of pricing copy — the
 // UI never hardcodes prices). accountPriceFor → a named tier's price; accountPrice →
 // the customer's OWN active tier price (null when absent).
+// ⭐ `price` is a SHORT SHAPE line ("See Marketplace pricing"), never a per-user rate: the Forge
+// License object carries no seat count or price band, so the app cannot know this site's band
+// (src/usage.js PRICING COPY). `priceNote` is the fuller sentence — free only while the WHOLE
+// Confluence site is ≤10 users, per user above that on a declining rate — rendered below.
 function accountPriceFor(account, key) {
   return (account?.pricing || []).find((t) => t.key === key)?.price || null;
 }
@@ -98,6 +107,15 @@ function accountPrice(account) {
   // subscriber — whose tier is no longer in the Standard-only pricingTable — still shows their real price.
   // Fall back to the pricing[] lookup for older payloads.
   return account?.price || (account?.tier ? accountPriceFor(account, account.tier) : null);
+}
+// Same precedence for the shape sentence. Absent on an older payload ⇒ null ⇒ nothing rendered.
+function accountPriceNote(account) {
+  return (
+    account?.priceNote ||
+    (account?.tier
+      ? (account?.pricing || []).find((t) => t.key === account.tier)?.priceNote || null
+      : null)
+  );
 }
 
 // Props (diagnostics Phase 5, design §5):
@@ -2258,6 +2276,30 @@ function ContextProfilesEditor({ profiles, setProfiles, apiKeyConfigured, onMess
       }
       if (result?.error) {
         const label = result.label || `step ${step + 1}`;
+        // ⭐ 2026-07-25: the per-step trial-credit stopper. Its payload carries an honest surface-aware
+        // detail ("This project-context step needs ~$X, only $Y of free trial credit left") and ships
+        // with code:'NOT_CONFIGURED', so the detail MUST be preferred here — otherwise
+        // ERROR_MESSAGES.NOT_CONFIGURED ("No API key configured") shadows it and misleads a trial user
+        // who simply ran out of credit (the exact shadowing bug the audit caught on the
+        // startDistillSession sibling below). No retry handle: this session is bound to the managed key,
+        // so retrying it can only re-block — the honest route is a key + a fresh run.
+        if (result.error === "trial_credit_exhausted") {
+          onMessage({
+            type: "error",
+            text: `${result.detail || "Your free trial credit is used."} Then run Summarize again.`,
+          });
+          return;
+        }
+        // ⭐ 2026-07-25: the defensive unlicensed backstop is TERMINAL too — retrying the step cannot
+        // fix a missing license, so it gets no retry handle and no "retry from where it stopped" hint
+        // (the generic branch below appended one, because the payload used to carry no `code`).
+        if (result.error === "license_required") {
+          onMessage({
+            type: "error",
+            text: result.detail || ERROR_MESSAGES.LICENSE_REQUIRED,
+          });
+          return;
+        }
         // Managed-unavailable: prefer the backend detail (it says "switch to BYOK"),
         // NOT the generic NOT_CONFIGURED "paste your key" text — wrong for a Managed
         // user who has no key by design.
@@ -2991,6 +3033,7 @@ function PathArrow() {
 // Plan / model card (§4.4). Price comes from pricing[] (single source), model from Test/verify.
 function PlanModelCard({ account, model, hasPlanner, trialActive }) {
   const price = accountPrice(account);
+  const priceNote = accountPriceNote(account);
   const breakdowns = account?.unlimited
     ? "Unlimited"
     : `${account?.used ?? 0}${account?.limit ? ` / ${account.limit}` : ""}`;
@@ -3007,6 +3050,13 @@ function PlanModelCard({ account, model, hasPlanner, trialActive }) {
           ? "Your Standard plan includes everything: unlimited breakdowns (running on your $5 free trial credit for now), AI test-case generation, and the capacity planner."
           : "Your Standard plan includes everything: unlimited breakdowns on your own Anthropic key, AI test-case generation, and the capacity planner."}
       </p>
+      {/* The subscription-price SHAPE. The PLAN column can only hold a short line, and the app
+          genuinely cannot know this site's price band (no seat count in the Forge License object),
+          so the honest detail lives here: free only while the WHOLE Confluence site is 10 or fewer
+          users, per user above that on a declining rate, exact figure on the Marketplace listing. */}
+      {priceNote && (
+        <p style={{ ...TYPE.micro, marginTop: 6 }}>{priceNote}</p>
+      )}
       <div className="flex gap-2 flex-wrap" style={{ marginTop: 8 }}>
         <FeatureChip>Test-case generation</FeatureChip>
         {hasPlanner && <FeatureChip>Capacity planner</FeatureChip>}

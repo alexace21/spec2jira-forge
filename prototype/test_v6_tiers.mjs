@@ -97,9 +97,43 @@ const pt = pricingTable();
 check('pricingTable lists exactly 1 edition (Standard-only)', pt.length === 1);
 check('pricingTable key is byokPro', pt[0].key === 'byokPro');
 check('pricingTable does NOT list managedPro', !pt.some((p) => p.key === 'managedPro'));
-check('pricingTable Standard is priced ($6.70)', /6\.70/.test(pt[0].price || ''));
 check('pricingTable Standard carries hasTestCases true', pt[0].hasTestCases === true);
 check('pricingTable Standard carries hasPlanner true', pt[0].hasPlanner === true);
+
+// 11b. PRICING COPY — the strings state a SHAPE, never a rate (2026-07-25; replaces the old
+// `/6\.70/` assertion). Marketplace pricing is GRADUATED (≤10 users free, then per-user bands
+// declining with instance size) and the Forge License object exposes NO seat count and NO price
+// band — so the app CANNOT know which band an install is in. Asserting one rate as "your price"
+// would be wrong for every customer in a different band. These assertions are the regression
+// guard for that: the CTA must still render, no rate may leak back in, and the free-tier claim
+// must always travel with the whole-instance qualifier.
+const stdPrice = pt[0].price || '';
+const stdNote = pt[0].priceNote || '';
+const RATE = /\$\s?\d/; // any asserted dollar figure
+check('Standard price is non-empty (LimitReachedScreen hides the whole CTA card on a falsy price)', stdPrice.length > 0);
+check('Standard price stays SHORT (EditionRow renders it in a shrink-0 cell)', stdPrice.length <= 30);
+check('Standard price asserts NO dollar rate (the band is unknowable at runtime)', !RATE.test(stdPrice));
+check('Standard price defers the figure to the Marketplace', /marketplace/i.test(stdPrice));
+check('Standard price makes no bare "free" claim (the qualifier lives in priceNote)', !/free/i.test(stdPrice));
+check('Standard priceNote states the free band', /free/i.test(stdNote));
+check('Standard priceNote carries the WHOLE-SITE qualifier', /whole Confluence site/i.test(stdNote));
+check('Standard priceNote rules out the "small team in a big instance" reading', /not just your team/i.test(stdNote));
+check('Standard priceNote states the per-user + declining shape', /per user/i.test(stdNote) && /declines/i.test(stdNote));
+check('Standard priceNote defers the exact figure to the Marketplace', /marketplace/i.test(stdNote));
+check('Standard priceNote asserts NO dollar rate either', !RATE.test(stdNote));
+
+// The RETIRED-but-resolvable Advanced row is not in pricingTable, yet checkQuota returns the ACTIVE
+// tier's own price → an existing/pending Advanced subscriber still reads it in the Account panel.
+// Same rule applies, minus any free-band claim (only the live Standard offer's bands are verified).
+check('Advanced price asserts NO dollar rate', !RATE.test(TIERS.byokAdvanced.price || ''));
+check('Advanced priceNote defers to the Marketplace', /marketplace/i.test(TIERS.byokAdvanced.priceNote || ''));
+check('Advanced makes NO free-band claim (unverified for that edition)', !/free/i.test(TIERS.byokAdvanced.priceNote || ''));
+
+// Whole-table invariant: no tier may hardcode a subscription rate anywhere.
+check(
+  'NO tier asserts a subscription rate in price or priceNote',
+  Object.values(TIERS).every((t) => !RATE.test(`${t.price || ''} ${t.priceNote || ''}`)),
+);
 
 // 12. isTrialLicense — gates the $5 managed credit. The 30-day trial is signalled by isEvaluation===true
 // (real Marketplace) OR — when isEvaluation is UNDEFINED — a FUTURE trialEndDate (dev `forge install

@@ -193,9 +193,15 @@ app:
   # the two-price model (licensing.enabled alone → a SINGLE price).
   # ⭐ v6 VALUE-SPLIT (2026-06-17): BOTH editions are BYOK (customer's own key); they
   # differ by VALUE (feature set), NOT key-source:
-  #   Standard = core breakdown + push + Project Context (UNLIMITED, BYOK) — portal price
-  #              (set 2026-06-04): 100% of Confluence ($6.70/user, $57 ≤10, declining, 1.5x multi)
-  #   Advanced = Standard + test-case generation (UNLIMITED, BYOK; $13.40/user). Single anchor =
+  #   Standard = core breakdown + push + Project Context (UNLIMITED, BYOK) — portal pricing
+  #              (verified 2026-07-24): 100% of Confluence, GRADUATED per-user bands (cumulative
+  #              brackets, NOT one flat rate): ≤10 users FREE · $6.70 (1-100) · $5.10 (101-250) ·
+  #              $3.80 (251-1000) … declining to $1.15 at 45001+ · 1.5x multi-instance.
+  #              "≤10 users" = the WHOLE Confluence site (Paid via Atlassian licenses the instance),
+  #              NOT a small team inside a big one. The old "$57 ≤10 flat" floor is RETIRED.
+  #              ⚠ The runtime exposes no seat count / band, so in-app copy states the SHAPE only and
+  #              defers the figure to the listing — see the PRICING COPY block in src/usage.js.
+  #   Advanced = Standard + test-case generation (UNLIMITED, BYOK). Single anchor =
   #              test-cases; custom prompts + Capacity-Sheet are FUTURE (don't advertise until built).
   # ⚠ DEPLOY-TIMING: the portal Advanced edition is currently still the v5 "Managed" edition
   #   (pending). Re-config it to the BYOK test-cases value at editions Phase 2 (POST-PUBLISH),
